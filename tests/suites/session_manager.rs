@@ -4103,3 +4103,123 @@ fn warn_unparsed_line_preview_is_capped_and_ellipsized() {
         "the raw tail beyond the cap must not leak into the log: {warning}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-101: a windowed slice must NOT be walked with the PIR-BIN-092 bridge
+// ---------------------------------------------------------------------------
+
+/// A paged/live-trimmed manager holds only a tail window, and every leaf-path
+/// view of that window must STOP where the parent leaves the slice
+/// ([`pir::session_manager::projection::build_session_path_windowed`];
+/// `projected_branch_path` passes `bridge_missing_parents = !is_paged()` for
+/// exactly that reason: on a window a missing parent means "the rest of the
+/// branch is on disk", not "a line was skipped"). `retained_context` at the
+/// time of writing hardcodes the file-wide bridge (`true`), so when the live
+/// branch point falls inside the skipped prefix and ABANDONED rows sit just
+/// before the window's first live-path entry, the projection joins those
+/// file-order predecessors across the boundary: the model context of a window
+/// gains an exchange from a branch the user left, while the same prompt's
+/// branch snapshot (the thing the compaction gate prices) stops at the
+/// boundary. The windowed walk is the contract (upstream pi stops at the
+/// missing parent; pre-fa6e498 pir stopped too).
+///
+/// RED on purpose (PIR-BIN-101, filed 2026-11-14 by lane v1): the fixture and
+/// the windowed-walk assertion pass; the projection assertions fail until
+/// `retained_context` takes the windowed flag.
+#[test]
+fn windowed_projection_stops_at_the_page_start_pir_bin_101() {
+    let dir = temp_dir("bin101-windowed-bridge");
+    let mut session = SessionManager::create("C:/repo", &dir).unwrap();
+    let u1 = session.append_message(user_message("live-u1")).unwrap();
+    session
+        .append_message(assistant_message("live-a1", StopReason::Stop))
+        .unwrap();
+    session
+        .append_message(user_message("abandoned-b2"))
+        .unwrap();
+    session
+        .append_message(assistant_message("abandoned-b3", StopReason::Stop))
+        .unwrap();
+    session.branch(&u1).unwrap();
+    let c2 = session.append_message(user_message("live-c2")).unwrap();
+    let c3 = session
+        .append_message(assistant_message("live-c3", StopReason::Stop))
+        .unwrap();
+    let path = session.path().to_path_buf();
+    drop(session);
+
+    // The window is the header plus the last four entries, so it starts inside
+    // the ABANDONED tail: [b2, b3, c2, c3] — the live branch point u1 stays on
+    // disk.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let tail_four_bytes: usize = lines[lines.len() - 4..]
+        .iter()
+        .map(|line| line.len() + 1)
+        .sum();
+    let paged = SessionManager::open_paged(&path, tail_four_bytes + 1, 4).expect("paged open");
+    assert!(paged.is_paged(), "the fixture must exceed the page caps");
+    assert_eq!(paged.leaf_id(), Some(c3.as_str()));
+
+    let windowed = |manager: &SessionManager| -> Vec<String> {
+        manager
+            .projected_branch_path(None)
+            .iter()
+            .map(|entry| entry.entry_id().to_owned())
+            .collect()
+    };
+    let projected = |manager: &SessionManager| -> (Vec<String>, Vec<String>) {
+        let projection = manager.build_session_projection().expect("projection");
+        (
+            projection
+                .entries
+                .iter()
+                .map(|entry| entry.source_entry.entry_id().to_owned())
+                .collect(),
+            projection.messages.iter().map(text_of).collect(),
+        )
+    };
+
+    assert_eq!(
+        windowed(&paged),
+        vec![c2.clone(), c3.clone()],
+        "projected_branch_path is the documented windowed budget"
+    );
+    let (projected_ids, projected_texts) = projected(&paged);
+    assert_eq!(
+        projected_ids,
+        vec![c2.clone(), c3.clone()],
+        "the projection over the same window must stop where the windowed walk stops (PIR-BIN-101)"
+    );
+    assert_eq!(
+        projected_texts,
+        vec!["live-c2".to_owned(), "live-c3".to_owned()],
+        "the model context of a window must never carry the abandoned branch (PIR-BIN-101): {projected_texts:?}"
+    );
+
+    // The live-trimmed SDK shape (PIR-SDK-018 R46: prompt_loop keeps the
+    // window, never widens) takes the same walk with the same window.
+    let mut trimmed = SessionManager::open(&path).unwrap();
+    trimmed.enable_live_tail_trim(1, 4);
+    assert!(
+        trimmed.trim_resident_tail(usize::MAX, 4).unwrap(),
+        "the trim must fire"
+    );
+    assert!(trimmed.is_live_trimmed());
+    assert_eq!(
+        windowed(&trimmed),
+        vec![c2.clone(), c3.clone()],
+        "the live-trim windowed walk"
+    );
+    let (projected_ids, projected_texts) = projected(&trimmed);
+    assert_eq!(
+        projected_ids,
+        vec![c2, c3],
+        "the live-trimmed projection must stop at the window boundary (PIR-BIN-101)"
+    );
+    assert_eq!(
+        projected_texts,
+        vec!["live-c2".to_owned(), "live-c3".to_owned()],
+        "the live-trimmed model context must never carry the abandoned branch (PIR-BIN-101): {projected_texts:?}"
+    );
+}

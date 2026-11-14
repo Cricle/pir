@@ -29,6 +29,20 @@ pub const EPHEMERAL_HISTORY_MAX_TOKENS: u64 = MAX_EPHEMERAL_HISTORY_TOKENS;
 /// [`EPHEMERAL_HISTORY_MAX_TOKENS`]).
 pub const EPHEMERAL_HISTORY_MAX_MESSAGES: usize = MAX_EPHEMERAL_HISTORY_MESSAGES;
 
+/// A prompt-start projection with the branch snapshot built alongside it and
+/// the R3 [`ParkToken`](crate::session_manager::projection::ParkToken) the
+/// run-end park validates against.
+///
+/// The token travels WITH the projection: whenever a projection is discarded
+/// for a moved leaf (gate prebuilt check, D4) and rebuilt, its stale token is
+/// dropped with it, so the park only ever sees the proof of the projection the
+/// run's context was actually built from.
+type PromptProjection = (
+    crate::session_manager::SessionProjection,
+    Vec<crate::compaction::PathEntryShared>,
+    Option<crate::session_manager::projection::ParkToken>,
+);
+
 /// Inputs of one shared `before_agent_start` dispatch.
 pub(crate) struct BeforeAgentStartDispatch<'a> {
     /// The user prompt text (`messageType: "user"`), or `None` for a custom
@@ -486,22 +500,24 @@ impl AgentSession {
     /// transcript-sized `Message` is cloned on the reuse path. A cache miss,
     /// an edit/compaction/branch change, or any count mismatch falls back to
     /// the unchanged full builder (`projection_build_count` moves only then).
+    ///
+    /// R3: a reused extend also returns its
+    /// [`ParkToken`](crate::session_manager::projection::ParkToken) — the
+    /// proof the run-end park validates in O(delta). The caller must keep it
+    /// with the projection and drop it together (a projection rebuilt for a
+    /// moved leaf has no token).
     pub(super) async fn project_session_with_cache(
         &self,
         session: &Arc<tokio::sync::Mutex<SessionManager>>,
-    ) -> crate::Result<(
-        crate::session_manager::SessionProjection,
-        Vec<crate::compaction::PathEntryShared>,
-    )> {
+    ) -> crate::Result<PromptProjection> {
         let cached = self.take_cached_prompt_projection();
-        let session = Arc::clone(session);
-        let (projection, branch, reused) = tokio::task::spawn_blocking(
+        let session_handle = Arc::clone(session);
+        let (outcome, branch) = tokio::task::spawn_blocking(
             move || -> crate::Result<(
-                crate::session_manager::SessionProjection,
+                crate::session_manager::projection::CachedProjectionOutcome,
                 Vec<crate::compaction::PathEntryShared>,
-                bool,
             )> {
-                let mut session = session.blocking_lock();
+                let mut session = session_handle.blocking_lock();
                 // PIR-SDK-018 R46: a LIVE-TRIMMED session must stay on its
                 // tail window. Widening here re-materialized the whole
                 // transcript on every prompt, so the allocator high-water
@@ -511,21 +527,21 @@ impl AgentSession {
                 if session.is_paged() && !session.is_live_trimmed() {
                     session.widen_to_full()?;
                 }
-                let (projection, reused) = session.build_session_projection_with_cache(cached);
+                let outcome = session.build_session_projection_with_cache(cached);
                 // The per-PROMPT branch snapshot: shared entry handles
                 // (PIR-BIN-096) — the hook reads ids/flags off it, so the
                 // owned-id shape would clone one `String` per path entry per
                 // prompt for nothing.
                 let branch = session.branch_path_shared(None);
-                Ok((projection, branch, reused))
+                Ok((outcome, branch))
             },
         )
         .await
         .map_err(|error| anyhow::anyhow!("session startup blocking task failed: {error}"))??;
-        if reused {
+        if outcome.reused {
             self.record_projection_reuse();
         }
-        Ok((projection, branch))
+        Ok((outcome.projection, branch, outcome.park_token))
     }
 
     /// RSS-B: park the completed run's context as the next prompt's snapshot.
@@ -535,11 +551,19 @@ impl AgentSession {
     /// (rare) case the cache stays empty and the next prompt pays one full
     /// build. Only append-only runs whose materialized context still matches
     /// the projection's message-count contract are cached.
+    ///
+    /// R3: when the prompt-start projection was served by the incremental
+    /// extend, `park_token` carries its proof and the append-only/count
+    /// validation runs in O(delta) (`SessionManager::validate_park_delta`).
+    /// Any run without a token — full build (edit/compaction/branch/cache
+    /// miss, continuations) or a walk that cannot conclude — keeps today's
+    /// full validation unchanged.
     async fn park_completed_projection(
         &self,
         result: &mut crate::agent::agent_loop::LoopResult,
         run_start_leaf: Option<&str>,
         run_session_id: Option<&str>,
+        park_token: Option<&crate::session_manager::projection::ParkToken>,
     ) {
         let Some(session) = &self.session else {
             self.clear_cached_prompt_projection();
@@ -608,10 +632,28 @@ impl AgentSession {
             }) else {
                 return;
             };
-            if session.projected_message_count_for_leaf(leaf_id.as_deref()) != messages.len() {
-                return;
-            }
-            if !session.path_delta_is_append_only(run_start_leaf, leaf_id.as_deref()) {
+            // R3 fast path: the extend proved the delta up to the token's
+            // leaf append-only and counted; only the entries this run walked
+            // above its start anchor are re-checked. `Some(false)` is the
+            // same rejection the full checks below would produce (a
+            // non-append-safe entry or a count that cannot reconcile), only
+            // cheaper; `None` (the anchor or the token's leaf left the live
+            // path: branch reset/rewrite/window slide) falls through to the
+            // unchanged full validation.
+            let validated = match park_token {
+                Some(token) => session
+                    .validate_park_delta(token, leaf_id.as_deref(), run_start_leaf, messages.len())
+                    .unwrap_or_else(|| {
+                        session.projected_message_count_for_leaf(leaf_id.as_deref())
+                            == messages.len()
+                            && session.path_delta_is_append_only(run_start_leaf, leaf_id.as_deref())
+                    }),
+                None => {
+                    session.projected_message_count_for_leaf(leaf_id.as_deref()) == messages.len()
+                        && session.path_delta_is_append_only(run_start_leaf, leaf_id.as_deref())
+                }
+            };
+            if !validated {
                 return;
             }
             crate::session_manager::projection::CachedSessionProjection {
@@ -1362,7 +1404,7 @@ impl AgentSession {
         // building at their own call sites.
         let prebuild_projection = self.event_extensions().is_some()
             || (self.plugins.is_some() && self.compaction_config().is_some());
-        let mut snapshot_projection = if prebuild_projection {
+        let mut snapshot_projection: Option<PromptProjection> = if prebuild_projection {
             match &self.session {
                 Some(session) => self.project_session_with_cache(session).await.ok(),
                 None => None,
@@ -1378,7 +1420,7 @@ impl AgentSession {
             &model,
             snapshot_projection
                 .as_ref()
-                .map(|(projection, _branch)| projection),
+                .map(|(projection, _branch, _park_token)| projection),
         )
         .await;
 
@@ -1469,10 +1511,7 @@ impl AgentSession {
         // prompt therefore never builds the whole transcript twice), and skip
         // the separate metadata walk the old gate ran first — one leaf-path
         // index build per prompt instead of two.
-        let mut startup_projection: Option<(
-            crate::session_manager::SessionProjection,
-            Vec<crate::compaction::PathEntryShared>,
-        )> = None;
+        let mut startup_projection: Option<PromptProjection> = None;
         // The prompt-start gate runs the threshold check once before the
         // starting message is persisted. If it actually starts a compaction,
         // the loop's first per-turn check is skipped: a failed append must not
@@ -1507,7 +1546,7 @@ impl AgentSession {
                     // common case: session_start/input handlers registered
                     // tools or rewrote the prompt but appended no entry.
                     let prebuilt = match snapshot_projection.take() {
-                        Some((projection, branch)) => {
+                        Some((projection, branch, park_token)) => {
                             let live_leaf = session.lock().await.leaf_id().map(str::to_owned);
                             let projected_leaf = projection
                                 .entries
@@ -1515,7 +1554,7 @@ impl AgentSession {
                                 .and_then(|entry| entry.source_entry.id())
                                 .map(str::to_owned);
                             if live_leaf == projected_leaf {
-                                Some((projection, branch))
+                                Some((projection, branch, park_token))
                             } else {
                                 None
                             }
@@ -1526,7 +1565,7 @@ impl AgentSession {
                         Some(value) => Some(value),
                         None => self.project_session_with_cache(session).await.ok(),
                     };
-                    if let Some((mut projection, branch)) = built {
+                    if let Some((mut projection, branch, park_token)) = built {
                         // The MATERIALIZED projection decides whether the gate
                         // has an assistant usage record to inspect: a context
                         // edit can omit every assistant entry, and a trailing
@@ -1586,13 +1625,13 @@ impl AgentSession {
                                 drop(returned);
                                 if let Some(context) = Arc::into_inner(pre_context) {
                                     projection.messages = context.messages;
-                                    startup_projection = Some((projection, branch));
+                                    startup_projection = Some((projection, branch, park_token));
                                 }
                             }
                         } else {
                             // Not a compaction candidate, but the projection is
                             // exactly the run context.
-                            startup_projection = Some((projection, branch));
+                            startup_projection = Some((projection, branch, park_token));
                         }
                     }
                 }
@@ -1811,7 +1850,7 @@ impl AgentSession {
         // messages), so reuse it only while the session still ends on the
         // leaf the projection ended on; otherwise rebuild from the live
         // session. The projection's last entry is the projected path leaf.
-        if let Some((projection, _)) = startup_projection.as_ref() {
+        if let Some((projection, _, _)) = startup_projection.as_ref() {
             if let Some(session) = &self.session {
                 let live_leaf = session.lock().await.leaf_id().map(str::to_owned);
                 let projected_leaf = projection
@@ -1828,20 +1867,27 @@ impl AgentSession {
         // Whether the ephemeral (store-less) trim above dropped anything; only
         // the `None` (no session store) arm can set it (PIR-BIN-075).
         let mut ephemeral_trim = EphemeralTrim::default();
+        // R3: the park proof of the projection the loop's context is built
+        // from (see [`PromptProjection`]); `None` forces the full park
+        // validation, exactly today's behavior.
+        let mut park_token: Option<crate::session_manager::projection::ParkToken> = None;
         let mut messages = match &self.session {
             Some(session) => match startup_projection.take() {
                 // The prompt-start projection was already built for the
                 // compaction gate and the gate did NOT compact: reuse it
                 // (messages + branch metadata) instead of rebuilding the
                 // transcript.
-                Some((projection, branch)) => {
+                Some((projection, branch, token)) => {
+                    park_token = token;
                     let metas =
                         compaction::ProjectionEntryMeta::from_projection(&projection.entries);
                     projected = Some((Arc::new(metas), Arc::new(branch)));
                     projection.messages
                 }
                 None => {
-                    let (projection, branch) = self.project_session_with_cache(session).await?;
+                    let (projection, branch, token) =
+                        self.project_session_with_cache(session).await?;
+                    park_token = token;
                     // Snapshot = per-entry METADATA only (shared source entries +
                     // message counts); the messages are moved into the loop's
                     // context below and the hook slices THAT list, so a
@@ -3235,13 +3281,15 @@ impl AgentSession {
 
         // RSS-B: park this run's final transcript as the next prompt's
         // projection snapshot. The move-in is conditional on append-only /
-        // message-count validation; on any mismatch the next prompt pays one
-        // full projection and starts a fresh snapshot.
+        // message-count validation (R3: O(delta) when `park_token` carries the
+        // prompt-start extend's proof); on any mismatch the next prompt pays
+        // one full projection and starts a fresh snapshot.
         let run_session_id = persist_ledger.run_session_id();
         self.park_completed_projection(
             &mut result,
             run_start_leaf.as_deref(),
             run_session_id.as_deref(),
+            park_token.as_ref(),
         )
         .await;
 

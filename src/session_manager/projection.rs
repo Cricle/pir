@@ -673,16 +673,29 @@ fn context_edit_for<'a>(
 
 /// The leaf path plus its retained context entries and edit index — the one
 /// walk every projection/context reader shares.
+/// The leaf path / retained context / edit index of `entries` — the shared
+/// first step of every projection reader.
+///
+/// `bridge_missing_parents` is the caller's slice contract (PIR-BIN-101):
+/// `true` for the whole file (the PIR-BIN-092 broken-chain bridge), `false`
+/// for a WINDOWED slice (a paged/live-trimmed resident tail), where a parent
+/// outside the slice means "the rest of the branch is on disk" and the walk
+/// must stop at the boundary — the same rule
+/// [`SessionManager::projected_branch_path`] pins with `!is_paged()`.
+/// Bridging a window would join to the previous non-header ROW IN THE SLICE,
+/// which can belong to an abandoned branch (the model-context bug this flag
+/// closes).
 fn retained_context<'a, E: Borrow<FileEntry>>(
     entries: &'a [E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> (
     Vec<&'a E>,
     Vec<&'a E>,
     Option<std::collections::HashMap<String, &'a ContextEditEntry>>,
 ) {
-    let path = build_session_path_entries(entries, leaf_id, true, positions);
+    let path = build_session_path_entries(entries, leaf_id, bridge_missing_parents, positions);
     let context_entries = context_entry_refs(&path);
     let edits = context_edit_index(&context_entries);
     (path, context_entries, edits)
@@ -735,17 +748,20 @@ pub fn build_projection_entry_meta<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<crate::compaction::ProjectionEntryMeta> {
-    build_projection_entry_meta_indexed(entries, leaf_id, None)
+    build_projection_entry_meta_indexed(entries, leaf_id, true, None)
 }
 
 /// [`build_projection_entry_meta`] over the manager's persistent
 /// [`EntryPositions`] (the per-prompt compaction-metadata path).
+/// `bridge_missing_parents`: the slice contract (see [`retained_context`]).
 pub(crate) fn build_projection_entry_meta_indexed<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> Vec<crate::compaction::ProjectionEntryMeta> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
+    let (_path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, positions);
 
     let mut metas = Vec::with_capacity(context_entries.len());
     for (index, source_entry) in context_entries.iter().enumerate() {
@@ -849,17 +865,20 @@ pub fn build_session_projection<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> SessionProjection {
-    build_session_projection_indexed(entries, leaf_id, None)
+    build_session_projection_indexed(entries, leaf_id, true, None)
 }
 
 /// [`build_session_projection`] over the manager's persistent
 /// [`EntryPositions`] (the per-prompt projection build).
+/// `bridge_missing_parents`: the slice contract (see [`retained_context`]).
 pub(crate) fn build_session_projection_indexed<E: SharedEntry>(
     entries: &[E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> SessionProjection {
-    let (path, context_entries, edits) = retained_context(entries, leaf_id, positions);
+    let (path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, positions);
     let (thinking_level, model) = get_session_context_settings(&path);
 
     // One shared handle per retained entry (the source `Arc` when the walk
@@ -925,17 +944,20 @@ pub fn build_session_messages<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<Message> {
-    build_session_messages_indexed(entries, leaf_id, None)
+    build_session_messages_indexed(entries, leaf_id, true, None)
 }
 
 /// [`build_session_messages`] over the manager's persistent [`EntryPositions`]
 /// (the whole-history readers' per-prompt rebuild).
+/// `bridge_missing_parents`: the slice contract (see [`retained_context`]).
 pub(crate) fn build_session_messages_indexed<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> Vec<Message> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
+    let (_path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, positions);
     let message_capacity: usize = context_entries
         .iter()
         .enumerate()
@@ -1374,11 +1396,14 @@ pub fn extend_projection_entry_fragments(
 /// structs), materializing a `Message` only for the entries whose model view
 /// differs from the stored record (bash executions, custom/system messages,
 /// summaries, context edits).
+///
+/// Takes the WHOLE FILE's entries (the PIR-BIN-092 bridge applies); a paged
+/// caller widens first ([`SessionManager::widen_to_full`], PIR-SDK-025).
 pub fn build_session_context_json<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Vec<JsonValue> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, None);
+    let (_path, context_entries, edits) = retained_context(entries, leaf_id, true, None);
     // Exact output capacity: the message-count contract the projection and
     // its metadata twin share. One pass over entries already in cache, no
     // growth reallocations on a transcript-sized resident window.
@@ -1478,8 +1503,10 @@ pub fn current_system_message(messages: &[Message]) -> Option<StoredSystemMessag
 pub fn current_system_message_from_entries<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
 ) -> Option<StoredSystemMessage> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, None);
+    let (_path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, None);
 
     let mut system_messages: Vec<Message> = Vec::new();
     for (index, source_entry) in context_entries.iter().enumerate() {
@@ -1532,19 +1559,22 @@ pub fn last_assistant_text_from_entries<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
 ) -> Option<String> {
-    last_assistant_text_from_entries_indexed(entries, leaf_id, None)
+    last_assistant_text_from_entries_indexed(entries, leaf_id, true, None)
 }
 
 /// [`last_assistant_text_from_entries`] over the manager's persistent
 /// [`EntryPositions`] (the RPC state-poll path).
+/// `bridge_missing_parents`: the slice contract (see [`retained_context`]).
 pub(crate) fn last_assistant_text_from_entries_indexed<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> Option<String> {
     use crate::ai::types::StopReason;
 
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
+    let (_path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, positions);
 
     for source_entry in context_entries.iter().rev() {
         let entry: &FileEntry = (*source_entry).borrow();
@@ -1609,6 +1639,46 @@ pub(crate) struct CachedSessionProjection {
     pub(crate) messages: Vec<Message>,
 }
 
+/// The proof [`extend_cached_session_projection`] leaves behind for the
+/// run-end park — the R3 token that turns the park validation from two
+/// transcript-sized walks into an O(delta) one.
+///
+/// The extend validated, for the projection it returned at `leaf_id`:
+/// every entry appended since the previous parked leaf was append-safe and
+/// its materialized message count matched the projection contract, and the
+/// retained prefix satisfied the count contract. Together those prove
+/// `message_count == projected_message_count_for_leaf(leaf_id)` — the number
+/// the full park validation would re-derive — so the park only has to
+/// re-check what THIS run appended after the leaf.
+///
+/// The token is withheld (the extend returns `None` for it) whenever the
+/// retained context carries a `context_edit`: an edit could name a target
+/// that does not exist yet (hand-edited file), which no delta-only walk can
+/// price; the park then runs the unchanged full validation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParkToken {
+    /// The leaf the extended projection ended on. The park's delta walk stops
+    /// as soon as it reaches this entry — everything up to and including it
+    /// is the prefix the extend already proved. `None` is the empty-session
+    /// snapshot: the whole leaf path is the delta.
+    pub(crate) leaf_id: Option<String>,
+    /// Model-visible message count of the extended projection, proven equal
+    /// to a full build's count at `leaf_id` (see the type docs).
+    pub(crate) message_count: usize,
+}
+
+/// Outcome of [`SessionManager::build_session_projection_with_cache`].
+pub(crate) struct CachedProjectionOutcome {
+    pub(crate) projection: SessionProjection,
+    /// Whether the projection was served by extending the cached snapshot
+    /// (drives `projection_reuse_count`; `projection_build_count` moves only
+    /// on the full-build fallback).
+    pub(crate) reused: bool,
+    /// Park proof for the run-end validation; `None` means the park must run
+    /// the full validation (full build, retained context edit, empty cache).
+    pub(crate) park_token: Option<ParkToken>,
+}
+
 /// Build a projection by extending `cached` with the entries appended after
 /// its leaf. Returns `None` — the caller must fall back to
 /// [`build_session_projection`] — when the session did not grow by pure
@@ -1624,12 +1694,17 @@ pub(crate) struct CachedSessionProjection {
 /// The walk below is metadata-only over the OLD entries; only the appended
 /// entries run [`push_context_entry_messages`]. That is the per-turn
 /// transcript-sized materialization H1 removed.
+///
+/// On success it also returns the [`ParkToken`] the run-end park validates
+/// against (`None` when the retained context carries a context edit; see the
+/// token docs).
 pub(crate) fn extend_cached_session_projection(
     entries: &[Arc<FileEntry>],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
     cached: CachedSessionProjection,
-) -> Option<SessionProjection> {
+) -> Option<(SessionProjection, Option<ParkToken>)> {
     let CachedSessionProjection {
         leaf_id: cached_leaf_id,
         leaf_entry: cached_leaf_entry,
@@ -1638,7 +1713,8 @@ pub(crate) fn extend_cached_session_projection(
 
     // One leaf-path walk feeds both the append delta and the retained range —
     // the same selection a full build uses, without touching a single message.
-    let (path, context_entries, edits) = retained_context(entries, leaf_id, positions);
+    let (path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, positions);
 
     let cached_path_index: Option<usize> = match (&cached_leaf_entry, &cached_leaf_id) {
         (Some(leaf_entry), Some(_)) => Some(
@@ -1738,12 +1814,20 @@ pub(crate) fn extend_cached_session_projection(
     }
 
     let (thinking_level, model) = get_session_context_settings(&path);
-    Some(SessionProjection {
+    let projection = SessionProjection {
         entries: projected,
         messages,
         thinking_level,
         model,
-    })
+    };
+    // R3: the park proof. Everything above proved this aggregate's count
+    // equals a full build at `leaf_id`; a retained context edit withholds the
+    // token (see [`ParkToken`]) so the park falls back to the full validation.
+    let park_token = edits.is_none().then(|| ParkToken {
+        leaf_id: leaf_id.map(str::to_owned),
+        message_count: projection.messages.len(),
+    });
+    Some((projection, park_token))
 }
 
 /// The number of model-visible messages a full projection of `leaf_id` would
@@ -1752,9 +1836,11 @@ pub(crate) fn extend_cached_session_projection(
 pub(crate) fn projected_message_count_for_leaf(
     entries: &[Arc<FileEntry>],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> usize {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, positions);
+    let (_path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, positions);
     context_entries
         .iter()
         .enumerate()
@@ -1777,9 +1863,10 @@ pub(crate) fn path_delta_is_append_only(
     entries: &[Arc<FileEntry>],
     from_leaf: Option<&str>,
     to_leaf: Option<&str>,
+    bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
 ) -> bool {
-    let path = build_session_path_entries(entries, to_leaf, true, positions);
+    let path = build_session_path_entries(entries, to_leaf, bridge_missing_parents, positions);
     let start = match from_leaf {
         None => 0,
         Some(from) => match path.iter().position(|entry| {
@@ -1801,33 +1888,171 @@ pub(crate) fn path_delta_is_append_only(
 
 impl SessionManager {
     /// RSS-B projection entry point: reuse `cached` when the session grew by
-    /// pure append, else fall back to the full builder. Returns the projection
-    /// and whether it was served incrementally.
+    /// pure append, else fall back to the full builder. The outcome carries
+    /// the reuse flag plus the [`ParkToken`] the run-end park validates
+    /// against (`None` = full validation).
     ///
     /// `projection_build_count` deliberately counts FULL builds only; the
     /// caller tracks reuses separately (`projection_reuse_count`).
     pub(crate) fn build_session_projection_with_cache(
         &self,
         cached: Option<CachedSessionProjection>,
-    ) -> (SessionProjection, bool) {
+    ) -> CachedProjectionOutcome {
         if let Some(cached) = cached {
-            if let Some(projection) = extend_cached_session_projection(
+            if let Some((projection, park_token)) = extend_cached_session_projection(
                 &self.file_entries,
                 self.leaf_id.as_deref(),
+                !self.is_paged(),
                 Some(&self.entry_positions),
                 cached,
             ) {
-                return (projection, true);
+                return CachedProjectionOutcome {
+                    projection,
+                    reused: true,
+                    park_token,
+                };
             }
         }
         self.projection_builds.fetch_add(1, Ordering::Relaxed);
-        (
-            build_session_projection_indexed(
+        CachedProjectionOutcome {
+            projection: build_session_projection_indexed(
                 &self.file_entries,
                 self.leaf_id.as_deref(),
+                !self.is_paged(),
                 Some(&self.entry_positions),
             ),
-            false,
+            reused: false,
+            park_token: None,
+        }
+    }
+
+    /// R3: the run-end park validation over the delta the prompt-start extend
+    /// did NOT already prove — the entries this run appended after the
+    /// token's leaf ([`park_delta_validates`]).
+    pub(crate) fn validate_park_delta(
+        &self,
+        token: &ParkToken,
+        leaf_id: Option<&str>,
+        run_start_leaf: Option<&str>,
+        parked_message_count: usize,
+    ) -> Option<bool> {
+        park_delta_validates(
+            &self.file_entries,
+            leaf_id,
+            run_start_leaf,
+            !self.is_paged(),
+            &self.entry_positions,
+            token,
+            parked_message_count,
         )
     }
+}
+
+/// R3: validate a completed run's aggregate against the prompt-start
+/// [`ParkToken`] in O(delta) instead of the full transcript.
+///
+/// Walks parent pointers from `leaf_id` (the run's final leaf) DOWN to
+/// `run_start_leaf` (the run's start anchor) through the persistent index with
+/// the SAME rules `build_session_path_entries` uses (validated id→position
+/// resolution, the PIR-BIN-092 broken-chain bridge, the repeated-id cycle
+/// guard). That walk passes the token's leaf on the way and stops there for
+/// nothing: it is exactly the range today's
+/// [`path_delta_is_append_only`] slices out of a full path, and exactly the
+/// base today's [`projected_message_count_for_leaf`] needs
+///
+/// - every entry between the anchor and the leaf is append-safe (a
+///   compaction / context_edit / session entry means a full projection at
+///   `leaf_id` is not the extended aggregate plus this delta — `Some(false)`,
+///   the same rejection the full checks produce);
+/// - entries above the token's leaf are the run's own delta; their projected
+///   contribution plus the token's proven count must reconcile the parked
+///   aggregate — the same absolute equality the full count check computes,
+///   reached from the extend's base (no retained `context_edit` can exist; see
+///   [`ParkToken`]). Entries between the anchor and the token's leaf are
+///   already priced inside that base and are only append-safety-checked.
+///
+/// `None` means the walk cannot conclude — `leaf_id` is not resolvable, the
+/// anchor or the token's leaf is no longer on the live path (branch reset /
+/// rewrite / window slide), the chain cycles first, or the token is the
+/// empty-session snapshot. The caller must then run the unchanged full
+/// validation, so park behavior is never weaker than before.
+///
+/// `bridge_missing_parents` is the slice contract (PIR-BIN-101, see
+/// [`retained_context`]): on a WINDOWED slice the walk never bridges, so a
+/// window whose chain leaves the slice before the anchor resolves to `None`
+/// (cannot prove) instead of concluding over off-path rows.
+pub(crate) fn park_delta_validates(
+    entries: &[Arc<FileEntry>],
+    leaf_id: Option<&str>,
+    run_start_leaf: Option<&str>,
+    bridge_missing_parents: bool,
+    positions: &EntryPositions,
+    token: &ParkToken,
+    parked_message_count: usize,
+) -> Option<bool> {
+    let index = LeafPathIndex::Persistent(positions, entries);
+    // The park resolved `leaf_id` from the resident entries before calling;
+    // a position map that disagrees means a foreign/stale index, so leave the
+    // answer to the full validation (it falls back to the last non-header
+    // entry, the same path builder rule).
+    let leaf_id = leaf_id?;
+    let Some(token_leaf_id) = token.leaf_id.as_deref() else {
+        // Empty-session snapshot: no proven count base to anchor a split at.
+        return None;
+    };
+    let mut current = Some(index.resolve(leaf_id)?);
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut delta_count = 0usize;
+    let mut passed_token_leaf = false;
+    while let Some((position, source)) = current {
+        let entry: &FileEntry = (*source).borrow();
+        if let Some(id) = entry.id() {
+            if !visited.insert(id) {
+                // Cycle: the path builder stops at the repeat too; what that
+                // truncated path means is the full validation's call.
+                return None;
+            }
+        }
+        // The run's start anchor ends the (run_start_leaf, leaf_id] range
+        // (exclusive of the anchor), exactly as the full check slices it.
+        if entry.id() == run_start_leaf {
+            if !passed_token_leaf && entry.id() != Some(token_leaf_id) {
+                // The extend's leaf is not on this path: the base is
+                // meaningless, let the full validation decide.
+                return None;
+            }
+            return Some(token.message_count + delta_count == parked_message_count);
+        }
+        if matches!(
+            entry,
+            FileEntry::Compaction(_) | FileEntry::ContextEdit(_) | FileEntry::Session(_)
+        ) {
+            return Some(false);
+        }
+        if !passed_token_leaf {
+            if entry.id() == Some(token_leaf_id) {
+                passed_token_leaf = true;
+            } else {
+                delta_count += projected_message_count(entry, None);
+            }
+        }
+        current = match entry.parent_id() {
+            None => None,
+            Some(parent) => match index.resolve(parent) {
+                Some(slot) => Some(slot),
+                // PIR-BIN-101: only a whole-file slice may bridge a missing
+                // parent; on a window the parent is the link into the
+                // streamed prefix and nothing across it can be proven.
+                None if bridge_missing_parents => bridging_predecessor(position, entries),
+                None => return None,
+            },
+        };
+    }
+    // The chain ended before the anchor. A run that started from an empty
+    // session (no anchor) owns the whole path — today's `from_leaf: None`
+    // rule — but the extend's leaf must still have been on it.
+    if run_start_leaf.is_none() && passed_token_leaf {
+        return Some(token.message_count + delta_count == parked_message_count);
+    }
+    None
 }

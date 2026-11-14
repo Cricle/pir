@@ -5754,6 +5754,7 @@ impl SessionManager {
         let system_message = projection::current_system_message_from_entries(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            !self.is_paged(),
         )
         .map(|system| StoredSystemMessage {
             timestamp: ms_from_iso(&timestamp).unwrap_or(now_ms()),
@@ -6238,6 +6239,7 @@ impl SessionManager {
         Ok(projection::build_session_messages_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            !self.is_paged(),
             Some(&self.entry_positions),
         ))
     }
@@ -6253,6 +6255,7 @@ impl SessionManager {
         projection::build_session_messages_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            !self.is_paged(),
             Some(&self.entry_positions),
         )
     }
@@ -6287,6 +6290,7 @@ impl SessionManager {
         projection::build_projection_entry_meta_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            !self.is_paged(),
             Some(&self.entry_positions),
         )
     }
@@ -6298,6 +6302,7 @@ impl SessionManager {
         projection::projected_message_count_for_leaf(
             &self.file_entries,
             leaf_id,
+            !self.is_paged(),
             Some(&self.entry_positions),
         )
     }
@@ -6313,6 +6318,7 @@ impl SessionManager {
             &self.file_entries,
             from_leaf,
             to_leaf,
+            !self.is_paged(),
             Some(&self.entry_positions),
         )
     }
@@ -6326,6 +6332,7 @@ impl SessionManager {
         projection::last_assistant_text_from_entries_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            !self.is_paged(),
             Some(&self.entry_positions),
         )
     }
@@ -6354,8 +6361,9 @@ impl SessionManager {
     ///
     /// This is the branch snapshot the per-prompt compaction gate and the
     /// run's threshold hook hold (`AgentSession::project_session_with_cache`
-    /// → `ProjectionSnapshot`); callers that need the owned-id shape (tests,
-    /// the paged/print hosts, `context_usage`) keep using
+    /// → `ProjectionSnapshot`), and what `context_usage` walks; callers that
+    /// need the owned-id shape (tests, the paged/print hosts, the
+    /// start-or-resume snapshot in `agent_session::prompt_loop`) keep using
     /// [`Self::branch_path_meta`].
     pub fn branch_path_shared(
         &self,
@@ -6396,6 +6404,7 @@ impl SessionManager {
         Ok(projection::build_session_projection_indexed(
             &self.file_entries,
             self.leaf_id.as_deref(),
+            !self.is_paged(),
             Some(&self.entry_positions),
         ))
     }
@@ -6416,6 +6425,7 @@ impl SessionManager {
             &projection::build_session_projection_indexed(
                 &self.file_entries,
                 self.leaf_id.as_deref(),
+                !self.is_paged(),
                 Some(&self.entry_positions),
             ),
             true,
