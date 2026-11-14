@@ -10245,6 +10245,19 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
     spawn_ui_watchdog(Arc::clone(&ui_heartbeat));
     loop {
         ui_heartbeat.beat(UI_PHASE_DRAIN);
+        // Clear the worker wake flag BEFORE the drain (the post-drain clear
+        // was a lost-wakeup window, PIR-TUI-024): the frame work after the
+        // drain (first paint, resize pass, the render scheduler pump) can
+        // take tens of milliseconds, and a producer that queued during it
+        // set the flag exactly once. Clearing after that work erased the
+        // wake while the events stayed queued, so the loop slept out the
+        // idle timeout instead of rendering them — the startup attach replay
+        // (queued while the first frame paints) surfaced a full second late.
+        // With the clear first: events queued before it are consumed by the
+        // drain below; a producer that pushes after its last `try_recv`
+        // stores the flag after the push, after this clear, so the wait
+        // below returns early instead of sleeping on a non-empty queue.
+        worker_wake.store(false, std::sync::atomic::Ordering::Release);
         // Drain worker events.
         //
         // P0.3: the drain is BOUNDED per iteration. A resumed huge session
@@ -11915,12 +11928,8 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
             }
             app.note_entries_resized(entries_len_before_event, entries.len());
         }
-        // The drain consumed everything queued at this point, so clear the
-        // worker wake flag (see `WorkerEventSender::wake`): a producer that
-        // pushed while the drain ran leaves it set again (it stores AFTER its
-        // push), so the wait below returns early instead of sleeping on an
-        // event that is already in the queue.
-        worker_wake.store(false, std::sync::atomic::Ordering::Release);
+        // (The worker wake flag was cleared BEFORE the drain, at the top of
+        // this iteration — see the PIR-TUI-024 note there.)
         // P0.3: the batch cap stopped the drain with worker events still
         // queued. Do not wait out the poll this iteration — render the batch
         // that is already in hand (the timeout below turns into a zero poll).
@@ -23118,9 +23127,11 @@ struct WorkerEventSender {
     pending_deltas: Arc<Mutex<PendingDeltas>>,
     /// Set after every successful queue push; the event loop's input wait
     /// polls it so a worker event never waits out the poll timeout (the
-    /// channel is not a pollable handle). Set AFTER the push, cleared AFTER
-    /// the drain — no lost-wakeup window: an event queued before the drain is
-    /// consumed by it, one queued after it leaves the flag set.
+    /// channel is not a pollable handle). Set AFTER the push and cleared
+    /// BEFORE the drain (PIR-TUI-024 — clearing after the drain erased a
+    /// wake that landed during the frame work, stranding the event until the
+    /// idle timeout): an event queued before the clear is consumed by the
+    /// drain, one queued after it leaves the flag set.
     wake: Arc<std::sync::atomic::AtomicBool>,
 }
 
