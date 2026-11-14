@@ -180,9 +180,25 @@ jobs:
             echo "test group ${shard}/8: ${#args[@]} selectors over ${#targets[@]} targets"
             # Record a failure but keep going: stopping at the first red group
             # hides every later group's result, turning one flake into a
-            # misleading "suite never ran" red build.
-            if ! cargo nextest run --locked --profile ci "${args[@]}"; then
+            # misleading "suite never ran" red build. The group log is kept
+            # for the failure annotations below (the job log needs a token to
+            # read; annotations do not).
+            group_log="/tmp/nextest-group-${shard}.log"
+            if ! cargo nextest run --locked --profile ci "${args[@]}" 2>&1 | tee "$group_log"; then
               status=1
+              {
+                echo "### Test group ${shard}/8 failed"
+                echo '```'
+                grep -E "^\s*(FAIL|TIMEOUT)|^ *Summary|^error" "$group_log" | head -60
+                tail -30 "$group_log"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              grep -E "^\s*(FAIL|TIMEOUT)" "$group_log" | head -20 | while IFS= read -r line; do
+                [ -n "$line" ] && echo "::error title=Nextest group ${shard}::$line"
+              done
+              tail -c 4000 "$group_log" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+                | awk '{printf "%s%%0A", $0}' | cut -c1-40000 > /tmp/nextest-group-tail.txt
+              echo "::error title=Nextest group ${shard} log tail::$(cat /tmp/nextest-group-tail.txt)"
             fi
             # Each group links ~10 GiB of test binaries. Drop only THIS group's
             # linked executables; keep the pir-sdk rlib and shared dependency
