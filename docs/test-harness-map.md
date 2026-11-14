@@ -1,7 +1,9 @@
 # Test Harness Map
 
-> Generated 2026-11-13 from the repository itself. Every row below was derived from,
-> and is verified against, the real `#[path = "..."]` lines in the generated
+> Generated 2026-11-13; rows re-derived and re-verified 2026-11-14 against the
+> current tree (the on-disk `tests/zz_merged_*` harnesses and the `[[test]]`
+> block) — every row still matches. Every row below was derived from, and is
+> verified against, the real `#[path = "..."]` lines in the generated
 > harnesses and the explicit `[[test]]` targets in `Cargo.toml`.
 
 ## TL;DR
@@ -23,8 +25,9 @@
 Each `[[test]]` target (and each generated `zz_merged_N.rs`) is its own crate:
 it is compiled and **statically linked against the whole `pir-sdk`** (RustPython,
 QuickJS, SWC, ...). Naming `N` harnesses therefore means `N` link steps, and link
-time (not test execution) dominates the build. This is exactly why the ~340
-original test files were folded into 8 harnesses. Before adding a new
+time (not test execution) dominates the build. This is exactly why the 337
+original root test files are folded into the 8 merged harnesses (plus the 5
+standalone targets). Before adding a new
 `[[test]]` entry / new harness, ask whether the suites can join an existing one
 (`g_agent`/`g_ai`/`g_tui`/`g_tools`/`g_durable`/... already aggregate the
 `tests/suites/*.rs` files); every extra name multiplies the link phase.
@@ -751,6 +754,15 @@ instead. The originals are intentionally left in the tree but are not targets.
 | `tests/session_projection_heap.rs` | `tests/zz_shadow_session_projection_heap.rs` | `zz_merged_8` |
 | `tests/startup_heap_profile.rs` | `tests/zz_shadow_startup_heap_profile.rs` | `zz_merged_8` |
 
+### Composite sources pulled in with `include!`
+
+One compiled source is neither a suite nor a root `mod` include:
+`tests/fragments/sdk_round13_on_event.rs` is textually pulled into
+`tests/sdk_extended.rs` with `include!("fragments/sdk_round13_on_event.rs")`, so
+its tests compile into `zz_merged_1` under the `sdk_extended::` prefix. It is
+deliberately not a target of its own (`autotests = false`) and does not appear
+in the `#[path = ...]` greps below.
+
 ## Verification evidence
 
 Every row above resolves to one of these two greps (plus the `[[test]]` block).
@@ -1464,7 +1476,9 @@ $ grep -n -A2 '^\[\[test\]\]' Cargo.toml
   `print_native_session`) that are not reachable from a `zz_merged_*` file.
 - Result: 294 suites files + 332 root files reachable from `zz_merged_*` +
   5 standalone root files = 631 mapped rows; 6 `#[global_allocator]` originals
-  are deliberately not targets.
+  are deliberately not targets. (Re-derived 2026-11-14: all 631 rows and the
+  three greps above still match the tree; the `include!` fragment described
+  above carries no `#[path]` and is outside these counts.)
 
 ---
 

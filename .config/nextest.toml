@@ -43,7 +43,7 @@ terminate-after = 3
 
 # CI profile (`cargo nextest run --profile ci`).
 #
-# The tree has 318 integration test targets (9 merged g_* harnesses + 309
+# The tree has 13 integration test targets (8 merged zz_merged_* harnesses + 5
 # standalone tests/*.rs); the lib unit target has no tests and the bin unit
 # harness is a separate cargo target. 6.3k test functions; many spawn bash
 # processes or bind local sockets, so under contention a real-timer test can

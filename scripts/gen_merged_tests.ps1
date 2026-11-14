@@ -1,11 +1,11 @@
 # scripts/gen_merged_tests.ps1 — regenerate the merged integration-test harnesses.
 #
 # WHY: every tests/*.rs file is its own cargo test target, and each target
-# statically links the full pir-sdk (RustPython/QuickJS/SWC). With ~340
+# statically links the full pir-sdk (RustPython/QuickJS/SWC). With 337
 # targets the link phase dominates `cargo test --no-run`. This script folds
 # every root-level test file into N generated harness files (8 by default)
 # via `#[path = "..."] mod <stem>;`, so cargo builds N test binaries instead
-# of ~340. Cargo's test auto-discovery is disabled by `autotests = false` in
+# of 337. Cargo's test auto-discovery is disabled by `autotests = false` in
 # Cargo.toml; the explicit [[test]] entries for the generated harnesses live
 # in the marked block at the end of Cargo.toml and are rewritten by this
 # script.
