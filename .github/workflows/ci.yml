@@ -73,6 +73,15 @@ jobs:
             sed -r 's/\x1b\[[0-9;]*[mK]//g' /tmp/clippy.log | grep -E -A3 '^error(\[|:)' | head -80 | while IFS= read -r line; do
               [ -n "$line" ] && echo "::error title=Clippy::$line"
             done
+            # A failure with NO `^error` line (a cargo/rustc panic, an OOM, a
+            # runner-level fault) leaves the annotations empty and the log
+            # unreachable without downloading it. Always annotate the raw
+            # tail as one escaped message so the checks API alone shows WHY.
+            # Workflow commands need %/CR/LF escaped; 6 KiB keeps it under the
+            # command limit.
+            tail -c 6000 /tmp/clippy.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+              | awk '{printf "%s%%0A", $0}' | cut -c1-60000 > /tmp/clippy-tail.txt
+            echo "::error title=Clippy log tail::$(cat /tmp/clippy-tail.txt)"
           fi
           exit "$status"
       - name: SDK feature matrix (no-default-features)
