@@ -29,10 +29,10 @@
 #   - -Tests takes cargo target names (the file stem of tests/<name>.rs, or
 #     "pir" for the lib unit tests) and passes `--test <name>` through to
 #     cargo, so only those binaries are (re)built and linked. This is the
-#     lever that keeps a one-suite edit from re-linking all ~280 cargo test
-#     targets (as of 2026-10-29: 281 integration targets = 9 merged g_*
-#     harnesses + 272 standalone tests/*.rs; the lib unit target has no
-#     tests and the bin unit harness is a separate cargo target).
+#     lever that keeps a one-suite edit from re-linking all 13 integration
+#     targets (as of 2026-11-14: 8 merged zz_merged_* harnesses + 5
+#     standalone tests/*.rs; the lib unit target has no tests and the bin
+#     unit harness is a separate cargo target).
 #   - CI does not use this script: it runs `cargo nextest run --profile ci`
 #     (.config/nextest.toml) as one Linux+Windows matrix job, in eight
 #     sequential groups per OS. This

@@ -29,6 +29,12 @@
 # `cargo test` for the full suite.
 #
 # Usage: powershell -NoProfile -File scripts/gen_merged_tests.ps1 [-HarnessCount 8] [-Check]
+#
+# `-Check` verifies the on-disk generated files against what this script would
+# write, read-only: it reports a delta per drifted artifact and exits non-zero
+# when any exist. At HEAD it is red because the harnesses were hand-adjusted
+# after generation (PIR-QE-002, option 2; see the final message). It is not
+# part of the gate battery or CI.
 param(
     [int]$HarnessCount = 8,
     [switch]$Check
@@ -46,6 +52,64 @@ function Write-NoBom {
 }
 $beginMarker = "# BEGIN GENERATED MERGED TEST TARGETS"
 $endMarker = "# END GENERATED MERGED TEST TARGETS"
+
+# --- `-Check` drift reporting ------------------------------------------------
+# `-Check` is read-only and accumulates one entry per drifted artifact instead
+# of throwing on the first one (the old shape hid every later difference). It
+# prints a generator-vs-on-disk delta per artifact and fails once at the end.
+# Drift at HEAD is EXPECTED and tracked by PIR-QE-002: the on-disk harnesses
+# were hand-adjusted after the generator last ran, so -Check stays red until
+# the dedicated regeneration lane (PIR-QE-002 option 1) lands. -Check is not
+# part of the gate battery or CI.
+$checkFailures = [System.Collections.Generic.List[string]]::new()
+
+function Get-ShortLine {
+    param([string]$Text, [int]$Width = 96)
+    if ($null -eq $Text) { return "<none>" }
+    if ($Text.Length -le $Width) { return $Text }
+    return ($Text.Substring(0, $Width) + "...")
+}
+
+# Harness delta summary (only when the file has any `#[path = ...]` lines, so
+# the plain shadow copies and Cargo.toml skip it): module-include counts, how
+# many modules are placed differently (membership overlap), line counts, and
+# the first line that differs, both sides truncated.
+function Format-TextDelta {
+    param([string]$Expected, [string]$OnDisk)
+    $expMods = ([regex]::Matches($Expected, '(?m)^#\[path\s*=')).Count
+    $actMods = ([regex]::Matches($OnDisk, '(?m)^#\[path\s*=')).Count
+    $exp = @($Expected -split "\r?\n")
+    $act = @($OnDisk -split "\r?\n")
+    $n = [Math]::Max($exp.Count, $act.Count)
+    $at = 0
+    $firstExp = ""
+    $firstAct = ""
+    for ($i = 0; $i -lt $n; $i++) {
+        $e = if ($i -lt $exp.Count) { $exp[$i] } else { "<end of file>" }
+        $a = if ($i -lt $act.Count) { $act[$i] } else { "<end of file>" }
+        if ($e -cne $a) { $at = $i + 1; $firstExp = $e; $firstAct = $a; break }
+    }
+    $lines = @()
+    if ($expMods -gt 0 -or $actMods -gt 0) {
+        $expNames = @([regex]::Matches($Expected, '(?m)^mod ([A-Za-z0-9_]+);') | ForEach-Object { $_.Groups[1].Value })
+        $actNames = @([regex]::Matches($OnDisk, '(?m)^mod ([A-Za-z0-9_]+);') | ForEach-Object { $_.Groups[1].Value })
+        $onlyGen = @($expNames | Where-Object { $actNames -notcontains $_ })
+        $onlyAct = @($actNames | Where-Object { $expNames -notcontains $_ })
+        $lines += ("      module includes (#[path]): generator {0}, on disk {1}" -f $expMods, $actMods)
+        if ($onlyGen.Count -eq 0 -and $onlyAct.Count -eq 0) {
+            $lines += ("      module membership: identical ({0} modules)" -f $expNames.Count)
+        } else {
+            $lines += ("      module membership: {0} shared of {1}; {2} only in generator, {3} only on disk" -f ($expNames.Count - $onlyGen.Count), $expNames.Count, $onlyGen.Count, $onlyAct.Count)
+        }
+    }
+    $lines += ("      lines: generator {0}, on disk {1}" -f $exp.Count, $act.Count)
+    if ($at -gt 0) {
+        $lines += ("      first difference at line {0}:" -f $at)
+        $lines += ("        generator: " + (Get-ShortLine $firstExp))
+        $lines += ("        on disk:   " + (Get-ShortLine $firstAct))
+    }
+    return ($lines -join "`r`n")
+}
 
 # --- collect root-level test files -----------------------------------------
 # These root files keep their own test binary and are emitted as explicit
@@ -132,9 +196,13 @@ foreach ($m in $dhat) {
     # it (the old shape rewrote every shadow copy before the comparison, so a
     # failed check still mutated the tree).
     if ($Check) {
-        if (-not (Test-Path -LiteralPath $shadowPath) -or
-            (Get-Content -LiteralPath $shadowPath -Raw -Encoding UTF8) -ne $stripped) {
-            throw "generated shadow copy is stale: $shadowRel (run without -Check)"
+        if (-not (Test-Path -LiteralPath $shadowPath)) {
+            $checkFailures.Add("  $shadowRel - missing; the generator would write it (the stripped dhat copy).")
+        } else {
+            $shadowOnDisk = Get-Content -LiteralPath $shadowPath -Raw -Encoding UTF8
+            if ($shadowOnDisk -ne $stripped) {
+                $checkFailures.Add("  $shadowRel - differs from the stripped dhat copy the generator would write:" + "`r`n" + (Format-TextDelta -Expected $stripped -OnDisk $shadowOnDisk))
+            }
         }
     } else {
         Write-NoBom $shadowPath $stripped
@@ -204,8 +272,13 @@ foreach ($b in $bins) {
     }
     $target = Join-Path $root $rel
     if ($Check) {
-        if (-not (Test-Path -LiteralPath $target) -or (Get-Content -LiteralPath $target -Raw) -ne $sb.ToString()) {
-            throw "generated harness is stale: $rel (run without -Check)"
+        if (-not (Test-Path -LiteralPath $target)) {
+            $checkFailures.Add("  $rel - missing; the generator would write it.")
+        } else {
+            $harnessOnDisk = Get-Content -LiteralPath $target -Raw
+            if ($harnessOnDisk -ne $sb.ToString()) {
+                $checkFailures.Add("  $rel - differs from the generated harness:" + "`r`n" + (Format-TextDelta -Expected $sb.ToString() -OnDisk $harnessOnDisk))
+            }
         }
     } else {
         Write-NoBom $target $sb.ToString()
@@ -216,8 +289,11 @@ foreach ($b in $bins) {
 Get-ChildItem -Path $testsDir -Filter "zz_merged_*.rs" -File | ForEach-Object {
     $rel = "tests/$($_.Name)"
     if ($harnessRels -notcontains $rel) {
-        if ($Check) { throw "stale generated harness: $rel" }
-        Remove-Item -LiteralPath $_.FullName -Force
+        if ($Check) {
+            $checkFailures.Add("  $rel - no longer generated; the script would delete it (left over from an earlier, larger run).")
+        } else {
+            Remove-Item -LiteralPath $_.FullName -Force
+        }
     }
 }
 
@@ -245,7 +321,9 @@ if ($toml -match [regex]::Escape($beginMarker)) {
     $newToml = $toml.TrimEnd() + "`r`n`r`n" + $block.TrimEnd() + "`r`n"
 }
 if ($Check) {
-    if ($newToml -ne $toml) { throw "Cargo.toml generated block is stale (run without -Check)" }
+    if ($newToml -ne $toml) {
+        $checkFailures.Add("  Cargo.toml - the generated [[test]] block differs from what the script would write:" + "`r`n" + (Format-TextDelta -Expected $newToml -OnDisk $toml))
+    }
 } else {
     Write-NoBom $cargoToml $newToml
 }
@@ -256,4 +334,18 @@ foreach ($b in $bins) {
     Write-Host ("  zz_merged_{0}: {1,3} modules, ~{2,4} tests" -f $b.Index, $b.Modules.Count, $b.Load)
 }
 Write-Host ("  exceptions: {0} counting-allocator tests (one per harness 1..{0}), {1} dhat tests (shared harness {2})" -f $counting.Count, $dhat.Count, $HarnessCount)
-if ($Check) { Write-Host "[gen_merged_tests] up to date" }
+if ($Check) {
+    if ($checkFailures.Count -gt 0) {
+        Write-Host ""
+        Write-Host ("[gen_merged_tests] -Check: {0} generated artifact(s) differ from what this generator would write (read-only run; nothing was modified):" -f $checkFailures.Count)
+        foreach ($failure in $checkFailures) { Write-Host $failure }
+        throw (@"
+-Check FAILED (PIR-QE-002): $($checkFailures.Count) generated artifact(s) are not what scripts/gen_merged_tests.ps1 would write; the tree was NOT modified.
+This drift is EXPECTED at HEAD: the on-disk harnesses were hand-adjusted after the generator last ran. No gate and no CI workflow runs -Check, so it is latent.
+Two paths forward:
+  (1) PIR-QE-002 option 1 (dedicated quiet-tree lane): run this script WITHOUT -Check, re-derive docs/test-harness-map.md, re-run the gate battery. Only this makes -Check green again (regeneration reshuffles which bin each root test file lands in).
+  (2) PIR-QE-002 option 2 (this lane): option 1 deferred on purpose. Leave the tree as is and treat the deltas above as the known-drift record; do not regenerate just to silence this check.
+"@).Trim()
+    }
+    Write-Host "[gen_merged_tests] up to date"
+}

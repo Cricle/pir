@@ -3,8 +3,8 @@
 # (scripts/test_select.ps1 measures/report; see scripts/lld-config.toml.example).
 # Disable: delete this file. Full test_fast was verified green with this linker
 # (139 test targets at the time: 7 merged harnesses + 131 standalone targets +
-# the lib unit target). The current tree has 270 cargo test targets: 269
-# integration targets (9 merged harnesses + 260 standalone tests/*.rs) + the
+# the lib unit target). The current tree has 14 cargo test targets: 13
+# integration targets (8 merged harnesses + 5 standalone tests/*.rs) + the
 # lib unit target.
 #
 # The local Windows toolchain in this environment is
