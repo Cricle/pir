@@ -61,7 +61,12 @@ jobs:
       - name: Clippy
         shell: bash
         run: |
-          set -o pipefail
+          # GitHub's `shell: bash` runs with `-e`: disable errexit around the
+          # lint so the failure branch below (summary + annotations) actually
+          # executes instead of the step dying on the pipeline status. Keep it
+          # off for the whole script — the diagnostic pipelines may exit
+          # non-zero (grep with no match) and must not abort the annotations.
+          set +e
           cargo clippy --all-targets --all-features --locked -- -D warnings 2>&1 | tee /tmp/clippy.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
