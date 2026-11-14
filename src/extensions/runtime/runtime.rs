@@ -414,14 +414,10 @@ impl ExtensionRuntime {
                     }
                 }
                 let preempt_at = preempt_at.load(std::sync::atomic::Ordering::Relaxed);
-                if preempt_at != 0
+                preempt_at != 0
                     && commands_in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
                     && pending_commands.load(std::sync::atomic::Ordering::Relaxed) > 0
                     && super::monotonic_millis() >= preempt_at
-                {
-                    return true;
-                }
-                false
             })))
             .await;
         }

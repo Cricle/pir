@@ -501,16 +501,13 @@ pub fn resolve_path_str(path: &str) -> String {
 /// (`session_cwd_matches`, `filter_sessions_by_cwd`,
 /// [`is_default_session_dir`], `session_resolve::cwd_matches`).
 pub fn resolved_paths_equal(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
     #[cfg(windows)]
     {
-        a.to_lowercase() == b.to_lowercase()
+        a == b || a.to_lowercase() == b.to_lowercase()
     }
     #[cfg(not(windows))]
     {
-        false
+        a == b
     }
 }
 

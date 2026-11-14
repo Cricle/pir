@@ -264,9 +264,9 @@ impl Blowfish {
     /// re-encipher the whole state from a zero block.
     fn expand0state(&mut self, key: &[u8]) {
         let mut offset = 0usize;
-        for index in 0..18 {
+        for slot in self.p.iter_mut() {
             let word = Self::stream2word(key, &mut offset);
-            self.p[index] ^= word;
+            *slot ^= word;
         }
         let mut lr = [0u32, 0u32];
         for index in (0..18).step_by(2) {
@@ -285,9 +285,9 @@ impl Blowfish {
     /// XORed into the running block each step (the "expensive key schedule").
     fn expandstate(&mut self, data: &[u8], key: &[u8]) {
         let mut offset = 0usize;
-        for index in 0..18 {
+        for slot in self.p.iter_mut() {
             let word = Self::stream2word(key, &mut offset);
-            self.p[index] ^= word;
+            *slot ^= word;
         }
         offset = 0;
         let mut lr = [0u32, 0u32];

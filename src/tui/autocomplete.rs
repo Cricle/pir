@@ -894,10 +894,9 @@ impl CombinedAutocompleteProvider {
         };
         let before: String = line.chars().take(cursor_col).collect();
         let trimmed = before.trim();
-        if trimmed.starts_with('/') && !trimmed.contains(' ') {
-            return false;
-        }
-        true
+        // A `/`-prefixed word without a space is a SLASH COMMAND, not a file
+        // path: only file completion is suppressed there.
+        !(trimmed.starts_with('/') && !trimmed.contains(' '))
     }
 
     /// Apply the selected completion (upstream `applyCompletion`). Returns
