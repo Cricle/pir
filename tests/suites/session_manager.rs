@@ -4226,6 +4226,47 @@ fn windowed_projection_stops_at_the_page_start_pir_bin_101() {
     );
 }
 
+/// PIR-BIN-104: the R3 park guard compares the SLICE IDENTITY (the storage
+/// generation the token was minted under), not the `is_paged` boolean. A
+/// widen followed by a re-trim into a NEW window restores
+/// `is_paged() == true` while the token's proven base describes the OLD
+/// window, so the boolean guard would accept a stale-base proof. The
+/// differential probe reports `(guard, fast, full)` for exactly that
+/// transition: the unguarded fast walk still concludes on the stale base
+/// (fast=Some(true)) while the full validation rejects it (full=false) —
+/// the mismatch the guard must refuse (guard=None -> full validation).
+#[test]
+fn park_guard_refuses_a_token_from_before_a_widen_then_retrim() {
+    let dir = temp_dir("park-widen-retrim");
+    let mut session = SessionManager::create(".", &dir).unwrap();
+    for turn in 0..6 {
+        session
+            .append_message(user_message(&format!("turn {turn}")))
+            .unwrap();
+    }
+    session.enable_live_tail_trim(1, 4);
+    assert!(
+        session.trim_resident_tail(usize::MAX, 4).unwrap(),
+        "the live-trim window must arm"
+    );
+
+    let appended = [user_message("run question"), user_message("run answer")];
+    let (guard, fast, full) = session.park_guard_widen_then_retrim_probe_for_test(&appended, 3);
+    assert!(
+        !full,
+        "the full validation must reject the stale-base state: fast={fast:?}"
+    );
+    assert_eq!(
+        fast,
+        Some(true),
+        "the unguarded fast walk still concludes on the stale base — the reason PIR-BIN-104's guard exists: full={full}"
+    );
+    assert_eq!(
+        guard, None,
+        "a token minted before the widen+re-trim must fall back to the full validation (PIR-BIN-104)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // PIR-BIN-101 companion pin (lane w1, review of 44ea612): the windowed stop
 // must hold through every PUBLIC windowed reader, and `widen_to_full` must

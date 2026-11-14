@@ -1677,13 +1677,15 @@ pub(crate) struct ParkToken {
     /// Model-visible message count of the extended projection, proven equal
     /// to a full build's count at `leaf_id` (see the type docs).
     pub(crate) message_count: usize,
-    /// Whether the extend ran over a WINDOWED slice (`is_paged()` was true,
-    /// PIR-BIN-102). The proof holds for the slice contract it was built
-    /// under; a state change before the park (a concurrent widen clears
-    /// `paged`, a trim sets it) makes
-    /// [`SessionManager::validate_park_delta`] refuse the fast path and run
-    /// the full validation under the CURRENT semantics.
-    pub(crate) windowed: bool,
+    /// The manager's storage generation at the extend (PIR-BIN-102/104): the
+    /// proof holds for the slice contract it was built under, and every
+    /// slice-identity change — a concurrent widen, a trim, a reload, a
+    /// replacement — goes through `build_index`, which moves this generation.
+    /// Comparing it makes the guard cover a widen followed by a re-trim to a
+    /// NEW window (same `is_paged()` boolean, different resident base), and
+    /// [`SessionManager::validate_park_delta`] then refuses the fast path and
+    /// runs the full validation under the CURRENT semantics.
+    pub(crate) storage_generation: u64,
 }
 
 /// Outcome of [`SessionManager::build_session_projection_with_cache`].
@@ -1722,6 +1724,7 @@ pub(crate) fn extend_cached_session_projection(
     leaf_id: Option<&str>,
     bridge_missing_parents: bool,
     positions: Option<&EntryPositions>,
+    storage_generation: u64,
     cached: CachedSessionProjection,
 ) -> Option<(SessionProjection, Option<ParkToken>)> {
     let CachedSessionProjection {
@@ -1845,7 +1848,7 @@ pub(crate) fn extend_cached_session_projection(
     let park_token = edits.is_none().then(|| ParkToken {
         leaf_id: leaf_id.map(str::to_owned),
         message_count: projection.messages.len(),
-        windowed: !bridge_missing_parents,
+        storage_generation,
     });
     Some((projection, park_token))
 }
@@ -1924,6 +1927,7 @@ impl SessionManager {
                 self.leaf_id.as_deref(),
                 !self.is_paged(),
                 Some(&self.entry_positions),
+                self.storage_generation(),
                 cached,
             ) {
                 return CachedProjectionOutcome {
@@ -1956,12 +1960,15 @@ impl SessionManager {
         run_start_leaf: Option<&str>,
         parked_message_count: usize,
     ) -> Option<bool> {
-        // PIR-BIN-102: the proof holds for the slice contract it was built
-        // under. A widen (clears `paged`) or a trim (sets it) between the
-        // prompt-start extend and this park changes the walk the full
-        // validation would take, so a mismatch falls back to it (None)
-        // instead of concluding on a proof with stale slice semantics.
-        if token.windowed != self.is_paged() {
+        // PIR-BIN-102/104: the proof holds for the SLICE IDENTITY it was
+        // built under, not merely for the `is_paged` boolean. The token
+        // records the storage generation at the extend; every slice-identity
+        // change (widen, trim, reload, replacement) rebuilds the index and
+        // moves it. This covers the boolean-restoring transition too (a
+        // widen followed by a re-trim into a NEW window): a mismatch falls
+        // back to the full validation (None) instead of concluding on a
+        // proof with stale slice semantics.
+        if token.storage_generation != self.storage_generation() {
             return None;
         }
         park_delta_validates(
@@ -1973,6 +1980,75 @@ impl SessionManager {
             token,
             parked_message_count,
         )
+    }
+
+    /// PIR-BIN-104 in-crate differential probe: mint a park token through the
+    /// real extend path on a live-trimmed manager, append `appended`, then
+    /// perform the window transition no current caller reaches — widen to
+    /// full, then re-trim into a NEW window — and report
+    /// `(guard_decision, fast, full)` for the park at the new leaf.
+    ///
+    /// `guard_decision == None` means the seam refused the fast path and the
+    /// caller runs the unchanged full validation. The pre-fix hole reported
+    /// `(Some(true), Some(true), false)`: the boolean guard passed on the
+    /// restored `is_paged()` while the token's proven base described the OLD
+    /// window (fast accepts, full rejects).
+    ///
+    /// The caller must have a flushed, live-tail-enabled manager; every
+    /// appended message must project exactly ONE model-visible message.
+    #[doc(hidden)]
+    #[cfg(feature = "session")]
+    pub fn park_guard_widen_then_retrim_probe_for_test(
+        &mut self,
+        appended: &[crate::ai::types::Message],
+        retrim_entries: usize,
+    ) -> (Option<bool>, Option<bool>, bool) {
+        let first = self.build_session_projection_with_cache(None);
+        let leaf_entry = self.leaf_id.as_deref().and_then(|id| {
+            self.file_entries
+                .iter()
+                .find(|entry| entry.id() == Some(id))
+                .cloned()
+        });
+        let cached = CachedSessionProjection {
+            leaf_id: self.leaf_id.clone(),
+            leaf_entry,
+            messages: first.projection.messages,
+        };
+        let extended = self.build_session_projection_with_cache(Some(cached));
+        let token = extended
+            .park_token
+            .clone()
+            .expect("the extend over an append-only delta mints a token");
+        let base = extended.projection.messages.len();
+        for message in appended {
+            self.append_message(message.clone())
+                .expect("append the run's message");
+        }
+        let parked = base + appended.len();
+        let run_start_leaf = token.leaf_id.clone();
+        self.widen_to_full().expect("widen the live-trimmed window");
+        self.trim_resident_tail(usize::MAX, retrim_entries)
+            .expect("re-trim into the new window");
+        let leaf_id = self.leaf_id.clone();
+        let guard = self.validate_park_delta(
+            &token,
+            leaf_id.as_deref(),
+            run_start_leaf.as_deref(),
+            parked,
+        );
+        let fast = park_delta_validates(
+            &self.file_entries,
+            leaf_id.as_deref(),
+            run_start_leaf.as_deref(),
+            !self.is_paged(),
+            &self.entry_positions,
+            &token,
+            parked,
+        );
+        let full = self.projected_message_count_for_leaf(leaf_id.as_deref()) == parked
+            && self.path_delta_is_append_only(run_start_leaf.as_deref(), leaf_id.as_deref());
+        (guard, fast, full)
     }
 }
 
