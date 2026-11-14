@@ -186,7 +186,14 @@ async fn message_that_predates_the_stream_is_not_timed() {
     // than this stream's creation and must stay untimed.
     let stream = AssistantMessageEventStream::new();
     let mut old = msg("old");
-    old.timestamp = pir::ai::util::now_ms().saturating_sub(1);
+    // The margin is NOT 1 ms: `new()` captures the stream's own
+    // `started_at_ms`, so under load the wall clock can tick between that
+    // capture and this line — a timestamp of `now_ms() - 1` then lands ON
+    // the stream's start and the message is (rightly) timed, failing this
+    // test with a wrong-looking `duration_ms`. The contract is "predates the
+    // stream", not "predates by exactly one millisecond": use a margin no
+    // scheduler stall can overtake and keep the assertion exact.
+    old.timestamp = pir::ai::util::now_ms().saturating_sub(60_000);
     stream.push(AssistantMessageEventStream::done_event(
         TerminalReason::Stop,
         old,

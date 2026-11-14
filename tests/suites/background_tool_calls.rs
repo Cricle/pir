@@ -3042,7 +3042,7 @@ fn scripted_turn_stream(
 }
 
 /// The detached bash probe command: publish the command's own OS process ids,
-/// then block in `wait` on a 30s `sleep` child. Each line of `pid.txt` is
+/// then block in `wait` on a 300s `sleep` child. Each line of `pid.txt` is
 /// `<msys pid>:<OS pid>` — `$$` is the (persistent or per-call) shell's pid,
 /// `${BASHPID:-$$}` the process that actually runs the command and `$!` the
 /// forked `sleep`; the OS pid comes from `/proc/<pid>/winpid` (empty on a
@@ -3051,8 +3051,14 @@ fn scripted_turn_stream(
 /// with a rename so a reader never observes a half-written set. (`${BASHPID}`
 /// is captured into `$sub` first on purpose: inside a `$( )` substitution it
 /// would expand to the substitution's own pid.)
+///
+/// PIR-QE-001: the child's natural lifetime (300 s) is strictly larger than
+/// every settle deadline the probe tests wait under (60 s), so a `gone`
+/// verdict inside a deadline can only mean the kill worked. With a 30 s child
+/// a loaded host could arrive late enough that the probe died on its own and
+/// a failed kill passed vacuously.
 fn bash_pid_probe_command() -> &'static str {
-    "sleep 30 &\nsub=${BASHPID:-$$}\n{\necho \"$$:$(cat /proc/$$/winpid 2>/dev/null)\"\necho \"$sub:$(cat /proc/$sub/winpid 2>/dev/null)\"\necho \"$!:$(cat /proc/$!/winpid 2>/dev/null)\"\n} > pid.tmp\nmv -f pid.tmp pid.txt\nwait\n"
+    "sleep 300 &\nsub=${BASHPID:-$$}\n{\necho \"$$:$(cat /proc/$$/winpid 2>/dev/null)\"\necho \"$sub:$(cat /proc/$sub/winpid 2>/dev/null)\"\necho \"$!:$(cat /proc/$!/winpid 2>/dev/null)\"\n} > pid.tmp\nmv -f pid.tmp pid.txt\nwait\n"
 }
 
 /// The in-shell observation body shared by [`pid_observe_command`] and the
@@ -3344,8 +3350,11 @@ async fn abort_background_kills_the_detached_bash_process() {
     let pids = wait_for_probe_pids(&fixture.path("pid.txt"), Duration::from_secs(30)).await;
 
     // Self-validation of the observation mechanism: every published process
-    // must be visible in the OS process view before the abort.
-    let live = wait_for_probe_alive(&checker, Duration::from_secs(15)).await;
+    // must be visible in the OS process view before the abort. PIR-QE-001:
+    // this is a deadline-based settle too — each poll spawns a checker bash
+    // and one `tasklist` per published pid, which a loaded host can stretch
+    // well past the old 15 s bound. The verdict asserted below is unchanged.
+    let live = wait_for_probe_alive(&checker, Duration::from_secs(60)).await;
     assert_eq!(
         live.os_alive.len(),
         live.total,
@@ -3368,8 +3377,14 @@ async fn abort_background_kills_the_detached_bash_process() {
         "aborting a call that already settled is a no-op false"
     );
 
-    // The OS process must be gone within the bound.
-    let gone = wait_for_probe_gone(&checker, Duration::from_secs(15)).await;
+    // The OS process must be gone within the bound. PIR-QE-001: this wait is
+    // the deadline-based settle (poll every 25 ms until every published OS pid
+    // is gone, or 60 s — the gate showed one pid still settling when the old
+    // 15 s bound struck). The assertion is unchanged and strict, and the
+    // probe's 300 s lifetime means `gone()` can only come from the kill: a
+    // genuine leak never reaches it and trips the deadline with the survivor
+    // named in the panic.
+    let gone = wait_for_probe_gone(&checker, Duration::from_secs(60)).await;
     assert!(
         gone.gone(),
         "abort_background must kill the detached command's processes {pids:?}: {}",
@@ -3515,7 +3530,9 @@ async fn dropping_the_session_kills_the_detached_bash_process() {
         .expect("the run must complete on the placeholder result");
     assert_eq!(session.background_call_count(), 1);
     let pids = wait_for_probe_pids(&fixture.path("pid.txt"), Duration::from_secs(30)).await;
-    let live = wait_for_probe_alive(&checker, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s); the strict verdict below
+    // (every published pid visible alive) is unchanged.
+    let live = wait_for_probe_alive(&checker, Duration::from_secs(60)).await;
     assert_eq!(
         live.os_alive.len(),
         live.total,
@@ -3528,7 +3545,12 @@ async fn dropping_the_session_kills_the_detached_bash_process() {
     // must observe the abort and stop the OS work).
     drop(session);
 
-    let gone = wait_for_probe_gone(&checker, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s; this test red-lined at
+    // 54 s under the gate's load). The assertion is unchanged and strict, and
+    // the probe's 300 s lifetime means `gone()` can only come from teardown:
+    // a genuine leak never reaches it and trips the deadline with the
+    // survivor named in the panic.
+    let gone = wait_for_probe_gone(&checker, Duration::from_secs(60)).await;
     assert!(
         gone.gone(),
         "dropping the session must kill the detached command's processes {pids:?}: {}",
@@ -3613,7 +3635,10 @@ async fn a_foreground_bash_still_runs_after_an_aborted_background_bash() {
     // already see it (otherwise the marker command below would be chasing a
     // pid the mechanism cannot observe).
     let pids = wait_for_probe_pids(&fixture.path("pid.txt"), Duration::from_secs(30)).await;
-    let live = wait_for_probe_alive(&checker, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s; audit flaky-hunt C0a names
+    // this self-validation site — the same thin bound as the abort tests).
+    // The strict verdict is unchanged.
+    let live = wait_for_probe_alive(&checker, Duration::from_secs(60)).await;
     assert_eq!(live.os_alive.len(), live.total, "{}", live.describe());
     assert_eq!(
         session.background_call_count(),
@@ -4037,7 +4062,9 @@ async fn abort_background_kills_the_detached_bash_process_without_the_pool() {
         "the session registry must own the detached per-call bash"
     );
     let pids = wait_for_probe_pids(&fixture.path("pid.txt"), Duration::from_secs(30)).await;
-    let live = wait_for_probe_alive(&checker, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s; the gate tripped this
+    // self-validation under load). The strict verdict is unchanged.
+    let live = wait_for_probe_alive(&checker, Duration::from_secs(60)).await;
     assert_eq!(live.os_alive.len(), live.total, "{}", live.describe());
 
     assert!(
@@ -4046,7 +4073,12 @@ async fn abort_background_kills_the_detached_bash_process_without_the_pool() {
     );
     assert_eq!(session.background_call_count(), 0);
 
-    let gone = wait_for_probe_gone(&checker, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s; the gate showed one pid
+    // still settling when the old bound struck). The assertion is unchanged
+    // and strict, and the probe's 300 s lifetime means `gone()` can only come
+    // from the per-call kill: a genuine leak never reaches it and trips the
+    // deadline with the survivor named in the panic.
+    let gone = wait_for_probe_gone(&checker, Duration::from_secs(60)).await;
     assert!(
         gone.gone(),
         "the per-call abort must kill the detached command's processes {pids:?}: {}",
@@ -4057,7 +4089,7 @@ async fn abort_background_kills_the_detached_bash_process_without_the_pool() {
 /// The out-of-loop `!`-command path (`AgentSession::execute_bash` +
 /// `abort_bash`) must kill the command's whole tree: it spawns the real MSYS
 /// bash and aborts through the same tree kill as the tool, so a forked
-/// descendant (`sleep 30 &` inside the command) does not survive the abort.
+/// descendant (the probe's `sleep 300 &`) does not survive the abort.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_bash_kills_the_out_of_loop_command_tree() {
     let _agent_dir = hermetic_agent_dir("abort-bash-tree").await;
@@ -4078,7 +4110,9 @@ async fn abort_bash_kills_the_out_of_loop_command_tree() {
 
     // The command is really running (it published its own OS pids).
     let pids = wait_for_probe_pids(&fixture.path("pid.txt"), Duration::from_secs(30)).await;
-    let live = wait_for_probe_alive(&session, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s); the strict verdict below
+    // (every published pid visible alive) is unchanged.
+    let live = wait_for_probe_alive(&session, Duration::from_secs(60)).await;
     assert_eq!(
         live.os_alive.len(),
         live.total,
@@ -4103,7 +4137,12 @@ async fn abort_bash_kills_the_out_of_loop_command_tree() {
         "an aborted `!`-command has no exit code (killed, not exited)"
     );
 
-    let gone = wait_for_probe_gone(&session, Duration::from_secs(15)).await;
+    // PIR-QE-001: deadline-based settle (was 15 s; the 300 s probe lifetime
+    // means the old vacuous-pass escape through natural exit is gone, so the
+    // settle bound must carry the load tolerance). The assertion is unchanged
+    // and strict: a genuine leak never reaches `gone()` and trips the
+    // deadline with the survivor named in the panic.
+    let gone = wait_for_probe_gone(&session, Duration::from_secs(60)).await;
     assert!(
         gone.gone(),
         "abort_bash must kill the whole command tree {pids:?}: {}",

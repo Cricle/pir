@@ -32,11 +32,16 @@
 //!
 //! Runtime: ~11 s (26 scripted steps at 400 ms + a 600 ms settle), inside the
 //! runtime's 30 s hook budget; the JS side caps its own wait so the test cannot
-//! hang.
+//! hang. The tail of the recorded stream is then settled against the reference
+//! sets by a deadline poll (see `SETTLE_DEADLINE`): on a loaded host the
+//! watcher's queue delivery can lag the driver's fixed windows, and the poll
+//! waits for the observable end state instead of reading the stream once — the
+//! comparison itself stays exact, so a real event-set regression still fails
+//! (parity never holds and the assertions below run on the deadline's stream).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pir::extensions::{ExtensionConfig, ExtensionRuntime};
 use serde_json::{json, Value};
@@ -52,6 +57,21 @@ const STEP_WINDOW: Duration = Duration::from_millis(400);
 /// `session_start` handler and their threads take the baseline snapshot in this
 /// window (3 fast ticks).
 const WATCH_SETTLE: Duration = Duration::from_millis(600);
+
+/// Load-tolerance net, not a correctness window: after the driver thread's
+/// script ends, the watcher's delivery can still be in flight (a starved watch
+/// thread's sweep, a queued-but-unpolled event, a pump tick the loaded JS loop
+/// has not reached), so the test keeps pumping the fixture's own delivery step
+/// and re-reading the recorded stream until it reaches FULL parity with the
+/// reference algorithm, or this deadline expires. The parity predicate is the
+/// comparison itself (set equality per watcher plus the multiset/shape checks),
+/// so a real event-set regression never reaches parity and fails on the
+/// deadline with the same assertion battery as before — nothing is masked.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// One settle round: pump the watchers, give the watch threads a slice to
+/// finish their lagging sweeps, re-read.
+const SETTLE_ROUND: Duration = Duration::from_millis(100);
 
 /// One event as both sides express it: Node's kind plus `filename` (`None` for
 /// the root-level `rename` of the absent state).
@@ -518,6 +538,30 @@ fn events_of(records: &Value, bucket: &str) -> Vec<Event> {
         .collect()
 }
 
+/// The exact FULL comparison, as a predicate for the settle poll: the three
+/// per-watcher set equalities plus the multiset/shape checks the assertions
+/// below make (dirB exactly two root renames, dirA never absent, fileC's
+/// basename override). A lagging delivery makes this `false` and the settle
+/// loop keeps polling; a real divergence makes it `false` forever.
+fn parity_holds(records: &Value, expected: &ReferenceSets) -> bool {
+    let observed_a = events_of(records, "a");
+    let observed_b = events_of(records, "b");
+    let observed_c = events_of(records, "c");
+    let set_a: BTreeSet<Event> = observed_a.iter().cloned().collect();
+    let set_b: BTreeSet<Event> = observed_b.iter().cloned().collect();
+    let set_c: BTreeSet<Event> = observed_c.iter().cloned().collect();
+    let root_rename: Event = ("rename", None);
+    set_a == expected.a
+        && set_b == expected.b
+        && set_c == expected.c
+        && observed_b.len() == 2
+        && observed_b.iter().all(|event| *event == root_rename)
+        && observed_a.iter().all(|(_, filename)| filename.is_some())
+        && observed_c
+            .iter()
+            .all(|(_, filename)| filename.as_deref() == Some("c.txt"))
+}
+
 const TS: &str = r#"
 import fs from "node:fs";
 
@@ -592,10 +636,50 @@ async fn incremental_snapshot_events_match_the_reference_algorithm() {
         eprintln!("fs_watch_incremental note: {note}");
     }
 
-    let records: Value = rt
+    // Settle on the observable end state before comparing. The fixed windows
+    // above (the driver's per-step sleeps, the JS side's 450 ms drain) are
+    // calibrated for a quiet host: under load the watcher's queues can still
+    // be filling when the driver joins and the JS pump has not delivered the
+    // tail. The pump below is the fixture's own delivery step — exactly what
+    // the FSWatcher's 30 ms timer calls (drain the host watcher into the
+    // recorder) — driven explicitly so the observation does not depend on the
+    // loaded timer cadence, with a settle round between pumps so the watch
+    // threads can finish their lagging sweeps. Parity must hold on two
+    // consecutive reads (one extra pump + round after the first agreement), so
+    // an event still in flight when the sets first agree cannot slip past the
+    // comparison. On the deadline the full assertion battery below runs on the
+    // final stream either way: parity is the WHOLE comparison, so a real
+    // event-set regression cannot be waited away.
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    let mut records: Value = rt
         .eval_json("JSON.stringify(globalThis.__pirIncRecs || {})")
         .await
         .expect("read records");
+    let mut agreed = false;
+    loop {
+        if parity_holds(&records, &expected) {
+            if agreed {
+                break;
+            }
+            agreed = true;
+        } else {
+            agreed = false;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        rt.eval_json(
+            "JSON.stringify((globalThis.__pirIncWatchers || []).map((w) => { w._pirPump(); return w.closed; }))",
+        )
+        .await
+        .expect("pump watcher delivery");
+        tokio::time::sleep(SETTLE_ROUND).await;
+        records = rt
+            .eval_json("JSON.stringify(globalThis.__pirIncRecs || {})")
+            .await
+            .expect("read records");
+    }
+
     let observed_a = events_of(&records, "a");
     let observed_b = events_of(&records, "b");
     let observed_c = events_of(&records, "c");

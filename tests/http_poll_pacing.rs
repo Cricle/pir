@@ -96,8 +96,9 @@ async fn run_pacing_fixture(name: &str, body: &str) -> Value {
     run_fixture(&rt, name, body, "__pirPaced").await
 }
 
-/// The client half every fixture shares: `count` sequential GETs, each fully
-/// drained, reporting the wall time and the bodies.
+/// The client half every fixture shares: `count` sequential GETs to `path`
+/// (default `/seq`), each fully drained, reporting the wall time and the
+/// bodies.
 const CLIENT_HELPERS: &str = r#"
 import http from "node:http";
 
@@ -107,7 +108,8 @@ function nowMs() {
   return Date.now();
 }
 
-function getSequence(port, count) {
+function getSequence(port, count, path) {
+  path = path || "/seq";
   return (async function () {
     const started = nowMs();
     const bodies = [];
@@ -115,7 +117,7 @@ function getSequence(port, count) {
     for (let i = 0; i < count; i++) {
       const at = nowMs();
       bodies.push(await new Promise(function (resolve, reject) {
-        const request = http.get("http://127.0.0.1:" + port + "/seq?i=" + i, function (res) {
+        const request = http.get("http://127.0.0.1:" + port + path + "?i=" + i, function (res) {
           let body = "";
           res.on("data", function (chunk) { body += chunk.toString("utf8"); });
           res.on("end", function () { resolve(body); });
@@ -129,46 +131,169 @@ function getSequence(port, count) {
 }
 "#;
 
+/// Per-request delay the control path's responses pay (ms). The runtime is
+/// single-threaded and the handler holds the response for this long before it
+/// writes it, so an in-process control round trip cannot be observed any
+/// earlier — on any host, however loaded. That hard per-response floor is what
+/// makes the relative bound below load-proof.
+const SLOW_PATH_DELAY_MS: u64 = 200;
+
+/// How much faster the fast path must be than the control path:
+/// `slow_floor >= FAST_PATH_MIN_SPEEDUP * fast_floor`. The control's floor
+/// cannot undershoot [`SLOW_PATH_DELAY_MS`] by construction, so the bound
+/// admits a fast-path floor of at most `SLOW_PATH_DELAY_MS /
+/// FAST_PATH_MIN_SPEEDUP` = 50 ms per request; a load spike that lifts the
+/// control's floor too raises that to `SLOW_PATH_DELAY_MS /
+/// (FAST_PATH_MIN_SPEEDUP - 1)` = 66 ms. Measured fast floors: 5.4 ms under
+/// the recorded 2026-11-14 gate load, 15.8 ms at this box's ambient load, and
+/// 32 ms under a 6-way self-inflicted probe harsher than that gate run — the
+/// worst still leaves 1.6x headroom to the 50 ms floor, while a pacing
+/// regression to the pre-fix shape (~100 ms per request) lands 2x over it.
+/// The effective per-request threshold is also stricter than the bound this
+/// replaces (600 ms / 10 requests = 60 ms per request).
+const FAST_PATH_MIN_SPEEDUP: f64 = 4.0;
+
+/// Anti-hang net (ms) on the fast sequence's TOTAL — not the contract (that is
+/// the relative bound above), just a ceiling so a wedged run fails with this
+/// message instead of riding into the 30 s dispatch deadline. It sits >15x
+/// above the worst total ever recorded under the gate's own load (963 ms).
+const FAST_PATH_ANTI_HANG_MS: f64 = 15_000.0;
+
+/// Slack for the control self-check, covering the fixture clock's millisecond
+/// resolution. The delay cannot undershoot by construction (the response is
+/// written only after the wait); this only absorbs rounding.
+const SLOW_PATH_FLOOR_SLACK_MS: f64 = 10.0;
+
+/// The fastest single round trip in a per-request sample list: the pacing
+/// floor. Load reaches a sequence as a few hundred-millisecond outliers (the
+/// recorded gate failure's fast sequence took 963 ms total with per-request
+/// times from 5.4 to 421 ms), so the floor is the statistic that stays
+/// comparable across hosts, while a per-request pacing regression lifts every
+/// sample — floor included — into the threshold.
+fn per_request_floor_ms(v: &Value, key: &str) -> f64 {
+    let samples = v[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{key} must hold the per-request samples: {v}"));
+    assert_eq!(samples.len(), 10, "{key} must hold every request: {v}");
+    samples
+        .iter()
+        .map(|sample| {
+            sample
+                .as_f64()
+                .unwrap_or_else(|| panic!("{key} samples must be numbers: {v}"))
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// Ten sequential requests against a server inside the same runtime: the shape
 /// the pacing was built for. Before the pacing/accept work this took ~1 s
 /// (each request paid a blocking poll that starved the server, then ~10 ms
-/// timer hops); it is a handful of milliseconds now. The bound is deliberately
-/// loose — an order of magnitude over the observed value — so a loaded CI box
-/// cannot flake it, while a regression to timer-hop pacing fails it.
+/// timer hops); it is a handful of milliseconds now.
+///
+/// The bound is RELATIVE, because the previous absolute one (total < 600 ms)
+/// failed the gate while every request was still served by intact pacing: on
+/// the loaded gate run the fast sequence took 963 ms, yet six of its ten
+/// requests were under 17 ms and one was 5.4 ms — scheduler outliers, not
+/// pacing. So the same work now runs twice through the same client helper:
+/// once on `/seq` (the fast path, the subject) and once on `/slow`, whose
+/// handler holds every response [`SLOW_PATH_DELAY_MS`] before writing it,
+/// pinning the control sequence's floor at that delay no matter how loaded the
+/// host is. The contract is that the fast path's floor is at least
+/// [`FAST_PATH_MIN_SPEEDUP`]x the control's — equivalently, its quickest round
+/// trip must stay under 50 ms — plus a generous absolute anti-hang ceiling.
 #[tokio::test(flavor = "current_thread")]
 async fn loopback_ten_sequential_requests_are_fast() {
     let ts = format!(
         r#"{CLIENT_HELPERS}
+const SLOW_DELAY_MS = {delay};
 export default (pi) => {{
   pi.on("session_start", async () => {{
-    const server = http.createServer(function (_req, res) {{
-      res.writeHead(200, {{ "content-type": "text/plain" }});
-      res.end("pong");
+    const server = http.createServer(function (req, res) {{
+      const answer = function () {{
+        res.writeHead(200, {{ "content-type": "text/plain" }});
+        res.end("pong");
+      }};
+      if (req.url.indexOf("/slow") === 0) {{
+        // The control path: the same handler and the same answer, held back by
+        // a deliberate wait. This runtime is single-threaded, so the client
+        // cannot observe the response before the wait is over: every control
+        // round trip costs at least SLOW_DELAY_MS whatever the host is doing.
+        const end = Date.now() + SLOW_DELAY_MS;
+        while (Date.now() < end) {{ /* deliberate delay, not a race */ }}
+      }}
+      answer();
     }});
     await new Promise(function (resolve) {{ server.listen(0, resolve); }});
-    const out = await getSequence(server.address().port, 10);
+    const port = server.address().port;
+    // Fast first: the control path's delay must not perturb this measurement.
+    const fast = await getSequence(port, 10, "/seq");
+    const slow = await getSequence(port, 10, "/slow");
     server.close();
-    globalThis.__pirPaced = out;
+    globalThis.__pirPaced = {{
+      fastMs: fast.totalMs,
+      fastPerRequestMs: fast.perRequestMs,
+      fastBodies: fast.bodies,
+      slowMs: slow.totalMs,
+      slowPerRequestMs: slow.perRequestMs,
+      slowBodies: slow.bodies,
+    }};
   }});
 }};
-"#
+"#,
+        delay = SLOW_PATH_DELAY_MS,
     );
     let v = run_pacing_fixture("in-process", &ts).await;
 
-    let total = v["totalMs"].as_f64().expect("totalMs");
-    let bodies = v["bodies"].as_array().expect("bodies");
-    assert_eq!(bodies.len(), 10, "every request answered: {v}");
+    let fast_bodies = v["fastBodies"].as_array().expect("fastBodies");
+    assert_eq!(fast_bodies.len(), 10, "every request answered: {v}");
     assert!(
-        bodies.iter().all(|body| body == "pong"),
+        fast_bodies.iter().all(|body| body == "pong"),
         "every response body round tripped: {v}"
     );
-    println!(
-        "in-process loopback: {total:.1} ms for 10 requests, per request {:?}",
-        v["perRequestMs"]
+    let slow_bodies = v["slowBodies"].as_array().expect("slowBodies");
+    assert_eq!(
+        slow_bodies.len(),
+        10,
+        "the control path must answer every request too: {v}"
     );
     assert!(
-        total < 600.0,
-        "10 in-process loopback requests must not pay timer-hop pacing (took {total} ms): {v}"
+        slow_bodies.iter().all(|body| body == "pong"),
+        "the control path must carry the same work: {v}"
+    );
+
+    let fast_total = v["fastMs"].as_f64().expect("fastMs");
+    let slow_total = v["slowMs"].as_f64().expect("slowMs");
+    let fast_floor = per_request_floor_ms(&v, "fastPerRequestMs");
+    let slow_floor = per_request_floor_ms(&v, "slowPerRequestMs");
+    println!(
+        "in-process loopback: fast {fast_total:.1} ms / control {slow_total:.1} ms for 10 requests \
+         each; floors fast {fast_floor:.2} ms, control {slow_floor:.2} ms (speedup {:.1}x); fast \
+         per request {:?}, control per request {:?}",
+        slow_floor / fast_floor,
+        v["fastPerRequestMs"],
+        v["slowPerRequestMs"],
+    );
+
+    // Anti-hang net only: the contract is the relative bound below.
+    assert!(
+        fast_total < FAST_PATH_ANTI_HANG_MS,
+        "even a loaded host must finish 10 in-process loopback requests before the \
+         {FAST_PATH_ANTI_HANG_MS} ms anti-hang net (took {fast_total} ms): {v}"
+    );
+    // Control self-check: a delay that is not paid would make the relative
+    // bound meaningless (and would pass a zero-work control).
+    assert!(
+        slow_floor + SLOW_PATH_FLOOR_SLACK_MS >= SLOW_PATH_DELAY_MS as f64,
+        "the control path must actually pay its injected {SLOW_PATH_DELAY_MS} ms before the first \
+         byte (its quickest round trip took {slow_floor:.2} ms): {v}"
+    );
+    assert!(
+        slow_floor >= fast_floor * FAST_PATH_MIN_SPEEDUP,
+        "10 in-process loopback requests must not pay timer-hop pacing: the fast path must be \
+         {FAST_PATH_MIN_SPEEDUP}x faster than the same work against the {SLOW_PATH_DELAY_MS} ms \
+         control path, i.e. its quickest round trip must stay under {:.0} ms (fast {fast_floor:.2} \
+         ms, control {slow_floor:.2} ms): {v}",
+        SLOW_PATH_DELAY_MS as f64 / FAST_PATH_MIN_SPEEDUP,
     );
 }
 

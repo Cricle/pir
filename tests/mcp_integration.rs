@@ -5767,11 +5767,29 @@ async fn generic_request_and_notify_use_the_custom_method_path() {
 
 #[tokio::test]
 async fn per_request_progress_reaches_the_callback_and_resets_the_idle_deadline() {
+    // PIR-QE-001: the timing margins are load-tolerant; BOTH directions of the
+    // idle-deadline contract stay strict, and the assertions are on the
+    // observable state (the callback saw progress / the call was killed by its
+    // deadline), never on elapsed time.
+    //
+    //   * WITH progress: the server reports progress every 250ms across ~4s of
+    //     work, while the request deadline is 3s. A fixed deadline would cut
+    //     the call off (4s > 3s); an idle deadline restarted by each progress
+    //     notification finishes it (upstream resets its request timer on
+    //     progress). A 250ms tick against a 3s deadline leaves ~2.75s of
+    //     scheduling slack for a tick delayed by a loaded box — the property
+    //     that flaked under the gate's parallel load. The callback assertions
+    //     also prove the resets HAPPENED (every notification delivered, in
+    //     order, with the token), not merely that the call did not fail.
+    //   * WITHOUT progress: the same 3s deadline against the `slow` tool
+    //     (PIR_MOCK_DELAY_MS = 15s; it never reports progress) must still kill
+    //     the request with a typed timeout; 15s vs 3s leaves no race.
     let client = connect_mock_with_options(
         "progress",
         &[
-            ("PIR_MOCK_PROGRESS_MS", "30"),
-            ("PIR_MOCK_PROGRESS_COUNT", "5"),
+            ("PIR_MOCK_PROGRESS_MS", "250"),
+            ("PIR_MOCK_PROGRESS_COUNT", "16"),
+            ("PIR_MOCK_DELAY_MS", "15000"),
         ],
         McpClientOptions::new(),
     )
@@ -5781,9 +5799,9 @@ async fn per_request_progress_reaches_the_callback_and_resets_the_idle_deadline(
     ));
     let progress_seen = Arc::clone(&seen);
     let options = McpRequestOptions::new()
-        // Shorter than the 150ms total run: only progress resets keep this
+        // Shorter than the ~4s total run: only progress resets keep this
         // request alive.
-        .with_timeout(Duration::from_millis(80))
+        .with_timeout(Duration::from_secs(3))
         .with_progress(move |progress| {
             progress_seen
                 .lock()
@@ -5799,19 +5817,42 @@ async fn per_request_progress_reaches_the_callback_and_resets_the_idle_deadline(
         .call_tool_with_options("progress", &json!({}), &options)
         .await
         .expect("progress keeps the request alive");
-    assert_eq!(tool_result_text(&result), "progress:5");
+    assert_eq!(tool_result_text(&result), "progress:16");
     let seen = seen
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    assert_eq!(seen.len(), 5, "one callback per notification: {seen:?}");
+    assert_eq!(seen.len(), 16, "one callback per notification: {seen:?}");
     assert_eq!(seen[0].0, 1.0);
-    assert_eq!(seen[4].0, 5.0);
-    assert_eq!(seen[4].1, Some(5.0));
-    assert_eq!(seen[4].2.as_deref(), Some("step 5"));
+    assert_eq!(seen[15].0, 16.0);
+    assert_eq!(seen[15].1, Some(16.0));
+    assert_eq!(seen[15].2.as_deref(), Some("step 16"));
     assert!(
-        !seen[4].3.is_null(),
+        !seen[15].3.is_null(),
         "the progress token is delivered: {seen:?}"
+    );
+
+    // Direction 2 — a request with NO progress still dies: the `slow` tool
+    // answers only after 15s and never reports progress, so the same 3s
+    // deadline must end the call with a typed timeout. The elapsed bound is a
+    // generous anti-hang net, not a latency assertion.
+    let started = std::time::Instant::now();
+    let error = client
+        .call_tool_with_options(
+            "slow",
+            &json!({ "text": "no-progress" }),
+            &McpRequestOptions::new().with_timeout(Duration::from_secs(3)),
+        )
+        .await
+        .expect_err("a call with no progress cannot finish inside its deadline");
+    assert!(
+        matches!(error, McpError::Timeout { timeout_ms: 3000 }),
+        "a call with no progress reports Timeout: {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the request deadline ended the call, took {:?}",
+        started.elapsed()
     );
     client.close().await;
 }

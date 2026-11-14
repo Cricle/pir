@@ -702,16 +702,33 @@ fn aborting_a_call_reports_aborted_without_waiting_for_the_server() {
 
 #[test]
 fn progress_notifications_keep_a_slow_request_alive() {
-    // Idle deadline 1 s, ~1.2 s of work, progress every ~0.2 s: a fixed
-    // deadline would cut this off, an idle deadline restarted by progress
-    // finishes it (upstream resets its request timer on progress). The 1 s
-    // ceiling stays below the 1.2 s of work (so a broken idle reset still
-    // fails) while leaving ~0.8 s for a progress tick delayed by a loaded box.
-    // The shape (deadline < work, progress period < deadline) is what the test
-    // pins; the absolute durations are only wall time.
+    // PIR-QE-001: the timing margins are load-tolerant; BOTH directions of the
+    // idle-deadline contract stay strict, and the assertions are on the
+    // observable end state (the call completed / the call was killed by its
+    // deadline), never on elapsed time.
+    //
+    //   * WITH progress: the mock reports progress every ~1.5 s across ~9 s of
+    //     work, while the idle deadline is 5 s. A fixed deadline would cut the
+    //     call off (9 s > 5 s); an idle deadline restarted by each progress
+    //     notification finishes it (upstream resets its request timer on
+    //     progress). A 1.5 s tick against a 5 s deadline leaves ~3.5 s of
+    //     scheduling slack for a tick delayed by a loaded box — the property
+    //     that flaked under the gate's parallel load was that a delayed tick
+    //     must not be mistaken for a dead request. The 5 s budget is also the
+    //     connect budget (`entry.timeout_ms()` bounds the spawn + handshake
+    //     too), generously above the ~1.1 s measured for a fresh mock child on
+    //     an idle box.
+    //   * WITHOUT progress: the SAME 5 s deadline against a server that never
+    //     reports progress (MOCK_SLOW, holding the call for 30 s) must still
+    //     end the call with `Timeout`; 30 s vs 5 s leaves no race. This is the
+    //     direction the progress fixture must never relax.
     let manager = McpManager::without_log(&std::env::current_dir().expect("cwd"));
-    register_mock(&manager, "reporting", MOCK_PROGRESS, 1, 1_200, &[]);
+    register_mock(&manager, "reporting", MOCK_PROGRESS, 5, 9_000, &[]);
+    register_mock(&manager, "quiet", MOCK_SLOW, 5, 30_000, &[]);
     runtime().block_on(async {
+        // Direction 1 — a request WITH progress survives its own deadline: the
+        // mock reports 6 times over ~9 s of work, every notification restarts
+        // the 5 s idle deadline, and the call reaches its "done" result.
         let result = manager
             .call_tool("reporting", "work", &json!({}), None)
             .await
@@ -723,6 +740,23 @@ fn progress_notifications_keep_a_slow_request_alive() {
                 .and_then(|block| block.text.as_deref()),
             Some("done"),
             "the call completed: {result:?}"
+        );
+        // Direction 2 — a request with NO progress still dies: the same 5 s
+        // deadline ends the silent call with a typed timeout. The elapsed
+        // bound is a generous anti-hang net, not a latency assertion.
+        let started = Instant::now();
+        let error = manager
+            .call_tool("quiet", "work", &json!({}), None)
+            .await
+            .expect_err("a call with no progress cannot finish inside its deadline");
+        assert!(
+            matches!(error, McpError::Timeout { .. }),
+            "a call with no progress reports Timeout: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the idle deadline ended the call, took {:?}",
+            started.elapsed()
         );
         manager.shutdown().await;
     });

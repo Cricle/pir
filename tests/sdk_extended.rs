@@ -8,7 +8,7 @@
 //! actually receives rather than on internal bookkeeping.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
@@ -3649,23 +3649,31 @@ async fn prompt_stream_slow_consumer_drops_intermediate_but_delivers_terminal_in
     const DELTAS: usize = 300;
     let cwd = TempDir::new("sdk-stream-slow-consumer");
 
-    let registry = frame_registry(Arc::new(|_index| {
-        let full: String = (0..DELTAS).map(|i| format!("d{i:03};")).collect();
-        let message = assistant(vec![text_block(&full)], StopReason::Stop);
-        let mut frames = Vec::with_capacity(DELTAS + 1);
-        for i in 0..DELTAS {
-            frames.push(AssistantMessageEvent::TextDelta {
-                content_index: 0,
-                delta: format!("d{i:03};"),
-                partial: Arc::new(message.clone()),
+    // Set by the mock when it is asked for frames, so the slow phase below
+    // can wait for the real settlement instead of guessing with a fixed
+    // sleep.
+    let flood_started = Arc::new(AtomicBool::new(false));
+    let registry = frame_registry({
+        let flood_started = Arc::clone(&flood_started);
+        Arc::new(move |_index| {
+            flood_started.store(true, Ordering::SeqCst);
+            let full: String = (0..DELTAS).map(|i| format!("d{i:03};")).collect();
+            let message = assistant(vec![text_block(&full)], StopReason::Stop);
+            let mut frames = Vec::with_capacity(DELTAS + 1);
+            for i in 0..DELTAS {
+                frames.push(AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: format!("d{i:03};"),
+                    partial: Arc::new(message.clone()),
+                });
+            }
+            frames.push(AssistantMessageEvent::Done {
+                reason: TerminalReason::Stop,
+                message,
             });
-        }
-        frames.push(AssistantMessageEvent::Done {
-            reason: TerminalReason::Stop,
-            message,
-        });
-        frames
-    }));
+            frames
+        })
+    });
     let agent = agent_builder(registry, cwd.path())
         .no_session()
         .build()
@@ -3678,9 +3686,23 @@ async fn prompt_stream_slow_consumer_drops_intermediate_but_delivers_terminal_in
     agent.set_event_channel_capacity(32);
 
     let mut stream = agent.prompt_stream("flood the stream");
-    // Real slow consumer: do not poll for a while, so the burst overflows the
-    // channel and the run settles with the terminal event still parked.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Deterministic slow-consumer window: do not poll until the flood run
+    // has settled. A fixed sleep raced the producer — under load the sleep
+    // could end before the burst had been produced, the drain then kept up
+    // with the producer and nothing was dropped. Waiting for the mock to be
+    // asked for frames AND for the run to settle guarantees that every delta
+    // was already offered (`try_send`) to the capacity-32 channel with no
+    // consumer draining it: the overflow (and its drops) is decided, and the
+    // terminal `AgentSettled` is queued or parked behind the full channel.
+    // The generous deadline is an anti-hang net, not a timing assertion.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !flood_started.load(Ordering::SeqCst) || agent.is_streaming() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the flood run did not settle within 30s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {

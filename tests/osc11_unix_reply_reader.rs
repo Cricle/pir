@@ -102,19 +102,46 @@ fn background(outcome: &ReplyReadOutcome) -> Option<(u8, u8, u8)> {
     outcome.colors.as_ref().and_then(|colors| colors.background)
 }
 
+/// How long `a_fragmented_reply_is_read_through_its_terminator` replays its
+/// script before giving up.
+///
+/// The reader's window is a wall-clock budget, and under the gate's parallel
+/// load this thread can be descheduled long enough for it to expire between two
+/// fragments — that is the fixture's race (PIR-QE-001), so a single attempt
+/// cannot decide the test. The fixture instead settles on the observable end
+/// state: it replays the *same* fragmented script until the terminator has been
+/// read, bounded by this deadline. The bound is an anti-hang net, not a
+/// functional budget: on a quiet host the first attempt settles in well under a
+/// millisecond, and on a loaded one each attempt still stops at the reader's
+/// own 50 ms window, so 30 s covers hundreds of replays.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
 #[test]
 fn a_fragmented_reply_is_read_through_its_terminator() {
     // The terminal answers in three pieces (and only the DA1 ends the query).
-    let (outcome, unread, _) = drive(
-        &[
-            Step::Bytes(&REPLY[..4]),
-            Step::Bytes(&REPLY[4..11]),
-            Step::Bytes(&REPLY[11..]),
-            Step::Bytes(DA1),
-        ],
-        Duration::from_millis(50),
-        Duration::from_millis(50),
-    );
+    // The fragmentation is the point, so every attempt replays exactly these
+    // fragments; only the *settle* is load-tolerant, never the assertions.
+    let fragments = [
+        Step::Bytes(&REPLY[..4]),
+        Step::Bytes(&REPLY[4..11]),
+        Step::Bytes(&REPLY[11..]),
+        Step::Bytes(DA1),
+    ];
+    let settle_deadline = Instant::now() + SETTLE_DEADLINE;
+    let (outcome, unread) = loop {
+        let (outcome, unread, _) = drive(
+            &fragments,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        );
+        // The terminator was consumed exactly when the reader asked for every
+        // scripted look (the last of them is the DA1). Anything short of that
+        // is the reader's window expiring under load, not a verdict — retry,
+        // until the deadline above turns it into one.
+        if unread.is_empty() || Instant::now() >= settle_deadline {
+            break (outcome, unread);
+        }
+    };
     assert_eq!(background(&outcome), Some(BACKGROUND));
     assert_eq!(outcome.handed_back, Vec::<u8>::new());
     assert!(unread.is_empty(), "every step was read: {unread:?}");

@@ -923,8 +923,22 @@ async fn a_deferred_deadline_stores_the_hold() {
         .expect("deferred edit");
     assert_eq!(stored_count(&storage, record_id).await, 0);
 
-    // The native deadline timer fires after ~10 ms; wait well past it.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // The native deadline timer fires after ~10 ms, but the timer task, the
+    // queued flush command and the storage commit are all scheduler-bound: a
+    // loaded host can lag well past any fixed wait. Settle on the observable
+    // end state instead — the hold stored AND gone — with a generous
+    // anti-hang deadline; the assertions below stay exact.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if stored_count(&storage, record_id).await == 9 && !session.handle().has_deferred() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the deferred deadline did not store the hold within 30s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(
         stored_count(&storage, record_id).await,
         9,
