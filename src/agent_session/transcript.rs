@@ -331,7 +331,11 @@ impl AgentSession {
             Some(session) => {
                 let mut manager = session.lock().await;
                 // Whole-history JSON read: widen both live-trimmed and
-                // tail-first paged managers (PIR-SDK-025).
+                // tail-first paged managers (PIR-SDK-025). The slice flag is
+                // read AFTER the widen: on success the list is whole
+                // (bridge on, PIR-BIN-092 recovery intact), and on a FAILED
+                // widen the reader serves the window with the windowed rule
+                // instead of grafting abandoned rows (PIR-BIN-103).
                 #[cfg(feature = "session")]
                 if manager.is_paged() {
                     let _ = manager.widen_to_full();
@@ -339,6 +343,7 @@ impl AgentSession {
                 crate::session_manager::projection::build_session_context_json(
                     manager.resident_entries(),
                     manager.leaf_id(),
+                    !manager.is_paged(),
                 )
             }
             None => self.history_snapshot().iter().map(message_json).collect(),

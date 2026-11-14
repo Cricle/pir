@@ -3294,6 +3294,7 @@ fn context_json_matches_the_projection_without_materializing_it() {
     let actual = pir::session_manager::projection::build_session_context_json(
         session.resident_entries(),
         session.leaf_id(),
+        true,
     );
     assert_eq!(actual, expected);
 }
@@ -3319,6 +3320,7 @@ fn context_json_matches_a_plain_projection_too() {
         pir::session_manager::projection::build_session_context_json(
             session.resident_entries(),
             session.leaf_id(),
+            true,
         ),
         expected
     );
@@ -4221,5 +4223,238 @@ fn windowed_projection_stops_at_the_page_start_pir_bin_101() {
         projected_texts,
         vec!["live-c2".to_owned(), "live-c3".to_owned()],
         "the live-trimmed model context must never carry the abandoned branch (PIR-BIN-101): {projected_texts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-101 companion pin (lane w1, review of 44ea612): the windowed stop
+// must hold through every PUBLIC windowed reader, and `widen_to_full` must
+// restore the whole-file bridge (PIR-BIN-092) — the two directions of the
+// same `bridge_missing_parents` flag.
+// ---------------------------------------------------------------------------
+
+/// [`windowed_projection_stops_at_the_page_start_pir_bin_101`] pins
+/// `build_session_projection` on the open_paged and live-trim arms. This
+/// companion pins the OTHER public windowed readers over the same fixture
+/// (`build_session_messages`, `build_context_entries`,
+/// `projection_entry_meta`, `last_assistant_text`, `branch_path_shared`), and
+/// the other end of the flag: once the manager is WIDENED (the whole file is
+/// resident), the walk must bridge a PIR-BIN-092 hole again — and still must
+/// never graft the abandoned-branch rows.
+#[test]
+fn windowed_readers_pin_the_flag_and_widening_restores_the_bridge() {
+    let dir = temp_dir("bin101-windowed-readers");
+    let mut session = SessionManager::create("C:/repo", &dir).unwrap();
+    let u1 = session.append_message(user_message("live-u1")).unwrap();
+    session
+        .append_message(assistant_message("live-a1", StopReason::Stop))
+        .unwrap();
+    session
+        .append_message(user_message("abandoned-b2"))
+        .unwrap();
+    session
+        .append_message(assistant_message("abandoned-b3", StopReason::Stop))
+        .unwrap();
+    session.branch(&u1).unwrap();
+    let c2 = session.append_message(user_message("live-c2")).unwrap();
+    let c3 = session
+        .append_message(assistant_message("live-c3", StopReason::Stop))
+        .unwrap();
+    let path = session.path().to_path_buf();
+    drop(session);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let tail_four_bytes: usize = lines[lines.len() - 4..]
+        .iter()
+        .map(|line| line.len() + 1)
+        .sum();
+
+    let branch_ids = |manager: &SessionManager| -> Vec<String> {
+        manager
+            .projected_branch_path(None)
+            .iter()
+            .map(|entry| entry.entry_id().to_owned())
+            .collect()
+    };
+    let shared_ids = |manager: &SessionManager| -> Vec<String> {
+        manager
+            .branch_path_shared(None)
+            .iter()
+            .map(|entry| entry.entry().entry_id().to_owned())
+            .collect()
+    };
+    let projection_ids = |manager: &SessionManager| -> Vec<String> {
+        manager
+            .build_session_projection()
+            .expect("projection")
+            .entries
+            .iter()
+            .map(|entry| entry.source_entry.entry_id().to_owned())
+            .collect()
+    };
+    let meta_ids = |manager: &SessionManager| -> Vec<String> {
+        manager
+            .projection_entry_meta()
+            .iter()
+            .map(|meta| meta.source_entry.entry_id().to_owned())
+            .collect()
+    };
+    let texts = |messages: &[Message]| -> Vec<String> { messages.iter().map(text_of).collect() };
+    // PIR-BIN-103: the transcript_json seam must follow the same slice rule —
+    // it reads the flag AFTER its widen attempt, so a windowed manager gets
+    // the windowed walk (the projection below is the windowed oracle) and a
+    // widened one the whole-file walk.
+    let context_json = |manager: &SessionManager| -> Vec<serde_json::Value> {
+        pir::session_manager::projection::build_session_context_json(
+            manager.resident_entries(),
+            manager.leaf_id(),
+            !manager.is_paged(),
+        )
+    };
+    let expected_json = |manager: &SessionManager| -> Vec<serde_json::Value> {
+        manager
+            .build_session_projection()
+            .expect("projection")
+            .messages
+            .iter()
+            .map(|message| serde_json::to_value(message).unwrap())
+            .collect()
+    };
+    let live_texts = vec!["live-c2".to_owned(), "live-c3".to_owned()];
+
+    let assert_windowed = |manager: &SessionManager, arm: &str| {
+        assert_eq!(
+            branch_ids(manager),
+            vec![c2.clone(), c3.clone()],
+            "{arm}: projected_branch_path"
+        );
+        assert_eq!(
+            shared_ids(manager),
+            vec![c2.clone(), c3.clone()],
+            "{arm}: branch_path_shared"
+        );
+        assert_eq!(
+            projection_ids(manager),
+            vec![c2.clone(), c3.clone()],
+            "{arm}: build_session_projection"
+        );
+        assert_eq!(
+            texts(&manager.build_session_messages()),
+            live_texts,
+            "{arm}: build_session_messages"
+        );
+        assert_eq!(
+            texts(&manager.build_context_entries().unwrap()),
+            live_texts,
+            "{arm}: build_context_entries"
+        );
+        assert_eq!(
+            meta_ids(manager),
+            vec![c2.clone(), c3.clone()],
+            "{arm}: projection_entry_meta"
+        );
+        assert_eq!(
+            manager.last_assistant_text().as_deref(),
+            Some("live-c3"),
+            "{arm}: last_assistant_text"
+        );
+        assert_eq!(
+            context_json(manager),
+            expected_json(manager),
+            "{arm}: build_session_context_json follows the windowed walk (PIR-BIN-103)"
+        );
+    };
+
+    let paged = SessionManager::open_paged(&path, tail_four_bytes + 1, 4).expect("paged open");
+    assert!(paged.is_paged(), "the fixture must exceed the page caps");
+    assert_windowed(&paged, "open_paged");
+
+    let mut trimmed = SessionManager::open(&path).unwrap();
+    trimmed.enable_live_tail_trim(1, 4);
+    assert!(
+        trimmed.trim_resident_tail(usize::MAX, 4).unwrap(),
+        "the trim must fire"
+    );
+    assert_windowed(&trimmed, "live-trim");
+
+    // Widening restores the whole-file walk: the live branch point u1 joins
+    // the path again, and the abandoned b2/b3 stay OUT (the bridge is not a
+    // sibling-join).
+    let mut widened =
+        SessionManager::open_paged(&path, tail_four_bytes + 1, 4).expect("paged open");
+    widened.widen_to_full().unwrap();
+    assert!(!widened.is_paged());
+    assert_eq!(
+        branch_ids(&widened),
+        vec![u1.clone(), c2.clone(), c3.clone()],
+        "a widened manager must walk the whole live branch"
+    );
+    assert_eq!(
+        projection_ids(&widened),
+        vec![u1.clone(), c2.clone(), c3.clone()],
+        "a widened projection must match the widened branch"
+    );
+    assert_eq!(
+        texts(&widened.build_session_messages()),
+        vec![
+            "live-u1".to_owned(),
+            "live-c2".to_owned(),
+            "live-c3".to_owned()
+        ],
+        "a widened model context must never carry the abandoned branch"
+    );
+    assert_eq!(
+        context_json(&widened),
+        expected_json(&widened),
+        "a widened build_session_context_json follows the widened walk"
+    );
+
+    // The PIR-BIN-092 recovery the whole-file bridge exists for: an entry
+    // whose parent names a line the loader skipped. Whole file = joined;
+    // window = stopped at the boundary; widened window = joined again.
+    let dir = temp_dir("bin101-widened-bridge");
+    let mut session = SessionManager::create("C:/repo", &dir).unwrap();
+    let hole_u1 = session.append_message(user_message("hole-u1")).unwrap();
+    session
+        .append_message(assistant_message("hole-a1", StopReason::Stop))
+        .unwrap();
+    let hole_path = session.path().to_path_buf();
+    drop(session);
+    let text = std::fs::read_to_string(&hole_path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    lines.insert(lines.len() - 1, "not json at all".to_owned());
+    for line in lines.iter_mut().skip(1) {
+        if line == "not json at all" {
+            continue;
+        }
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        if value.get("parentId").and_then(|parent| parent.as_str()) == Some(hole_u1.as_str()) {
+            value["parentId"] = serde_json::Value::String("ghost-id".to_owned());
+        }
+        *line = serde_json::to_string(&value).unwrap();
+    }
+    std::fs::write(&hole_path, lines.join("\n") + "\n").unwrap();
+
+    let full = SessionManager::open(&hole_path).unwrap();
+    assert_eq!(
+        full.projected_branch_path(None).len(),
+        2,
+        "PIR-BIN-092: the whole-file walk must join across the skipped line"
+    );
+    let last_one_bytes = lines[lines.len() - 1].len() + 1;
+    let mut windowed =
+        SessionManager::open_paged(&hole_path, last_one_bytes + 1, 1).expect("paged open");
+    assert!(windowed.is_paged());
+    assert_eq!(
+        windowed.projected_branch_path(None).len(),
+        1,
+        "a resident window must stop where the parent leaves the slice"
+    );
+    windowed.widen_to_full().unwrap();
+    assert_eq!(
+        windowed.projected_branch_path(None).len(),
+        2,
+        "widening must restore the whole-file bridge (PIR-BIN-092)"
     );
 }

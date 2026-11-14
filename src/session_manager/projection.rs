@@ -1397,13 +1397,18 @@ pub fn extend_projection_entry_fragments(
 /// differs from the stored record (bash executions, custom/system messages,
 /// summaries, context edits).
 ///
-/// Takes the WHOLE FILE's entries (the PIR-BIN-092 bridge applies); a paged
-/// caller widens first ([`SessionManager::widen_to_full`], PIR-SDK-025).
+/// Takes the WHOLE FILE's entries (the PIR-BIN-092 bridge applies when
+/// `bridge_missing_parents` is true); a paged caller widens first
+/// ([`SessionManager::widen_to_full`], PIR-SDK-025) and passes the flag that
+/// matches whatever slice it actually holds — a FAILED widen must pass the
+/// windowed rule, or the walk grafts abandoned-branch rows (PIR-BIN-103).
 pub fn build_session_context_json<E: Borrow<FileEntry>>(
     entries: &[E],
     leaf_id: Option<&str>,
+    bridge_missing_parents: bool,
 ) -> Vec<JsonValue> {
-    let (_path, context_entries, edits) = retained_context(entries, leaf_id, true, None);
+    let (_path, context_entries, edits) =
+        retained_context(entries, leaf_id, bridge_missing_parents, None);
     // Exact output capacity: the message-count contract the projection and
     // its metadata twin share. One pass over entries already in cache, no
     // growth reallocations on a transcript-sized resident window.
@@ -1665,6 +1670,13 @@ pub(crate) struct ParkToken {
     /// Model-visible message count of the extended projection, proven equal
     /// to a full build's count at `leaf_id` (see the type docs).
     pub(crate) message_count: usize,
+    /// Whether the extend ran over a WINDOWED slice (`is_paged()` was true,
+    /// PIR-BIN-102). The proof holds for the slice contract it was built
+    /// under; a state change before the park (a concurrent widen clears
+    /// `paged`, a trim sets it) makes
+    /// [`SessionManager::validate_park_delta`] refuse the fast path and run
+    /// the full validation under the CURRENT semantics.
+    pub(crate) windowed: bool,
 }
 
 /// Outcome of [`SessionManager::build_session_projection_with_cache`].
@@ -1826,6 +1838,7 @@ pub(crate) fn extend_cached_session_projection(
     let park_token = edits.is_none().then(|| ParkToken {
         leaf_id: leaf_id.map(str::to_owned),
         message_count: projection.messages.len(),
+        windowed: !bridge_missing_parents,
     });
     Some((projection, park_token))
 }
@@ -1936,6 +1949,14 @@ impl SessionManager {
         run_start_leaf: Option<&str>,
         parked_message_count: usize,
     ) -> Option<bool> {
+        // PIR-BIN-102: the proof holds for the slice contract it was built
+        // under. A widen (clears `paged`) or a trim (sets it) between the
+        // prompt-start extend and this park changes the walk the full
+        // validation would take, so a mismatch falls back to it (None)
+        // instead of concluding on a proof with stale slice semantics.
+        if token.windowed != self.is_paged() {
+            return None;
+        }
         park_delta_validates(
             &self.file_entries,
             leaf_id,
