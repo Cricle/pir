@@ -240,7 +240,10 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     // 780 -> 836 by the R7 branch-text cache (the `CachedBranchText` /
     // `BranchTextCacheKey` type docs and the `build_branch_text` section above
     // the same function; site and invariant unchanged).
-    ("agent_session/session_ctx.rs", 836),
+    // 780 -> 836 by the R7 branch-text cache, then 836 -> 841 by the
+    // PIR-BIN-105 storage_generation key field above the same function (same
+    // site, same invariant).
+    ("agent_session/session_ctx.rs", 841),
     // `reuse` is computed two lines above as
     // `old.as_ref().is_some_and(|slot| ..)`, so `Some` is proven when this
     // branch runs; the `take` cannot observe `None`. Shifted 8398 -> 8458 by

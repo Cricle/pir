@@ -1257,7 +1257,14 @@ pub fn extend_projection_entry_fragments(
                 // Splice: `[...cached items]` + `,` + the appended entries'
                 // MESSAGE texts (inside their fragment arrays — each fragment
                 // text is `[m1,...]`, so the inner part joins the flat list).
-                Some(cached_text) if cached_text.len() >= 2 => {
+                // An EMPTY cached aggregate (`"[]"`) cannot splice: stripping
+                // its closing bracket leaves `[`, and the first appended
+                // message would get a leading comma — invalid JSON in the
+                // pushed envelope (PIR-BIN-106; reachable whenever the
+                // retained path holds only zero-message entries, e.g. a new
+                // session's startup rows). The fallback re-renders the whole
+                // aggregate instead.
+                Some(cached_text) if cached_text.len() >= 2 && cached_text != "[]" => {
                     let mut text = String::with_capacity(
                         cached_text.len() + new_texts.iter().map(|t| t.len() + 1).sum::<usize>(),
                     );

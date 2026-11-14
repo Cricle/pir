@@ -3157,6 +3157,200 @@ mod branch_text_cache_tests {
             "the empty-path splice must not emit a leading comma: {after_reset}"
         );
     }
+
+    /// FALSIFICATION PIN (lane x5, adversarial review of 89ce717; issue
+    /// `.play/issues/PIR-BIN-105.md`): a same-path storage reload is NOT a
+    /// cache-key change. `set_session_file` on the SAME file after an
+    /// external rewrite that keeps every entry id (same id, same position,
+    /// new bytes) leaves `session_id`/`session_path` equal and the covered
+    /// path ids a prefix of the live path, so the next append-shaped push
+    /// SPLICES the stale cached bytes for the already-covered entry. Pre-R7
+    /// the branch was re-rendered from the live path and served the new
+    /// bytes. FIXED (PIR-BIN-105): the branch-text key now carries the manager's
+    /// storage generation, so a same-path reload (bumped by build_index)
+    /// refuses the splice and full-renders. This pin stays green.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn branch_text_same_path_reload_serves_stale_bytes() {
+        let _serial = env_lock();
+        let temp = TempDir::new("branch-reload");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_message(user_message("original user text"))
+            .expect("append user");
+        manager
+            .append_message(assistant_message("reply"))
+            .expect("append assistant");
+        let session_file = manager
+            .session_file()
+            .expect("persisted session path")
+            .to_path_buf();
+
+        let (recorder, pushes) = SnapshotRecorder::new();
+        let handle =
+            ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+        let mut config = agent_config(temp.path(), manager);
+        config.extensions = Some(handle.clone());
+        let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
+        let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+
+        // (a) First push caches the branch text for [user, assistant].
+        assert!(
+            agent.push_session_context_for_test().await,
+            "first push builds"
+        );
+        assert_eq!(recorded_branch(&pushes), branch_oracle(&agent).await);
+
+        // (b) External same-file rewrite: keep the header and every entry id,
+        // change the user message's text (the ordinary hand-edit shape).
+        let raw = std::fs::read_to_string(&session_file).expect("read session file");
+        let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+        let mut patched = 0usize;
+        for line in lines.iter_mut() {
+            let mut value: serde_json::Value =
+                serde_json::from_str(line).expect("session line parses");
+            if value.get("type").and_then(|kind| kind.as_str()) != Some("message") {
+                continue;
+            }
+            if value
+                .pointer("/message/role")
+                .and_then(|role| role.as_str())
+                != Some("user")
+            {
+                continue;
+            }
+            let content = value
+                .pointer_mut("/message/content")
+                .and_then(|content| content.as_array_mut())
+                .expect("user content is an array");
+            content[0]["text"] = serde_json::json!("MUTATED EXTERNAL TEXT");
+            *line = serde_json::to_string(&value).expect("re-encode line");
+            patched += 1;
+        }
+        assert_eq!(patched, 1, "exactly the user message line was rewritten");
+        std::fs::write(&session_file, format!("{}\n", lines.join("\n")))
+            .expect("rewrite session file");
+
+        // (c) Reload the SAME path in place: same session id, same path, same
+        // entry ids/count/leaf. No push runs between reload and append — a
+        // fingerprint HIT push would drop the cached branch (it is `take`n on
+        // every push entry) and mask the splice.
+        let session = agent.session_manager().expect("persisted session");
+        session
+            .lock()
+            .await
+            .set_session_file(&session_file, None)
+            .expect("same-path reload");
+
+        // (d) One append-shaped push: the covered ids still prefix-match, so
+        // the cached (pre-rewrite) bytes for the user message are reused.
+        session
+            .lock()
+            .await
+            .append_message(user_message("after reload"))
+            .expect("append after reload");
+        assert!(
+            agent.push_session_context_for_test().await,
+            "the append invalidates the snapshot cache"
+        );
+
+        let text = recorded_branch(&pushes);
+        let oracle = branch_oracle(&agent).await;
+        assert_eq!(
+            text, oracle,
+            "a same-path reload must not serve stale covered-entry bytes"
+        );
+        let wire: serde_json::Value = handle
+            .eval_json("__pir_host.getSessionManagerJson()")
+            .await
+            .expect("the pushed snapshot parses");
+        assert_eq!(
+            wire["branch"],
+            serde_json::from_str::<serde_json::Value>(&oracle).expect("oracle parses"),
+            "the wire branch must match the from-scratch render"
+        );
+    }
+
+    /// FALSIFICATION PIN (lane x5, adversarial review of 89ce717; issue
+    /// `.play/issues/PIR-BIN-106.md`): the R7 empty-projection guard only
+    /// catches cached sets with ZERO entries (`cached_views == 0`). A cached
+    /// set whose entries ALL project zero messages (e.g. a
+    /// `thinking_level_change`-only path) carries the SAME empty rendered
+    /// aggregate text (`aggregate_text == "[]"`, `projection_json`
+    /// `...],"messages":[]}`), takes the `cached_views > 0` extend path,
+    /// and the extender's text splice strips only the closing bracket —
+    /// emitting a leading comma (`"messages":[,{...}]`) into the pushed
+    /// envelope. `getSessionManagerJson` splices that text raw, so the wire
+    /// reply is unparsable. Expected to FAIL until the caller/extender also
+    /// refuses to splice from an EMPTY rendered aggregate.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
+    async fn zero_message_cached_projection_splice_emits_invalid_json() {
+        let _serial = env_lock();
+        let temp = TempDir::new("empty-aggregate");
+        let cwd = temp.path().to_string_lossy().into_owned();
+        let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
+        manager
+            .append_thinking_level_change("high")
+            .expect("append thinking level change");
+
+        let (recorder, pushes) = SnapshotRecorder::new();
+        let handle =
+            ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
+        let mut config = agent_config(temp.path(), manager);
+        config.extensions = Some(handle.clone());
+        let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
+        let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+        let session = agent.session_manager().expect("persisted session");
+
+        let last_projection = |pushes: &Arc<Mutex<Vec<SessionContextSnapshot>>>| {
+            pushes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .expect("a recorded snapshot")
+                .projection_json
+                .clone()
+        };
+
+        // (a) First push: the projection holds ONE entry that projects ZERO
+        // messages, and the cached fragment set still carries rendered text.
+        assert!(
+            agent.push_session_context_for_test().await,
+            "first push builds"
+        );
+        let first = last_projection(&pushes);
+        assert!(
+            first.ends_with("\"messages\":[]}"),
+            "the first push's aggregate is the empty array: {first}"
+        );
+
+        // (b) One append that DOES project a message: `cached_views > 0`, so
+        // the R7 guard does not apply and the aggregate text is spliced from
+        // the cached EMPTY text.
+        session
+            .lock()
+            .await
+            .append_message(user_message("first message"))
+            .expect("append user");
+        assert!(
+            agent.push_session_context_for_test().await,
+            "the append invalidates the snapshot cache"
+        );
+        let text = last_projection(&pushes);
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
+        assert!(
+            parsed.is_ok(),
+            "the pushed projection text must stay valid JSON: {text}"
+        );
+        // The same invalid text is spliced RAW into the JS wire envelope.
+        let wire = handle.eval_json("__pir_host.getSessionManagerJson()").await;
+        assert!(
+            wire.is_ok(),
+            "the pushed ctx.sessionManager envelope must parse: {wire:?}"
+        );
+    }
 }
 
 /// A host with NO JS face (builtin/inline plugins only, `config.extensions =

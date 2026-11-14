@@ -2431,6 +2431,16 @@ impl Drop for SessionWriterLock {
     }
 }
 
+/// Process-global sequence for [`SessionManager::storage_generation`]
+/// (PIR-BIN-105/108): unique across manager instances, so a fresh manager
+/// opened over the same path can never collide with an outgoing instance's
+/// cached generation.
+static STORAGE_GENERATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_storage_generation() -> u64 {
+    STORAGE_GENERATION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Manages one conversation session as an append-only entry tree stored in a
 /// JSONL file (the pir facade over upstream `SessionManager` semantics).
 #[derive(Debug)]
@@ -2490,6 +2500,18 @@ pub struct SessionManager {
     /// map instead of rebuilding an id index 4-6 times per prompt
     /// ([`projection::EntryPositions`]).
     entry_positions: HashMap<String, usize>,
+    /// Bumped by every [`Self::build_index`] — i.e. whenever the resident list
+    /// is REBUILT from storage (load/replace, `set_session_file`, widen,
+    /// live-trim, branched session). Consumer caches whose key is otherwise
+    /// only the storage IDENTITY (session id + path + count + leaf) include
+    /// this so a same-path reload of an externally EDITED file invalidates
+    /// them: ids survive an edit, bytes do not (PIR-BIN-105, R7's branch text).
+    ///
+    /// Values come from a PROCESS-GLOBAL sequence, not a per-instance counter:
+    /// a fresh manager opened over the same path (a same-path
+    /// `ctx.switchSession`) must never collide with the outgoing instance's
+    /// generation, or a cached splice could survive the swap (PIR-BIN-108).
+    storage_generation: u64,
     /// Interned `toolsAdded` payloads shared by every compaction checkpoint.
     /// The loadout is identical across hundreds of compactions; storing one
     /// `Arc` per distinct schema instead of a deep `serde_json::Value` per
@@ -2688,6 +2710,7 @@ impl SessionManager {
             unparsed_raw_lines: Vec::new(),
             by_id: HashMap::new(),
             entry_positions: HashMap::new(),
+            storage_generation: next_storage_generation(),
             tool_schema_intern: HashMap::new(),
             labels_by_id: BTreeMap::new(),
             label_timestamps_by_id: BTreeMap::new(),
@@ -2734,6 +2757,7 @@ impl SessionManager {
             unparsed_raw_lines: Vec::new(),
             by_id: HashMap::new(),
             entry_positions: HashMap::new(),
+            storage_generation: next_storage_generation(),
             tool_schema_intern: HashMap::new(),
             labels_by_id: BTreeMap::new(),
             label_timestamps_by_id: BTreeMap::new(),
@@ -3232,6 +3256,13 @@ impl SessionManager {
     }
 
     fn build_index(&mut self) {
+        // Every call replaces the whole resident list from storage (load/
+        // replace, widen, live-trim, branched session): take a fresh
+        // process-unique generation so identity-keyed consumer caches (R7's
+        // branch text) refuse a splice over a same-path reload of an
+        // externally edited file (PIR-BIN-105) — and can never collide with
+        // another manager instance over the same path (PIR-BIN-108).
+        self.storage_generation = next_storage_generation();
         self.by_id.clear();
         self.entry_positions.clear();
         // Exact capacity: the index has one slot per non-header resident
@@ -4065,6 +4096,14 @@ impl SessionManager {
     /// of a paged manager; the full list otherwise).
     pub fn resident_entries(&self) -> &[Arc<FileEntry>] {
         &self.file_entries
+    }
+
+    /// The storage generation of the resident list (see the field): bumped by
+    /// every [`Self::build_index`]. Consumer caches keyed on the storage
+    /// IDENTITY include it so a same-path reload of an externally edited file
+    /// invalidates them (PIR-BIN-105).
+    pub(crate) fn storage_generation(&self) -> u64 {
+        self.storage_generation
     }
 
     /// Stream the SKIPPED prefix, one entry at a time (bounded memory: a 1 MiB

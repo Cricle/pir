@@ -253,6 +253,11 @@ pub struct BranchTextCacheKey {
     pub entry_count: usize,
     #[doc(hidden)]
     pub leaf_id: Option<String>,
+    /// The manager's storage generation (PIR-BIN-105): a same-path reload of
+    /// an externally EDITED file keeps every id but changes bytes, which the
+    /// id-prefix splice check cannot see. Bumped by every list rebuild.
+    #[doc(hidden)]
+    pub storage_generation: u64,
 }
 
 /// The cached branch text (R7) plus the leaf-path entry ids it covers.
@@ -1019,6 +1024,7 @@ pub fn build_branch_text(
     let cached = cached.filter(|cached| {
         cached.key.session_id == key.session_id
             && cached.key.session_path == key.session_path
+            && cached.key.storage_generation == key.storage_generation
             && path.len() >= cached.path_ids.len()
             && path[..cached.path_ids.len()]
                 .iter()
@@ -2158,6 +2164,7 @@ session does not have"
                     session_path: session.session_file().map(Path::to_path_buf),
                     entry_count: session.resident_entries().len(),
                     leaf_id: session.leaf_id().map(str::to_owned),
+                    storage_generation: session.storage_generation(),
                 };
                 let (branch, branch_cache) = if js_face {
                     let (text, cache) = build_branch_text(&session, branch_key, cached_branch);

@@ -344,6 +344,16 @@ impl AgentSession {
             .session_path
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = session_path;
+        // PIR-BIN-108: the snapshot cache all derives from the OUTGOING
+        // manager — the branch text (whose storage generation is unique across
+        // instances, but only the replacement's own pushes can prove that), the
+        // forest text, the projection fragments and the session list. Drop it
+        // with the swap; any push during the dispatch below rebuilds from the
+        // replacement, so nothing stale can splice across managers.
+        *self
+            .session_context_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         // The transcript behind this slot changed: long-running work that
         // captured the previous generation must not persist into the new
         // session (checked by its recording seam). The per-message persistence
