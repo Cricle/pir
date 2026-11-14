@@ -3581,7 +3581,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pir-phone-server"
-version = "0.3.1"
+version = "0.3.1-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3608,7 +3608,7 @@ dependencies = [
 
 [[package]]
 name = "pir-sdk"
-version = "0.3.1"
+version = "0.3.1-rc.1"
 dependencies = [
  "aes",
  "anyhow",

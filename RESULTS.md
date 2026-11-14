@@ -69,6 +69,38 @@ pir 与上游 `pi` 1.4.0 的本轮 A/B（封闭环境、loopback mock、隔离 a
 - PIR-BIN-061/062/063：默认系统提示比上游多 4 条规则、少一个 `<docs>` 段、默认加载 9 个工具而 pi 加载 4 个，基线请求成本 **+4464 字符（≈+1116 tokens）**。是否为有意设计需要产品决策，不是纯缺陷。
 - 设置文件写坏时同一错误会打印三行（CLI + codemod + memory 各一条），内容真实但格式重复。
 
+## 0.3.1-rc.1 release (2026-11-14)
+
+0.3.1-rc.1 是 0.3.1 之后的预发布候选：读路径性能整备（R1–R8 全部落地，R5/R6/R7
+本批完成）、会话替换语义与上游对齐（PIR-BIN-049/110）、对抗复核揪出并修复 6 个
+真实缺陷（PIR-BIN-101/105/106/107/108/110），Kitty 裁剪 parity 闭合
+（drift 15/16 → Landed）。无破坏性变更。
+
+**本轮修复/性能（均有前后实测）**
+
+| 类别 | issue | 修复效果（实测） |
+|---|---|---|
+| 性能 | R3 park token | 运行结束的 park 校验从两次全转录本遍历降为 O(delta)，保留全量校验回退 |
+| 性能 | R5/R6 会话读路径 | `context_usage()` 1 622 → 21 allocs/调用（N=800）；RPC `get_entries` 不再深拷贝整个会话 |
+| 性能 | R7 快照分支文本增量 | 16.7 ms / 5 283 allocs → 1.06 ms / 35（N=800，字节恒等） |
+| 性能 | PIR-BIN-099 事件行预规格化 | 200 KB 工具结果轮 full 配置 −2.3 MB 分配；session face −12.6%（3 042 → 2 658 KB），字节恒等 |
+| 正确性 | PIR-BIN-101/102/103 窗口化投影桥接 | 被弃分支不再进入模型上下文；两个投影 walker 对同一窗口一致；30/30 钉住 |
+| 正确性 | PIR-BIN-105/106/108 R7 缓存陈旧 | 进程级 storage generation + swap 清缓存；空 aggregate 回退全量渲染；x5 三轮对抗复核 verified |
+| 正确性 | PIR-BIN-049/110 替换语义 | 替换统一按操作给 reason（new/resume，含父链子会话）；fork 缝由调用方显式选择；new/resume/fork 均不发 `session_tree` 与 drain 期 `queue_update` |
+| 正确性 | PIR-BIN-052 残留 / PIR-BIN-107 临时会话 | `--mode json` 认领会话控制动作；ephemeral `ctx.newSession()` 保持内存态；无存储 fork 与上游同文案拒绝 |
+| TUI | Kitty 裁剪 / TUI-042 / TUI-043 | 字节钉 + 启动期 status/widget 行 + 启动排队 turn 恰好一次 |
+| 测试 | QE-001 / QE-002 / 线语料 | 计时 flake 以更强契约根治；harness 地图逐行复验；776 事件随机对抗语料钉字节恒等 |
+
+**门禁（本机 GNU，2026-11-14 实测）**
+
+- `cargo fmt --all -- --check` EXIT 0。
+- `cargo clippy --all-targets --all-features --locked -- -D warnings` EXIT 0（0 条诊断）。
+- 全量 nextest（`--profile ci`，`RUST_MIN_STACK=8388608`）：**7497 tests，0 failed，46 skipped**；
+  分项 = lib/bins 29 + zz_merged_1..8 的 772/791/795/776/790/1091/880/791 + standalone 20 + profiling 762。
+- doctests 33 passed / 0 failed / 7 ignored；`cargo check --no-default-features --features sdk` EXIT 0。
+- 版本三处一致：`[workspace.package]`、`.migration-info`、二进制 `--version` 均为 0.3.1-rc.1，
+  `Cargo.lock` 两个 workspace 包同步。证据：`.play/evidence/release-candidate-032/`。
+
 ## 0.3.1 release (2026-11-13)
 
 0.3.1 收入 2026-11-12 A/B 战役的全部修复，并补完发版前发现的会话持久性 / Windows

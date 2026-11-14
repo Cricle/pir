@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.3.1-rc.1 (2026-11-14)
+
+Pre-release candidate carrying the post-0.3.1 batch: read-path performance work
+(R1–R8 all landed; R5/R6/R7 in this batch), session-replacement semantics aligned
+with upstream, and six real defects found by adversarial review. No breaking
+changes.
+
+### performance
+
+- Run-end park validation is O(delta) instead of two transcript-sized walks: the
+  prompt-start projection leaves a park token (leaf + message count + window
+  flag) that the run-end park re-validates incrementally, with a full-validation
+  fallback (R3, PIR-BIN-101 family).
+- `context_usage()` walks the shared branch snapshot (1 622 → 21 allocations per
+  call at N=800, R5) and the RPC `get_entries` poll no longer deep-clones the
+  whole session (R6).
+- The session-context snapshot's branch text is incremental: 16.7 ms / 5 283
+  allocations → 1.06 ms / 35 per push at N=800, byte-identical (R7).
+- The session and JSON event lines are pre-sized before serialization: 200 KB
+  tool-result turn ~2.3 MB fewer allocations in the full host config, bytes
+  unchanged (PIR-BIN-099, both faces); the session face alone −12.6 % (pse
+  3 042 → 2 658 KB).
+- R1/R2/R4 read-path wins from the earlier post-0.3.1 pass are included.
+
+### correctness
+
+- Windowed sessions (paged / live-trimmed) no longer graft abandoned-branch
+  rows into the model context: the broken-chain bridge is whole-file only and
+  both projection walkers agree on the same window (PIR-BIN-101, with the two
+  adversarial-review residuals PIR-BIN-102/103).
+- The R7 snapshot cache can no longer splice stale text across a same-path
+  reload or across manager instances (process-global storage generation, cache
+  drop on swap), and an empty cached aggregate falls back to a full render
+  (PIR-BIN-105/106/108).
+- A session replacement reports upstream's per-operation reason on every event
+  — `new` for a fresh session, `resume` for any opened file, including one
+  parent-linked to the outgoing session — and emits neither `session_tree` nor
+  a drain-time `queue_update`; the fork flavor is the clone/fork-at-current
+  caller's explicit seam, never a file-shape inference (PIR-BIN-049,
+  PIR-BIN-110).
+- The `--mode json` print host claims its session-control actions; ephemeral
+  runs keep `ctx.newSession()` in memory and a storage-less fork rejects with
+  upstream's message inside the call (PIR-BIN-052 residual, PIR-BIN-107).
+- Extension `setStatus`/`setWidget` rows appear at interactive startup like pi,
+  and a startup-queued `sendUserMessage` starts its turn at startup
+  (PIR-TUI-042/043).
+
+### tui
+
+- Kitty image crop/re-emit for a scrolled placement is ported with byte parity
+  (upstream `cropKittyImageLine`, `terminal-image.ts:471-483`), closing drift
+  rows 15/16.
+
+### tests and infrastructure
+
+- The harness map was re-verified row-for-row, stale target counts corrected,
+  and the generator's `-Check` now itemizes drift per artifact (PIR-QE-002).
+- Timing flakes were root-caused with stronger contracts instead of widened
+  timeouts (PIR-QE-001).
+- Randomized adversarial wire corpora (776 events) pin byte identity across
+  both event faces.
+- `clipboard-win` 5.4.1 → 5.4.3 (PIR-BIN-025).
+
 ## 0.3.1 (2026-11-13)
 
 A/B parity pass against upstream `pi` 1.4.0 (TUI, CLI, sessions, providers,
