@@ -205,10 +205,10 @@ pub use runtime_loader::{
 };
 pub use session_commands::{
     apply_session_command_to_storage, commit_navigation_to_storage, generate_navigation_summary,
-    prepare_session_command_to_storage, record_session_command_action,
-    take_session_command_actions, take_session_command_actions_for, NavigateSummaryBinding,
-    NavigateSummaryOutcome, PreparedNavigateTree, SessionCommandAction, SessionCommandActionEntry,
-    SessionCommandStep, SessionOrigin, SessionReloadOutcome,
+    prepare_session_command_to_storage, print_session_switch_is_queued,
+    record_session_command_action, take_session_command_actions, take_session_command_actions_for,
+    NavigateSummaryBinding, NavigateSummaryOutcome, PreparedNavigateTree, SessionCommandAction,
+    SessionCommandActionEntry, SessionCommandStep, SessionOrigin, SessionReloadOutcome,
 };
 #[doc(hidden)]
 pub use session_ctx::{fragment_cache_stats_for_test, reset_fragment_cache_stats_for_test};

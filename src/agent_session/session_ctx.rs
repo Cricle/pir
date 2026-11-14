@@ -2566,6 +2566,14 @@ session does not have"
             leaf_id,
             labels,
             projection_json: projection,
+            // Upstream `SessionManager.isPersisted()` (session-manager.ts:1136-1138):
+            // the AgentSession slot's file-backedness, for reading hosts. An
+            // in-memory manager's `path()` is the empty placeholder path, so
+            // emptiness is the `session_file() == None` signal here.
+            session_persisted: Some(
+                self.session_path()
+                    .is_some_and(|path| !path.as_os_str().is_empty()),
+            ),
         };
         (
             snapshot,

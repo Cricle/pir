@@ -571,6 +571,22 @@ pub struct SessionContextSnapshot {
     /// readers) plus this string, and the per-entry views are serialized
     /// borrowed from the projection's message slices instead of cloned.
     pub projection_json: String,
+    /// Whether a session FILE backs the pushing host's live session
+    /// (upstream `SessionManager.isPersisted()`, session-manager.ts:1136-1138
+    /// `return this.persist`): `Some(true)` for a file-backed session,
+    /// `Some(false)` for a host running without persisted storage (the print
+    /// host's storage-less `--no-session` slot, and a never-persisted
+    /// in-memory replacement — upstream `inMemory`, session-manager.ts:1804-1806).
+    /// `None` means the host did not report it.
+    ///
+    /// The `commandAction` host fn reads it to give the extension the outcome
+    /// upstream resolves INSIDE the `ctx.*` call (an entry fork on a
+    /// non-file-backed session refuses at record time instead of
+    /// false-succeeding through the print host's deferred application,
+    /// PIR-BIN-107); a host that reported nothing keeps the record-and-apply
+    /// behavior, since absence of information is not evidence of a
+    /// storage-less run.
+    pub session_persisted: Option<bool>,
 }
 
 /// Outcome of dispatching an event through all registered handlers.

@@ -415,7 +415,7 @@ async fn print_session_snapshot(
     model: &crate::ai::types::Model,
     session: &SharedSession,
 ) -> SessionContextSnapshot {
-    let (entries, session_id, session_path, cwd) = {
+    let (entries, session_id, session_path, cwd, session_persisted) = {
         let guard = session.lock().await;
         match guard.as_ref() {
             Some(session) => {
@@ -429,16 +429,25 @@ async fn print_session_snapshot(
                         .unwrap_or(serde_json::Value::Null),
                     Err(_) => serde_json::Value::Null,
                 };
+                let session_file = session.session_file();
                 (
                     entries,
                     Some(session.id().to_owned()),
-                    session
-                        .session_file()
-                        .map(|path| path.to_string_lossy().into_owned()),
+                    session_file.map(|path| path.to_string_lossy().into_owned()),
                     Some(session.cwd().to_owned()),
+                    // Upstream `SessionManager.isPersisted()`
+                    // (session-manager.ts:1136-1138): the record-time
+                    // `commandAction` guard refuses an entry fork on a
+                    // non-file-backed session the way upstream's
+                    // `runtimeHost.fork` does inside the call
+                    // (agent-session-runtime.ts:274-276, PIR-BIN-107).
+                    Some(session_file.is_some()),
                 )
             }
-            None => (serde_json::Value::Null, None, None, None),
+            // Storage-less (`--no-session`): no manager at all — reported as
+            // not persisted, so a recorded `ctx.fork(entryId)` is rejected at
+            // record time instead of false-succeeding and warning on stderr.
+            None => (serde_json::Value::Null, None, None, None, Some(false)),
         }
     };
     SessionContextSnapshot {
@@ -447,6 +456,7 @@ async fn print_session_snapshot(
         session_id,
         session_path,
         cwd,
+        session_persisted,
         project_trusted: true,
         ..SessionContextSnapshot::default()
     }
@@ -5572,8 +5582,10 @@ async fn try_extension_command_impl(
 /// json-print extension command's `ctx.fork(entryId)` reaches this same
 /// storage seam (PIR-BIN-052's residual). Each claimed action
 /// is consumed even when its application fails; an ephemeral run
-/// (`--no-session`, `None` storage) rejects every action like the upstream
-/// runtimeHost does without session storage.
+/// (`--no-session`, `None` storage) keeps `newSession` in-memory like the
+/// upstream runtimeHost (agent-session-runtime.ts:236-240) and rejects the
+/// leaf-bound actions it cannot satisfy (an entry fork is already refused at
+/// record time — `commandAction`, PIR-BIN-107).
 async fn apply_print_command_actions(
     name: &str,
     session: &SharedSession,
@@ -5584,9 +5596,11 @@ async fn apply_print_command_actions(
     // Apply the command-context session actions (see the doc above). Only the
     // actions stamped with THIS host's identity are claimed — actions recorded
     // by other hosts stay queued for their owner. Each claimed action is
-    // consumed even when its application fails; an ephemeral run
-    // (`--no-session`, `None` storage) rejects every action like the upstream
-    // runtimeHost does without session storage.
+    // consumed even when its application fails; on an ephemeral run
+    // (`--no-session`, `None` storage) `newSession` swaps in an in-memory
+    // manager (upstream agent-session-runtime.ts:236-240) and the remaining
+    // storage-bound actions are rejected like the upstream runtimeHost
+    // without session storage.
     for entry in crate::agent_session::take_session_command_actions_for(
         &crate::agent_session::SessionOrigin::Print,
     ) {

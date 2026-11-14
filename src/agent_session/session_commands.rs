@@ -188,6 +188,30 @@ pub fn take_session_command_actions_for(origin: &SessionOrigin) -> Vec<SessionCo
     mine
 }
 
+/// Whether the queue already holds an action that will make the PRINT host's
+/// session file-backed when the deferred application runs: a
+/// `ctx.switchSession` recorded EARLIER in the same command handler.
+///
+/// The record-time fork guard in the `commandAction` host fn (PIR-BIN-107)
+/// refuses an entry fork on a session the print host reported as not
+/// file-backed — but a queued switch will replace that storage BEFORE the
+/// fork applies (the application preserves record order), and the extension
+/// may legitimately hold a real entry id read from the file it just switched
+/// to. Upstream, where `ctx.switchSession` already completed inside the call,
+/// resolves that fork against the switched file
+/// (agent-session-runtime.ts:262-350). Only a switch already queued when the
+/// fork is recorded counts: a switch recorded AFTER the fork applies later
+/// and cannot save it.
+pub fn print_session_switch_is_queued() -> bool {
+    let queue = SESSION_COMMAND_ACTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queue.iter().any(|entry| {
+        entry.origin == SessionOrigin::Print
+            && matches!(entry.action, SessionCommandAction::SwitchSession { .. })
+    })
+}
+
 /// Rejection for a `withSession` action applied by a STORAGE-ONLY host.
 ///
 /// The callback is a JS function registered in the extension runtime; running
@@ -217,9 +241,16 @@ pub struct NavigateSummaryBinding {
 /// Apply one extension command-context action against raw session storage
 /// (the print host's `SharedSession`): new/fork/switch replace the storage,
 /// fork-at-entry and navigateTree move the leaf in place. `None` storage
-/// (`--no-session`) rejects every action like the upstream runtimeHost
-/// ("no attached session storage"). Summarized navigation requires the
-/// `navigate_summary` binding; without one it is rejected.
+/// (`--no-session`) cannot navigate or branch: `newSession` swaps in an
+/// IN-MEMORY manager — upstream `runtimeHost.newSession` keeps a
+/// non-persisted session non-persisted (`SessionManager.inMemory`,
+/// agent-session-runtime.ts:236-240 `isPersisted()` branch), so an ephemeral
+/// run stays ephemeral — while the intra-session leaf actions are rejected
+/// like the upstream runtimeHost without a session ("no attached session
+/// storage"; an entry fork is refused already at record time on a
+/// storage-less print run, see the `commandAction` host fn). Summarized
+/// navigation requires the `navigate_summary` binding; without one it is
+/// rejected.
 ///
 /// This entry point applies everything in one call. A caller that shares its
 /// storage behind a lock (the print host) uses the split sequence instead —
@@ -311,8 +342,29 @@ pub fn prepare_session_command_to_storage(
                         .and_then(|path| path.to_str().map(str::to_owned))
                 })
                 .unwrap_or_else(|| session_dir.display().to_string());
-            let mut fresh = SessionManager::create(&cwd, session_dir)
-                .map_err(|error| format!("new session failed: {error}"))?;
+            // Upstream `runtimeHost.newSession` swaps in a manager with the
+            // SAME persistence shape as the outgoing one
+            // (agent-session-runtime.ts:236-240:
+            // `this.session.sessionManager.isPersisted()
+            //   ? SessionManager.create(this.cwd, sessionDir)
+            //   : SessionManager.inMemory(this.cwd)`;
+            // `isPersisted` is session-manager.ts:1136-1138, `inMemory`
+            // session-manager.ts:1804-1806). A storage-less print run
+            // (`--no-session`, `None`) or a never-persisted in-memory storage
+            // therefore gets an IN-MEMORY replacement; the previous
+            // unconditional `SessionManager::create` materialized a session
+            // FILE from `ctx.newSession()` on an ephemeral run at the next
+            // append (PIR-BIN-107).
+            let persisted = storage
+                .as_ref()
+                .is_some_and(|session| session.session_file().is_some());
+            let mut fresh = if persisted {
+                SessionManager::create(&cwd, session_dir)
+                    .map_err(|error| format!("new session failed: {error}"))?
+            } else {
+                SessionManager::in_memory(&cwd, None)
+                    .map_err(|error| format!("new session failed: {error}"))?
+            };
             if let Some(parent) = parent_session {
                 fresh
                     .new_session(Some(crate::session_manager::NewSessionOptions {

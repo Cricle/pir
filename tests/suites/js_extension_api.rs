@@ -563,6 +563,8 @@ async fn session_manager_methods_backed_by_snapshot() {
         leaf_id: Some("entry-2".to_string()),
         labels: json!({ "entry-2": "pinned" }),
         projection_json: serde_json::to_string(&json!({ "entries": [ { "entry": {}, "messages": [] }, { "entry": {}, "messages": [] } ], "messages": [] })).expect("projection text"),
+        // A file-backed snapshot (session_path is set above).
+        session_persisted: Some(true),
     });
     seed_and_load(&handle, &dir, "sm.ts", SESSION_MANAGER_TS).await;
 

@@ -94,6 +94,14 @@ export default function (pi) {
   pi.registerCommand("capture-fork-at", { handler: async (args, ctx) => {
     globalThis.__pir_last = await ctx.fork(args, { position: "at" });
   } });
+  // A switch recorded BEFORE the fork: by the time the deferred application
+  // runs, the session is file-backed and the entry id names a real entry of
+  // the switched file (upstream applies the switch inside the call).
+  pi.registerCommand("capture-switch-fork", { handler: async (args, ctx) => {
+    const parsed = JSON.parse(args);
+    await ctx.switchSession(parsed.path);
+    globalThis.__pir_last = await ctx.fork(parsed.entryId, { position: "at" });
+  } });
   // Invalid usage: the prelude must reject before any host fn call.
   pi.registerCommand("capture-nav-missing", { handler: async (args, ctx) => {
     globalThis.__pir_last = await ctx.navigateTree(undefined);
@@ -265,6 +273,187 @@ async fn ctx_new_session_honors_parent_session() {
     );
     drop(_window);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recursively collect `*.jsonl` files under `root` (the property "an
+/// ephemeral run wrote NO session file" is asserted over the whole directory
+/// tree, not just its immediate children).
+fn jsonl_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Apply a bare `newSession` action at the storage seam (the direct-call
+/// helper of [`storage_level_new_session_on_ephemeral_storage_stays_in_memory`]).
+async fn apply_new_session(
+    storage: &mut Option<SessionManager>,
+    session_dir: &std::path::Path,
+    parent: Option<&str>,
+) -> Result<(), String> {
+    pir::agent_session::apply_session_command_to_storage(
+        storage,
+        session_dir,
+        &SessionCommandAction::NewSession {
+            parent_session: parent.map(str::to_owned),
+            with_session: None,
+        },
+        None,
+    )
+    .await
+}
+
+/// The lowest seam for the PIR-BIN-107 newSession property: applying
+/// `SessionCommandAction::NewSession` over a storage slot with NO persisted
+/// storage must swap in an IN-MEMORY manager, not a file-backed one.
+/// Upstream `runtimeHost.newSession` branches on `isPersisted()`
+/// (agent-session-runtime.ts:236-240: `SessionManager.create` for a persisted
+/// session, `SessionManager.inMemory` otherwise; `isPersisted` is
+/// session-manager.ts:1136-1138), so a `--no-session` run stays ephemeral and
+/// the next append materializes no `.jsonl` — the old unconditional
+/// `SessionManager::create` wrote a file here.
+#[tokio::test]
+async fn storage_level_new_session_on_ephemeral_storage_stays_in_memory() {
+    let dir = temp_dir("new-in-memory-direct");
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    // (a) The `--no-session` slot (`None`): the replacement stays in-memory,
+    // and an appended message must not materialize a file.
+    let mut storage: Option<SessionManager> = None;
+    apply_new_session(&mut storage, &session_dir, None)
+        .await
+        .expect("newSession applies");
+    {
+        let session = storage.as_mut().expect("replacement storage");
+        assert_eq!(
+            session.session_file(),
+            None,
+            "a --no-session replacement must not be file-backed (upstream SessionManager.inMemory)"
+        );
+        assert_eq!(session.leaf_id(), None, "the replacement is fresh");
+        session
+            .append_message(user_message("hi"))
+            .expect("append to the in-memory replacement");
+        assert_eq!(
+            session.session_file(),
+            None,
+            "the append must not turn the replacement file-backed"
+        );
+    }
+    assert!(
+        jsonl_files(&session_dir).is_empty(),
+        "no session file may appear on an ephemeral run: {:?}",
+        jsonl_files(&session_dir)
+    );
+
+    // (b) A never-persisted (in-memory) live storage is replaced by another
+    // in-memory one — the `isPersisted() == false` side of the upstream
+    // branch — with the `parentSession` link still recorded.
+    let mut storage = Some(SessionManager::in_memory(".", None).expect("in-memory source"));
+    apply_new_session(&mut storage, &session_dir, Some("/parent/session.jsonl"))
+        .await
+        .expect("newSession applies over in-memory storage");
+    let session = storage.as_ref().expect("replacement storage");
+    assert_eq!(
+        session.session_file(),
+        None,
+        "replacing an in-memory session keeps the replacement in-memory"
+    );
+    assert_eq!(
+        session.parent_session(),
+        Some("/parent/session.jsonl"),
+        "the parentSession link rides the in-memory replacement"
+    );
+    assert!(
+        jsonl_files(&session_dir).is_empty(),
+        "no session file may appear on a never-persisted run: {:?}",
+        jsonl_files(&session_dir)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same property through the real print host seam (`try_extension_command`
+/// and the `commandAction` bridge), for BOTH output labels: a storage-less
+/// `--no-session` print run's `ctx.newSession()` resolves the upstream
+/// runner-default `{cancelled:false}` (agent-session-runtime.ts:243) and swaps
+/// in an in-memory session — no `.jsonl` may be written, even when the run's
+/// next prompt appends through the replacement.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // the action-queue lock must span the runtime awaits
+async fn ctx_new_session_on_a_storage_less_print_run_stays_in_memory() {
+    for mode in ["print", "json"] {
+        let (dir, handle) =
+            load_fixture_with_mode(&format!("new-ephemeral-{mode}"), mode, false).await;
+        let session_dir = dir.join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let storage: SharedStorage = Arc::new(tokio::sync::Mutex::new(None));
+        // The print host pushes the live session snapshot before every prompt
+        // (`print_session_snapshot`); a `--no-session` run reports
+        // `session_persisted: Some(false)`.
+        let mut snapshot = pir::extensions::SessionContextSnapshot::default();
+        snapshot.session_persisted = Some(false);
+        handle.update_session_context(snapshot);
+
+        let _window = ACTION_WINDOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            dispatch(&handle, "/capture-new", &storage, &session_dir).await,
+            "[{mode}] the command was handled"
+        );
+        assert_eq!(
+            handle
+                .eval_json("JSON.stringify(globalThis.__pir_last)")
+                .await
+                .unwrap(),
+            json!({ "cancelled": false }),
+            "[{mode}] ctx.newSession resolves the upstream runner-default shape"
+        );
+        {
+            let mut guard = storage.lock().await;
+            let session = guard.as_mut().expect("in-memory replacement storage");
+            assert_eq!(
+                session.session_file(),
+                None,
+                "[{mode}] the --no-session replacement must not be file-backed"
+            );
+            assert_eq!(session.leaf_id(), None, "[{mode}] the replacement is fresh");
+            // The ephemeral run's next prompt appends through the same
+            // manager (print.rs `session.append_message`).
+            session
+                .append_message(user_message("hi"))
+                .expect("append the follow-up prompt");
+        }
+        assert!(
+            take_queue_is_empty(),
+            "[{mode}] the print host drained every recorded action"
+        );
+        let files = jsonl_files(&session_dir);
+        assert!(
+            files.is_empty(),
+            "[{mode}] a --no-session run must not write a session file: {files:?}"
+        );
+        drop(_window);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -613,6 +802,144 @@ async fn ctx_fork_at_entry_is_claimed_and_branches_in_json_print_mode() {
         Some(ids[0].as_str()),
         "resume derives the fork point from the branch file"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A storage-less print run (`--no-session`) cannot resolve ANY entry id: its
+/// session has no storage, and the in-memory replacement (PIR-BIN-107's
+/// `newSession` shape) exposes no ids to the extension (`getEntries()`
+/// carries projection messages without ids; the print snapshot's tree stays
+/// empty). Upstream `runtimeHost.fork` resolves the entry INSIDE the
+/// `ctx.fork` call and throws `"Invalid entry ID for forking"` when it is
+/// absent (agent-session-runtime.ts:274-276), so the extension promise must
+/// REJECT with that message — not resolve `{cancelled:false}` while the print
+/// host only warns on stderr after the handler settled. Both output labels
+/// are the ONE print host, so both must reject.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // the action-queue lock must span the runtime awaits
+async fn ctx_fork_on_a_storage_less_print_run_rejects_in_the_extension() {
+    for mode in ["print", "json"] {
+        let (dir, handle) =
+            load_fixture_with_mode(&format!("fork-no-storage-{mode}"), mode, false).await;
+        let session_dir = dir.join("sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let storage: SharedStorage = Arc::new(tokio::sync::Mutex::new(None));
+        // The print host's pushed snapshot reports the persistence shape; a
+        // `--no-session` run is `Some(false)` (`print_session_snapshot`).
+        let mut snapshot = pir::extensions::SessionContextSnapshot::default();
+        snapshot.session_persisted = Some(false);
+        handle.update_session_context(snapshot);
+
+        let _window = ACTION_WINDOW
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = handle
+            .dispatch_command("capture-fork", "x6-no-such-entry")
+            .await
+            .unwrap();
+        assert!(
+            !outcome.ok,
+            "[{mode}] ctx.fork on a storage-less run must reject, not resolve"
+        );
+        let error = outcome.error.expect("error text");
+        assert!(
+            error.contains("Invalid entry ID for forking"),
+            "[{mode}] the rejection carries the upstream error shape: {error}"
+        );
+        assert!(
+            take_queue_is_empty(),
+            "[{mode}] a rejected fork never records a session action"
+        );
+        assert!(
+            storage.lock().await.is_none(),
+            "[{mode}] the rejected fork leaves the storage slot untouched"
+        );
+        drop(_window);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The record-time fork guard must NOT refuse a fork that a `switchSession`
+/// recorded EARLIER in the same command handler makes resolvable: the switch
+/// replaces the non-persisted storage before the deferred application reaches
+/// the fork (record order is preserved), which is the state upstream's
+/// already-completed `ctx.switchSession` produces (agent-session-runtime.ts
+/// :217-260 then :262-350). The extension can read a real entry id from the
+/// file it just switched to, so the fork must record, resolve
+/// `{cancelled:false}`, and branch the switched file.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // the action-queue lock must span the runtime awaits
+async fn ctx_switch_then_fork_on_a_storage_less_print_run_still_records() {
+    let (dir, handle) = load_fixture_with_mode("switch-then-fork", "json", false).await;
+    let session_dir = dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).unwrap();
+    // The switch target: a real session file with one user message.
+    let mut target = SessionManager::create(&session_dir.display().to_string(), &session_dir)
+        .expect("create switch target");
+    let target_id = target
+        .append_message(user_message("switch target"))
+        .expect("append target message");
+    let target_path = target.path().to_path_buf();
+    drop(target);
+
+    let storage: SharedStorage = Arc::new(tokio::sync::Mutex::new(None));
+    let mut snapshot = pir::extensions::SessionContextSnapshot::default();
+    snapshot.session_persisted = Some(false);
+    handle.update_session_context(snapshot);
+
+    let _window = ACTION_WINDOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let payload = json!({
+        "path": target_path.display().to_string(),
+        "entryId": target_id,
+    })
+    .to_string();
+    assert!(
+        dispatch(
+            &handle,
+            &format!("/capture-switch-fork {payload}"),
+            &storage,
+            &session_dir
+        )
+        .await,
+        "the command was handled"
+    );
+    assert_eq!(
+        handle
+            .eval_json("JSON.stringify(globalThis.__pir_last)")
+            .await
+            .unwrap(),
+        json!({ "cancelled": false }),
+        "the fork after the queued switch must resolve, not reject"
+    );
+    assert!(
+        take_queue_is_empty(),
+        "the print host drained the switch and the fork"
+    );
+    let guard = storage.lock().await;
+    let session = guard.as_ref().expect("branched storage");
+    assert_eq!(
+        session.parent_session(),
+        Some(target_path.to_string_lossy().as_ref()),
+        "the branch was forked from the switched file"
+    );
+    assert!(
+        session.entry(&target_id).is_some(),
+        "position 'at' keeps the switched file's entry in the branch"
+    );
+    assert_eq!(
+        session.leaf_id(),
+        Some(target_id.as_str()),
+        "the branch leaf is the forked entry"
+    );
+    assert_ne!(
+        session.path(),
+        target_path.as_path(),
+        "the fork lives in its own file"
+    );
+    drop(guard);
+    drop(_window);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

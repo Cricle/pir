@@ -232,11 +232,18 @@ pub(super) fn register_tool_exec_host_fns(
                     // Stamp each recorded action with THIS runtime's host
                     // identity (mode + pushed session id) so the owning
                     // session host — and only it — claims the action later.
-                    let origin = {
+                    // The pushed session's persistence shape rides along: a
+                    // print host reports `Some(false)` for a storage-less
+                    // run, and an entry fork on such a session can never
+                    // resolve (see the guard below).
+                    let (origin, session_persisted) = {
                         let state = lock_state(&st);
-                        crate::agent_session::SessionOrigin::for_runtime_mode(
-                            &state.config.mode,
-                            state.session.session_id.clone(),
+                        (
+                            crate::agent_session::SessionOrigin::for_runtime_mode(
+                                &state.config.mode,
+                                state.session.session_id.clone(),
+                            ),
+                            state.session.session_persisted,
                         )
                     };
                     // Residual-origin guards (record time — the bounded queue
@@ -265,6 +272,38 @@ pub(super) fn register_tool_exec_host_fns(
                     };
                     let payload: JsonValue =
                         serde_json::from_str(&payload_json).unwrap_or(JsonValue::Null);
+                    // Storage-less print fork: a `--no-session` run (empty
+                    // storage slot) or a never-persisted in-memory
+                    // replacement exposes NO entry ids the extension could
+                    // name (`getEntries()` carries projection messages
+                    // without ids; the print host's tree snapshot stays
+                    // empty), so `ctx.fork(entryId)` can only fail — and
+                    // upstream fails it INSIDE the call: `runtimeHost.fork`
+                    // resolves the entry first and throws "Invalid entry ID
+                    // for forking" when it is absent
+                    // (agent-session-runtime.ts:274-276; the "before"
+                    // position's user-message check throws the same message,
+                    // :279-284). The print host applies recorded actions
+                    // after the handler settles, so without this guard the
+                    // extension would be told `{cancelled:false}` and the
+                    // refusal would only reach stderr (PIR-BIN-107). The
+                    // host's pushed `session_persisted` is the trigger;
+                    // `None` (host did not report) keeps the record-and-apply
+                    // path, a file-backed session still records (the
+                    // extension can name real ids read from the session
+                    // file), and a `switchSession` recorded EARLIER in this
+                    // same batch keeps recording too — it will make the
+                    // session file-backed before the fork applies, and
+                    // upstream's already-completed switch would have resolved
+                    // the fork against that file.
+                    if matches!(&origin, crate::agent_session::SessionOrigin::Print)
+                        && name == "fork"
+                        && session_persisted == Some(false)
+                        && payload.get("entryId").and_then(JsonValue::as_str).is_some()
+                        && !crate::agent_session::print_session_switch_is_queued()
+                    {
+                        return r#"{"error":"Invalid entry ID for forking"}"#.to_string();
+                    }
                     // The caller's `withSession` callback token (prelude
                     // `registerSessionCallback`). Absent when the caller did
                     // not pass one; a non-number is a malformed bridge payload

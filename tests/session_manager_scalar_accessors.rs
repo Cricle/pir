@@ -158,6 +158,8 @@ fn full_snapshot() -> SessionContextSnapshot {
         leaf_id: Some("entry-2".into()),
         labels: json!({ "entry-1": "checkpoint" }),
         projection_json: json!({ "entries": [], "messages": [] }).to_string(),
+        // A file-backed snapshot (session_path is set above).
+        session_persisted: Some(true),
     }
 }
 
