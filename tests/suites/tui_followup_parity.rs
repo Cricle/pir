@@ -541,19 +541,24 @@ async fn session_retry_countdown_reaches_the_host_sink_and_settles() {
         .expect("prompt runs");
     // The retry budget is exhausted by the second 429.
     let error = message.error_message.clone().unwrap_or_default();
-    assert!(error.contains("429"), "unexpected error: {error}");
+    // The exact wire text, not a substring: the mock's body is known, and the
+    // prefix is what a user reads (k6's re-derivation flagged the old
+    // `contains("429")` as looser than achievable).
+    assert_eq!(
+        error, r#"HTTP 429: {"error":{"message":"rate limited"}}"#,
+        "the provider's text survives the retry layer unchanged"
+    );
     assert!(
         requests.load(Ordering::SeqCst) >= 2,
         "the scheduled retry re-sent the request"
     );
     let transport = events.lock().unwrap().clone();
+    // STRICT: a status-class retryable error is owned by the AGENT layer
+    // (PIR-BIN-086), so the transport-only notice sink must stay untouched. If
+    // the transport ever retries one of these, this test fails by design.
     assert!(
-        transport.is_empty()
-            || matches!(
-                transport.as_slice(),
-                [RetryEvent::Scheduled(_), RetryEvent::Settled]
-            ),
-        "a transport retry is scheduled then settled: {transport:?}"
+        transport.is_empty(),
+        "status-class retries must not ride the transport notice sink: {transport:?}"
     );
     let starts = starts.lock().unwrap().clone();
     assert_eq!(
@@ -631,10 +636,11 @@ async fn session_abort_retry_cancels_the_wait_and_keeps_the_retry_setting() {
     // layer, so the transport-layer rendering
     // "Retry failed after N attempts: Retry cancelled" no longer applies to a
     // 429; the cancel is pinned on the event instead (a stronger assertion:
-    // the whole finalError payload).
-    assert!(
-        error.contains("429"),
-        "the original provider error is kept: {error}"
+    // the whole finalError payload). The message keeps the provider's exact
+    // text (k6's re-derivation: assert the full string, not a substring).
+    assert_eq!(
+        error, r#"HTTP 429: {"error":{"message":"rate limited"}}"#,
+        "the original provider error is kept verbatim"
     );
     assert_eq!(
         requests.load(Ordering::SeqCst),

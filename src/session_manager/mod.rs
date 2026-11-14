@@ -3500,6 +3500,11 @@ impl SessionManager {
                 // line a short write left behind.
                 drop(file);
                 let _ = std::fs::remove_file(&path);
+                // The invariant is "any FAILED write reprobes" (k5 found this
+                // creation path missing it): re-arm the throttled ownership
+                // probe so the next attempt re-reads the token instead of
+                // trusting a cached answer.
+                self.reprobe_writer_lock();
                 return Err(error);
             }
             // Reuse the created descriptor for every later append.
