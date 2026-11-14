@@ -8,7 +8,6 @@ external `cm` process is spawned for memory operations.
   entry `src/plugins/builtin.rs` (`name: "memory"`, `replaceable: true`, default-enabled).
 - Backend: `cm_memory::Cm` (library), opened lazily per store path; all calls run through
   `tokio::task::spawn_blocking`.
-- Design/status: the earlier research plan is in [`cm-rs-integration-plan.md`](cm-rs-integration-plan.md).
 
 ## 1. Store location
 
@@ -162,18 +161,17 @@ published `cm-memory 0.3.1` registry crate is what these tests link against.
 
 ## 8. Measured A/B
 
-The post-fix 36-run real-agent A/B (auto policy, one provider/model) is recorded
-in [memory-builtin-ab-2026-11-09.md](memory-builtin-ab-2026-11-09.md).
-Q&A aggregate median total tokens improved by **-30.1%** (N 9/9; per-task
--31.5%, +13.5% on a high-variance task, and -19.6%). After the short-edit
+The post-0.3.1 real-agent A/B (auto policy, one provider/model) is recorded in
+[memory-builtin-ab-2026-11-10.md](memory-builtin-ab-2026-11-10.md). Q&A
+aggregate median total tokens improved by **-42.1%** (N 9/9); the coding
+tasks are neutral to positive within run-to-run variance. After the short-edit
 routing change, plain C1–C3 prompts receive **no automatic memory context**
-(`memory_context` 0/9; user prompt chars identical, **0% prompt overhead**)
-and all 18 runs pass their verifiers; the total-token deltas in that small-N
-sample are run-to-run model variance, not injection cost. Continuation short
-edits (`Session 2`, `continue`, ...) get only the active task frame: the
+(`memory_context` 0/15; user prompt chars byte-identical, **0% prompt
+overhead**) and every run passes its verifier. Continuation short edits
+(`Session 2`, `continue`, ...) get only the active task frame: the earlier
 two-session plan→implement comparison reduced median total tokens by **45.8%**
 (129,708 → 70,327) and tool calls by 12.9%, both arms 3/3 verified. The
 practical rule is to use memory for non-trivial, cross-session, or
-large-repository work; auto mode no longer pays context on plain one-shot edits. The earlier 46-run phase-1 dataset (different provider,
-always-full-brief) is retained only in `.ab-test/archive-before-review-fixes/`;
-it is not mixed into this table.
+large-repository work; auto mode no longer pays context on plain one-shot
+edits. Earlier provider/policy phases are archived under
+`.ab-test/archive-before-review-fixes/` and are not mixed into these tables.

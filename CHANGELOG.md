@@ -212,7 +212,7 @@ streaming, SDK) plus a Windows portability pass. No breaking changes;
   supersede/merge metadata. Source anchors/snippets/audit reads are confined to
   the canonical project root.
 - Added memory_builtin integration tests plus a 3-agent cross-review pass and
-  a post-fix A/B report (`docs/memory-builtin-ab-2026-11-09.md`).
+  a post-fix A/B report (results summarized in `docs/memory-builtin.md` §8).
 
 ### pi-phone central relay
 
