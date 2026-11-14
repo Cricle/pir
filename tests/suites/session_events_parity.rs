@@ -505,6 +505,51 @@ impl AgentPlugin for RecordForkLifecyclePlugin {
     }
 }
 
+/// PIR-BIN-049 (new/resume halves): records every event a native plugin can
+/// observe around a HOST `new`/`resume` storage replacement — including the
+/// two events upstream never emits for one (`session_tree`, `queue_update`)
+/// and the replacement lifecycle the seam must produce instead
+/// (`session_before_switch` → `session_shutdown` → `session_start`).
+struct RecordSwitchLifecyclePlugin {
+    info: PluginInfo,
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl RecordSwitchLifecyclePlugin {
+    fn new(seen: Arc<Mutex<Vec<serde_json::Value>>>) -> Self {
+        Self {
+            info: PluginInfo::inline("record-switch-lifecycle"),
+            seen,
+        }
+    }
+}
+
+impl AgentPlugin for RecordSwitchLifecyclePlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+    fn events(&self) -> EventInterest {
+        // `compaction_start` is the FIFO flush probe; `session_tree` /
+        // `queue_update` are declared so their absence (not just their
+        // non-delivery) is asserted (PIR-BIN-049).
+        EventInterest::List(vec![
+            "session_before_switch".into(),
+            "session_shutdown".into(),
+            "session_start".into(),
+            "session_tree".into(),
+            "queue_update".into(),
+            "compaction_start".into(),
+        ])
+    }
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            seen.lock().unwrap().push(event.payload.clone());
+            PluginEventOutcome::None
+        })
+    }
+}
+
 /// Wait until `kind` reached the recorder. The native session-event bridge
 /// dispatches asynchronously in FIFO order, so the probe event doubles as
 /// the flush barrier for the negative assertions around it.
@@ -2031,6 +2076,348 @@ async fn session_before_fork_cancel_aborts_the_fork() {
         .with_session_manager(|sm| sm.build_context_entries().unwrap_or_default().len())
         .await;
     assert_eq!(projected, Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-049 (new/resume halves): the replacement reasons and the two events
+// upstream never emits for a storage swap
+// ---------------------------------------------------------------------------
+
+/// A `new`-session replacement (`SessionManager::create` + the host seam)
+/// reports upstream's `"new"` on BOTH pre-swap events and on the post-swap
+/// `session_start` (agent-session-runtime.ts:231 `emitBeforeSwitch("new")` →
+/// :245 `teardownCurrent("new", target)` → :251 `session_start{new}`), and
+/// emits NEITHER `session_tree` (only `navigateTree` produces it,
+/// agent-session.ts:4200-4204) NOR a swap-time `queue_update`
+/// (`teardownCurrent` disposes the outgoing queues silently — the replacement
+/// runtime starts empty, agent-session-runtime.ts:167-178).
+///
+/// The one `queue_update` in the recorded sequence is the ENQUEUE's own
+/// (before the swap); waiting for it first proves the recorder observes
+/// `queue_update` through this bridge when one is emitted, so the absence of
+/// a SECOND one is meaningful. A queued message is present, so a
+/// `clear_queue`-style drain would have emitted it.
+#[tokio::test]
+async fn new_session_replacement_reports_new_and_drops_the_outgoing_queues_silently() {
+    let temp = TempDir::new("switch-new-lifecycle");
+    let outgoing = SessionManager::create(".", &temp.0).expect("outgoing session");
+    let outgoing_path = outgoing
+        .session_file()
+        .expect("outgoing session file")
+        .to_path_buf();
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSession::new_with_plugins(
+        agent_session_builder(registry, Some(outgoing), None, Some(temp.0.clone())),
+        vec![Arc::new(RecordSwitchLifecyclePlugin::new(Arc::clone(
+            &events,
+        )))],
+    );
+
+    agent.steer("queued for the outgoing session");
+    wait_for_recorded(&events, "queue_update").await;
+    assert_eq!(
+        agent.pending_message_count(),
+        1,
+        "the steering message is pending before the swap"
+    );
+
+    let fresh = SessionManager::create(".", &temp.0).expect("fresh session");
+    let fresh_path = fresh
+        .session_file()
+        .expect("fresh session file")
+        .to_path_buf();
+    assert!(
+        agent.replace_session_storage(fresh).await,
+        "the new-session replacement completes"
+    );
+
+    // FIFO flush probe: everything the swap pushed rides the ordered native
+    // session-event backlog, so once the probe lands, a swapped-in
+    // `queue_update` or `session_tree` would have been recorded too.
+    agent.emit_session_event_for_test(SessionEvent::CompactionStart { reason: "manual" });
+    wait_for_recorded(&events, "compaction_start").await;
+
+    let recorded = events.lock().unwrap().clone();
+    let types: Vec<&str> = recorded
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "queue_update",
+            "session_before_switch",
+            "session_shutdown",
+            "session_start",
+            "compaction_start",
+        ],
+        "a new-session replacement emits before_switch -> shutdown -> start \
+         with no session_tree and no second (drain-time) queue_update: {recorded:?}"
+    );
+
+    // The single queue_update is the ENQUEUE's (self-check: the recorder
+    // observes queue updates through this bridge when they exist).
+    assert_eq!(
+        recorded[0]["steering"],
+        serde_json::json!(["queued for the outgoing session"])
+    );
+
+    // Upstream reasons: `emitBeforeSwitch("new")` / `teardownCurrent("new")`
+    // / `session_start{reason:"new"}`; `"switch"` is not an upstream reason
+    // anywhere (types.ts:771-775 / :824-829).
+    assert_eq!(recorded[1]["reason"], serde_json::json!("new"));
+    assert_eq!(recorded[2]["reason"], serde_json::json!("new"));
+    assert_eq!(
+        recorded[2]["targetSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        fresh_path.to_string_lossy().as_ref(),
+        "session_shutdown names the destination file"
+    );
+    assert_eq!(recorded[3]["reason"], serde_json::json!("new"));
+    assert_eq!(
+        recorded[3]["previousSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        outgoing_path.to_string_lossy().as_ref(),
+        "session_start names the outgoing file"
+    );
+
+    // The queued text died with the outgoing session (silently): the drain
+    // emptied the pending counter without carrying the text across.
+    assert_eq!(
+        agent.pending_message_count(),
+        0,
+        "the swap drained the outgoing queues"
+    );
+}
+
+/// A resume replacement (`switchSession`: open an existing session file and
+/// swap it in) reports upstream's `"resume"` on BOTH pre-swap events and on
+/// the post-swap `session_start` (agent-session-runtime.ts:204
+/// `emitBeforeSwitch("resume", sessionPath)` → :212 `teardownCurrent("resume",
+/// target)` → :218 `session_start{resume}`), and emits neither `session_tree`
+/// nor a swap-time `queue_update` (same replacement shape as `new`).
+#[tokio::test]
+async fn resume_replacement_reports_resume_and_drops_the_outgoing_queues_silently() {
+    let temp = TempDir::new("switch-resume-lifecycle");
+    let mut incoming = SessionManager::create(".", &temp.0).expect("incoming session");
+    incoming
+        .append_message(user_message("in the target session"))
+        .expect("seed the target transcript");
+    let incoming_path = incoming
+        .session_file()
+        .expect("incoming session file")
+        .to_path_buf();
+    assert!(
+        incoming_path.exists(),
+        "the seeded target has a persisted file"
+    );
+    drop(incoming);
+
+    let outgoing = SessionManager::create(".", &temp.0).expect("outgoing session");
+    let outgoing_path = outgoing
+        .session_file()
+        .expect("outgoing session file")
+        .to_path_buf();
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSession::new_with_plugins(
+        agent_session_builder(registry, Some(outgoing), None, Some(temp.0.clone())),
+        vec![Arc::new(RecordSwitchLifecyclePlugin::new(Arc::clone(
+            &events,
+        )))],
+    );
+
+    agent.steer("queued for the outgoing session");
+    wait_for_recorded(&events, "queue_update").await;
+
+    let resumed = SessionManager::open(&incoming_path).expect("open the target session");
+    assert!(
+        agent.replace_session_storage(resumed).await,
+        "the resume replacement completes"
+    );
+
+    agent.emit_session_event_for_test(SessionEvent::CompactionStart { reason: "manual" });
+    wait_for_recorded(&events, "compaction_start").await;
+
+    let recorded = events.lock().unwrap().clone();
+    let types: Vec<&str> = recorded
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "queue_update",
+            "session_before_switch",
+            "session_shutdown",
+            "session_start",
+            "compaction_start",
+        ],
+        "a resume replacement emits before_switch -> shutdown -> start with \
+         no session_tree and no second (drain-time) queue_update: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["steering"],
+        serde_json::json!(["queued for the outgoing session"]),
+        "the single queue_update is the enqueue's (recorder self-check)"
+    );
+
+    assert_eq!(recorded[1]["reason"], serde_json::json!("resume"));
+    // Upstream `switchSession` passes the target sessionPath to
+    // `emitBeforeSwitch` (agent-session-runtime.ts:204) and the incoming
+    // manager's file to `teardownCurrent` (:212).
+    assert_eq!(
+        recorded[1]["targetSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        incoming_path.to_string_lossy().as_ref(),
+        "session_before_switch names the resume target"
+    );
+    assert_eq!(recorded[2]["reason"], serde_json::json!("resume"));
+    assert_eq!(
+        recorded[2]["targetSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        incoming_path.to_string_lossy().as_ref(),
+        "session_shutdown names the destination file"
+    );
+    assert_eq!(recorded[3]["reason"], serde_json::json!("resume"));
+    assert_eq!(
+        recorded[3]["previousSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        outgoing_path.to_string_lossy().as_ref(),
+        "session_start names the outgoing file"
+    );
+    assert_eq!(
+        agent.pending_message_count(),
+        0,
+        "the swap drained the outgoing queues"
+    );
+    // The swap really resumed the target transcript.
+    assert_eq!(
+        agent.state().session_path.as_deref(),
+        Some(incoming_path.to_string_lossy().as_ref()),
+        "the incoming session is live"
+    );
+}
+
+/// PIR-BIN-110: resuming an OPENED session file reports upstream's `"resume"`
+/// even when its header links it to the OUTGOING session. `switchSession`
+/// hardcodes `"resume"` for any opened path (agent-session-runtime.ts:204
+/// `emitBeforeSwitch("resume", sessionPath)` → :212 `teardownCurrent("resume",
+/// target)` → :218 `session_start{resume}`), and `SessionManager.open` keeps
+/// the header's `parentSession` — so a fork child reopened through `/resume`
+/// is a resume, not a fork. The seam flavor follows the CALL, never the file
+/// shape: the previous classifier compared `parentSession` against the
+/// outgoing file and misread this shape as a fork-flavored swap (reason
+/// `"fork"`, plus `session_tree` and the drain-time `queue_update` upstream
+/// never emits for a replacement).
+#[tokio::test]
+async fn parent_linked_resume_reports_resume_not_fork() {
+    let temp = TempDir::new("switch-parent-linked-resume");
+    let mut outgoing = SessionManager::create(".", &temp.0).expect("outgoing session");
+    outgoing
+        .append_message(user_message("in the outgoing session"))
+        .expect("seed the outgoing transcript");
+    let outgoing_path = outgoing
+        .session_file()
+        .expect("outgoing session file")
+        .to_path_buf();
+    // The incoming file has exactly the shape a fork-at-current child has on
+    // disk (`fork_from_source` writes `parentSession` = source path): opening
+    // it back is the switch-to-a-session-you-forked-FROM case.
+    let child = SessionManager::fork_from_source(&outgoing_path, ".", &temp.0, None)
+        .expect("fork the outgoing transcript");
+    let child_path = child
+        .session_file()
+        .expect("fork child session file")
+        .to_path_buf();
+    drop(child);
+
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("ok")], StopReason::Stop)
+    }));
+    let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = AgentSession::new_with_plugins(
+        agent_session_builder(registry, Some(outgoing), None, Some(temp.0.clone())),
+        vec![Arc::new(RecordSwitchLifecyclePlugin::new(Arc::clone(
+            &events,
+        )))],
+    );
+
+    agent.steer("queued for the outgoing session");
+    wait_for_recorded(&events, "queue_update").await;
+
+    let resumed = SessionManager::open(&child_path).expect("open the parent-linked child");
+    assert!(
+        resumed.parent_session().is_some(),
+        "fixture self-check: the incoming file is parent-linked"
+    );
+    assert!(
+        agent.replace_session_storage(resumed).await,
+        "the parent-linked resume replacement completes"
+    );
+
+    // FIFO flush probe: once `compaction_start` lands, any `session_tree` or
+    // drain-time `queue_update` the swap pushed would have been recorded too.
+    agent.emit_session_event_for_test(SessionEvent::CompactionStart { reason: "manual" });
+    wait_for_recorded(&events, "compaction_start").await;
+
+    let recorded = events.lock().unwrap().clone();
+    let types: Vec<&str> = recorded
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "queue_update",
+            "session_before_switch",
+            "session_shutdown",
+            "session_start",
+            "compaction_start",
+        ],
+        "a parent-linked resume emits the plain switch lifecycle with no \
+         session_tree and no second (drain-time) queue_update: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["steering"],
+        serde_json::json!(["queued for the outgoing session"]),
+        "the single queue_update is the enqueue's (recorder self-check)"
+    );
+
+    // The reason is upstream's `resume` on all three events; `"fork"` would
+    // mean the file shape leaked into the operation classification.
+    assert_eq!(recorded[1]["reason"], serde_json::json!("resume"));
+    assert_eq!(
+        recorded[1]["targetSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        child_path.to_string_lossy().as_ref(),
+        "session_before_switch names the resume target"
+    );
+    assert_eq!(recorded[2]["reason"], serde_json::json!("resume"));
+    assert_eq!(recorded[3]["reason"], serde_json::json!("resume"));
+    assert_eq!(
+        recorded[3]["previousSessionFile"]
+            .as_str()
+            .unwrap_or_default(),
+        outgoing_path.to_string_lossy().as_ref(),
+        "session_start names the outgoing file"
+    );
+    assert_eq!(
+        agent.pending_message_count(),
+        0,
+        "the swap drained the outgoing queues"
+    );
 }
 
 // ---------------------------------------------------------------------------

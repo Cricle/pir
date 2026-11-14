@@ -1341,7 +1341,14 @@ async fn switch_payloads_carry_target_session_file() {
     let shutdown = payloads(&events, "session_shutdown")
         .pop()
         .expect("session_shutdown dispatched on replacement");
-    assert_eq!(shutdown["reason"], json!("switch"), "{shutdown}");
+    // PIR-BIN-049: the target is a FRESH manager (`SessionManager::create`),
+    // so upstream's operation reason is `"new"` — `newSession` emits
+    // `emitBeforeSwitch("new")` / `teardownCurrent("new", target)`
+    // (agent-session-runtime.ts:231/:245); `"switch"` is not an upstream
+    // reason (SessionBeforeSwitchEvent/ SessionShutdownEvent unions:
+    // extensions/types.ts:771-775/:824-829). What this test pins is the
+    // `targetSessionFile` both events carry.
+    assert_eq!(shutdown["reason"], json!("new"), "{shutdown}");
     assert_eq!(
         shutdown["targetSessionFile"],
         json!(target_file),
@@ -1851,11 +1858,13 @@ async fn session_start_reasons_for_new_resume_and_fork_without_a_duplicate_start
         "{starts:?}"
     );
 
-    // A fork whose header links the OUTGOING file is upstream `fork` =>
-    // reason "fork".
+    // The fork reason belongs to the clone / fork-at-current SEAM, not to a
+    // file shape: opening a parent-linked file is upstream `switchSession` =>
+    // "resume" (agent-session-runtime.ts:204/:212/:218; PIR-BIN-110), so this
+    // leg selects the fork flavor explicitly, exactly like the clone callers.
     let forked = SessionManager::fork_from_source(&opened_path, ".", &temp.0, None)
         .expect("fork the resumed session");
-    assert!(agent.replace_session_storage(forked).await);
+    assert!(agent.replace_session_storage_forked(forked).await);
     let starts = payloads(&events, "session_start");
     assert_eq!(starts.len(), 3, "one more session_start: {starts:?}");
     assert_eq!(starts[2]["reason"], json!("fork"), "{starts:?}");

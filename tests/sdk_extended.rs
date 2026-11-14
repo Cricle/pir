@@ -8818,9 +8818,15 @@ async fn session_start_modes_are_ordered_single_and_carry_upstream_payloads() {
         "attach replays the source history before the new prompt"
     );
 
-    // 4. FORK: attaching a SessionManager::fork_from_source file while the
-    // outgoing session is its parent classifies as `fork`, and the fork's
-    // transcript is the source branch (not the modified live session).
+    // 4. FORK FILE: opening a `fork_from_source` file — even one whose header
+    // links it to the currently attached session — is an ATTACH upstream:
+    // `switchSession` hardcodes `resume` for any opened path
+    // (agent-session-runtime.ts:204 `emitBeforeSwitch("resume", path)` →
+    // :212 `teardownCurrent("resume", ...)` → :218 `session_start{resume}`),
+    // and the only producer of the `fork` reason is `fork(entryId)`
+    // (:262-350 — an ENTRY, never a file path; PIR-BIN-110). The attached
+    // fork's transcript is still the source branch (not the modified live
+    // session).
     agent
         .attach_session(&source_b)
         .await
@@ -8845,11 +8851,14 @@ async fn session_start_modes_are_ordered_single_and_carry_upstream_payloads() {
         1,
         "one session_start for fork: {fork_events:?}"
     );
-    assert_eq!(fork_starts[0].1["reason"], "fork");
+    assert_eq!(
+        fork_starts[0].1["reason"], "resume",
+        "opening a fork file is a resume upstream (PIR-BIN-110)"
+    );
     assert_eq!(
         fork_starts[0].1["previousSessionFile"].as_str(),
         Some(source_b.to_string_lossy().as_ref()),
-        "fork names its parent session file"
+        "the resume names the outgoing session file"
     );
     let before_fork_prompt = log.lock().unwrap().len();
     agent.prompt("fork follow-up").await.expect("fork prompt");

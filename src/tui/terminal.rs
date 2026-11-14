@@ -30072,7 +30072,11 @@ async fn handle_session_command(
                             let forked_path = forked.path().to_string_lossy().into_owned();
                             // §2.5: never carry a background call across a fork.
                             session.abort_all_background();
-                            match session.replace_session_storage(forked).await {
+                            // The fork flavor is this caller's intent, never a
+                            // file-shape inference (PIR-BIN-110): the forked
+                            // seam reports `fork` and keeps the historical
+                            // switch-shaped pre-swap inventory.
+                            match session.replace_session_storage_forked(forked).await {
                                 true => {
                                     let _ = events
                                         .send(WorkerEvent::SessionSwitchSettled { switch_epoch });

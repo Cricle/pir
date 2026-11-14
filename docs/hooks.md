@@ -37,12 +37,12 @@ the host applies, **B** block/cancel, **R** replace the provider request/respons
 | `resources_discover` | `plugins.emit` | `plugins.emit` | `agent_session/session_ctx.rs:332`; print `coding_agent/print.rs:3026` | O (paths collected) | wired |
 | `session_start` | `plugins.emit` | `plugins.emit` | `agent_session/prompt_loop.rs:978`, `session_store.rs:949`; native reload `session_commands.rs:1092`; print `coding_agent/print.rs:553`, `:2851` | O | wired (reasons `startup`/`new`/`resume`/`fork`/`reload`; see deviations) |
 | `session_info_changed` | `plugins.emit` | `plugins.emit` | `agent_session/transcript.rs:143` | O | wired |
-| `session_before_switch` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:100` | B | wired (reason `switch`; see deviations) |
+| `session_before_switch` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:100` | B | wired (reasons `new`/`resume` per operation, incl. parent-linked switch targets; the clone/fork-at-current residual seam still carries `switch`; see deviations) |
 | `session_before_fork` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:786` | B | wired |
 | `session_before_compact` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:398`, `:851`, `:1752`; print `coding_agent/print.rs:5581`, `:5732` | B, T (compaction) | wired (both faces cancel/replace; print: threshold only) |
 | `session_compact` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:545`, `:1072`, `:1272`; `prompt_loop.rs:2474`; print `coding_agent/print.rs:5093`, `:5462` | O | wired |
 | `session_compact_failed` | `plugins.emit` | `plugins.emit` | `agent_session/compact.rs:876`, `:919`, `:1138`, `:1322`; `notifications.rs:646`; print `coding_agent/print.rs:4827`, `:4857` | O | wired |
-| `session_shutdown` | actor mailbox close / reload (`extensions/handle/actor.rs:450`, `:672`) | `emit_native` for quit/reload; both faces for switch | `plugins/host.rs:3138` (`emit_session_shutdown` → `self.emit`, both faces; switch caller `agent_session/session_store.rs:117`); `plugins/host.rs:3065` (`emit_native_session_shutdown`, reload `:3203`, quit `:3247`) | O | wired (switch sees both faces; quit/reload native-only; JS actor closes its own lifecycle, never double-emitted) |
+| `session_shutdown` | actor mailbox close / reload (`extensions/handle/actor.rs:450`, `:672`) | `emit_native` for quit/reload; both faces for replacements | `plugins/host.rs:3138` (`emit_session_shutdown` → `self.emit`, both faces; replacement caller `agent_session/session_store.rs:117`); `plugins/host.rs:3065` (`emit_native_session_shutdown`, reload `:3203`, quit `:3247`) | O | wired (replacements see both faces with the operation reason `new`/`resume`/`fork`; quit/reload native-only; JS actor closes its own lifecycle, never double-emitted) |
 | `session_before_tree` | `plugins.emit` | `plugins.emit` | `agent_session/session_store.rs:509` (after the read-only collection, before summarize/leaf move) | B, M, T (cancel; instructions/summary/label overrides) | wired |
 | `session_tree` | `emit_read_only_json` | `emit_read_only_json` | `agent_session/session_store.rs:297`, `:332`, `:1042` | O | wired |
 | `context` | runtime emit | `emit_native` | `agent/agent_loop.rs:286` (native at `:281`) | T (replace messages) | wired (native mutation + JS return; JS return wins) |
@@ -224,10 +224,19 @@ cells.
    resolve ([packages.md](packages.md), [extensions.md](extensions.md)). Hook names/payloads are unaffected.
 2. **`session_start` reasons.** `startup` (first prompt / print start), `reload` (native reload
    face; the JS actor reloads itself), and `new`/`resume`/`fork` when storage is replaced
-   (`session_store.rs:949`); `session_shutdown` reasons: `quit`, `reload`, `switch` (storage
-   replacement, `session_store.rs:117`).
-3. **`session_before_switch` reason.** `switch` only; upstream's `new`/`resume` split rides the
-   post-swap `session_start` reason.
+   (`session_store.rs:949`); `session_shutdown` reasons: `quit`, `reload`, and the same
+   per-operation `new`/`resume`/`fork` (storage replacement, `session_store.rs`).
+3. **`session_before_switch` reason — RESOLVED for the switch operations (2026-11).**
+   `session_before_switch` and the replacing `session_shutdown` carry upstream's per-operation
+   reasons for `newSession` (`new`) and `switchSession`/`importFromJsonl` (`resume`, INCLUDING a
+   target parent-linked to the outgoing session — PIR-BIN-110; upstream hardcodes `resume` there,
+   `agent-session-runtime.ts:204/:212/:218, :379/:391/:397`), pinned by the
+   `session_events_parity` sequence tests. The clone / fork-at-current seam
+   (`replace_session_storage_forked`) still emits the historical switch-shaped
+   `session_before_switch{switch}` plus `session_tree`/`queue_update` while reporting
+   `session_start{fork}` — the recorded PIR-BIN-049 residual (upstream emits
+   `session_before_fork` with neither tree nor queue, `agent-session-runtime.ts:150-165,
+   :267, :299-345`); moving it onto the fork seam is rpc.rs / session_commands.rs plumbing.
 4. **`session_before_tree`'s `signal` is a state snapshot.** Upstream passes a live `AbortSignal`;
    pir's JSON wire carries `{aborted: false}` (same shape as `session_before_compact`); host-side
    Esc during branch summarization remains the live seam (`abort_branch_summary`).

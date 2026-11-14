@@ -61,38 +61,114 @@ impl AgentSession {
     // Session storage seams (upstream newSession / fork / clone / name)
     // ------------------------------------------------------------------
 
-    /// Replace the persisted session storage (upstream `newSession`, `fork`,
-    /// and `clone` swap the session manager on the live runtime). The cached
+    /// Replace the persisted session storage on the live runtime (upstream
+    /// `newSession` / `switchSession` / `importFromJsonl`). The cached
     /// session identity refreshes; the next prompt run reads its context from
     /// the replacement transcript. Returns `false` when no storage is
     /// configured (`--no-session`: the run stays ephemeral) or when a
     /// `session_before_switch` handler CANCELLED the switch (upstream
     /// cancel/summary semantics, runner.ts:1080-1118).
     ///
-    /// Extension seams (upstream runner.ts): `session_before_switch` fires
-    /// before the swap (a `cancel: true` result aborts it), and
-    /// `session_tree` fires after the swap with the new session's tree.
+    /// Extension seams: `session_before_switch` fires before the swap with
+    /// the upstream operation reason — `new` for a fresh session, `resume`
+    /// for an opened file (agent-session-runtime.ts:133-148, :204/:231; the
+    /// reason union is `"new" | "resume"`, extensions/types.ts:771-775) — and
+    /// a `cancel: true` result aborts it; `session_shutdown` follows with the
+    /// same reason (upstream `teardownCurrent("new"|"resume", target)`,
+    /// agent-session-runtime.ts:167-178, :212/:245). Upstream emits NEITHER
+    /// `session_tree` (only `navigateTree` produces it, agent-session.ts:4200-
+    /// 4204) NOR `queue_update` (`teardownCurrent` disposes the outgoing
+    /// queues silently and the replacement starts empty, PIR-BIN-049) for a
+    /// replacement, so both announcements are off on this seam.
     ///
-    /// The post-swap lifecycle also emits `session_start` with the upstream
-    /// reason (`new`/`resume`/`fork`, [`infer_session_start_reason`]) and
+    /// A file linked to the outgoing session through `parentSession` is NOT a
+    /// fork here: switching back to a session you forked FROM is a plain
+    /// resume upstream (`switchSession`/`importFromJsonl` hardcode `resume`,
+    /// agent-session-runtime.ts:204/:212/:218, :379/:391/:397 — PIR-BIN-110).
+    /// Only [`Self::replace_session_storage_forked`], called by the clone /
+    /// fork-at-current seam, carries the fork flavor.
+    ///
+    /// The post-swap lifecycle emits `session_start` with the same upstream
+    /// reason (`new`/`resume`, [`infer_session_start_reason`]) and
     /// `previousSessionFile`, then marks the lazy startup dispatch consumed so
     /// the next prompt cannot deliver a second `session_start`.
     pub async fn replace_session_storage(&self, session: SessionManager) -> bool {
-        // The destination file is resolved BEFORE the swap (`session_before_switch`
-        // and `session_shutdown` both carry it, upstream
-        // `SessionBeforeSwitchEvent.targetSessionFile` /
-        // `SessionShutdownEvent.targetSessionFile`); it is omitted when the
-        // replacement has no persisted file (in-memory target).
+        self.replace_session_storage_with_kind(session, false).await
+    }
+
+    /// The clone / fork-at-current replacement seam: the same swap, but the
+    /// replacement reports the `"fork"` operation reason and keeps the
+    /// historical switch-shaped inventory — `session_before_switch{switch}`
+    /// plus `session_tree` + `queue_update` — that predates the upstream
+    /// fork seam. Upstream routes a fork through `session_before_fork` (never
+    /// `session_before_switch`, agent-session-runtime.ts:150-165/:267) and
+    /// emits neither tree nor queue; moving these callers onto that seam is
+    /// rpc.rs / session_commands.rs plumbing, the recorded PIR-BIN-049
+    /// residual.
+    pub async fn replace_session_storage_forked(&self, session: SessionManager) -> bool {
+        self.replace_session_storage_with_kind(session, true).await
+    }
+
+    /// [`Self::replace_session_storage`] with the seam's fork flavor: the
+    /// clone / fork-at-current callers are the ONLY ones that want the
+    /// legacy switch-shaped pre-swap events plus the two extra announcements;
+    /// every operation classified `new`/`resume` emits exactly upstream's
+    /// replacement lifecycle.
+    async fn replace_session_storage_with_kind(
+        &self,
+        session: SessionManager,
+        fork_at_current: bool,
+    ) -> bool {
+        // The destination file is resolved BEFORE the swap (`session_shutdown`
+        // carries it, upstream `SessionShutdownEvent.targetSessionFile`); it
+        // is omitted when the replacement has no persisted file (in-memory
+        // target).
         let target_session_file = session
             .session_file()
             .map(|path| path.display().to_string());
+        // Upstream carries ONE operation reason through the whole
+        // replacement: `newSession` => "new", `switchSession`/`importFromJsonl`
+        // => "resume" (agent-session-runtime.ts:204/231/379), delivered to
+        // BOTH the pre-swap `session_before_switch` (:133-148) and
+        // `session_shutdown` (:167-178, :212/:245). `"switch"` and `"fork"`
+        // are not switch-seam reasons. The incoming manager names the
+        // operation: a not-yet-written file is a fresh session
+        // (`SessionManager::create` writes lazily) => "new"; every existing
+        // file — parent-linked or not — is an opened session => "resume"
+        // ([`infer_session_start_reason`], the same reason the post-swap
+        // `session_start` reports). The fork flavor is the CALLER's intent,
+        // never the file shape (PIR-BIN-110).
+        let reason = if fork_at_current {
+            "fork"
+        } else {
+            infer_session_start_reason(&session)
+        };
+        // A `fork`-flavored replacement reaches this seam only from the
+        // clone / fork-at-current callers (RPC `fork` without entryId and
+        // `clone` -> `fork_current`, JS `ctx.fork` at the current position,
+        // TUI `/fork`·`/clone`). Upstream routes a fork through its OWN
+        // replacement seam and emits `session_before_fork` — never
+        // `session_before_switch` (agent-session-runtime.ts:150-165, :267),
+        // with `session_shutdown`/`session_start` reason `"fork"`
+        // (:299/:320/:334, :305/:326/:345) and NEITHER `session_tree` NOR
+        // `queue_update` (PIR-BIN-049). Moving those callers onto the fork
+        // seam is rpc.rs / session_commands.rs plumbing (out of this file's
+        // scope), so they keep the historical switch-shaped emission —
+        // including the two extra events — until that lands. This is the
+        // recorded PIR-BIN-049 residual.
+        let fork_flavored = fork_at_current;
+        let (pre_swap_reason, emit_session_tree, emit_queue_update) = if fork_flavored {
+            ("switch", true, true)
+        } else {
+            (reason, false, false)
+        };
         // `session_before_switch`: a handler may cancel the switch (upstream
         // `SessionBeforeEventResult.cancel` short-circuits the emit loop).
         if let Some(plugins) = &self.plugins {
             if plugins.has_handlers("session_before_switch") {
                 let mut payload = serde_json::json!({
                     "type": "session_before_switch",
-                    "reason": "switch",
+                    "reason": pre_swap_reason,
                 });
                 if let Some(target) = &target_session_file {
                     payload["targetSessionFile"] = JsonValue::String(target.clone());
@@ -112,44 +188,35 @@ impl AgentSession {
             }
             // Upstream `teardownCurrent` emits `session_shutdown` for the
             // outgoing session with the destination file before the swap
-            // (agent-session-runtime.ts:167-177).
+            // (agent-session-runtime.ts:167-178).
             plugins
-                .emit_session_shutdown("switch", target_session_file.as_deref())
+                .emit_session_shutdown(pre_swap_reason, target_session_file.as_deref())
                 .await;
         }
-        self.swap_session_storage(session, None).await
-    }
-
-    /// Swap in a replacement session storage WITHOUT the
-    /// `session_before_switch` dispatch: refreshes the cached session
-    /// identity, fires `session_tree`, drains the steering/follow-up queues
-    /// (emitting `queue_update`), and emits the post-swap `session_start`
-    /// (`reason` overrides the inferred upstream reason). Upstream's fork
-    /// path (agent-session-runtime.ts) swaps the manager after a
-    /// `session_before_fork` (NOT a `session_before_switch`), so
-    /// [`Self::fork_entry`] swaps through this seam with both
-    /// announcements disabled.
-    async fn swap_session_storage(&self, session: SessionManager, reason: Option<&str>) -> bool {
-        self.swap_session_storage_with(session, reason, true, true)
+        self.swap_session_storage_with(session, Some(reason), emit_session_tree, emit_queue_update)
             .await
     }
 
-    /// [`Self::swap_session_storage`] with explicit control over the two
-    /// observer announcements a swap can add beyond the upstream replacement
-    /// lifecycle:
+    /// [`Self::replace_session_storage`] / [`Self::fork_entry`] swap helper
+    /// with explicit control over the two observer announcements a swap can
+    /// add beyond the upstream replacement lifecycle:
     ///
-    /// - `emit_session_tree`: a fork replaces the session FILE (upstream
-    ///   `fork` → `createBranchedSession` → `createRuntime`) and emits only
-    ///   `session_shutdown {reason:"fork"}` plus
-    ///   `session_start {reason:"fork", previousSessionFile}`; `session_tree`
-    ///   belongs to `navigateTree` (agent-session.ts:4140-4146), so
-    ///   [`Self::fork_entry`] passes `false` (PIR-BIN-049).
+    /// - `emit_session_tree`: upstream emits `session_tree` from `navigateTree`
+    ///   ONLY (agent-session.ts:4200-4204); an upstream replacement
+    ///   (`newSession` / `switchSession` / `fork` → `createRuntime`) emits just
+    ///   `session_shutdown {reason}` plus
+    ///   `session_start {reason, previousSessionFile}`. Both
+    ///   [`Self::fork_entry`] and the `new`/`resume` arms of
+    ///   [`Self::replace_session_storage`] pass `false` (PIR-BIN-049).
     /// - `emit_queue_update`: upstream's replacement disposes the outgoing
     ///   session TOGETHER with its steering/follow-up queues
-    ///   (`teardownCurrent` → `dispose`, agent-session-runtime.ts:167-177)
+    ///   (`teardownCurrent` → `dispose`, agent-session-runtime.ts:167-178)
     ///   and starts the replacement runtime with empty queues, so no
-    ///   `queue_update` is emitted for a fork; the drain below is silent in
-    ///   that case ([`Self::drain_queues_without_update`], PIR-BIN-049).
+    ///   `queue_update` is emitted for `new`/`resume`/`fork`; the drain below
+    ///   is silent in that case ([`Self::drain_queues_without_update`],
+    ///   PIR-BIN-049). Only the fork-flavored incoming arm of
+    ///   [`Self::replace_session_storage`] still passes `true` (the
+    ///   clone/fork-at-current residual; see the call site).
     async fn swap_session_storage_with(
         &self,
         session: SessionManager,
@@ -203,10 +270,11 @@ impl AgentSession {
         // switch creates a new session runtime with empty arrays. pir's inbox
         // facade survives the storage swap, so drain it here or the first
         // prompt in the new session receives text queued for the outgoing one.
-        // The host new/resume seam keeps `clear_queue` (which emits the
-        // historical `queue_update` snapshot); the fork seam drains silently,
-        // exactly like upstream's disposed session, whose replacement starts
-        // with empty queues and emits no `queue_update` at all (PIR-BIN-049).
+        // The `new`/`resume` and fork arms drain silently, exactly like
+        // upstream's disposed session, whose replacement starts with empty
+        // queues and emits no `queue_update` at all (PIR-BIN-049); only the
+        // fork-flavored clone residual below still carries the historical
+        // `clear_queue` snapshot.
         let cleared = if emit_queue_update {
             self.clear_queue().await
         } else {
@@ -245,12 +313,12 @@ impl AgentSession {
                 outgoing.session_file().map(Path::to_path_buf),
             )
         };
-        // The upstream `SessionStartEvent.reason`: hosts that know the
-        // operation override it; RPC/SDK swaps through the plain
-        // `replace_session_storage` and are classified from the incoming
-        // manager (fresh create / opened file / fork of the outgoing file).
-        let start_reason = reason
-            .unwrap_or_else(|| infer_session_start_reason(&session, old_session_file.as_deref()));
+        // The upstream `SessionStartEvent.reason`: both live callers pass it
+        // explicitly ([`Self::replace_session_storage`] classifies the
+        // incoming manager; [`Self::fork_entry`] knows the operation); a
+        // caller that passes `None` falls back to the same classification
+        // (fresh create / opened file / fork of the outgoing file).
+        let start_reason = reason.unwrap_or_else(|| infer_session_start_reason(&session));
         let (session_id, session_path) = {
             let mut slot_guard = slot.lock().await;
             *slot_guard = session;
@@ -1179,22 +1247,26 @@ impl AgentSession {
 
 /// Classify a replacement that did not name its operation (the RPC and SDK
 /// hosts call [`AgentSession::replace_session_storage`] directly), matching
-/// the upstream `SessionStartEvent.reason` of the operation that produced the
-/// incoming manager:
+/// the upstream operation reason of the manager that produced the incoming
+/// storage. The same classification now feeds BOTH the pre-swap
+/// `session_before_switch` / `session_shutdown` reasons and the post-swap
+/// `SessionStartEvent.reason` (upstream carries one reason across the whole
+/// replacement, agent-session-runtime.ts:133-148, :167-178, :204/:231):
 ///
 /// - a manager whose file does not exist yet is a fresh session
 ///   ([`SessionManager::create`] writes lazily) => `new`;
-/// - an incoming header whose `parentSession` is the OUTGOING session's file
-///   is a fork (`fork_from_source` / `create_branched_session` /
-///   fork-before-first all link the source that way) => `fork`;
-/// - every other existing file is an opened session => `resume`.
+/// - every existing file is an opened session => `resume`. This includes a
+///   file linked to the outgoing session through `parentSession`: switching
+///   back to a session you forked FROM is a plain resume upstream
+///   (`switchSession`/`importFromJsonl` hardcode `resume`,
+///   agent-session-runtime.ts:204/:212/:218, :379/:391/:397). The fork flavor
+///   is the clone / fork-at-current CALLER's intent
+///   ([`AgentSession::replace_session_storage_forked`]), never the file shape
+///   (PIR-BIN-110).
 ///
 /// Hosts that know the operation (the session-command plane and the entry
 /// fork) pass the reason explicitly instead.
-fn infer_session_start_reason(
-    incoming: &SessionManager,
-    outgoing_file: Option<&Path>,
-) -> &'static str {
+fn infer_session_start_reason(incoming: &SessionManager) -> &'static str {
     let Some(incoming_file) = incoming.session_file() else {
         // In-memory replacement (SDK `reset`): a fresh transcript.
         return "new";
@@ -1202,22 +1274,7 @@ fn infer_session_start_reason(
     if !incoming_file.exists() {
         return "new";
     }
-    let parent_is_outgoing = match (incoming.parent_session(), outgoing_file) {
-        (Some(parent), Some(outgoing)) => {
-            let parent_path = Path::new(parent);
-            parent_path == outgoing
-                || std::fs::canonicalize(parent_path)
-                    .ok()
-                    .zip(std::fs::canonicalize(outgoing).ok())
-                    .is_some_and(|(parent, outgoing)| parent == outgoing)
-        }
-        _ => false,
-    };
-    if parent_is_outgoing {
-        "fork"
-    } else {
-        "resume"
-    }
+    "resume"
 }
 
 /// How the swap carries the `session_tree` forest: pre-rendered text when only

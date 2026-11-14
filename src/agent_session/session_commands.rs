@@ -823,7 +823,7 @@ impl AgentSession {
                         message: format!("fork failed: {error}"),
                     })?;
                 check_native_cancel(cancel)?;
-                if !self.replace_session_storage(forked).await {
+                if !self.replace_session_storage_forked(forked).await {
                     return Err(NativeHostError::Cancelled {
                         reason: "session switch cancelled or no attached session storage"
                             .to_owned(),

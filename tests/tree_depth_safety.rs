@@ -114,14 +114,22 @@ fn user_entry(id: &str, parent_id: Option<&str>, text: &str, timestamp: &str) ->
 /// built for tree SHAPE, and writing it in one pass keeps a 2000-entry
 /// fixture cheap (the append API fsyncs per entry).
 fn write_session_file(dir: &Path, name: &str, entries: &[FileEntry]) -> PathBuf {
+    write_session_file_with_parent(dir, name, entries, None)
+}
+
+/// [`write_session_file`] with an optional `parentSession` header link (the
+/// on-disk shape of a fork child; see [`write_linear_session_with_parent`]).
+fn write_session_file_with_parent(
+    dir: &Path,
+    name: &str,
+    entries: &[FileEntry],
+    parent: Option<&Path>,
+) -> PathBuf {
     let path = dir.join(name);
     let mut text = String::new();
-    let header = FileEntry::Session(SessionHeader::new(
-        "tree-depth-session",
-        "C:\\repo",
-        timestamp_for(0),
-    ));
-    text.push_str(&serde_json::to_string(&header).expect("header json"));
+    let mut header = SessionHeader::new("tree-depth-session", "C:\\repo", timestamp_for(0));
+    header.parent_session = parent.map(|parent| parent.display().to_string());
+    text.push_str(&serde_json::to_string(&FileEntry::Session(header)).expect("header json"));
     text.push('\n');
     for entry in entries {
         text.push_str(&serde_json::to_string(entry).expect("entry json"));
@@ -134,6 +142,12 @@ fn write_session_file(dir: &Path, name: &str, entries: &[FileEntry]) -> PathBuf 
 /// A linear chain `e0000 -> e0001 -> ...`: the shape that crashed (one nesting
 /// level per entry).
 fn write_linear_session(dir: &Path, entries: usize) -> PathBuf {
+    write_session_file(dir, "linear-deep.jsonl", &linear_session_rows(entries))
+}
+
+/// The chain rows shared by [`write_linear_session`] and its parent-linked
+/// variant.
+fn linear_session_rows(entries: usize) -> Vec<FileEntry> {
     let mut rows = Vec::with_capacity(entries);
     let mut previous: Option<String> = None;
     for index in 0..entries {
@@ -146,7 +160,22 @@ fn write_linear_session(dir: &Path, entries: usize) -> PathBuf {
         ));
         previous = Some(id);
     }
-    write_session_file(dir, "linear-deep.jsonl", &rows)
+    rows
+}
+
+/// [`write_linear_session`] with the header's `parentSession` pointing at the
+/// outgoing session file — the on-disk shape of an incoming fork child. The
+/// swap that emits the `session_tree` forest is selected by the CALL
+/// ([`AgentSession::replace_session_storage_forked`], the clone/fork-at-
+/// current seam — PIR-BIN-110), not by this header; the header only mirrors
+/// what a fork-at-current child looks like on disk.
+fn write_linear_session_with_parent(dir: &Path, entries: usize, parent: &Path) -> PathBuf {
+    write_session_file_with_parent(
+        dir,
+        "linear-deep.jsonl",
+        &linear_session_rows(entries),
+        Some(parent),
+    )
 }
 
 /// A star: one root with `entries - 1` children (breadth, depth 1).
@@ -511,7 +540,14 @@ async fn session_swap_serializes_a_deep_session_tree() {
 ///   forest rendering) entirely;
 /// - with a handler the JS side still receives the full 2000-entry tree,
 ///   while the return leg carries no `Value` — the old path re-parsed, deep
-///   cloned and recursively dropped the echoed payload here.
+///   cloned and recursively dropped the echoed payload here. PIR-BIN-049: a
+///   host `new`/`resume` swap no longer emits `session_tree` (upstream emits
+///   it from `navigateTree` only, agent-session.ts:4200-4204), so this leg
+///   drives the remaining swap emitter — the clone/fork-at-current seam
+///   ([`AgentSession::replace_session_storage_forked`], selected by the CALL,
+///   never by the file shape: PIR-BIN-110) — to keep the reply-free forest
+///   route depth-tested. The fixture still parent-links its file because that
+///   is what a fork-at-current child looks like on disk.
 #[tokio::test(flavor = "current_thread")]
 async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
     // 1. A live runtime with no `session_tree` handler.
@@ -537,10 +573,15 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
         );
     }
 
-    // 2. A real `session_tree` handler on a real handle.
+    // 2. A real `session_tree` handler on a real handle (fork-flavored swap).
     {
         let temp = TempDir::new("swap-handle-tree");
-        let path = write_linear_session(temp.path(), DEEP_ENTRIES);
+        let outgoing = SessionManager::create(".", temp.path()).expect("outgoing session");
+        let outgoing_file = outgoing
+            .session_file()
+            .expect("outgoing session file")
+            .to_path_buf();
+        let path = write_linear_session_with_parent(temp.path(), DEEP_ENTRIES, &outgoing_file);
         let deep = SessionManager::open(&path).expect("open deep session");
         let handle = extension_handle(temp.path());
         let extension = temp.path().join("session-tree-probe.ts");
@@ -554,15 +595,12 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
             "extension load errors: {:?}",
             loaded.errors
         );
-        let mut config = agent_config(
-            temp.path(),
-            SessionManager::in_memory(".", None).expect("in-memory session"),
-        );
+        let mut config = agent_config(temp.path(), outgoing);
         config.extensions = Some(handle.clone());
         let agent = AgentSession::new(config);
         // PIR-BIN-091: a fresh session records pi's startup state
-        // (`model_change` + `thinking_level_change`), so the in-memory
-        // session has a leaf before the swap; capture it and pin it below.
+        // (`model_change` + `thinking_level_change`), so the outgoing session
+        // has a leaf before the swap; capture it and pin it below.
         let startup_leaf = agent
             .with_session_manager(|session| session.leaf_id().map(str::to_owned))
             .await;
@@ -572,7 +610,7 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
         );
 
         assert!(
-            agent.replace_session_storage(deep).await,
+            agent.replace_session_storage_forked(deep).await,
             "the swap must complete with a deep session_tree handler"
         );
         let probe = handle
@@ -600,7 +638,7 @@ async fn session_swap_with_a_real_extension_handle_is_depth_safe() {
             probe["oldLeafId"],
             serde_json::json!(startup_leaf.expect("captured startup leaf")),
             "the event carries the pre-swap leaf (the startup-state row of the \
-             fresh in-memory session): {probe}"
+             fresh outgoing session): {probe}"
         );
     }
 }

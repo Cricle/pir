@@ -300,7 +300,9 @@ async fn fork_command_creates_a_linked_copy_and_swaps_it_in() {
         .expect("fork from source");
     let forked_path = forked.path().to_path_buf();
     assert_ne!(forked_path, source_path);
-    assert!(agent.replace_session_storage(forked).await);
+    // `/fork` swaps through the explicit fork seam (the command's intent,
+    // never a file-shape inference — PIR-BIN-110).
+    assert!(agent.replace_session_storage_forked(forked).await);
 
     // The fork links back to its parent and carries the source transcript.
     let reopened = SessionManager::open(&forked_path).expect("reopen fork");
@@ -330,11 +332,12 @@ async fn clone_command_forks_at_the_current_position() {
     let agent = agent(session, &temp);
     agent.prompt("one", silent()).await.expect("prompt");
 
-    // `/clone` forks the current leaf (upstream `handleCloneCommand`).
+    // `/clone` forks the current leaf (upstream `handleCloneCommand`); like
+    // `/fork`, it selects the fork flavor explicitly (PIR-BIN-110).
     let cloned = SessionManager::fork_from_source(&source_path, ".", &temp.0, None)
         .expect("clone from source");
     let cloned_path = cloned.path().to_path_buf();
-    assert!(agent.replace_session_storage(cloned).await);
+    assert!(agent.replace_session_storage_forked(cloned).await);
 
     let state = agent.state();
     assert_eq!(
