@@ -743,13 +743,157 @@ impl serde::Serialize for SessionEventWire<'_> {
     }
 }
 
+impl SessionEvent {
+    /// Upper bound of the line [`to_session_event_line`] will produce for
+    /// this event. Used to pre-size the output buffer before serializing:
+    /// without it `serde_json::to_string` starts at 128 bytes and doubles, so
+    /// a 200 KB `entry_appended` line asks the allocator for ~0.4 MB across
+    /// its growth steps (`PIR-BIN-099`'s remaining session-face term) and
+    /// copies the payload again on every growth. The bound never affects the
+    /// wire bytes — a shorter estimate only means the serializer grows as
+    /// before.
+    ///
+    /// Every arm mirrors the wire view's fields: exact JSON-escaped string
+    /// lengths via [`crate::coding_agent::json::json_string_len`], `Value`
+    /// payloads (`entry`, `result`, `details`, `structuredContent`) via
+    /// [`crate::coding_agent::json::json_value_len`], and a fixed budget for
+    /// the bounded scalar/envelope fields each arm spells out.
+    ///
+    /// Hidden-public so the session-line capacity contract can be pinned
+    /// from `tests/json_stream_wire.rs` (inline tests are forbidden in
+    /// `src/`).
+    #[doc(hidden)]
+    pub fn wire_size_hint(&self) -> usize {
+        use crate::coding_agent::json::{json_string_len, json_value_len};
+
+        /// Serialized length of one JSON array of strings (brackets, commas
+        /// and quotes included).
+        fn string_array_len(items: &[String]) -> usize {
+            2 + items.len().saturating_sub(1)
+                + items
+                    .iter()
+                    .map(|item| json_string_len(item))
+                    .sum::<usize>()
+        }
+
+        let hint = match self {
+            SessionEvent::QueueUpdate {
+                steering,
+                follow_up,
+                ..
+            } => 64 + string_array_len(steering) + string_array_len(follow_up),
+            SessionEvent::CompactionStart { reason } => 64 + json_string_len(reason),
+            SessionEvent::CompactionEnd {
+                reason,
+                result,
+                error_message,
+                ..
+            } => {
+                128 + json_string_len(reason)
+                    + result.as_ref().map_or(8, json_value_len)
+                    + error_message
+                        .as_ref()
+                        .map_or(0, |message| json_string_len(message) + 16)
+            }
+            SessionEvent::AgentSettled { .. } => 64,
+            SessionEvent::EntryAppended { entry } => 64 + json_value_len(entry),
+            SessionEvent::SessionInfoChanged { name } => {
+                64 + name.as_ref().map_or(0, |name| json_string_len(name) + 16)
+            }
+            // Six `usize`/`u64` counters (at most 20 decimal digits each) plus
+            // the `reason` tag and the key envelope: 256 is a safe budget.
+            SessionEvent::HistoryTrimmed { reason, .. } => 256 + json_string_len(reason),
+            SessionEvent::ThinkingLevelChanged { level } => 64 + json_string_len(level),
+            SessionEvent::BashExecutionUpdate { id, delta } => {
+                64 + json_string_len(delta) + id.as_ref().map_or(0, |id| json_string_len(id) + 16)
+            }
+            SessionEvent::BackgroundToolEnd {
+                call_id,
+                tool_name,
+                parent_call_id,
+                duration_ms,
+                output,
+                images,
+                details,
+                structured_content,
+                usage,
+                ..
+            } => {
+                let mut len = 128
+                    + json_string_len(call_id)
+                    + json_string_len(tool_name)
+                    + json_string_len(output);
+                if let Some(parent) = parent_call_id {
+                    len += json_string_len(parent) + 24; // key + ':'
+                }
+                if duration_ms.is_some() {
+                    len += 40; // key + ':' + up to 20 digits
+                }
+                if !images.is_empty() {
+                    len += 2 + images.len().saturating_sub(1); // '[' ']' commas
+                    for image in images {
+                        // `{"type":"image","data":..,"mimeType":..}`
+                        len +=
+                            48 + json_string_len(&image.data) + json_string_len(&image.mime_type);
+                    }
+                }
+                if let Some(details) = details {
+                    len += json_value_len(details) + 16;
+                }
+                if let Some(structured) = structured_content {
+                    len += json_value_len(structured) + 24;
+                }
+                if usage.is_some() {
+                    // `Usage` is a bounded set of `u64`/`f64` scalars (seven
+                    // counters, five cost rates, one flag): 512 covers its
+                    // widest serialization.
+                    len += 512;
+                }
+                len
+            }
+            SessionEvent::AutoRetryStart { error_message, .. } => {
+                160 + json_string_len(error_message)
+            }
+            SessionEvent::AutoRetryEnd { final_error, .. } => {
+                128 + final_error
+                    .as_ref()
+                    .map_or(0, |error| json_string_len(error) + 16)
+            }
+            SessionEvent::SummarizationRetryScheduled { error_message, .. } => {
+                192 + json_string_len(error_message)
+            }
+            SessionEvent::SummarizationRetryAttemptStart { source } => match source {
+                SummarizationRetrySource::BranchSummary => 96,
+                SummarizationRetrySource::Compaction { reason } => 96 + json_string_len(reason),
+            },
+            SessionEvent::SummarizationRetryFinished => 64,
+        };
+        // Safety slack for the fixed envelope fields (flags, turn counters)
+        // the per-variant sums do not spell out. Kept small and proportional,
+        // exactly like the agent-event hint: a fixed kilobyte per event would
+        // itself become the dominant cost of a run with many small events.
+        hint.saturating_add(64 + hint / 32)
+    }
+}
+
 /// Serialize one session event straight to its wire line, byte-identical to
 /// `serde_json::to_string(&session_event_to_json(event))` (pinned by
 /// `tests/json_stream_wire.rs::every_session_event_line_matches_the_value_construction`),
 /// without the intermediate `Value` (the session bridge seam, `PIR-BIN-099`).
+///
+/// The line buffer is pre-sized from [`SessionEvent::wire_size_hint`] so the
+/// payload is not copied again by `String` growth (the `entry_appended`
+/// follow-up w2 measured on the agent-event line); the hint only chooses the
+/// capacity, serde_json still produces every byte.
 #[doc(hidden)]
 pub fn to_session_event_line(event: &SessionEvent) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&SessionEventWire::new(event))
+    let mut buffer = Vec::with_capacity(event.wire_size_hint());
+    serde_json::to_writer(&mut buffer, &SessionEventWire::new(event))?;
+    // serde_json only ever writes valid UTF-8 for `Serialize` inputs; the
+    // checked conversion keeps the function panic-free (and needs no unsafe).
+    String::from_utf8(buffer).map_err(|error| {
+        serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
 }
 
 /// Build the summarizer-retry observer the compaction module calls

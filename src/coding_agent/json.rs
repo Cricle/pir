@@ -257,12 +257,13 @@ fn usage_of(event: &AssistantMessageEvent) -> Option<serde_json::Value> {
 /// wire order); optional keys are appended exactly where the old
 /// post-inserts placed them. Pinned per event by
 /// `tests/json_stream_wire.rs::every_agent_event_line_matches_the_value_construction`.
-pub(crate) struct AgentEventWire<'a> {
+pub struct AgentEventWire<'a> {
     event: &'a AgentEvent,
 }
 
 impl<'a> AgentEventWire<'a> {
-    pub(crate) fn new(event: &'a AgentEvent) -> Self {
+    #[doc(hidden)]
+    pub fn new(event: &'a AgentEvent) -> Self {
         Self { event }
     }
 }
@@ -456,7 +457,12 @@ impl serde::Serialize for AgentEventWire<'_> {
 /// `serde_json` escapes it: `\"`, `\\` and the five named control escapes cost
 /// one extra byte, every other character below `0x20` is written as `\u00XX`.
 /// Non-ASCII bytes are emitted verbatim (UTF-8), so they cost one byte each.
-fn json_string_len(s: &str) -> usize {
+///
+/// Shared with the session-event line sizer
+/// (`agent_session::events::SessionEvent::wire_size_hint`): the same exact
+/// escaping math, one implementation (`PIR-BIN-099` follow-up).
+#[doc(hidden)]
+pub fn json_string_len(s: &str) -> usize {
     let mut len = 2; // the enclosing quotes
     for &byte in s.as_bytes() {
         len += 1 + ESCAPE_EXTRA[byte as usize] as usize;
@@ -490,7 +496,13 @@ const fn build_escape_extra() -> [u8; 256] {
 /// nested tool payload must not recurse on the stack). Exact for strings,
 /// keys and structure; every scalar is counted at its widest form, so the
 /// result is an upper bound of the real serialization.
-fn json_value_len(value: &serde_json::Value) -> usize {
+///
+/// Shared with the session-event line sizer
+/// (`agent_session::events::SessionEvent::wire_size_hint`), which bounds the
+/// `entry`/`result`/`details`/`structuredContent` payloads the same way
+/// (`PIR-BIN-099` follow-up).
+#[doc(hidden)]
+pub fn json_value_len(value: &serde_json::Value) -> usize {
     stack_value_len(&mut vec![value])
 }
 
@@ -656,7 +668,8 @@ impl AgentEventWire<'_> {
     /// steps (`PIR-BIN-099`'s per-face attribution) and copies the payload
     /// again on every growth. The bound never affects the wire bytes — a
     /// shorter estimate only means the serializer grows as before.
-    fn wire_size_hint(&self) -> usize {
+    #[doc(hidden)]
+    pub fn wire_size_hint(&self) -> usize {
         let hint = match self.event {
             AgentEvent::AgentStart { .. } | AgentEvent::Compaction { .. } => 64,
             AgentEvent::AgentEnd { result } => {
@@ -865,188 +878,4 @@ pub fn print_run_diagnostics(summary: &crate::diagnostics::RunDiagnostics) {
         }
     };
     write_json_line(&line);
-}
-
-#[cfg(test)]
-mod wire_size_tests {
-    //! The size hint is a pure capacity optimization: these tests pin that it
-    //! never under-sizes the text [`to_json_event_line`] produces (an
-    //! under-sized hint only means the serializer grows as before) and that
-    //! the escaping math matches `serde_json`'s own output byte for byte.
-
-    use super::*;
-    use crate::ai::types::{
-        AssistantRole, TextContent, ToolCall, ToolResultRole, UserMessage, UserRole,
-    };
-
-    fn text_block(text: String) -> ContentBlock {
-        ContentBlock::Text(TextContent {
-            text,
-            text_signature: None,
-        })
-    }
-
-    #[test]
-    fn json_string_len_matches_serde_json_escaping() {
-        let cases = [
-            "",
-            "plain",
-            "quote\" and \\ backslash",
-            "tab\t nl\n cr\r backspace\u{8} formfeed\u{c}",
-            "control \u{0} \u{1f}",
-            "del \u{7f}",
-            "unicode: é 你好 🚀",
-            "mixed \"\n\\\u{2} end",
-        ];
-        for case in cases {
-            let actual = serde_json::to_string(case).expect("serialize string").len();
-            assert_eq!(json_string_len(case), actual, "hint drifted for {case:?}");
-        }
-    }
-
-    #[test]
-    fn json_value_len_upper_bounds_serde_json() {
-        let values = [
-            serde_json::json!(null),
-            serde_json::json!(true),
-            serde_json::json!(-12_345_678_901_i64),
-            serde_json::json!(1.5e-300),
-            serde_json::json!("a \"quoted\"\nstring"),
-            serde_json::json!([1, "two", {"three": [4, 5, {"six": null}]}]),
-            serde_json::json!({"k": {"nested": ["x", {"deep": "y\nz"}]}}),
-        ];
-        for value in values {
-            let actual = serde_json::to_string(&value)
-                .expect("serialize value")
-                .len();
-            let hint = json_value_len(&value);
-            assert!(
-                hint >= actual,
-                "hint {hint} under-sized the serialization ({actual} bytes) for {value}"
-            );
-        }
-    }
-
-    /// Every event whose payload carries text must get a hint at least as
-    /// large as the line the borrowed wire view produces.
-    #[test]
-    fn wire_size_hint_covers_every_large_event() {
-        let long_text = "x".repeat(4096) + "\n\"escaped\t";
-        let user = Message::User(UserMessage {
-            role: UserRole::User,
-            content: vec![text_block(long_text.clone())],
-            tools_added: None,
-            tools_removed: None,
-            sections: None,
-            timestamp: 0,
-        });
-        let tool_result = ToolResultMessage {
-            role: ToolResultRole::ToolResult,
-            tool_call_id: "call-1".into(),
-            tool_name: "big".into(),
-            content: vec![text_block(long_text.clone())],
-            details: Some(serde_json::json!({"truncation": {"content": long_text.clone()}})),
-            usage: None,
-            added_tool_names: Vec::new(),
-            structured_content: Some(serde_json::json!({"text": long_text.clone()})),
-            nested_calls: None,
-            is_error: false,
-            duration_ms: None,
-            timestamp: 0,
-        };
-        let assistant = AssistantMessage {
-            role: AssistantRole::Assistant,
-            content: vec![
-                text_block(long_text.clone()),
-                ContentBlock::ToolCall(ToolCall {
-                    id: "call-1".into(),
-                    name: "big".into(),
-                    arguments: [("path".to_owned(), serde_json::json!(long_text.clone()))]
-                        .into_iter()
-                        .collect(),
-                    thought_signature: Some("sig".into()),
-                    namespace: None,
-                    arguments_error: None,
-                }),
-            ],
-            api: "mock".into(),
-            provider: "mock".into(),
-            model: "mock-model".into(),
-            stop_reason: crate::ai::types::StopReason::Stop,
-            ..AssistantMessage::default()
-        };
-        let tool_execution = crate::agent::tool_batch::ToolExecutionEvent::End {
-            index: 0,
-            call_id: "call-1".into(),
-            tool_name: "big".into(),
-            is_error: false,
-            duration_ms: Some(3),
-            parent_call_id: None,
-        };
-        let events = [
-            AgentEvent::MessageStart {
-                turn: 1,
-                message: user.clone(),
-            },
-            AgentEvent::MessageEnd {
-                turn: 1,
-                message: Message::ToolResult(tool_result.clone()),
-            },
-            AgentEvent::TurnEnd {
-                turn: 1,
-                message: assistant.clone(),
-                tool_results: vec![tool_result.clone()],
-            },
-            AgentEvent::StreamStart {
-                turn: 1,
-                message: assistant.clone(),
-            },
-            AgentEvent::ToolExecutionStart {
-                turn: 1,
-                event: crate::agent::tool_batch::ToolExecutionEvent::Start {
-                    index: 0,
-                    call_id: "call-1".into(),
-                    tool_name: "big".into(),
-                    parent_call_id: None,
-                },
-                args: serde_json::json!({"path": long_text}),
-            },
-            AgentEvent::ToolExecutionEnd {
-                turn: 1,
-                event: tool_execution,
-                result: serde_json::json!({"content": [{"type": "text", "text": "y".repeat(4096)}]}),
-            },
-            AgentEvent::AgentEnd {
-                result: std::sync::Arc::new(crate::agent::agent_loop::LoopResult {
-                    terminal: assistant,
-                    context: std::sync::Arc::new(crate::ai::types::Context {
-                        system_prompt: None,
-                        messages: vec![user.clone()],
-                        tools: None,
-                    }),
-                    tool_results: Vec::new(),
-                    new_messages: vec![user],
-                    preamble: Vec::new(),
-                    turns: 1,
-                    aborted: false,
-                    usage_total: 0,
-                    will_retry: false,
-                }),
-            },
-        ];
-        for event in &events {
-            let line = to_json_event_line(event).expect("borrowed line serializes");
-            let hint = AgentEventWire::new(event).wire_size_hint();
-            assert!(
-                hint >= line.len(),
-                "hint {hint} under-sized the {line_len}-byte line for {event:?}",
-                line_len = line.len()
-            );
-            let value_line = serde_json::to_string(&to_json_event(event)).expect("value line");
-            assert_eq!(
-                line, value_line,
-                "the pre-sized line drifted from the Value construction for {event:?}"
-            );
-        }
-    }
 }
