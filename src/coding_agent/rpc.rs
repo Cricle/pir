@@ -2175,7 +2175,7 @@ impl RpcServerState {
         )
         .map_err(|error| format!("{label} failed: {error}"))?;
         self.settle_before_storage_replacement(&session).await?;
-        if !session.replace_session_storage(forked).await {
+        if !session.replace_session_storage_forked(forked).await {
             return Ok(true);
         }
         // The forked storage keeps this cwd; command discovery follows it.
