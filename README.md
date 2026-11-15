@@ -6,7 +6,7 @@ dependency.
 
 ## Status
 
-0.3.1-rc.1 (2026-11-14). End-to-end functional: agent loop, providers, sessions,
+0.3.2 (2026-11-15). End-to-end functional: agent loop, providers, sessions,
 extensions, TUI, RPC, server/client, SDK, builtins. Final result:
 [`RESULTS.md`](RESULTS.md); per-module truth: [MAPPING.md](MAPPING.md); feature
 contract: [`docs/FEATURES.md`](docs/FEATURES.md). Settled scope: chord delta
@@ -18,13 +18,15 @@ the installed binary is `pir`). CI tags also attach `pir-<tag>-windows-x86_64.zi
 `pir-<tag>-macos-universal.tar.gz`, each containing `pir` and
 `pir-phone-server`; local Windows verification in `RESULTS.md` is GNU-only.
 
-The local release gate is green on 2026-11-14 (`v0.3.1-rc.1`):
-`cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features
---locked -- -D warnings`, `cargo check --no-default-features --features sdk`,
-doctests (33 passed / 0 failed / 7 ignored) and the full cargo-nextest suite
-(7500 tests, 0 failed, 46 skipped across the lib/bins target and the 8 merged
-harnesses plus the standalone and profiling targets) all exit 0. Evidence:
-`.play/evidence/release-candidate-032/` (`summary.txt`, `gates.log`).
+The release gate is green on 2026-11-15 (`v0.3.2`): the full local battery on
+the release commit is 16/16 EXIT 0 — `cargo fmt --all -- --check`, the version
+consistency gate, `cargo clippy --all-targets --all-features --locked -- -D
+warnings`, the lib/bins target, all 8 merged nextest harnesses, the standalone
+and profiling targets (7501 tests, 0 failed, 46 skipped), doctests (33 passed /
+0 failed / 7 ignored), and `cargo check --no-default-features --features sdk`
+(`RUST_MIN_STACK=8388608`) — and the release workflow re-runs the full CI suite
+on the tag. Evidence: `.play/evidence/release-v032/` (`summary.txt`,
+`gates.log`).
 
 ## Building
 
@@ -40,7 +42,7 @@ providers, sessions, config, prompt/skills and the plugin framework.
 
 ```toml
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.3.1-rc.1", default-features = false, features = ["sdk"] }
+pir-sdk = { version = "0.3.2", default-features = false, features = ["sdk"] }
 ```
 
 Every optional surface is a cargo feature; `full` is the default, and the

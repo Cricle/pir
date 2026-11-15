@@ -2,8 +2,30 @@
 
 - 基线：`master` @ `b26a60fb23bd45306401190cacb5b6f2c1f5459c`
 - 结果日期：2026-11-02
-- 最新实测：2026-11-12（与上游 pi 1.4.0 的 A/B 轮，见第一节；其下依次为 0.3.0 发版准备与 2026-11-02 基线历史）
+- 最新实测：2026-11-15（0.3.2 发版，见第一节；其下依次为 2026-11-12 A/B 轮、0.3.1-rc.1 与更早历史）
 - 本文件是唯一面向用户的结果文档；过程材料仅在 `.audit/` 保留为原始证据。
+
+## 0.3.2 release (2026-11-15)
+
+0.3.2 是 0.3.1-rc.1 的稳定版：rc.1 的全部变更（读路径性能 R1–R8、会话替换
+语义、PIR-BIN-101/104/105/106/107/108/110 等修复）原样收入，详见下一节。
+相对 rc.1 的增量：
+
+| 类别 | 变更 | 验证 |
+|---|---|---|
+| 性能 | `efficient` profile 只省略无硬门禁的“结束前自检”prompt 规则；三条有硬门禁的规则（read-before-edit、字面路径、广搜索）在两个 profile 都保留，`balanced` 字节不变 | 单元测试钉住 balanced 4 条 / efficient 3 条；本地 mock provider 抓包：balanced 8 872 字符（含规则）vs efficient 8 088 字符（不含）；efficient-vs-balanced N=3 九次运行全部成功，无质量回归 |
+| 文档 | 删除已被取代的过程报告，重建 docs 索引 | 全部文档链接可解析 |
+
+**门禁（本机 GNU，2026-11-15 实测）**
+
+- 发版提交本地全套 16/16 EXIT 0：fmt、版本一致性、lib/bins、zz_merged_1..8、
+  standalone、extras、doctests、sdk_shape、clippy；nextest 合计 7 501 tests，
+  0 failed，46 skipped，doctests 33 passed / 0 failed / 7 ignored。
+- 版本三处一致：`[workspace.package]`、`.migration-info`、二进制 `--version`
+  均为 0.3.2；`Cargo.lock` 两个 workspace 包同步。
+- 发布标签由 `release.yml` 重新执行完整 CI（Lint + SDK 矩阵、Windows 全量、
+  Linux lib + bins）后才创建 GitHub Release 并发布 crates.io。证据：
+  `.play/evidence/release-v032/`。
 
 ## A/B campaign vs pi 1.4.0 (2026-11-12)
 

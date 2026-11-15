@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 (2026-11-15)
+
+Stable release of the `0.3.1-rc.1` candidate: the full change list in the
+`0.3.1-rc.1` section below applies unchanged. Since rc.1:
 
 ### performance
 
@@ -9,6 +12,11 @@
   literal paths, broad-search) stay in both profiles. `balanced` is unchanged.
   This removes the extra post-test verification turn that the clean A/B measured
   in roughly half of the coding runs.
+
+### docs
+
+- Removed superseded reports and rebuilt the docs index; every remaining link
+  resolves.
 
 ## 0.3.1-rc.1 (2026-11-14)
 
