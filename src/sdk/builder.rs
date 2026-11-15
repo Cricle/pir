@@ -2242,6 +2242,7 @@ impl AgentBuilder {
                     crate::config::trust::resolve_cwd_trust(&session_cwd, &agent_dir),
                     discover,
                     &files,
+                    append_system_prompt.is_some(),
                 )?;
             }
             if let Some(appendix) = append_system_prompt {
@@ -2518,7 +2519,11 @@ pub(crate) fn load_environment_at(
     // Registry: embedded catalog first, then the composed models.json
     // providers on top (upsert order keeps models.json entries winning per
     // provider), exactly like the shared loader.
-    let mut registry = crate::ai::provider::ProviderRegistry::default();
+    let mut registry = crate::ai::provider::ProviderRegistry::default().with_identity(
+        crate::ai::provider::pi_client_identity(crate::ai::provider::install_telemetry_enabled_in(
+            agent_dir,
+        )),
+    );
     crate::ai::providers::register_builtin_catalog(&mut registry)?;
     let mut merged: std::collections::BTreeMap<String, Vec<Model>> =
         std::collections::BTreeMap::new();

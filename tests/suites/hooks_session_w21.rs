@@ -1263,3 +1263,600 @@ async fn tool_execution_start_precedes_the_tool_call_gate() {
         "the tool_call rewrite must still reach the tool"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. PIR-BIN-043: `context` sees the conversation without system messages
+// ---------------------------------------------------------------------------
+
+/// Native plugin that echoes the `context` payload's `messages` back as its
+/// result (the upstream identity handler) and records what it saw.
+struct ContextEcho {
+    info: PluginInfo,
+    log: Arc<Mutex<Vec<Value>>>,
+}
+
+impl AgentPlugin for ContextEcho {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["context".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            self.log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event.payload.clone());
+            PluginEventOutcome::Generic(json!({
+                "messages": event.payload["messages"].clone(),
+            }))
+        })
+    }
+}
+
+/// Native plugin that replaces the visible conversation with its LAST message.
+struct ContextTruncate {
+    info: PluginInfo,
+}
+
+impl AgentPlugin for ContextTruncate {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["context".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            let last = event.payload["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .cloned();
+            PluginEventOutcome::Generic(json!({
+                "messages": last.into_iter().collect::<Vec<_>>(),
+            }))
+        })
+    }
+}
+
+fn tool_turn_registry() -> Arc<ProviderRegistry> {
+    fake_registry(Arc::new(|index, _context| {
+        if index == 0 {
+            assistant(
+                vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                StopReason::ToolUse,
+            )
+        } else {
+            assistant(vec![text("done")], StopReason::Stop)
+        }
+    }))
+}
+
+/// `ContextEvent.messages` "holds the conversation WITHOUT system messages"
+/// (coding-agent/src/core/extensions/types.ts:885-893); an unchanged return
+/// keeps the transcript (runner.ts:292-300 `restoreSystemMessages` early
+/// return), so the provider request keeps its tool declaration.
+#[tokio::test]
+async fn context_event_hides_system_messages_and_echo_leaves_the_request_untouched() {
+    let temp = TempDir::new("context-filter-echo");
+    let log: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_responder = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |index, context| {
+        if index == 0 {
+            assistant(
+                vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                StopReason::ToolUse,
+            )
+        } else {
+            requests_for_responder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.clone());
+            assistant(vec![text("done")], StopReason::Stop)
+        }
+    }));
+    let (tools, _runs) = probe_registry();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(
+            &temp,
+            registry,
+            tools,
+            Some(SessionManager::create(".", &temp.0).expect("session")),
+        ),
+        vec![Arc::new(ContextEcho {
+            info: PluginInfo::inline("context-echo"),
+            log: Arc::clone(&log),
+        }) as Arc<dyn AgentPlugin>],
+    ));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("prompt");
+
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "one context event per request: {seen:?}");
+    for payload in &seen {
+        let messages = payload["messages"].as_array().expect("messages array");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["role"] != json!("system")),
+            "`context` must never expose system messages (PIR-BIN-043): {payload}"
+        );
+    }
+    // Turn 2's visible conversation is the turn-1 user/assistant/toolResult
+    // with the declaration filtered out.
+    let second: Vec<&str> = seen[1]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .map(|message| message["role"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(second, vec!["user", "assistant", "toolResult"]);
+
+    // The echoed list is unchanged, so the request still carries the tool
+    // declaration the extension never saw.
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let declaration = requests[0]
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::System(system) => system.tools_added.clone().map(|tools| (system, tools)),
+            _ => None,
+        })
+        .expect("the echoed context keeps the tool declaration");
+    let names: Vec<&str> = declaration
+        .1
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["probe"]);
+}
+
+/// A handler that returns a CHANGED list gets the replayed system state as a
+/// leading message (runner.ts:296-299: `head = getCurrentSystemMessage(current)`,
+/// returned as `[head, ...returned]`).
+#[tokio::test]
+async fn context_event_replacement_is_reheaded_with_the_tool_declaration() {
+    let temp = TempDir::new("context-filter-restore");
+    let requests: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_responder = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |index, context| {
+        if index == 0 {
+            assistant(
+                vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                StopReason::ToolUse,
+            )
+        } else {
+            requests_for_responder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.clone());
+            assistant(vec![text("done")], StopReason::Stop)
+        }
+    }));
+    let (tools, _runs) = probe_registry();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(
+            &temp,
+            registry,
+            tools,
+            Some(SessionManager::create(".", &temp.0).expect("session")),
+        ),
+        vec![Arc::new(ContextTruncate {
+            info: PluginInfo::inline("context-truncate"),
+        }) as Arc<dyn AgentPlugin>],
+    ));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("prompt");
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    assert_eq!(
+        messages.len(),
+        2,
+        "the restored head plus the handler's one message: {:?}",
+        messages
+    );
+    let Message::System(head) = &messages[0] else {
+        panic!("the replacement must be re-headed with a system message: {messages:?}");
+    };
+    let names: Vec<&str> = head
+        .tools_added
+        .as_ref()
+        .expect("the restored head replays the tool declaration")
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["probe"]);
+    assert!(
+        matches!(&messages[1], Message::ToolResult(_)),
+        "the handler's own message follows the head: {messages:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. PIR-BIN-046: boundary `context` preview carries all five fields
+// ---------------------------------------------------------------------------
+
+/// `BoundaryContextPreview` (coding-agent/src/core/extensions/types.ts:1007-1013,
+/// `_buildBoundaryContext` agent-session.ts:999-1020) has five fields; pir
+/// shipped two (`contextMessages`, `canContinue`) on both boundaries.
+#[tokio::test]
+async fn boundary_context_carries_the_upstream_preview_fields() {
+    let temp = TempDir::new("boundary-preview");
+    let log: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Recorder::for_events(&["turn_end", "agent_before_settle"], Arc::clone(&log));
+    let (tools, _runs) = probe_registry();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(
+            &temp,
+            tool_turn_registry(),
+            tools,
+            Some(SessionManager::create(".", &temp.0).expect("session")),
+        ),
+        vec![recorder as Arc<dyn AgentPlugin>],
+    ));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("prompt");
+
+    let seen = log.lock().unwrap().clone();
+    let contexts: Vec<(&str, &Value)> = seen
+        .iter()
+        .filter(|(name, _)| name == "turn_end" || name == "agent_before_settle")
+        .map(|(name, payload)| (name.as_str(), &payload["context"]))
+        .collect();
+    assert!(
+        contexts
+            .iter()
+            .any(|(name, _)| *name == "agent_before_settle"),
+        "the settle boundary must dispatch: {seen:?}"
+    );
+    for (name, context) in &contexts {
+        let mut keys: Vec<&str> = context
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}.context must be an object: {context}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "canContinue",
+                "contextEntries",
+                "contextMessages",
+                "llmMessages",
+                "pendingMessages"
+            ],
+            "{name}.context must carry the full BoundaryContextPreview: {context}"
+        );
+        let context_messages = context["contextMessages"]
+            .as_array()
+            .expect("contextMessages array");
+        let llm_messages = context["llmMessages"]
+            .as_array()
+            .expect("llmMessages array");
+        assert_eq!(
+            llm_messages.len(),
+            context_messages.len(),
+            "pir's Message is already the LLM projection, so the two lists agree"
+        );
+        assert_eq!(context["pendingMessages"], json!([]));
+        let entries = context["contextEntries"]
+            .as_array()
+            .expect("contextEntries array");
+        assert!(
+            entries.iter().any(|entry| {
+                entry["sourceEntry"]["type"] == json!("message")
+                    && entry["messages"].as_array().is_some_and(|messages| {
+                        messages
+                            .iter()
+                            .any(|message| message["role"] == json!("user"))
+                    })
+            }),
+            "{name}.contextEntries must project the persisted prompt entry: {context}"
+        );
+    }
+}
+
+/// While a run is streaming, a steering message queued by a tool hook is
+/// pending at the turn boundary; `pendingMessages` must carry it (upstream
+/// `_getPendingBoundaryMessages`, agent-session.ts:997-999), and the next turn
+/// drains it.
+#[tokio::test]
+async fn boundary_context_pending_messages_carry_queued_steering() {
+    let temp = TempDir::new("boundary-pending");
+    let log: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Recorder::for_events(&["turn_end"], Arc::clone(&log));
+    let agent_slot: Arc<Mutex<Option<Arc<AgentSession>>>> = Arc::new(Mutex::new(None));
+
+    struct SteerOnToolResult {
+        info: PluginInfo,
+        agent: Arc<Mutex<Option<Arc<AgentSession>>>>,
+    }
+
+    impl AgentPlugin for SteerOnToolResult {
+        fn info(&self) -> &PluginInfo {
+            &self.info
+        }
+
+        fn events(&self) -> EventInterest {
+            EventInterest::List(vec!["tool_result".into()])
+        }
+
+        fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+            Box::pin(async move {
+                assert_eq!(event.name, "tool_result");
+                let agent = self
+                    .agent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(agent) = agent {
+                    let message = Message::User(UserMessage {
+                        role: UserRole::User,
+                        content: vec![text("steer from tool")],
+                        tools_added: None,
+                        tools_removed: None,
+                        sections: None,
+                        timestamp: 2,
+                    });
+                    agent.steer_message(message);
+                }
+                PluginEventOutcome::None
+            })
+        }
+    }
+
+    let (tools, _runs) = probe_registry();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(
+            &temp,
+            tool_turn_registry(),
+            tools,
+            Some(SessionManager::create(".", &temp.0).expect("session")),
+        ),
+        vec![
+            recorder as Arc<dyn AgentPlugin>,
+            Arc::new(SteerOnToolResult {
+                info: PluginInfo::inline("steer-on-tool-result"),
+                agent: Arc::clone(&agent_slot),
+            }) as Arc<dyn AgentPlugin>,
+        ],
+    ));
+    *agent_slot.lock().unwrap() = Some(Arc::clone(&agent));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("prompt");
+
+    // The native host offers every event to every plugin; keep the boundary
+    // dispatches under test.
+    let seen: Vec<(String, Value)> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name == "turn_end")
+        .cloned()
+        .collect();
+    assert_eq!(seen.len(), 2, "one turn_end per turn: {seen:?}");
+    let first_pending = seen[0].1["context"]["pendingMessages"]
+        .as_array()
+        .expect("pendingMessages array");
+    assert_eq!(
+        first_pending,
+        &vec![json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "steer from tool" }],
+            "timestamp": 2,
+        })],
+        "the queued steering message must ride the boundary preview: {}",
+        seen[0].1
+    );
+    assert_eq!(
+        seen[1].1["context"]["pendingMessages"],
+        json!([]),
+        "the next turn drains the queue: {}",
+        seen[1].1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. PIR-BIN-047: `agent_end.messages` includes the run's starting prompt
+// ---------------------------------------------------------------------------
+
+/// Upstream `runAgentLoop` seeds `newMessages` with the initial messages
+/// (agent-loop.ts:119-122) and `agent_end` emits that list
+/// (agent-loop.ts:329); pir's payload omitted the caller's prompt.
+#[tokio::test]
+async fn agent_end_messages_include_the_runs_starting_prompt() {
+    let temp = TempDir::new("agent-end-prompt");
+    let log: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Recorder::for_events(&["agent_end"], Arc::clone(&log));
+    let (tools, _runs) = probe_registry();
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(
+            &temp,
+            fake_registry(Arc::new(|index, _context| {
+                if index == 0 {
+                    assistant(
+                        vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                        StopReason::ToolUse,
+                    )
+                } else {
+                    assistant(vec![text("done")], StopReason::Stop)
+                }
+            })),
+            tools,
+            Some(SessionManager::create(".", &temp.0).expect("session")),
+        ),
+        vec![recorder as Arc<dyn AgentPlugin>],
+    ));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("first prompt");
+    agent
+        .prompt("again", Arc::new(|_| {}))
+        .await
+        .expect("second prompt");
+
+    let seen: Vec<(String, Value)> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name == "agent_end")
+        .cloned()
+        .collect();
+    assert_eq!(seen.len(), 2, "one agent_end per run: {seen:?}");
+    let first = seen[0].1["messages"].as_array().expect("messages array");
+    // Upstream `declareToolChanges` inserts the tool-declaration system
+    // message BEFORE the prompts (agent-loop.ts:342-372), so the first run's
+    // list starts with the declaration and then the caller's prompt.
+    assert_eq!(
+        first.first().map(|message| &message["role"]),
+        Some(&json!("system")),
+        "the tool declaration leads agent_end.messages: {}",
+        seen[0].1
+    );
+    assert!(
+        first[0]["toolsAdded"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == json!("probe"))),
+        "the leading declaration names the added tool: {}",
+        seen[0].1
+    );
+    assert_eq!(
+        first.get(1).map(|message| &message["role"]),
+        Some(&json!("user")),
+        "the run's starting prompt follows the declaration: {}",
+        seen[0].1
+    );
+    assert_eq!(
+        first.get(1).map(|message| &message["content"]),
+        Some(&json!([{ "type": "text", "text": "start" }]))
+    );
+    assert_eq!(
+        first.len(),
+        5,
+        "declaration + prompt + assistant + tool result + final assistant: {}",
+        seen[0].1
+    );
+    assert_eq!(
+        first.last().map(|message| &message["role"]),
+        Some(&json!("assistant"))
+    );
+
+    let second = seen[1].1["messages"].as_array().expect("messages array");
+    assert_eq!(
+        second.len(),
+        2,
+        "prompt + assistant, no re-declaration: {second:?}"
+    );
+    assert_eq!(second[0]["role"], json!("user"));
+    assert_eq!(
+        second[0]["content"],
+        json!([{ "type": "text", "text": "again" }])
+    );
+    assert_eq!(second[1]["role"], json!("assistant"));
+}
+
+// ---------------------------------------------------------------------------
+// 12. PIR-BIN-051: default block reason matches upstream
+// ---------------------------------------------------------------------------
+
+struct SilentBlocker {
+    info: PluginInfo,
+}
+
+impl AgentPlugin for SilentBlocker {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["tool_call".into()])
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        Box::pin(async move {
+            assert_eq!(event.name, "tool_call");
+            PluginEventOutcome::ToolCall {
+                block: true,
+                reason: None,
+                terminate: false,
+            }
+        })
+    }
+}
+
+/// Upstream `prepareToolCall` (packages/agent/src/agent-loop.ts:756):
+/// `createErrorToolResult(beforeResult.reason || "Tool execution was blocked")`.
+#[tokio::test]
+async fn blocked_tool_without_reason_uses_the_upstream_sentence() {
+    let temp = TempDir::new("block-default-reason");
+    let (tools, runs) = probe_registry();
+    let requests: Arc<Mutex<Vec<Context>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_responder = Arc::clone(&requests);
+    let registry = fake_registry(Arc::new(move |index, context| {
+        if index == 0 {
+            assistant(
+                vec![tool_call("call-1", "probe", json!({ "value": "in" }))],
+                StopReason::ToolUse,
+            )
+        } else {
+            requests_for_responder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.clone());
+            assistant(vec![text("done")], StopReason::Stop)
+        }
+    }));
+    let agent = Arc::new(AgentSession::new_with_plugins(
+        session_config(
+            &temp,
+            registry,
+            tools,
+            Some(SessionManager::create(".", &temp.0).expect("session")),
+        ),
+        vec![Arc::new(SilentBlocker {
+            info: PluginInfo::inline("silent-blocker"),
+        }) as Arc<dyn AgentPlugin>],
+    ));
+
+    agent
+        .prompt("start", Arc::new(|_| {}))
+        .await
+        .expect("prompt");
+
+    assert!(
+        runs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "a blocked tool must never execute"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let results = tool_results(&requests[0]);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_error);
+    assert_eq!(results[0].content, vec![text("Tool execution was blocked")]);
+}

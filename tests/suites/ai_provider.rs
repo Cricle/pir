@@ -2253,6 +2253,99 @@ async fn stream_simple_entries_clamp_max_tokens_before_dispatch() {
     );
 }
 
+/// PIR-BIN-055: the session request path — `stream_resolving_auth(_for)` — is
+/// upstream's `streamSimple` dispatch: the SDK's agent stream function calls
+/// `modelRuntime.streamSimple` (`packages/coding-agent/src/core/sdk.ts:422`)
+/// and compaction calls `completeSimple`
+/// (`packages/coding-agent/src/core/compaction/compaction.ts:636`). Every
+/// simple call runs `buildBaseOptions`, whose
+/// `maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ??
+/// model.maxTokens)` (`packages/ai/src/api/simple-options.ts:78-84`) must
+/// therefore ride every session request — the compaction summarizer included,
+/// which is exactly when the transcript has nearly filled the window.
+#[tokio::test]
+async fn stream_resolving_auth_applies_the_simple_context_clamp() {
+    use pir::ai::types::{Context, StreamOptions};
+
+    let mut model = reasoning_model();
+    model.provider = "simple-capture".into();
+    // The issue's A/B shape: a small window (2_000) with maxTokens 512.
+    model.context_window = 2_000;
+    model.max_tokens = 512;
+    let provider = SimpleCaptureProvider {
+        model: model.clone(),
+        seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let seen = std::sync::Arc::clone(&provider.seen);
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(std::sync::Arc::new(provider));
+
+    let options = || StreamOptions {
+        api_key: Some("test-key".into()),
+        ..StreamOptions::default()
+    };
+    // A transcript that nearly fills the window: 4000 chars ≈ 1000 estimated
+    // tokens, so 2000 - 1000 - 4096 saturates at the MIN_MAX_TOKENS floor.
+    // The UNCLAMPED model budget would be 512.
+    let context = Context {
+        messages: vec![user_message(&"x".repeat(4_000))],
+        ..Context::default()
+    };
+    let message = registry
+        .stream_resolving_auth(model.clone(), context.clone(), options())
+        .drain_and_result()
+        .await
+        .expect("the scripted stream ends with a message");
+    assert_eq!(message.stop_reason, pir::ai::types::StopReason::Stop);
+
+    // A session-scoped request takes the same seam (`None` = no overlay).
+    let message = registry
+        .stream_resolving_auth_for(None, model.clone(), context, options())
+        .drain_and_result()
+        .await
+        .expect("the session-scoped stream ends with a message");
+    assert_eq!(message.stop_reason, pir::ai::types::StopReason::Stop);
+
+    // Large window, empty context: the model default is what the clamp
+    // produces (200_000 - 0 - 4096 leaves room for all of 4096).
+    model.context_window = 200_000;
+    model.max_tokens = 4_096;
+    let message = registry
+        .stream_resolving_auth(model.clone(), Context::default(), options())
+        .drain_and_result()
+        .await
+        .expect("the large-window stream ends with a message");
+    assert_eq!(message.stop_reason, pir::ai::types::StopReason::Stop);
+
+    // An explicit, smaller caller budget is never raised.
+    let message = registry
+        .stream_resolving_auth(
+            model,
+            Context::default(),
+            StreamOptions {
+                max_tokens: Some(100),
+                ..options()
+            },
+        )
+        .drain_and_result()
+        .await
+        .expect("the explicit-budget stream ends with a message");
+    assert_eq!(message.stop_reason, pir::ai::types::StopReason::Stop);
+
+    assert_eq!(
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        [
+            (None, Some(1)),
+            (None, Some(1)),
+            (None, Some(4_096)),
+            (None, Some(100))
+        ],
+        "every session request carries the buildBaseOptions context clamp"
+    );
+}
+
 /// The overlay's first network hop is derived from the persisted
 /// `checkedAt`, not a blind full interval: a fresh check sleeps only the
 /// remainder of its freshness window, an expired one fires immediately, and
@@ -2426,4 +2519,24 @@ async fn remote_catalog_overlay_first_hop_uses_persisted_checked_at() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PIR-BIN-059: hosts install the pi client identity (upstream
+/// `getClientIdentity`), so adapters no longer fall back to the bare
+/// `pir (<os>)` default.
+#[test]
+fn host_identity_is_the_detailed_pi_client() {
+    let identity = pir::ai::provider::pi_client_identity(true);
+    let user_agent = pir::ai::types::format_user_agent(Some(&identity));
+    assert!(
+        user_agent.starts_with("pi/") && user_agent.contains("rust"),
+        "detailed pi User-Agent expected, got {user_agent:?}"
+    );
+    assert!(
+        identity
+            .attribution
+            .as_ref()
+            .is_some_and(|attribution| attribution.is_some()),
+        "enabled install telemetry carries pi attribution"
+    );
 }

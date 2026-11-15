@@ -1700,7 +1700,7 @@ async fn virtual_complete_applies_route_callback_prompt_and_max_tokens_override(
         "name": "Virtual Routed",
         "physical": { "provider": "session-provider", "id": "session-model" },
         "systemPrompt": "virtual system",
-        "modelOverride": { "contextWindow": 2048, "maxTokens": 77 }
+        "modelOverride": { "contextWindow": 32768, "maxTokens": 77 }
     });
     let slot = context_slot();
     let plugin = OnContextPlugin::new("virtual-projection", {
@@ -1830,7 +1830,7 @@ async fn virtual_model_max_tokens_matches_between_session_prompt_and_complete() 
         "provider": "virtual-provider",
         "name": "Virtual Session",
         "physical": { "provider": "session-provider", "id": "session-model" },
-        "modelOverride": { "contextWindow": 2048, "maxTokens": 77 }
+        "modelOverride": { "contextWindow": 32768, "maxTokens": 77 }
     });
     let plugin = OnContextPlugin::new("virtual-max-tokens-parity", {
         let slot = Arc::clone(&slot);

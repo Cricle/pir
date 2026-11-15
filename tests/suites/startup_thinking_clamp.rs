@@ -388,7 +388,7 @@ fn footer_level_equals_the_clamped_resolved_level() {
             "settings default off",
             None,
             Some(ThinkingLevel::Off),
-            ThinkingLevel::Medium,
+            ThinkingLevel::Off,
         ),
         ("no setting", None, None, ThinkingLevel::Medium),
         // The CLI wins over the settings default, and is still clamped.

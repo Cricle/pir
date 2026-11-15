@@ -675,7 +675,7 @@ const PARITY_TS: &str = r#"
 const seen = { input: null, updates: [], promptEvents: [], mode: null, renderers: null };
 export default function (pi) {
   pi.on("input", (event) => {
-    seen.input = { hasImages: Array.isArray(event.images), streamingBehavior: event.streamingBehavior === null };
+    seen.input = { hasImages: "images" in event, streamingBehavior: "streamingBehavior" in event };
     return undefined;
   });
   pi.on("ui_prompt_start", (event) => { seen.promptEvents.push(event.type + ":" + event.kind); });
@@ -718,13 +718,11 @@ async fn payload_parity_and_renderers() {
     let (handle, dir) = started_handle("parity").await;
     seed_and_load(&handle, &dir, "parity.ts", PARITY_TS).await;
 
-    // input payload parity (the host adds images/streamingBehavior; mirror
-    // the host shape here).
+    // input payload parity: an idle prompt has neither optional key
+    // (upstream `InputEvent`, extensions/types.ts:1171-1185).
     let mut payload = json!({
         "type": "input",
         "text": "hello",
-        "images": [],
-        "streamingBehavior": null,
     });
     let _ = handle.emit("input", &mut payload).await.expect("emit");
     // Renderer registrations are real (exported through the registry).
@@ -769,8 +767,8 @@ async fn payload_parity_and_renderers() {
         .await
         .expect("eval");
     assert_eq!(seen["mode"], "tui", "ctx.mode normalized to tui");
-    assert_eq!(seen["input"]["hasImages"], true);
-    assert_eq!(seen["input"]["streamingBehavior"], true);
+    assert_eq!(seen["input"]["hasImages"], false);
+    assert_eq!(seen["input"]["streamingBehavior"], false);
     assert!(
         seen["promptEvents"]
             .as_array()

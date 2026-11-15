@@ -1304,6 +1304,17 @@ impl Agent {
         self.inner.session_dir.as_deref()
     }
 
+    /// The live session facade behind this agent.
+    ///
+    /// Test/host seam for wrapping a plugin-attached agent in
+    /// [`crate::sdk::AgentSessionRuntime`] (the runtime's fork/switch lifecycle
+    /// needs the same session the agent drives). Not part of the stable
+    /// surface.
+    #[doc(hidden)]
+    pub fn session_arc(&self) -> Arc<AgentSession> {
+        Arc::clone(&self.inner.session)
+    }
+
     /// The session file path, when session persistence is enabled.
     ///
     /// The file itself is created lazily by the first persisted message, so

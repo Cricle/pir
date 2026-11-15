@@ -121,6 +121,7 @@ fn agent_end() -> AgentEvent {
             tool_results: Vec::new(),
             new_messages: Vec::new(),
             preamble: Vec::new(),
+            start_messages: Vec::new(),
             turns: 1,
             aborted: false,
             usage_total: 0,

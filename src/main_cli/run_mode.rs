@@ -1058,7 +1058,7 @@ pub(super) async fn run() -> Result<()> {
                 })
             }
         }
-        Some(Command::Print { prompt }) => {
+        Some(Command::Print { prompts }) => {
             // Upstream `--mode rpc` starts the RPC loop instead of printing.
             if mode == Some(Mode::Rpc) {
                 maybe_prune_before_rpc(&settings_manager, &config, &cli)?;
@@ -1070,10 +1070,26 @@ pub(super) async fn run() -> Result<()> {
                 .await;
             }
             // `pir print` accepts the prompt as stdin like the top-level form:
-            // a missing positional or explicit `-` reads piped input.
-            let prompt = match prompt {
-                Some(prompt) if prompt != "-" => prompt,
-                _ => match pir::coding_agent::cli::read_piped_input(stdin_tty, std::io::stdin()) {
+            // a missing positional or explicit `-` reads piped input. Extra
+            // positionals run as additional turns, matching the top-level
+            // `--print` path and upstream `runPrintMode` (PIR-BIN-029).
+            let mut prompts = prompts;
+            let first = prompts.first().cloned();
+            let prompt = match first.as_deref() {
+                Some(prompt) if prompt != "-" => prompts.remove(0),
+                Some(_) => {
+                    prompts.remove(0);
+                    match pir::coding_agent::cli::read_piped_input(stdin_tty, std::io::stdin()) {
+                        Some(prompt) => prompt,
+                        None => {
+                            return Err(anyhow::anyhow!(
+                                "pir print requires a prompt (pass an argument or pipe stdin)"
+                            ))
+                        }
+                    }
+                }
+                None => match pir::coding_agent::cli::read_piped_input(stdin_tty, std::io::stdin())
+                {
                     Some(prompt) => prompt,
                     None => {
                         return Err(anyhow::anyhow!(
@@ -1082,6 +1098,7 @@ pub(super) async fn run() -> Result<()> {
                     }
                 },
             };
+            let additional_messages = prompts;
             // Headless resolution never yields the picker plan: `--resume`
             // selects this project's most recent session instead.
             let plan = resolve_run_session_plan(&cli, &config, false)?;
@@ -1093,7 +1110,7 @@ pub(super) async fn run() -> Result<()> {
                 extension_paths: &extension_paths,
                 prompts: pir::coding_agent::cli::PrintPrompts {
                     initial_message: Some(prompt),
-                    additional_messages: Vec::new(),
+                    additional_messages,
                 },
                 images: Vec::new(),
                 plan,
@@ -2110,6 +2127,11 @@ fn rpc_overrides(
             .map(|entry| pir::coding_agent::overrides::resolve_text_or_file(entry))
             .collect::<Result<Vec<_>>>()?,
         session_name: cli.name.clone(),
+        // The shared resolver already layered `--session-dir`,
+        // `PI_CODING_AGENT_SESSION_DIR`, settings `sessionDir` and
+        // `PIR_SESSION_DIR`; pass the winner through instead of letting the
+        // RPC host re-read only the last one (PIR-BIN-026/038).
+        session_dir: Some(config.session_dir.clone()),
         // A headless host never sees the picker plan; guard anyway so a
         // future caller cannot park an unresolved plan on the RPC host.
         startup_session: match plan {

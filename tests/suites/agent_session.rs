@@ -9055,3 +9055,158 @@ async fn fork_entry_swaps_in_a_new_parent_linked_session_file() {
         "the live session id is the branched header's id"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PIR-TUI-044: an ephemeral (`--no-session`) run must still announce its
+// starting user message through the session-event seam, so the TUI bridge can
+// render the user bubble.
+//
+// Upstream truth: `--no-session` builds a real `SessionManager.inMemory`
+// (packages/coding-agent/src/main.ts:365), so `message_end` persistence still
+// runs (packages/coding-agent/src/core/agent-session.ts:1146-1167) and the
+// interactive TUI adds the bubble on the run's `message_start` with role
+// "user" (packages/coding-agent/src/modes/interactive/interactive-mode.ts:
+// 3457-3465). pir's TUI subscribes to `AgentEventInterest::UI`
+// (src/tui/terminal.rs) and therefore ignores message lifecycle events; its
+// transcript bridge renders out-of-band user appends from `entry_appended`
+// (`session_event_bridge` → `WorkerEvent::EntryAppended`). The ephemeral
+// preamble sink used to be `None`, so nothing was emitted and an
+// extension-driven `pi.sendUserMessage` run drew no bubble at all.
+// ---------------------------------------------------------------------------
+
+/// Entries recorded by a TUI-shaped session-event subscriber: the `entry`
+/// payload of every `entry_appended` the interest filter admits.
+type EntryAppendedLog = Arc<Mutex<Vec<serde_json::Value>>>;
+
+fn entry_appended_handler(log: EntryAppendedLog) -> SessionEventHandler {
+    Arc::new(move |event: SessionEvent| {
+        if let SessionEvent::EntryAppended { entry } = event {
+            log.lock().unwrap().push(entry);
+        }
+    })
+}
+
+fn user_entry_texts(entries: &[serde_json::Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry["message"]["role"].as_str() == Some("user"))
+        .filter_map(|entry| {
+            entry["message"]["content"].as_array().map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<String>()
+            })
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn ephemeral_prompt_announces_a_user_entry_appended_in_memory() {
+    let temp = TempDir::new("ephemeral-entry-appended");
+    let agent = ephemeral_agent(race_registry("done"), &temp);
+    let entries: EntryAppendedLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event_with_interest(
+        entry_appended_handler(Arc::clone(&entries)),
+        pir::agent_session::SessionEventInterest::EntryAppendedUserOnly,
+    );
+
+    agent
+        .prompt("X6STARTUP-TURN", event_handler(EventLog::default()))
+        .await
+        .expect("ephemeral prompt");
+
+    let entries = entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        user_entry_texts(&entries),
+        vec!["X6STARTUP-TURN".to_string()],
+        "the ephemeral run must announce its starting user message exactly \
+         once (the TUI bubble source): {entries:?}"
+    );
+    let entry = &entries[0];
+    assert!(
+        entry["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty() && id.len() <= 16),
+        "the entry carries a session-shaped id: {entry:?}"
+    );
+
+    // No session file was created: the announcement is an in-memory mirror,
+    // and the transcript itself still lives in `ephemeral_transcript`.
+    assert!(
+        agent.state().session_path.is_none(),
+        "--no-session must not gain a session file"
+    );
+    let transcript = agent.ephemeral_transcript().await;
+    assert!(
+        transcript.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::Text(text) if text.text == "X6STARTUP-TURN"
+            )),
+            _ => false,
+        }),
+        "the in-memory transcript still carries the prompt: {transcript:?}"
+    );
+}
+
+/// The issue's exact path: an extension's idle `pi.sendUserMessage` queues a
+/// reserved `__pir_user_message` record (`prompt_loop::PENDING_USER_RUN_TYPE`)
+/// and the host pumps it through `run_custom_turn`. That run is a USER run
+/// and must announce its starting message like a typed prompt on a
+/// `--no-session` TUI.
+#[tokio::test]
+async fn ephemeral_extension_send_user_message_announces_a_user_entry_appended() {
+    let temp = TempDir::new("ephemeral-extension-bubble");
+    let agent = ephemeral_agent(race_registry("done"), &temp);
+    let entries: EntryAppendedLog = Arc::new(Mutex::new(Vec::new()));
+    agent.on_session_event_with_interest(
+        entry_appended_handler(Arc::clone(&entries)),
+        pir::agent_session::SessionEventInterest::EntryAppendedUserOnly,
+    );
+
+    // The record shape `sendUserMessage` queues; `run_custom_turn` decodes it
+    // back into `RunTrigger::User`.
+    let record = pir::agent_session::CustomRunMessage {
+        custom_type: "__pir_user_message".to_string(),
+        content: serde_json::json!([]),
+        display: false,
+        details: Some(serde_json::json!({
+            "text": "X6STARTUP-TURN",
+            "images": [],
+        })),
+    };
+    let noop: pir::agent_session::EventHandler = Arc::new(|_| {});
+    let outcome = agent
+        .run_custom_turn(record, noop)
+        .await
+        .expect("extension-driven user run");
+    assert_eq!(
+        text_of_message(&Message::Assistant(outcome)).as_deref(),
+        Some("done"),
+        "the run reached the model"
+    );
+
+    let entries = entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        user_entry_texts(&entries),
+        vec!["X6STARTUP-TURN".to_string()],
+        "an extension-driven ephemeral user run must render its bubble from \
+         the session-event seam, like upstream's in-memory session: {entries:?}"
+    );
+    assert!(
+        agent.state().session_path.is_none(),
+        "--no-session must not gain a session file"
+    );
+    let transcript = agent.ephemeral_transcript().await;
+    let texts: Vec<String> = transcript.iter().filter_map(text_of_message).collect();
+    assert!(
+        texts.iter().any(|text| text == "X6STARTUP-TURN")
+            && texts.iter().any(|text| text == "done"),
+        "the in-memory transcript keeps the user message and the reply: {texts:?}"
+    );
+}

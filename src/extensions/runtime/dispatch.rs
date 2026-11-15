@@ -545,7 +545,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "text_start")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 serialize_block(&mut map, partial, *content_index)?;
             }
             AssistantMessageEvent::TextDelta {
@@ -554,7 +554,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "text_delta")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 if text_of(partial.content.get(*content_index)) == Some(delta.as_str()) {
                     serialize_block(&mut map, partial, *content_index)?;
@@ -566,7 +566,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "text_end")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("content", content)?;
                 serialize_block(&mut map, partial, *content_index)?;
             }
@@ -575,7 +575,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "thinking_start")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 serialize_block(&mut map, partial, *content_index)?;
             }
             AssistantMessageEvent::ThinkingDelta {
@@ -584,7 +584,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "thinking_delta")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 if thinking_of(partial.content.get(*content_index)) == Some(delta.as_str()) {
                     serialize_block(&mut map, partial, *content_index)?;
@@ -596,7 +596,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "thinking_end")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("content", content)?;
                 serialize_block(&mut map, partial, *content_index)?;
             }
@@ -605,7 +605,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "toolcall_start")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 serialize_block(&mut map, partial, *content_index)?;
             }
             AssistantMessageEvent::ToolCallDelta {
@@ -614,7 +614,7 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "toolcall_delta")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 // The authoritative value of this delta is either the O(delta)
                 // patch (one string argument gained `tail`), an unchanged
@@ -643,8 +643,8 @@ impl serde::Serialize for MessageUpdateEventWire<'_> {
                 partial,
             } => {
                 map.serialize_entry("type", "toolcall_end")?;
-                map.serialize_entry("content_index", content_index)?;
-                map.serialize_entry("tool_call", tool_call)?;
+                map.serialize_entry("contentIndex", content_index)?;
+                map.serialize_entry("toolCall", tool_call)?;
                 serialize_block(&mut map, partial, *content_index)?;
             }
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {

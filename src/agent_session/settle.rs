@@ -263,7 +263,59 @@ pub(crate) enum BoundarySession<'a> {
     Shared(&'a Arc<tokio::sync::Mutex<Option<SessionManager>>>),
 }
 
+/// Wire view of one projected session entry (upstream `ProjectedSessionEntry`,
+/// `core/session-manager.ts:209-215`): the source JSONL entry plus its
+/// model-visible messages.
+#[derive(serde::Serialize)]
+struct ProjectedEntryWire<'a> {
+    #[serde(rename = "sourceEntry")]
+    source_entry: &'a FileEntry,
+    messages: &'a [Message],
+}
+
+/// `contextEntries` of a boundary preview (upstream `_buildBoundaryContext`'s
+/// `projection.entries`, agent-session.ts:999-1014): the session's active
+/// projection, compaction-aware and context-edit aware. Empty when the
+/// projection cannot be built (diagnosed, never fatal to the boundary).
+fn projected_entries_json(session: &SessionManager) -> Vec<JsonValue> {
+    match session.build_session_projection() {
+        Ok(projection) => projection
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                serde_json::to_value(ProjectedEntryWire {
+                    source_entry: entry.source_entry.as_ref(),
+                    messages: entry.messages_in(&projection.messages),
+                })
+                .ok()
+            })
+            .collect(),
+        Err(error) => {
+            crate::ext_diag!("[ext] boundary projection failed: {error}");
+            Vec::new()
+        }
+    }
+}
+
 impl BoundarySession<'_> {
+    /// [`projected_entries_json`] over either host's storage slot.
+    async fn projected_entries(&self) -> Vec<JsonValue> {
+        match self {
+            Self::Direct(session) => {
+                let session = session.lock().await;
+                projected_entries_json(&session)
+            }
+            #[cfg(feature = "print")]
+            Self::Shared(session) => {
+                let guard = session.lock().await;
+                guard
+                    .as_ref()
+                    .map(projected_entries_json)
+                    .unwrap_or_default()
+            }
+        }
+    }
+
     async fn find_persisted_turn_entry_ids(
         &self,
         message: &AssistantMessage,
@@ -472,6 +524,42 @@ async fn append_compaction_shared_if_session(
     .map_err(|error| anyhow::anyhow!("session compaction append blocking task failed: {error}"))?
 }
 
+/// `pendingMessages` of a boundary preview (upstream
+/// `_getPendingBoundaryMessages`, agent-session.ts:997-999):
+/// `[...agent.peekQueuedMessages(), ...this._pendingCustomMessages]`.
+///
+/// The agent queue is pir's steering + follow-up inboxes (peek, never drain:
+/// the loop's poll owns delivery). A queued custom message keeps its `role:
+/// "custom"` wire shape, exactly what upstream's `AgentMessage[]` carries; the
+/// custom runs held for the next run (`deliverAs: "nextTurn"`) are the
+/// `_pendingCustomMessages` half.
+async fn collect_boundary_pending_messages(
+    steering: &super::inbox::Inbox,
+    follow_up: &super::inbox::Inbox,
+    pending_custom: &Mutex<VecDeque<CustomRunMessage>>,
+) -> Vec<JsonValue> {
+    let mut pending = Vec::new();
+    for prompt in steering
+        .peek()
+        .await
+        .into_iter()
+        .chain(follow_up.peek().await)
+    {
+        pending.push(match &prompt.wire {
+            Some(wire) => wire.clone(),
+            None => message_json(&prompt.message),
+        });
+    }
+    for custom in pending_custom
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        pending.push(custom.to_json());
+    }
+    pending
+}
+
 impl AgentSession {
     /// Chain the extension `turn_end` boundary onto the host-installed
     /// `finish_turn` hook (upstream `_installAgentBoundaryHooks`): the
@@ -495,10 +583,20 @@ impl AgentSession {
         }
         let session = self.session.clone();
         let pending = Arc::clone(&self.pending_messages);
+        // Boundary `pendingMessages` (upstream `_getPendingBoundaryMessages`,
+        // agent-session.ts:997-999): the live steering/follow-up inboxes plus
+        // the custom messages held for the next run. Cloned handles, sampled
+        // at boundary time.
+        let steering = self.steering_inbox.clone();
+        let follow_up = self.follow_up_inbox.clone();
+        let pending_custom = Arc::clone(&self.pending_custom_runs);
         Some(Arc::new(move |context: FinishTurnContext| {
             let plugins = Arc::clone(&plugins);
             let session = session.clone();
             let pending = Arc::clone(&pending);
+            let steering = steering.clone();
+            let follow_up = follow_up.clone();
+            let pending_custom = Arc::clone(&pending_custom);
             let inner = inner.clone();
             let run_session_id = run_session_id.clone();
             Box::pin(async move {
@@ -509,12 +607,20 @@ impl AgentSession {
                 // `turn_start` on every turn.
                 let turn_index = context.turn_index;
                 let boundary = session.as_ref().map(BoundarySession::Direct);
-                let extension_continue = dispatch_turn_end_boundary(
+                let pending_custom_empty = pending_custom
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty();
+                let has_pending = pending.load(Ordering::SeqCst) > 0 || !pending_custom_empty;
+                let pending_payload =
+                    collect_boundary_pending_messages(&steering, &follow_up, &pending_custom).await;
+                let extension_continue = dispatch_turn_end_boundary_with_pending(
                     &plugins,
                     boundary,
                     turn_index,
                     &context,
-                    pending.load(Ordering::SeqCst) > 0,
+                    has_pending,
+                    pending_payload,
                     run_session_id.as_deref(),
                 )
                 .await;
@@ -553,12 +659,25 @@ impl AgentSession {
         run_session_id: Option<&str>,
     ) -> bool {
         let boundary = self.session.as_ref().map(BoundarySession::Direct);
-        dispatch_agent_before_settle_boundary(
+        let pending_custom_empty = self
+            .pending_custom_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty();
+        let has_pending = self.pending_messages.load(Ordering::SeqCst) > 0 || !pending_custom_empty;
+        let pending_payload = collect_boundary_pending_messages(
+            &self.steering_inbox,
+            &self.follow_up_inbox,
+            &self.pending_custom_runs,
+        )
+        .await;
+        dispatch_agent_before_settle_boundary_with_pending(
             plugins,
             boundary,
             context,
             terminal,
-            self.pending_messages.load(Ordering::SeqCst) > 0,
+            has_pending,
+            pending_payload,
             run_session_id,
         )
         .await
@@ -937,6 +1056,35 @@ pub(crate) async fn append_compaction_if_session(
     .map_err(|error| anyhow::anyhow!("session compaction append blocking task failed: {error}"))?
 }
 
+/// The `context` object of a boundary event (upstream `BoundaryContextPreview`,
+/// `extensions/types.ts:1007-1013`):
+/// `{contextEntries, contextMessages, llmMessages, pendingMessages,
+/// canContinue}`, filled exactly like `_buildBoundaryContext`
+/// (agent-session.ts:999-1020).
+///
+/// `llmMessages` repeats `contextMessages`: pir's [`Message`] IS the LLM
+/// projection (`session_manager::projection` renders custom/bash entries at
+/// projection time), so upstream's `convertToLlm` has no further
+/// transformation to apply here.
+fn boundary_context_payload(
+    context: &Context,
+    can_continue: bool,
+    entries: Vec<JsonValue>,
+    pending: Vec<JsonValue>,
+) -> JsonValue {
+    let context_messages: Vec<JsonValue> = context.messages.iter().map(message_json).collect();
+    let mut payload = serde_json::Map::with_capacity(5);
+    payload.insert("contextEntries".to_owned(), JsonValue::Array(entries));
+    payload.insert(
+        "contextMessages".to_owned(),
+        JsonValue::Array(context_messages.clone()),
+    );
+    payload.insert("llmMessages".to_owned(), JsonValue::Array(context_messages));
+    payload.insert("pendingMessages".to_owned(), JsonValue::Array(pending));
+    payload.insert("canContinue".to_owned(), JsonValue::Bool(can_continue));
+    JsonValue::Object(payload)
+}
+
 /// Whether the boundary context can still run a provider request (upstream
 /// `BoundaryContextPreview.canContinue`, simplified): non-empty non-system
 /// transcript whose last message is not an assistant turn.
@@ -968,6 +1116,29 @@ pub(crate) async fn dispatch_turn_end_boundary(
     turn_index: usize,
     context: &FinishTurnContext,
     pending_messages: bool,
+    run_session_id: Option<&str>,
+) -> bool {
+    dispatch_turn_end_boundary_with_pending(
+        plugins,
+        session,
+        turn_index,
+        context,
+        pending_messages,
+        Vec::new(),
+        run_session_id,
+    )
+    .await
+}
+
+/// [`dispatch_turn_end_boundary`] with the boundary's `pendingMessages` (the
+/// AgentSession host samples its inboxes; the print host passes an empty list).
+pub(crate) async fn dispatch_turn_end_boundary_with_pending(
+    plugins: &PluginHost,
+    session: Option<BoundarySession<'_>>,
+    turn_index: usize,
+    context: &FinishTurnContext,
+    pending_messages: bool,
+    pending_payload: Vec<JsonValue>,
     run_session_id: Option<&str>,
 ) -> bool {
     // No handler: the emit below would be a no-op, but building the payload
@@ -1037,23 +1208,24 @@ pub(crate) async fn dispatch_turn_end_boundary(
         "outcome".to_owned(),
         JsonValue::String(outcome_label(&context.message).to_owned()),
     );
-    // `contextMessages` is the full transcript view the plugin contract
-    // requires: serialize it exactly once, then move the array into the
-    // payload. No second copy is made on the way in.
-    let mut context_payload = serde_json::Map::with_capacity(2);
-    context_payload.insert(
-        "contextMessages".to_owned(),
-        JsonValue::Array(
-            context
-                .context
-                .messages
-                .iter()
-                .map(message_json)
-                .collect::<Vec<_>>(),
+    // `BoundaryContextPreview` (upstream extensions/types.ts:1007-1013,
+    // `_buildBoundaryContext` agent-session.ts:999-1020): five fields, built
+    // once here. `contextEntries` is the session projection; the AgentSession
+    // host also supplies `pendingMessages` (print dispatches through the
+    // boolean-only wrapper above, so its list stays empty).
+    let entries = match &session {
+        Some(session) => session.projected_entries().await,
+        None => Vec::new(),
+    };
+    payload.insert(
+        "context".to_owned(),
+        boundary_context_payload(
+            context.context.as_ref(),
+            can_continue,
+            entries,
+            pending_payload,
         ),
     );
-    context_payload.insert("canContinue".to_owned(), JsonValue::Bool(can_continue));
-    payload.insert("context".to_owned(), JsonValue::Object(context_payload));
     let mut payload = JsonValue::Object(payload);
     if let Some(message_entry_id) = message_entry_id {
         payload["messageEntryId"] = serde_json::json!(message_entry_id);
@@ -1091,6 +1263,30 @@ pub(crate) async fn dispatch_agent_before_settle_boundary(
     pending_messages: bool,
     run_session_id: Option<&str>,
 ) -> bool {
+    dispatch_agent_before_settle_boundary_with_pending(
+        plugins,
+        session,
+        context,
+        terminal,
+        pending_messages,
+        Vec::new(),
+        run_session_id,
+    )
+    .await
+}
+
+/// [`dispatch_agent_before_settle_boundary`] with the boundary's
+/// `pendingMessages` (the AgentSession host samples its inboxes; the print
+/// host passes an empty list).
+pub(crate) async fn dispatch_agent_before_settle_boundary_with_pending(
+    plugins: &PluginHost,
+    session: Option<BoundarySession<'_>>,
+    context: &Context,
+    terminal: &AssistantMessage,
+    pending_messages: bool,
+    pending_payload: Vec<JsonValue>,
+    run_session_id: Option<&str>,
+) -> bool {
     // See `dispatch_turn_end_boundary`: a handler-less boundary must not
     // serialize the whole context before discovering there is nobody to
     // receive it.
@@ -1103,12 +1299,11 @@ pub(crate) async fn dispatch_agent_before_settle_boundary(
     let can_continue = context_can_continue(context) || pending_messages;
     // Build by moves: `json!` re-serializes Vec<Value>/Value expressions,
     // which doubled the whole transcript on every settle boundary.
-    let mut context_payload = serde_json::Map::with_capacity(2);
-    context_payload.insert(
-        "contextMessages".to_owned(),
-        JsonValue::Array(context.messages.iter().map(message_json).collect()),
-    );
-    context_payload.insert("canContinue".to_owned(), JsonValue::Bool(can_continue));
+    let entries = match &session {
+        Some(session) => session.projected_entries().await,
+        None => Vec::new(),
+    };
+    let context_payload = boundary_context_payload(context, can_continue, entries, pending_payload);
     let mut payload_map = serde_json::Map::with_capacity(5);
     payload_map.insert(
         "type".to_owned(),
@@ -1120,7 +1315,7 @@ pub(crate) async fn dispatch_agent_before_settle_boundary(
     );
     payload_map.insert("entries".to_owned(), JsonValue::Array(Vec::new()));
     payload_map.insert("continue".to_owned(), JsonValue::Bool(false));
-    payload_map.insert("context".to_owned(), JsonValue::Object(context_payload));
+    payload_map.insert("context".to_owned(), context_payload);
     let mut payload = JsonValue::Object(payload_map);
     let outcome = match plugins.emit("agent_before_settle", &mut payload).await {
         Ok(outcome) => outcome,

@@ -109,7 +109,9 @@ fn event_serde_shape_is_stable() {
     };
     let value = serde_json::to_value(&event).expect("serialize event");
     assert_eq!(value["type"], "text_delta");
-    assert_eq!(value["content_index"], 2);
+    // Upstream `AssistantMessageEvent` spells the carrier camelCase
+    // (packages/ai/src/types.ts:823-831).
+    assert_eq!(value["contentIndex"], 2);
     assert_eq!(value["delta"], "he");
     assert_eq!(value["partial"]["role"], "assistant");
     assert_eq!(value["partial"]["content"][0]["text"], "the");

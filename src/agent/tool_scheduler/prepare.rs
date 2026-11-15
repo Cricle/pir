@@ -12,7 +12,7 @@ use crate::agent::tool_batch::{
 use crate::agent::tool_dependencies::ResourceKey;
 use crate::agent::tool_execution::{
     panic_payload_message, AgentTool, BeforeToolCallResult, ToolContext, ToolEventFaces, ToolHooks,
-    ToolRegistry,
+    ToolRegistry, DEFAULT_BLOCKED_TOOL_REASON,
 };
 
 use super::execute::end_event;
@@ -325,9 +325,11 @@ pub(super) async fn prepare_calls(
             .await
             {
                 Ok(decision) if decision.blocked => {
-                    let reason = decision.reason.unwrap_or_else(|| {
-                        format!("Tool '{}' was blocked by an extension", call.tool_name)
-                    });
+                    // Upstream `agent-loop.ts:756`: a block without a reason
+                    // uses the fixed sentence, never the tool name.
+                    let reason = decision
+                        .reason
+                        .unwrap_or_else(|| DEFAULT_BLOCKED_TOOL_REASON.to_owned());
                     // Upstream `ToolCallEventResult.terminate` (types.ts:1430-
                     // 1434): a hint that the agent should stop after the
                     // current tool batch when this call is blocked — honored

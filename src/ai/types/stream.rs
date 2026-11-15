@@ -985,7 +985,7 @@ pub enum AssistantMessageEvent {
     /// Text content block started.
     #[serde(rename = "text_start")]
     TextStart {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         #[serde(default)]
         partial: Arc<AssistantMessage>,
@@ -993,7 +993,7 @@ pub enum AssistantMessageEvent {
     /// Text delta chunk.
     #[serde(rename = "text_delta")]
     TextDelta {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         delta: String,
         #[serde(default)]
@@ -1002,7 +1002,7 @@ pub enum AssistantMessageEvent {
     /// Text content block ended.
     #[serde(rename = "text_end")]
     TextEnd {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         content: String,
         #[serde(default)]
@@ -1011,7 +1011,7 @@ pub enum AssistantMessageEvent {
     /// Thinking content block started.
     #[serde(rename = "thinking_start")]
     ThinkingStart {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         #[serde(default)]
         partial: Arc<AssistantMessage>,
@@ -1019,7 +1019,7 @@ pub enum AssistantMessageEvent {
     /// Thinking delta chunk.
     #[serde(rename = "thinking_delta")]
     ThinkingDelta {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         delta: String,
         #[serde(default)]
@@ -1028,7 +1028,7 @@ pub enum AssistantMessageEvent {
     /// Thinking content block ended.
     #[serde(rename = "thinking_end")]
     ThinkingEnd {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         content: String,
         #[serde(default)]
@@ -1037,7 +1037,7 @@ pub enum AssistantMessageEvent {
     /// Tool call block started.
     #[serde(rename = "toolcall_start")]
     ToolCallStart {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         #[serde(default)]
         partial: Arc<AssistantMessage>,
@@ -1045,7 +1045,7 @@ pub enum AssistantMessageEvent {
     /// Tool call delta chunk (JSON arguments).
     #[serde(rename = "toolcall_delta")]
     ToolCallDelta {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
         delta: String,
         #[serde(default)]
@@ -1054,9 +1054,9 @@ pub enum AssistantMessageEvent {
     /// Tool call block ended with full ToolCall.
     #[serde(rename = "toolcall_end")]
     ToolCallEnd {
-        #[serde(alias = "contentIndex")]
+        #[serde(rename = "contentIndex", alias = "content_index")]
         content_index: usize,
-        #[serde(alias = "toolCall")]
+        #[serde(rename = "toolCall", alias = "tool_call")]
         tool_call: ToolCall,
         #[serde(default)]
         partial: Arc<AssistantMessage>,

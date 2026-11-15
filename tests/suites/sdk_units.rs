@@ -586,10 +586,12 @@ async fn create_agent_session_builds_a_hermetic_session_and_runtime() {
     registry.set_provider(Arc::new(IdleProvider));
     let registry = ModelRegistry::from_registry(Arc::new(registry));
     // Hermetic discovery: pin the user-global `.agents/skills` scan to the
-    // temp home, not the developer's real profile.
+    // temp home and deny the project ancestor scan (the temp dir lives under
+    // the developer profile, whose `.agents/skills` would otherwise load).
     let resource_loader = || {
         pir::sdk::DefaultResourceLoader::new(dir.0.clone(), agent_dir.clone())
             .with_home(dir.0.clone())
+            .with_project_trusted(false)
     };
 
     let created = create_agent_session(CreateAgentSessionOptions {

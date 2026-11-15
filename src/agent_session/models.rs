@@ -332,12 +332,12 @@ fn clamp_thinking_level(requested: ThinkingLevel, available: &[ThinkingLevel]) -
 /// .defaultThinkingLevel`, then the shared
 /// [`DEFAULT_THINKING_LEVEL`](crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL).
 ///
-/// `off` in the settings default is treated as absent (the setting expresses a
-/// starting effort, not "disable thinking"); an explicit `off` — CLI, pattern
-/// suffix, or per-model override — still wins. This is the policy the TUI
-/// host's `initial_interactive_thinking` applies (settings default → shared
-/// default, `off` absent); it lives here because the print host must build
-/// with `tui` compiled out (`--no-default-features`).
+/// `off` is a real settings value: upstream resolves
+/// `defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL` without filtering it
+/// (model-resolver.ts:571,584-585), so an explicitly configured `off` starts
+/// the session with thinking disabled. This is the policy the TUI host's
+/// `initial_interactive_thinking` applies; it lives here because the print
+/// host must build with `tui` compiled out (`--no-default-features`).
 pub fn resolve_starting_thinking_level(
     explicit: Option<ThinkingLevel>,
     per_model: Option<ThinkingLevel>,
@@ -345,7 +345,7 @@ pub fn resolve_starting_thinking_level(
 ) -> ThinkingLevel {
     explicit
         .or(per_model)
-        .or(default_thinking_level.filter(|level| *level != ThinkingLevel::Off))
+        .or(default_thinking_level)
         .unwrap_or(crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
 }
 

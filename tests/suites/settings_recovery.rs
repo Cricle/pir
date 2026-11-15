@@ -703,10 +703,14 @@ fn malformed_models_json_degrades_to_the_catalog_and_warns() {
             && !stderr.contains("authentication failure"),
         "the file failure must stay a warning: {stderr:?}"
     );
+    // Upstream `--list-models` lists only authenticated providers
+    // (`getAvailable` → `getAuthenticatedProviders`; PIR-BIN-033). This
+    // isolated home has no credential, so the degraded catalog is correctly
+    // hidden and the upstream no-models message is printed; the malformed-file
+    // warning above is the contract this test pins.
     assert!(
-        stdout.lines().count() > 1000,
-        "the built-in catalog must still be listed ({} lines)",
-        stdout.lines().count()
+        stdout.contains("No models available"),
+        "no credential means no listed provider: {stdout:?}"
     );
 
     // 2. `pir models`: exit 0, same warning, the ordinary empty-config state

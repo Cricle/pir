@@ -1025,9 +1025,10 @@ pub enum Command {
     Interactive,
     /// Non-interactive single execution mode
     Print {
-        /// Prompt to execute (read from stdin when omitted or `-`)
+        /// Prompt(s) to execute; each additional positional runs as its own
+        /// turn (read from stdin when omitted or `-`)
         #[arg(value_name = "PROMPT")]
-        prompt: Option<String>,
+        prompts: Vec<String>,
     },
     /// RPC mode (JSON lines over stdin/stdout)
     Rpc,

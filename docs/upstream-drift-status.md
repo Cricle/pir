@@ -203,3 +203,54 @@ this pass: full `test_fast.ps1`
 retry), `g_durable` 747/747, `g_ai` 763/763, `g_tui` 777/777,
 `d32_resume_active_tools` 11/11, `cargo clippy --all-targets --all-features
 --locked -- -D warnings` EXIT 0, `cargo fmt --all -- --check` EXIT 0.
+
+## 2026-11-15 v1.5.2 sync audit
+
+Upstream moved from the audited `38ff99177` (2026-10-24, `v1.4.0+62`) to
+`v1.5.2` (`b4afdddf44e`, 2026-11-10): **641 commits / 3,116 files / +472,293
+−37,474**. Most of that range is out-of-scope platform work (Chord, the
+views/settings UI, evals, docs, release plumbing); **130 non-merge commits
+touch the ported source surfaces** (`packages/coding-agent/src` or
+`packages/ai/src`). Every one of those 130 is classified below from the commit
+diff plus the current tree.
+
+| Verdict | Commits |
+|---|---:|
+| Landed | 12 |
+| Partial | 22 |
+| Open | 54 |
+| N/A (docs/tests/Node-only/out-of-scope feature) | 40 |
+| Unverified | 2 |
+| **Total** | **130** |
+
+Full per-commit tables with `file:line` evidence:
+`.play/evidence/upstream-v152/audit-half1.md` and `audit-half2.md` (local
+working evidence; the counts above are their exact totals).
+
+**Open items worth a follow-up lane** (all small, upstream citations in the
+audit tables): active-tool order on same-set re-apply; branch-summary thinking
+level; LiteLLM `context window exceeded` overflow pattern; project-trust
+"do not trust" precedence; OpenRouter max-token input margin; grep lone-CR and
+limit-notice edge; hidden-thinking empty label; smaller PNG/JPEG selection;
+npm `--no-audit --no-fund` and realpath prefix; provider ids containing `/`;
+branch-summary context edits; default-model map refresh; Zhipu 1308
+non-retryable; tool-search name/coverage ranking; npm unchanged-version
+warning; OpenCode endpoint catalog; Copilot classifier; helper spawn cwd;
+`pi.exec` `truncated` result; MCP `-l`; MCP refresh-only guard;
+`requiresNonNullAssistantContent`; `promptCacheKeyMode`; cache-warming
+idle default; apostrophes in prompt-template args; live thinking-level
+recording; grep context from the engine; `pi auth login/logout` flags;
+case-insensitive Windows resource keys; and the remaining queue/window
+edge items.
+
+**Deferred / large (not a parity bug)**: Anthropic message threads,
+Bedrock strict-tool fallback, the pi-schema coercion superset, extension
+changelogs UI, MCP client-ID metadata `auto`, package-update version
+summary, Markdown-transformer surfaces, temporary npm/git source scopes,
+and the views/settings/Chord feature families. These need their own design
+pass; they are recorded here so a future sync can scope from evidence.
+
+Two rows are **Unverified** (`b2cb6292` credential-write settle on exit,
+`80d4d3c8` overlay reset on reload): their surfaces do not exist in the Rust
+architecture or could not be established from code alone. No row was left
+unclassified.

@@ -104,7 +104,7 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             AssistantMessageEvent::TextStart { content_index, .. } => {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", "text_start")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.end()
             }
             AssistantMessageEvent::TextDelta {
@@ -114,7 +114,7 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "text_delta")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 map.end()
             }
@@ -125,14 +125,14 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "text_end")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("content", content)?;
                 map.end()
             }
             AssistantMessageEvent::ThinkingStart { content_index, .. } => {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", "thinking_start")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.end()
             }
             AssistantMessageEvent::ThinkingDelta {
@@ -142,7 +142,7 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "thinking_delta")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 map.end()
             }
@@ -153,7 +153,7 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "thinking_end")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("content", content)?;
                 map.end()
             }
@@ -168,7 +168,7 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
                 let mut map =
                     serializer.serialize_map(Some(if identity.is_some() { 4 } else { 2 }))?;
                 map.serialize_entry("type", "toolcall_start")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 if let Some(tool_call) = identity {
                     map.serialize_entry("id", &tool_call.id)?;
                     map.serialize_entry("toolName", &tool_call.name)?;
@@ -182,7 +182,7 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "toolcall_delta")?;
-                map.serialize_entry("content_index", content_index)?;
+                map.serialize_entry("contentIndex", content_index)?;
                 map.serialize_entry("delta", delta)?;
                 map.end()
             }
@@ -193,8 +193,8 @@ impl serde::Serialize for AssistantMessageEventWire<'_> {
             } => {
                 let mut map = serializer.serialize_map(Some(3))?;
                 map.serialize_entry("type", "toolcall_end")?;
-                map.serialize_entry("content_index", content_index)?;
-                map.serialize_entry("tool_call", tool_call)?;
+                map.serialize_entry("contentIndex", content_index)?;
+                map.serialize_entry("toolCall", tool_call)?;
                 map.end()
             }
             AssistantMessageEvent::Done { reason, message } => {

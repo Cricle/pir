@@ -1603,9 +1603,18 @@ fn read_pi_models_json_from(path: &Path) -> Option<String> {
 /// instead of only for status queries (`has_configured_auth`).
 fn auth_backed_registry() -> ProviderRegistry {
     let agent_dir = settings::agent_dir();
-    ProviderRegistry::default().with_auth_storage(std::sync::Arc::new(
-        crate::ai::auth::FileAuthStorage::in_agent_dir(&agent_dir),
-    ))
+    // Upstream `getClientIdentity(settingsManager)` (client-identity.ts:10-16)
+    // wired into every request (sdk.ts:346-350): the host registry carries the
+    // detailed pi User-Agent and install-telemetry attribution. PIR-BIN-059:
+    // the `with_identity` seam existed but no host installed it.
+    let identity = crate::ai::provider::pi_client_identity(
+        crate::ai::provider::install_telemetry_enabled_in(&agent_dir),
+    );
+    ProviderRegistry::default()
+        .with_auth_storage(std::sync::Arc::new(
+            crate::ai::auth::FileAuthStorage::in_agent_dir(&agent_dir),
+        ))
+        .with_identity(identity)
 }
 
 /// Build the runtime provider for a composed model list: catalog-backed

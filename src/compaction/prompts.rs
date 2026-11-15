@@ -14,7 +14,7 @@ pub use crate::session_manager::projection::{
 /// Upstream `SUMMARIZATION_SYSTEM_PROMPT` (`compaction/utils.ts`).
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
-/// Upstream `SUMMARIZATION_PROMPT` (`compaction/compaction.ts`).
+/// Upstream `SUMMARIZATION_PROMPT` (`compaction/compaction.ts:507-541`).
 pub const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -46,8 +46,7 @@ Use this EXACT format:
 - [Any data, examples, or references needed to continue]
 - [Or "(none)" if not applicable]
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.
-Preserve exact file paths, function names, error messages, command exit codes and unfinished items; do not infer facts not present in the messages."#;
+Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 
 /// Upstream `UPDATE_SUMMARIZATION_INSTRUCTIONS` (`compaction/compaction.ts`).
 const UPDATE_SUMMARIZATION_INSTRUCTIONS: &str = r#"Update the existing structured summary with new information. RULES:

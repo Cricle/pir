@@ -853,12 +853,23 @@ async fn compaction_fn_success_produces_summary_user_message_then_retained_tail(
     assert!(prompt.starts_with("<conversation>\n"));
     assert!(prompt.contains("[User]: turn one"));
     assert!(prompt.contains("[Tool result]: xxxx"));
+    // Byte parity with upstream `SUMMARIZATION_PROMPT`
+    // (packages/coding-agent/src/core/compaction/compaction.ts:507-541): the
+    // prompt ends at the "Keep each section concise…" line. pir used to carry
+    // an extra trailing sentence, which PIR-BIN-055 removed.
     assert!(prompt.contains("Preserve exact file paths, function names, and error messages."));
-    assert!(prompt.contains(
-        "Preserve exact file paths, function names, error messages, command exit codes and unfinished items; do not infer facts not present in the messages."
-    ));
+    assert!(
+        !prompt.contains("command exit codes and unfinished items"),
+        "PIR-BIN-055: the extra upstream-divergent sentence must not come back"
+    );
     assert!(!prompt.contains("<previous-summary>"));
     assert!(prompt.contains(SUMMARIZATION_PROMPT));
+    assert!(
+        SUMMARIZATION_PROMPT.ends_with(
+            "Keep each section concise. Preserve exact file paths, function names, and error messages."
+        ),
+        "the constant is byte-identical to upstream's closing line"
+    );
 }
 
 #[tokio::test]

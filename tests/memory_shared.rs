@@ -183,8 +183,8 @@ fn event_wire_shape_round_trips() {
         "partial snapshot must remain on the wire: {wire}"
     );
     assert!(
-        wire.contains("\"content_index\":2"),
-        "field names are snake_case on the wire: {wire}"
+        wire.contains("\"contentIndex\":2"),
+        "upstream spells the carrier camelCase: {wire}"
     );
     let parsed: AssistantMessageEvent = serde_json::from_str(&wire).expect("deserialize event");
     assert_eq!(event, parsed, "round-trip must be lossless");

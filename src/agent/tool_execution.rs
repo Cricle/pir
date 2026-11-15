@@ -1833,6 +1833,15 @@ pub async fn gate_tool_calls(
     gate_tool_calls_with_host(Some(runtime), None, calls, parent_call_id).await
 }
 
+/// Model-visible result of a `tool_call` handler that blocked a call without
+/// a reason (upstream `agent-loop.ts:756`:
+/// `createErrorToolResult(beforeResult.reason || "Tool execution was blocked")`).
+///
+/// The sentence is constant: upstream never derives it from the tool name, so
+/// a handler that blocks silently hands the model the same text on both
+/// implementations.
+pub(crate) const DEFAULT_BLOCKED_TOOL_REASON: &str = "Tool execution was blocked";
+
 /// One call's `tool_call` verdict (upstream `ToolCallEventResult` plus the
 /// possibly-rewritten `input`).
 #[derive(Debug, Clone)]
@@ -1935,9 +1944,11 @@ pub async fn gate_tool_calls_with_host(
         {
             Ok(decision) => {
                 if decision.blocked {
-                    let reason = decision.reason.unwrap_or_else(|| {
-                        format!("Tool '{}' was blocked by an extension", call.tool_name)
-                    });
+                    // Upstream `agent-loop.ts:756`: a block without a reason
+                    // uses the fixed sentence, never the tool name.
+                    let reason = decision
+                        .reason
+                        .unwrap_or_else(|| DEFAULT_BLOCKED_TOOL_REASON.to_owned());
                     // Upstream `ToolCallEventResult.terminate` (types.ts:1430-
                     // 1434): a hint that the agent should stop after the
                     // current tool batch when this call is blocked — honored

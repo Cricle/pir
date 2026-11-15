@@ -5,6 +5,8 @@ mod keybinding_actions;
 mod std_utils_w11;
 #[path = "suites/tui_alloc_trace_units.rs"]
 mod tui_alloc_trace_units;
+#[path = "suites/tui_burst_latency_w22.rs"]
+mod tui_burst_latency_w22;
 #[path = "suites/tui_cache_lane.rs"]
 mod tui_cache_lane;
 #[path = "suites/tui_clipboard_paste.rs"]

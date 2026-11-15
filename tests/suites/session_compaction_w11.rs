@@ -21,9 +21,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use pir::agent::tool_execution::ToolRegistry;
+use pir::agent_session::{AgentSession, AgentSessionConfig};
+use pir::ai::auth::ApiKeyAuth;
+use pir::ai::event_stream::AssistantMessageEventStream;
+use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, Message, Model, ModelCost, ModelCostRates, StopReason,
-    TextContent, Tool, ToolCall, ToolResultMessage, ToolResultRole, Usage, UserMessage, UserRole,
+    StreamOptions, TerminalReason, TextContent, ThinkingLevel, Tool, ToolCall, ToolResultMessage,
+    ToolResultRole, Usage, UserMessage, UserRole,
 };
 use pir::compaction::prompts::COMPACTION_SUMMARY_PREFIX;
 use pir::compaction::{
@@ -1776,5 +1782,202 @@ async fn compaction_append_runs_off_the_runtime_thread() {
         .expect("append task join")
         .expect("compaction append");
     assert!(!entry_id.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// PIR-BIN-055: the summarizer request budget
+// ---------------------------------------------------------------------------
+
+/// Records `StreamOptions.max_tokens` per request and flags the summarizer
+/// call (its context carries the serialized `<conversation>` transcript).
+struct BudgetCaptureProvider {
+    model: Model,
+    seen: Arc<Mutex<Vec<(bool, Option<u64>)>>>,
+}
+
+impl Provider for BudgetCaptureProvider {
+    fn id(&self) -> &str {
+        &self.model.provider
+    }
+
+    fn name(&self) -> &str {
+        "budget capture"
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        vec![self.model.clone()]
+    }
+
+    fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
+        // Keyless: `stream_resolving_auth_for` dispatches anyway.
+        Vec::new()
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        context: Context,
+        options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        let is_summarizer = context.messages.iter().any(|message| match message {
+            Message::User(user) => user.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text(text) if text.text.contains("<conversation>")
+                )
+            }),
+            _ => false,
+        });
+        self.seen
+            .lock()
+            .unwrap()
+            .push((is_summarizer, options.max_tokens));
+        let message = AssistantMessage {
+            api: self.model.api.clone(),
+            provider: self.model.provider.clone(),
+            model: self.model.id.clone(),
+            content: vec![text_block(if is_summarizer { "SUMMARY" } else { "reply" })],
+            stop_reason: StopReason::Stop,
+            timestamp: 1,
+            ..Default::default()
+        };
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEventStream::done_event(
+            TerminalReason::Stop,
+            message,
+        ));
+        stream
+    }
+}
+
+/// Every session request — the compaction summarizer included — goes through
+/// upstream's simple-request path: the SDK stream function calls
+/// `modelRuntime.streamSimple` (`packages/coding-agent/src/core/sdk.ts:422`)
+/// and compaction calls `completeSimple`
+/// (`.../compaction/compaction.ts:636`), so `buildBaseOptions`' clamp
+/// `maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ??
+/// model.maxTokens)` (`packages/ai/src/api/simple-options.ts:78-84`) rides
+/// along. On a 2 000-token window with maxTokens 512, a transcript that
+/// nearly fills the window must send 1, not 512 (PIR-BIN-055).
+#[tokio::test]
+async fn compaction_summarizer_request_carries_the_context_clamped_budget() {
+    let dir = temp_dir("summarizer-clamp");
+    let mut model = test_model(2_000, 512);
+    model.provider = "budget-capture".into();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(BudgetCaptureProvider {
+        model: model.clone(),
+        seen: Arc::clone(&seen),
+    }));
+    let session = SessionManager::create(".", &dir).expect("create session");
+    let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: Arc::new(registry),
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: ToolRegistry::new(),
+        session: Some(session),
+        // Manual `/compact` runs regardless of the automatic threshold flag;
+        // disabling it keeps the seed prompts from compacting on their own.
+        compaction: Some(CompactionConfig {
+            enabled: false,
+            reserve_tokens: 1,
+            keep_recent_tokens: 8,
+        }),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(dir.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    });
+    let handler: pir::agent_session::EventHandler = Arc::new(|_event| {});
+    agent
+        .prompt(&format!("u-{}", "x".repeat(400)), Arc::clone(&handler))
+        .await
+        .expect("first prompt");
+    agent
+        .prompt(&format!("u-{}", "y".repeat(400)), Arc::clone(&handler))
+        .await
+        .expect("second prompt");
+    let result = agent.compact(None).await.expect("manual compact");
+    assert_eq!(result.summary, "SUMMARY");
+
+    let seen = seen.lock().unwrap();
+    let summarizer_budgets: Vec<Option<u64>> = seen
+        .iter()
+        .filter(|(is_summarizer, _)| *is_summarizer)
+        .map(|(_, max_tokens)| *max_tokens)
+        .collect();
+    assert!(
+        !summarizer_budgets.is_empty(),
+        "the compaction must issue a summarizer request (seen: {seen:?})"
+    );
+    assert_eq!(
+        summarizer_budgets,
+        vec![Some(1)],
+        "the summarizer budget is clamped to the window left after the transcript, \
+         never the unclamped model.maxTokens (512)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A large window leaves the model default untouched: the same clamp resolves
+/// `min(4096, 200000 - estimate - 4096) = 4096`.
+#[tokio::test]
+async fn compaction_summarizer_keeps_the_model_budget_on_a_large_window() {
+    let dir = temp_dir("summarizer-large-window");
+    let mut model = test_model(200_000, 4_096);
+    model.provider = "budget-capture".into();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ProviderRegistry::default();
+    registry.set_provider(Arc::new(BudgetCaptureProvider {
+        model: model.clone(),
+        seen: Arc::clone(&seen),
+    }));
+    let session = SessionManager::create(".", &dir).expect("create session");
+    let agent = AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: Arc::new(registry),
+        model,
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: ToolRegistry::new(),
+        session: Some(session),
+        compaction: Some(CompactionConfig {
+            enabled: false,
+            reserve_tokens: 1,
+            keep_recent_tokens: 8,
+        }),
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(dir.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    });
+    let handler: pir::agent_session::EventHandler = Arc::new(|_event| {});
+    agent
+        .prompt(&format!("u-{}", "x".repeat(400)), Arc::clone(&handler))
+        .await
+        .expect("first prompt");
+    agent
+        .prompt(&format!("u-{}", "y".repeat(400)), Arc::clone(&handler))
+        .await
+        .expect("second prompt");
+    let result = agent.compact(None).await.expect("manual compact");
+    assert_eq!(result.summary, "SUMMARY");
+
+    let summarizer_budgets: Vec<Option<u64>> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(is_summarizer, _)| *is_summarizer)
+        .map(|(_, max_tokens)| *max_tokens)
+        .collect();
+    assert_eq!(summarizer_budgets, vec![Some(4_096)]);
     std::fs::remove_dir_all(&dir).ok();
 }

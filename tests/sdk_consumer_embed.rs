@@ -334,9 +334,9 @@ async fn consumer_builds_runs_one_turn_and_lands_upstream_session_entries() {
         .expect("MessageEnd carries the completed message");
     assert_eq!(assistant_text(message_end).as_deref(), Some(REPLY));
 
-    // The per-run `agent_end` carries THIS run's produced messages (the
-    // assistant reply; the starting user message is a preamble, not produced
-    // by the run) and never claims a session retry.
+    // The per-run `agent_end` carries upstream's `newMessages`: the run's
+    // starting prompt plus everything the loop produced (agent-loop.ts:119-122,
+    // 329; PIR-BIN-047) and never claims a session retry.
     let (agent_end_messages, will_retry) = events
         .iter()
         .find_map(|event| match event {
@@ -351,9 +351,16 @@ async fn consumer_builds_runs_one_turn_and_lands_upstream_session_entries() {
         !will_retry,
         "a successful one-turn run has no retry pending"
     );
-    assert_eq!(agent_end_messages.len(), 1, "{agent_end_messages:?}");
+    assert_eq!(agent_end_messages.len(), 2, "{agent_end_messages:?}");
     assert!(matches!(
         agent_end_messages.first(),
+        Some(Message::User(message)) if message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text(text) if text.text == "summarize the consumer contract"))
+    ));
+    assert!(matches!(
+        agent_end_messages.last(),
         Some(Message::Assistant(message)) if assistant_text(message).as_deref() == Some(REPLY)
     ));
 

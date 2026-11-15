@@ -2972,6 +2972,14 @@ pub struct RpcOverrides {
     pub append_system_prompt: Vec<String>,
     /// `--name`: applied to each attached session storage.
     pub session_name: Option<String>,
+    /// The session-storage directory the CLI resolved
+    /// (`--session-dir` / `PI_CODING_AGENT_SESSION_DIR` / settings
+    /// `sessionDir` / `PIR_SESSION_DIR`, first non-empty wins). The CLI's
+    /// resolution is authoritative: re-reading `Config::from_env()` inside
+    /// this host only sees `PIR_SESSION_DIR` and silently ignored the other
+    /// three (PIR-BIN-026/038). `None` keeps the embedder behavior (re-read
+    /// the environment).
+    pub session_dir: Option<String>,
     /// The session plan the CLI resolved (`-c/-r/--session/--session-id/
     /// --fork/--no-session`). The host attaches its session at startup
     /// (upstream `main.ts:950-952`); `None` keeps the library-embedder
@@ -3009,8 +3017,29 @@ fn default_session_factory(
     // The full model environment so a CLI `--model/--provider` can select any
     // available model (built-in catalog included), like print and the TUI.
     let environment = crate::ai::providers::load_pi_environment(None)?;
+    // A resumed/attached branch continues on its recorded model/thinking
+    // unless the CLI chose one (PIR-BIN-032; upstream createAgentSession on
+    // attach).
+    let recorded_selection = session
+        .as_ref()
+        .map(crate::sdk::agent::session_recorded_settings);
+    let mut model_overrides = overrides.model.clone();
+    if model_overrides.provider.is_none() && model_overrides.model.is_none() {
+        if let Some((provider, model)) = recorded_selection
+            .as_ref()
+            .and_then(|recorded| recorded.model.clone())
+        {
+            model_overrides.provider = Some(provider);
+            model_overrides.model = Some(model);
+        }
+    }
+    if model_overrides.thinking.is_none() {
+        model_overrides.thinking = recorded_selection
+            .as_ref()
+            .and_then(|recorded| recorded.thinking);
+    }
     let selection = crate::coding_agent::overrides::resolve_model(
-        &overrides.model,
+        &model_overrides,
         &environment.models,
         &environment.api_keys,
         &environment.settings,
@@ -3099,8 +3128,14 @@ fn default_session_factory(
         .clone()
         .or(system_prompt_file)
         .or(discovered.0);
-    let mut append: Vec<String> = discovered.1.into_iter().collect();
-    append.extend(overrides.append_system_prompt.iter().cloned());
+    // A CLI append source replaces the discovered APPEND_SYSTEM.md (upstream
+    // resource-loader.ts:695-706); discovery only runs when none was supplied
+    // (PIR-BIN-065).
+    let append: Vec<String> = if overrides.append_system_prompt.is_empty() {
+        discovered.1.into_iter().collect()
+    } else {
+        overrides.append_system_prompt.clone()
+    };
     agent_session.apply_prompt_overrides(preamble_override, append);
     // Install the SAME discovered resource set the session exposes to
     // `/skill:` / `/template` expansion. Before this, RPC sessions held an
@@ -3191,6 +3226,12 @@ pub async fn run_rpc_with_options(
     // Resolved once at host startup: every session this factory builds gets
     // the same non-interactive turn cap.
     let max_turns = config.max_turns;
+    // The CLI's resolved session directory wins; the env re-read is only the
+    // embedder fallback (PIR-BIN-026/038).
+    let session_dir = overrides
+        .session_dir
+        .clone()
+        .unwrap_or_else(|| config.session_dir.clone());
     let factory: SessionFactory = Arc::new(move |session| {
         default_session_factory(
             session,
@@ -3200,7 +3241,7 @@ pub async fn run_rpc_with_options(
             max_turns,
         )
     });
-    let mut server = RpcServer::new(PathBuf::from(&config.session_dir), factory);
+    let mut server = RpcServer::new(PathBuf::from(session_dir), factory);
     if let Some(plan) = startup_session {
         server = server.with_startup_session(plan);
     }

@@ -730,7 +730,15 @@ pub fn expand_skill_command_cow<'a>(
         .parent()
         .map(|dir| dir.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let body = crate::skills::strip_frontmatter(content.trim_start_matches('\u{feff}')).trim();
+    // Upstream `extractFrontmatter`: newline-normalized and trimmed
+    // (frontmatter.ts:19-21); the skill expander embeds the same body shape
+    // as `/template` (PIR-BIN-068).
+    let body = match crate::skills::extract_frontmatter(content.trim_start_matches('\u{feff}')) {
+        Some((_yaml, body)) => body,
+        None => crate::skills::normalize_newlines(content.trim_start_matches('\u{feff}'))
+            .trim()
+            .to_string(),
+    };
     let skill_block = format!(
         "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
         skill.name,

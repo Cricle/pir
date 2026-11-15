@@ -590,7 +590,9 @@ fn resolve_services(
 /// Precedence for the preamble: `files.system` >
 /// `PIR_SYSTEM_PROMPT_FILE` (only when `discover`) > discovered
 /// `<cwd>/.pi/SYSTEM.md` (trust-gated) / `<agent_dir>/SYSTEM.md`. Append
-/// sections: discovered `APPEND_SYSTEM.md` first, then `files.append`.
+/// sections: an explicit `files.append` (or the builder's explicit append
+/// text) replaces the discovered `APPEND_SYSTEM.md`; discovery only runs when
+/// no explicit source exists (upstream resource-loader.ts:695-706).
 /// A session built with an explicit system prompt ignores all of it (the
 /// caller owns the whole prompt).
 pub(crate) fn apply_system_prompt_files(
@@ -600,6 +602,7 @@ pub(crate) fn apply_system_prompt_files(
     project_trusted: bool,
     discover: bool,
     files: &SystemPromptFiles,
+    explicit_append: bool,
 ) -> Result<(), SdkError> {
     let mut preamble = files.system.as_deref().map(read_prompt_file).transpose()?;
     let mut append: Vec<String> = Vec::new();
@@ -619,8 +622,14 @@ pub(crate) fn apply_system_prompt_files(
         if preamble.is_none() {
             preamble = discovered.0;
         }
-        if let Some(section) = discovered.1 {
-            append.insert(0, section);
+        // An explicit append source — `files.append` or the builder's
+        // `.append_system_prompt(..)` text — replaces the discovered file
+        // (upstream resource-loader.ts:695-706); discovery only fills an
+        // empty list (PIR-BIN-065).
+        if append.is_empty() && !explicit_append {
+            if let Some(section) = discovered.1 {
+                append.push(section);
+            }
         }
     }
     session.apply_prompt_overrides(preamble, append);
@@ -724,6 +733,7 @@ async fn build_from_services(
             project_trusted,
             discover_system_prompt,
             &prompt_files,
+            false,
         )?;
     }
     let effective_thinking = session_facade.set_thinking_level(thinking).await;

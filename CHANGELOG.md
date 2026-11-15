@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+Post-0.3.2 backlog closure: every verified `reproduced` item in the local issue
+board was fixed against upstream pi, the upstream tree was audited through
+v1.5.2, and the generated test harnesses were rebuilt.
+
+### correctness
+
+- Extension/RPC stream events use upstream's camelCase carrier fields
+  (`contentIndex`, `toolCall`); the JS accumulator and every wire consumer
+  moved with them (PIR-BIN-044).
+- The `context` event hides system messages from handlers and re-heads a
+  changed conversation with the replayed tool declaration; boundary events
+  carry upstream's five-field preview (`contextEntries`, `contextMessages`,
+  `llmMessages`, `pendingMessages`, `canContinue`), and `agent_end.messages`
+  is the declaration + starting prompt + produced messages (PIR-BIN-043/046/047).
+- A tool blocked without a reason now uses upstream's fixed
+  `Tool execution was blocked` sentence (PIR-BIN-051).
+- Resumed sessions restore their recorded model/thinking in print and RPC
+  (PIR-BIN-032); RPC honors the CLI-resolved session directory instead of
+  re-reading only `PIR_SESSION_DIR` (PIR-BIN-026/038).
+- `auth check`/`print-api-key` resolve a `models.json` provider `apiKey`, and
+  `--list-models` lists only authenticated providers (PIR-BIN-033).
+- `settings.defaultThinkingLevel: "off"` is honored instead of rewritten to
+  `medium` (PIR-BIN-034).
+- Compaction summarizers apply upstream's context budget clamp and prompt
+  text (PIR-BIN-055); Responses requests from print carry the session id and
+  max output tokens (PIR-BIN-060).
+- Session listing and `-c` order by the newest in-file activity timestamp,
+  not the file mtime (PIR-BIN-056).
+- Host registries install the pi client identity (detailed User-Agent +
+  telemetry-gated attribution) (PIR-BIN-059).
+- An explicit append source replaces the discovered `APPEND_SYSTEM.md` in
+  print/RPC/TUI/SDK (PIR-BIN-065); prompt-template bodies are trimmed and
+  LF-normalized like upstream `extractFrontmatter` (PIR-BIN-068).
+- `pir print` accepts multiple positional prompts, each its own turn
+  (PIR-BIN-029).
+
+### tui
+
+- A complete multi-key console batch / paste paints after one frame instead of
+  the 120 ms run-quiet window (PIR-TUI-026).
+- An extension-driven `pi.sendUserMessage` run under `--no-session` renders
+  its user bubble from an in-memory `entry_appended` event (PIR-TUI-044).
+
+### tests / docs
+
+- `scripts/gen_merged_tests.ps1 -Check` is green again: the 8 harnesses were
+  regenerated and `docs/test-harness-map.md` was re-derived from the real
+  `#[path]` graph (PIR-QE-002 option 1).
+- Runtime fork lifecycle fixture pins `session_before_fork` before the new
+  `session_start` (PIR-SDK-014 residual).
+- `docs/upstream-drift-status.md` records the v1.5.2 audit: 641 commits, 130
+  touching ported source (12 Landed / 22 Partial / 54 Open / 40 N/A / 2
+  Unverified), with the follow-up list and deferred feature families.
+
 ## 0.3.2 (2026-11-15)
 
 Stable release of the `0.3.1-rc.1` candidate: the full change list in the

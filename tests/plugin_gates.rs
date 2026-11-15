@@ -516,5 +516,10 @@ async fn native_plugin_observes_user_bash_project_trust_and_print_events_once() 
     assert_eq!(input["type"], json!("input"));
     assert_eq!(input["text"], json!("hello"));
     assert_eq!(input["source"], json!("rpc"));
-    assert_eq!(input["images"], json!([]));
+    // Upstream `InputEvent` omits optional keys when absent
+    // (extensions/types.ts:1171-1185); an idle RPC prompt carries no images.
+    assert!(
+        input.get("images").is_none(),
+        "idle input must omit the empty images list: {input}"
+    );
 }

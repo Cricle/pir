@@ -253,6 +253,25 @@ pub fn strip_frontmatter(text: &str) -> &str {
         .unwrap_or(text)
 }
 
+/// Normalize CRLF/CR line endings to LF (upstream `normalizeNewlines`).
+/// Borrowed when the input has no carriage return.
+pub fn normalize_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// Upstream `extractFrontmatter`'s body contract: the text after the closing
+/// fence, newline-normalized and trimmed (frontmatter.ts:19-21). The raw
+/// [`frontmatter_parts`] slice stays available for byte-offset consumers; every
+/// prompt/skill expander uses this owned form so a CRLF or padded body reaches
+/// the model exactly like pi.
+pub fn extract_frontmatter(text: &str) -> Option<(&str, String)> {
+    frontmatter_parts(text).map(|(yaml, body)| (yaml, normalize_newlines(body).trim().to_string()))
+}
+
 /// Parse skill frontmatter from file contents. Returns an error message only
 /// for malformed YAML — the one frontmatter failure that also drops a declared
 /// `SKILL.md` upstream. Field values are read per field: a non-string `name` or

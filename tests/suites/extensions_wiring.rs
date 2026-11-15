@@ -959,7 +959,9 @@ mod shim_deflate {
             // 2026-11-04 A-line hot paths: `__pirUnchanged` tool-call delta
             // marker (the accumulator keeps the held block when parsed
             // arguments did not move).
-            "0e5ddb8dc6ce6f43f1bad9e647fd200536eb867c8b2512213ce5f8389dc77808",
+            // PIR-BIN-044: the accumulator reads upstream's camelCase
+            // `event.contentIndex` (packages/ai/src/types.ts:823-831).
+            "a5e0d0dd1a39d8667287d79e89d30b014cf6be011f1ccd202d8f996eef384d80",
         ),
         (
             "process_global_stub.js.txt",

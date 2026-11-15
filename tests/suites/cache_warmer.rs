@@ -42,7 +42,11 @@ fn fake_model() -> Model {
             },
             tiers: Vec::new(),
         },
-        context_window: 4096,
+        // A realistic window: upstream `buildBaseOptions` clamps every simple
+        // request to `contextWindow - estimate - 4096`, and a 4096-token
+        // window would clamp even conversational requests to the 1-token
+        // floor, colliding with the warm request's deliberate `maxTokens: 1`.
+        context_window: 131072,
         max_tokens: 256,
         sampling_params: None,
         headers: None,

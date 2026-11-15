@@ -24716,11 +24716,10 @@ impl WorkerHandle {
 /// The interactive session's STARTING thinking level — the level every
 /// request of a fresh session asks the provider for.
 ///
-/// `settings.defaultThinkingLevel`, with `off` treated as absent (upstream
-/// `findInitialModel`'s resolver: `thinkingLevel: defaultThinkingLevel ??
-/// DEFAULT_THINKING_LEVEL`, model-resolver.ts:498-512, and its caller's
-/// `defaultThinkingLevel never defaults to off` filter — `print.rs` applies
-/// the same filter). The default is the shared
+/// `settings.defaultThinkingLevel` verbatim — including `off`, which upstream
+/// treats as a real value (`thinkingLevel: defaultThinkingLevel ??
+/// DEFAULT_THINKING_LEVEL`, model-resolver.ts:571/584-585). The default when
+/// the setting is absent is the shared
 /// [`DEFAULT_THINKING_LEVEL`](crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
 /// (medium).
 ///
@@ -24736,9 +24735,12 @@ impl WorkerHandle {
 pub fn initial_interactive_thinking(
     default_thinking_level: Option<crate::ai::types::ThinkingLevel>,
 ) -> crate::ai::types::ThinkingLevel {
-    default_thinking_level
-        .filter(|level| *level != crate::ai::types::ThinkingLevel::Off)
-        .unwrap_or(crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
+    // Upstream treats `off` as a real starting value
+    // (`defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL`,
+    // model-resolver.ts:571/584-585): an explicitly configured `off` starts
+    // the session with thinking disabled instead of being rewritten to
+    // `medium`.
+    default_thinking_level.unwrap_or(crate::ai::providers::resolution::DEFAULT_THINKING_LEVEL)
 }
 
 /// The STARTING thinking level an interactive session installs — the ONE
@@ -24925,8 +24927,14 @@ fn build_agent_session(
         .clone()
         .or(system_prompt_file)
         .or(discovered.0);
-    let mut append: Vec<String> = discovered.1.into_iter().collect();
-    append.extend(overrides.append_system_prompt.iter().cloned());
+    // A CLI append source replaces the discovered APPEND_SYSTEM.md (upstream
+    // resource-loader.ts:695-706); discovery only runs when none was supplied
+    // (PIR-BIN-065).
+    let append: Vec<String> = if overrides.append_system_prompt.is_empty() {
+        discovered.1.into_iter().collect()
+    } else {
+        overrides.append_system_prompt.clone()
+    };
     agent_session.apply_prompt_overrides(preamble_override, append);
     agent_session.set_event_interest(crate::agent::agent_loop::AgentEventInterest::UI);
     Ok(agent_session)
@@ -26728,12 +26736,27 @@ impl PrintableBurst {
     /// ordinary typing/keybindings exact while giving a fast terminal a chance
     /// to deliver the second character of a paste.
     pub const SINGLE_QUIET: Duration = Duration::from_millis(6);
-    /// Quiet window after a multi-key paste run. A human cannot produce the
-    /// second character inside [`Self::SINGLE_QUIET`], so once a run has two
-    /// presses it is machine/paste input; the longer window bridges a
-    /// terminal's line-by-line delivery (winpty pauses between console
-    /// records) without ever delaying ordinary typing, which never enters
-    /// multi-key mode.
+    /// Quiet window after a multi-key run whose drained batch is already
+    /// complete (the input queue is empty). PIR-TUI-026: a tool/terminal that
+    /// writes a whole short payload in one go (one console batch, one
+    /// bracketed paste) is DONE when it stops; waiting [`Self::RUN_QUIET`]
+    /// there delayed the insertion and paint by ~140 ms (measured) while
+    /// upstream pi inserts and paints a complete batch in 17-30 ms
+    /// (`stdin-buffer.ts:200-279` dispatches each complete sequence
+    /// immediately; `terminal.ts:240-266` forwards them one by one, and the
+    /// 16 ms `requestRender` clamp is the only wait). One frame is that
+    /// whole-batch settle window: a second read inside it still joins the
+    /// same run, so a terminal that splits a paste across adjacent batches
+    /// keeps its one-insertion coalescing.
+    pub const BATCH_QUIET: Duration = Duration::from_millis(16);
+    /// Quiet window for a multi-key run that keeps receiving payload across
+    /// drains (a slow paste: the terminal or winpty pauses between console
+    /// records). A human cannot produce the second character inside
+    /// [`Self::SINGLE_QUIET`], so once a run has two presses it is machine
+    /// input; this longer window keeps coalescing its continuation chunks
+    /// into one insertion and is also the "still hot" bound that lets a
+    /// pasted newline/tab join the run. It is NOT the tail wait after a
+    /// complete batch — that is [`Self::BATCH_QUIET`].
     pub const RUN_QUIET: Duration = Duration::from_millis(120);
     /// A newline joins the run only while the previous key is this recent.
     pub const NEWLINE_GAP: Duration = Duration::from_millis(25);
@@ -26764,7 +26787,13 @@ impl PrintableBurst {
         self.blocked_by.as_deref()
     }
 
-    /// Time until the next quiet-window flush, for the loop's poll timeout.
+    /// Time until the next flush decision, for the loop's poll timeout.
+    ///
+    /// A multi-key run waits only [`Self::BATCH_QUIET`] (one frame) for its
+    /// drained batch to be complete, and never past [`Self::FLUSH_INTERVAL`]
+    /// while it keeps receiving payload — PIR-TUI-026: the old
+    /// [`Self::RUN_QUIET`] wait slept through the deadline at which
+    /// [`Self::should_flush`] would already have released a complete batch.
     pub fn time_until_flush(&self, now: Instant) -> Option<Duration> {
         if self.presses == 0 {
             return None;
@@ -26772,9 +26801,15 @@ impl PrintableBurst {
         let quiet = if self.presses == 1 {
             Self::SINGLE_QUIET
         } else {
-            Self::RUN_QUIET
+            Self::BATCH_QUIET
         };
-        Some(quiet.saturating_sub(now.saturating_duration_since(self.last_at)))
+        let mut wait = quiet.saturating_sub(now.saturating_duration_since(self.last_at));
+        if self.presses > 1 {
+            let interval = Self::FLUSH_INTERVAL
+                .saturating_sub(now.saturating_duration_since(self.last_flush_at));
+            wait = wait.min(interval);
+        }
+        Some(wait)
     }
 
     fn push_char(&mut self, c: char, key: &KeyEvent, now: Instant) {
@@ -26895,6 +26930,11 @@ impl PrintableBurst {
                         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL);
                     let tab = key.code == KeyCode::Tab
                         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
+                    // Whether a newline/tab is payload of the run rather than a
+                    // key. A completed batch is flushed after
+                    // [`Self::BATCH_QUIET`], so a run surviving this long is
+                    // one still receiving payload across drains; RUN_QUIET is
+                    // the cross-batch join bound, not the flush tail.
                     let hot = now.saturating_duration_since(self.last_at)
                         <= if self.presses > 1 {
                             Self::RUN_QUIET
@@ -26990,12 +27030,17 @@ impl PrintableBurst {
         if blocked {
             return true;
         }
+        // PIR-TUI-026: a run whose drained batch is already complete flushes
+        // at the next frame, not after [`Self::RUN_QUIET`]. A follow-up read
+        // inside [`Self::BATCH_QUIET`] joins the run before this is evaluated,
+        // so adjacent console batches of one paste still coalesce; only a
+        // genuinely quiet run is released.
         queue_empty
             && now.saturating_duration_since(self.last_at)
                 >= if self.presses == 1 {
                     Self::SINGLE_QUIET
                 } else {
-                    Self::RUN_QUIET
+                    Self::BATCH_QUIET
                 }
     }
 

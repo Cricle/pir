@@ -5102,6 +5102,7 @@ async fn agent_end_will_retry_is_the_shared_run_state() {
         tool_results: Vec::new(),
         new_messages: Vec::new(),
         preamble: Vec::new(),
+        start_messages: Vec::new(),
         turns: 0,
         aborted: false,
         usage_total: 0,

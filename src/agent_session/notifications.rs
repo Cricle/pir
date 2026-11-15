@@ -399,6 +399,40 @@ pub(super) fn entry_appended_subscriber_wants(
     })
 }
 
+/// Whether a TUI-style subscriber — the only consumer that registers
+/// [`crate::agent_session::events::SessionEventInterest::EntryAppendedUserOnly`]
+/// — needs the `entry_appended` wire entry for this message.
+///
+/// A store-less session has no persisted entry to announce. Upstream models
+/// `--no-session` as an in-memory `SessionManager`, so its interactive TUI
+/// still renders the starting user bubble (PIR-TUI-044); pir's ephemeral
+/// mirror is therefore scoped to that bridge. Subscribers that default to
+/// `All` (print/RPC/SDK) keep their historical no-session stream: they have
+/// no session API to read the entry from and would only receive an event they
+/// cannot correlate with storage.
+pub(super) fn entry_appended_user_only_subscriber_wants(
+    events: &Arc<SessionEventHandlers>,
+    message: &Message,
+) -> bool {
+    let handlers = events
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if handlers.is_empty() {
+        return false;
+    }
+    let mut registrations = SESSION_EVENT_INTERESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    registrations.retain(|entry| entry.events.strong_count() > 0);
+    handlers.iter().any(|handler| {
+        session_event_interest_for(&registrations, events, handler)
+            == super::events::SessionEventInterest::EntryAppendedUserOnly
+            && super::events::SessionEventInterest::EntryAppendedUserOnly
+                .wants_entry_appended(message)
+    })
+}
+
 /// Register the session-event fan-out on a session's [`SessionEvent`] stream
 /// exactly once.
 ///

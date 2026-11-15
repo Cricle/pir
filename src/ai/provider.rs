@@ -1605,6 +1605,18 @@ impl ProviderRegistry {
     /// [`Self::stream_resolving_auth`] for one session: provider lookup and
     /// the auth-resolution step that may refresh an OAuth credential both use
     /// the session overlay (SNAP8 P2-1).
+    ///
+    /// Every request through this entry carries the model-derived simple
+    /// options: upstream's agent loop and compaction both call
+    /// `models.streamSimple` / `completeSimple` (`sdk.ts:422`,
+    /// `compaction.ts:636`), whose `buildBaseOptions` always resolves
+    /// `maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens
+    /// ?? model.maxTokens)` (`simple-options.ts:78-84`). Applying it here — the
+    /// session's single dispatch seam — makes the summarizer budget fit the
+    /// window the compaction just decided to relieve, and fills the adapter's
+    /// `max_output_tokens` / `max_completion_tokens` for every host (TUI, RPC,
+    /// print, compaction, cache warming). The clamp only lowers the budget, so
+    /// a caller that already resolved a smaller one keeps it.
     pub fn stream_resolving_auth_for(
         &self,
         session: Option<&ProviderSessionKey>,
@@ -1614,6 +1626,7 @@ impl ProviderRegistry {
     ) -> AssistantMessageEventStream {
         let session = session.cloned();
         let context = context.into();
+        let options = simple_stream_options_for_context(&model, &context, options);
         let outer = AssistantMessageEventStream::new();
         let output = outer.producer();
         let mut observer = ModelRequestObserver::start(&model, &options);
@@ -2734,6 +2747,21 @@ impl Default for ProviderRegistry {
             Arc::new(crate::ai::auth::InMemoryCredentialStore::new()),
             Arc::new(crate::ai::auth::EnvAuthContext::new()),
         )
+    }
+}
+
+/// The process-wide client identity a host registry installs: detailed
+/// `User-Agent` with the pir version, plus pi attribution while install
+/// telemetry is enabled (upstream `getClientIdentity`).
+pub fn pi_client_identity(telemetry_enabled: bool) -> ClientIdentity {
+    ClientIdentity {
+        user_agent: Some(crate::ai::types::UserAgentMode::Detailed),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        attribution: Some(if telemetry_enabled {
+            Some(crate::ai::types::pi_attribution())
+        } else {
+            None
+        }),
     }
 }
 

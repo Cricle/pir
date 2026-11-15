@@ -3199,6 +3199,31 @@ pub async fn run_print_with_environment(
     // get a fresh signal after `clear_abort`.
     let mut startup_abort = Some(crate::ai::types::AbortSignal::new());
 
+    // Session storage per the resolved plan (JSONL only), opened BEFORE model
+    // resolution so a resumed branch's recorded model/thinking can participate
+    // in `find_initial_model` (PIR-BIN-032). The manager lives behind a shared
+    // handle: per-message persistence (LoopOptions `persist_message`) and the
+    // compaction hook both append to it DURING the run, so a mid-run crash or
+    // termination signal loses nothing already streamed (upstream persists per
+    // `message_end` too, agent-session.ts:1144-1163).
+    let mut session = open_session_manager(
+        &options.session,
+        &cwd_text,
+        std::path::Path::new(&config.session_dir),
+    )?;
+    // Upstream `assertSessionCwdExists` (session-cwd.ts:54-59): the text print
+    // host is headless, so a stored session cwd that no longer exists is a hard
+    // error (the interactive host may instead offer to continue in the current
+    // cwd).
+    if let Some(session) = &session {
+        if let Some(issue) = session.missing_session_cwd() {
+            return Err(anyhow::anyhow!(issue.error_message(&cwd_text)));
+        }
+    }
+    if let (Some(session), Some(name)) = (session.as_mut(), options.session_name.as_deref()) {
+        session.set_session_name(Some(name))?;
+    }
+
     // Run diagnostics (crate::diagnostics): the collector is fed from the
     // event handler built below (the layer that already consumes the loop's
     // stream), enabled by the existing `PI_TIMING=1` gate. It stays inert —
@@ -3245,18 +3270,42 @@ pub async fn run_print_with_environment(
             "--api-key requires a model to be specified via --model, --provider/--model, or --models"
         ));
     }
+    // A resumed branch continues on its recorded model/thinking unless the
+    // CLI chose one (upstream `createAgentSession` on attach; TUI/SDK do the
+    // same through `get_session_context_settings`). PIR-BIN-032: print used to
+    // resolve only CLI/settings, silently switching a resumed session back to
+    // the defaults.
+    let recorded_selection = session
+        .as_ref()
+        .map(crate::sdk::agent::session_recorded_settings);
+    let (effective_provider, effective_model) =
+        if options.cli_provider.is_none() && options.cli_model.is_none() {
+            match recorded_selection
+                .as_ref()
+                .and_then(|recorded| recorded.model.clone())
+            {
+                Some((provider, model)) => (Some(provider), Some(model)),
+                None => (None, None),
+            }
+        } else {
+            (options.cli_provider.clone(), options.cli_model.clone())
+        };
+    let effective_thinking = options.cli_thinking.or_else(|| {
+        recorded_selection
+            .as_ref()
+            .and_then(|recorded| recorded.thinking)
+    });
     let initial = match find_initial_model(InitialModelOptions {
-        cli_provider: options.cli_provider.as_deref(),
-        cli_model: options.cli_model.as_deref(),
-        cli_thinking: options.cli_thinking,
+        cli_provider: effective_provider.as_deref(),
+        cli_model: effective_model.as_deref(),
+        cli_thinking: effective_thinking,
         scoped_models: &scoped_models,
         is_continuing: options.is_continuing,
         default_provider: settings.default_provider.as_deref(),
         default_model_id: settings.default_model.as_deref(),
-        // `defaultThinkingLevel` never defaults to `off`.
-        default_thinking_level: settings
-            .default_thinking_level
-            .filter(|level| *level != crate::ai::types::ThinkingLevel::Off),
+        // `defaultThinkingLevel` is used verbatim, including `off`
+        // (model-resolver.ts:571/584-585; PIR-BIN-034).
+        default_thinking_level: settings.default_thinking_level,
         model_thinking_levels: settings
             .model_thinking_levels
             .as_ref()
@@ -3348,7 +3397,7 @@ pub async fn run_print_with_environment(
     // the same resolver `find_initial_model` uses, so the grammar stays
     // single-sourced), else the first scoped model's `:level` suffix, then the
     // per-model `modelThinkingLevels` override, then `defaultThinkingLevel`
-    // (`off` treated as absent), then the shared `DEFAULT_THINKING_LEVEL`.
+    // (including `off`), then the shared `DEFAULT_THINKING_LEVEL`.
     // `find_initial_model` folds most of this chain into its
     // `initial.thinking_level`, but its CLI-args and first-available fallbacks
     // hard-code the shared default instead of consulting settings — resolving
@@ -3362,7 +3411,7 @@ pub async fn run_print_with_environment(
         // let the settings default (or the shared `medium`) win while the same
         // flag with `--model` did apply. The model arm only refines the
         // PREFIX when the flag is absent (its `:level` suffix).
-        let pattern_thinking = match options.cli_model.as_deref() {
+        let pattern_thinking = match effective_model.as_deref() {
             Some(pattern) => {
                 // Same resolver call as `find_initial_model`: `--model`
                 // without `--provider` still contributes its `:level` suffix,
@@ -3370,12 +3419,12 @@ pub async fn run_print_with_environment(
                 // suffix intact.
                 let (_, pattern_thinking, _) =
                     crate::ai::providers::resolution::resolve_cli_model_with_auth(
-                        options.cli_provider.as_deref(),
+                        effective_provider.as_deref(),
                         pattern,
                         &environment.models,
                         &has_auth,
                         options.api_key_override.is_some(),
-                        options.cli_thinking,
+                        effective_thinking,
                     )
                     .map_err(anyhow::Error::msg)?;
                 pattern_thinking
@@ -3387,7 +3436,7 @@ pub async fn run_print_with_environment(
             }
             None => None,
         };
-        let explicit = options.cli_thinking.or(pattern_thinking);
+        let explicit = effective_thinking.or(pattern_thinking);
         let per_model = settings.model_thinking_levels.as_ref().and_then(|levels| {
             levels
                 .get(&format!("{}/{}", model.provider, model.id))
@@ -3416,29 +3465,6 @@ pub async fn run_print_with_environment(
         .clone()
         .or_else(|| environment.api_keys.get(&model.provider).cloned());
 
-    // Session storage per the resolved plan (JSONL only). The manager lives
-    // behind a shared handle: per-message persistence (LoopOptions
-    // `persist_message`) and the compaction hook both append to it DURING the
-    // run, so a mid-run crash or termination signal loses nothing already
-    // streamed (upstream persists per `message_end` too,
-    // agent-session.ts:1144-1163).
-    let mut session = open_session_manager(
-        &options.session,
-        &cwd_text,
-        std::path::Path::new(&config.session_dir),
-    )?;
-    // Upstream `assertSessionCwdExists` (session-cwd.ts:54-59): the text print
-    // host is headless, so a stored session cwd that no longer exists is a hard
-    // error (the interactive host may instead offer to continue in the current
-    // cwd).
-    if let Some(session) = &session {
-        if let Some(issue) = session.missing_session_cwd() {
-            return Err(anyhow::anyhow!(issue.error_message(&cwd_text)));
-        }
-    }
-    if let (Some(session), Some(name)) = (session.as_mut(), options.session_name.as_deref()) {
-        session.set_session_name(Some(name))?;
-    }
     // Upstream `createAgentSession` records a NEW session's startup state
     // before the first message (sdk.ts:437-450): `model_change` then
     // `thinking_level_change` — after `--name`'s `session_info` row, exactly
@@ -3534,16 +3560,14 @@ pub async fn run_print_with_environment(
                 &merged_models,
             );
             let merged_initial = find_initial_model(InitialModelOptions {
-                cli_provider: options.cli_provider.as_deref(),
-                cli_model: options.cli_model.as_deref(),
-                cli_thinking: options.cli_thinking,
+                cli_provider: effective_provider.as_deref(),
+                cli_model: effective_model.as_deref(),
+                cli_thinking: effective_thinking,
                 scoped_models: &merged_scoped,
                 is_continuing: options.is_continuing,
                 default_provider: settings.default_provider.as_deref(),
                 default_model_id: settings.default_model.as_deref(),
-                default_thinking_level: settings
-                    .default_thinking_level
-                    .filter(|level| *level != crate::ai::types::ThinkingLevel::Off),
+                default_thinking_level: settings.default_thinking_level,
                 model_thinking_levels: settings
                     .model_thinking_levels
                     .as_ref()
@@ -3839,12 +3863,18 @@ pub async fn run_print_with_environment(
         Some(value) => Some(resolve_prompt_input(value)),
         None => system_prompt_file.or(discovered.0),
     };
-    // `--append-system-prompt` entries (text or file contents) come after the
-    // discovered APPEND_SYSTEM.md.
-    let mut append = discovered.1.into_iter().collect::<Vec<_>>();
-    for entry in &options.append_system_prompt {
-        append.push(resolve_text_or_file(entry)?);
-    }
+    // Upstream `resource-loader.ts:695-706`: a CLI append source REPLACES the
+    // discovered APPEND_SYSTEM.md; discovery only runs when no source was
+    // supplied. The old shape stacked both (PIR-BIN-065).
+    let append: Vec<String> = if options.append_system_prompt.is_empty() {
+        discovered.1.into_iter().collect()
+    } else {
+        options
+            .append_system_prompt
+            .iter()
+            .map(|entry| resolve_text_or_file(entry))
+            .collect::<crate::Result<Vec<_>>>()?
+    };
     // The package asset dir is resolved once here (upstream `getPackageDir`);
     // the builder itself never reads the process environment.
     let package_dir = crate::config::env::package_dir();
@@ -4196,6 +4226,14 @@ pub async fn run_print_with_environment(
     // An extension-command turn (`continue` below) runs no model, so the
     // previous turn's disposition stands, like upstream reading session state.
     let mut exit_code = 0;
+    // Provider-facing session identity for a storage-less (`--no-session`)
+    // run. Upstream still has an in-memory `SessionManager` whose id is
+    // minted at construction and passed to every request (`sdk.ts:427`,
+    // `session-manager.ts:1061`: `this.sessionId = options?.id ??
+    // createSessionId()`), so the runner's `prompt_cache_key` / session
+    // affinity headers exist even without persistence. Mint once per
+    // invocation so every prompt of the run shares the id.
+    let ephemeral_provider_session_id = crate::session_manager::new_session_id();
     for (turn_index, prompt) in prompts.iter().enumerate() {
         // Abort notifications queued after the previous run settled (for
         // example by an `agent_settled` handler) have no live run to cancel;
@@ -4573,6 +4611,15 @@ pub async fn run_print_with_environment(
                 None => (None, None, None),
             }
         };
+        // The identity the provider sees (upstream sdk.ts:427 hands
+        // `sessionManager.getSessionId()` to every request, persisted or
+        // not): the stored session id when one exists, else the run's minted
+        // id. Carried on both stream option sets below so the openai-responses
+        // adapter emits `prompt_cache_key` plus the session-affinity headers
+        // (`openai-responses.ts:301-322,363-375`).
+        let provider_session_id = session_id
+            .clone()
+            .unwrap_or_else(|| ephemeral_provider_session_id.clone());
         // One prompt run may settle more than once: an `agent_before_settle`
         // continuation re-runs the loop over the settled context (upstream
         // runner boundary semantics). The deps are rebuilt per iteration —
@@ -4600,6 +4647,19 @@ pub async fn run_print_with_environment(
                     api_key: api_key.clone(),
                     reasoning: Some(thinking_level),
                     hooks: transport_hooks.clone(),
+                    // Upstream `buildBaseOptions` resolves the model default
+                    // before the adapter sees the request
+                    // (`simple-options.ts:78-84`: `options?.maxTokens ??
+                    // model.maxTokens`, then the context clamp); a zero
+                    // (JS-falsy) model cap still sends nothing. The responses
+                    // adapter has no `model.maxTokens` fallback of its own, so
+                    // without this the request omits `max_output_tokens`
+                    // (`openai-responses.ts:371-373`).
+                    max_tokens: (model.max_tokens > 0).then_some(model.max_tokens),
+                    // Provider session identity: `prompt_cache_key` and the
+                    // session-affinity headers exist only when the request
+                    // carries it (`openai-responses.ts:301-322,363-375`).
+                    session_id: Some(provider_session_id.clone()),
                     message_source: streamed_prompt_source
                         .clone()
                         .map(|source| source as Arc<dyn crate::ai::types::MessageSource>),
@@ -4886,6 +4946,12 @@ pub async fn run_print_with_environment(
                                 api_key: api_key.clone(),
                                 reasoning: Some(thinking_level),
                                 hooks: transport_hooks.clone(),
+                                // Same effective budget / provider session
+                                // identity the deps' own stream carries (see
+                                // the `with_provider_unchecked` options
+                                // above).
+                                max_tokens: (model.max_tokens > 0).then_some(model.max_tokens),
+                                session_id: Some(provider_session_id.clone()),
                                 ..Default::default()
                             };
                             // Same provider-retry knobs the deps' own stream

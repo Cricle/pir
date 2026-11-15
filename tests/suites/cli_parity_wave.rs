@@ -962,9 +962,9 @@ fn documented_print_subcommand_keeps_its_grammar() {
     ] {
         let cli = parse_pir(&argv).expect("argv should parse");
         match cli.command {
-            Some(Command::Print { prompt }) => {
+            Some(Command::Print { prompts }) => {
                 assert!(
-                    prompt.is_some(),
+                    !prompts.is_empty(),
                     "`pir {argv:?}` must carry its own prompt argument"
                 );
             }
@@ -1562,4 +1562,17 @@ fn binary_help_is_unaffected_by_an_earlier_print_flag() {
         );
     }
     assert!(mock.requests().is_empty(), "help must never call the model");
+}
+
+/// PIR-BIN-029: `pir print` takes every positional as a prompt turn, exactly
+/// like the top-level `--print` form and upstream `runPrintMode`.
+#[test]
+fn print_subcommand_accepts_multiple_positional_prompts() {
+    let cli = parse_pir(&["print", "--no-session", "one", "two"]).expect("argv parses");
+    match cli.command {
+        Some(Command::Print { prompts }) => {
+            assert_eq!(prompts, vec!["one".to_owned(), "two".to_owned()]);
+        }
+        other => panic!("expected the print subcommand, got {other:?}"),
+    }
 }

@@ -1898,9 +1898,9 @@ fn print_tool_schemas_offer_the_background_argument() {
 // Upstream's non-interactive host resolves a fresh session's starting level in
 // `createAgentSession` (sdk.ts:250-278): an explicit CLI/model level wins,
 // then the per-model `modelThinkingLevels` override, then
-// `settings.defaultThinkingLevel` (`off` absent), then the shared
+// `settings.defaultThinkingLevel` (including `off`), then the shared
 // `DEFAULT_THINKING_LEVEL`. The TUI host applies that same fallback through
-// `initial_interactive_thinking` (settings → shared default, `off` absent).
+// `initial_interactive_thinking` (settings verbatim → shared default).
 // The print host resolved a level through `find_initial_model` but never put
 // it on `LoopDeps`: the field stayed at its `off` default, and
 // `registry_stream*` REPLACED the `reasoning` baked into the stream options
@@ -2043,7 +2043,8 @@ async fn print_request_carries_the_settings_default_thinking_level() {
     use pir::ai::providers::resolution::DEFAULT_THINKING_LEVEL;
 
     // The shared chain: explicit wins, then per-model, then settings, then
-    // the shared default; `off` in the settings default is absent.
+    // the shared default. `off` is a real settings value upstream
+    // (model-resolver.ts:571/584-585), not an absent one.
     assert_eq!(
         resolve(
             Some(ThinkingLevel::High),
@@ -2062,7 +2063,7 @@ async fn print_request_carries_the_settings_default_thinking_level() {
     );
     assert_eq!(
         resolve(None, None, Some(ThinkingLevel::Off)),
-        DEFAULT_THINKING_LEVEL
+        ThinkingLevel::Off
     );
     assert_eq!(resolve(None, None, None), DEFAULT_THINKING_LEVEL);
 
@@ -2080,35 +2081,44 @@ async fn print_request_carries_the_settings_default_thinking_level() {
     assert_eq!(body["reasoning_effort"], "max");
 }
 
-/// Unset and explicit-`off` settings defaults fall back to the shared
+/// Unset `defaultThinkingLevel` falls back to the shared
 /// `DEFAULT_THINKING_LEVEL`, and that level STILL reaches the request even
 /// though the model's `thinkingLevelMap` nulls `medium`: the map's `null`
 /// means "unsupported for clamping", while the wire mapping is
 /// `thinkingLevelMap[level] ?? level`, so `reasoning_effort: "medium"` is
-/// sent. Before the deps wiring this request carried no reasoning field at
-/// all.
+/// sent. Explicit `off` is honored instead of being rewritten
+/// (model-resolver.ts:571/584-585): no reasoning field is sent.
 #[tokio::test(flavor = "current_thread")]
-async fn print_request_carries_the_shared_default_when_settings_default_is_off_or_unset() {
+async fn print_request_honors_the_settings_off_default() {
     use pir::agent_session::resolve_starting_thinking_level as resolve;
     use pir::ai::providers::resolution::DEFAULT_THINKING_LEVEL;
 
     let model = thinking_level_map_model("reasoning-default");
-    for settings_default in [None, Some(ThinkingLevel::Off)] {
-        let level = resolve(None, None, settings_default);
-        assert_eq!(level, DEFAULT_THINKING_LEVEL);
-        let levels = request_levels_for(&model, level).await;
-        assert_eq!(
-            levels,
-            [Some(level)],
-            "the shared default must be the request level, not `off`"
-        );
-        let mut body = serde_json::json!({});
-        pir::ai::api::openai::apply_reasoning_effort(&mut body, &model, levels[0]);
-        assert_eq!(
-            body["reasoning_effort"], "medium",
-            "a nulled map entry falls back to the wire key, it does not drop the field"
-        );
-    }
+    let level = resolve(None, None, None);
+    assert_eq!(level, DEFAULT_THINKING_LEVEL);
+    let levels = request_levels_for(&model, level).await;
+    assert_eq!(
+        levels,
+        [Some(level)],
+        "the shared default must be the request level"
+    );
+    let mut body = serde_json::json!({});
+    pir::ai::api::openai::apply_reasoning_effort(&mut body, &model, levels[0]);
+    assert_eq!(
+        body["reasoning_effort"], "medium",
+        "a nulled map entry falls back to the wire key, it does not drop the field"
+    );
+
+    let level = resolve(None, None, Some(ThinkingLevel::Off));
+    assert_eq!(level, ThinkingLevel::Off);
+    let levels = request_levels_for(&model, level).await;
+    assert_eq!(levels, [Some(ThinkingLevel::Off)]);
+    let mut body = serde_json::json!({});
+    pir::ai::api::openai::apply_reasoning_effort(&mut body, &model, levels[0]);
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "settings off disables the reasoning field: {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3727,6 +3737,85 @@ fn write_closed_pipe_agent(dir: &TempDir, port: u16) {
     std::fs::write(agent.join("settings.json"), "{}").expect("write settings.json");
 }
 
+/// [`write_closed_pipe_agent`] for the `openai-responses` API (upstream
+/// `packages/ai/src/api/openai-responses.ts`). The model declares the issue's
+/// fixture shape: `maxTokens: 4096`, a window wide enough that the
+/// `buildBaseOptions` clamp leaves the model default untouched.
+fn write_responses_pipe_agent(dir: &TempDir, port: u16) {
+    let agent = dir.0.join("agent");
+    std::fs::create_dir_all(&agent).expect("create agent dir");
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"mock":{{"name":"Mock","baseUrl":"http://127.0.0.1:{port}/v1","api":"openai-responses","apiKey":"k","models":[{{"id":"mock-model","name":"M","api":"openai-responses","baseUrl":"http://127.0.0.1:{port}/v1","reasoning":false,"input":["text"],"contextWindow":128000,"maxTokens":4096}}]}}}}}}"#),
+    )
+    .expect("write models.json");
+    std::fs::write(agent.join("settings.json"), "{}").expect("write settings.json");
+}
+
+/// Loopback `/responses` endpoint (the `spawn_capturing_mock` twin for the
+/// Responses wire shape): records every request body and answers with the
+/// golden text-stream fixture from the adapter's SSE tests.
+fn spawn_capturing_responses_mock() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let port = listener.local_addr().expect("mock addr").port();
+    let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(index + 4);
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            };
+            let Some(header_end) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buf[..read]),
+                }
+            }
+            sink.lock().expect("capture lock").push(
+                request[header_end..]
+                    .get(..content_length)
+                    .unwrap_or(&request[header_end..])
+                    .to_vec(),
+            );
+            let events = concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hello mock\"}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello mock\"}]}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"total_tokens\":13}}}\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                events.len(),
+                events
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (port, captured)
+}
+
 /// Spawn `pir` with stdout (and optionally stderr) closed from the start: the
 /// parent drops the read end of the pipe immediately, so the child's first
 /// write gets `BrokenPipe` — the deterministic form of `… | head -5`
@@ -4059,6 +4148,118 @@ fn print_subcommand_injects_at_file_into_request_body() {
             "json={json}: literal @references must not reach the provider request"
         );
     }
+}
+
+/// PIR-BIN-060: pi's `openai-responses` request always carries
+/// `prompt_cache_key` (from the session id) and `max_output_tokens` (from
+/// `buildBaseOptions`' resolved budget). Upstream sends both on a one-shot
+/// `--no-session` run too: its in-memory `SessionManager` mints an id
+/// (`session-manager.ts:1061`) and the SDK hands it to every request
+/// (`sdk.ts:427`); the adapter emits
+/// `prompt_cache_key: clampOpenAIPromptCacheKey(options?.sessionId)` and
+/// `max_output_tokens` when `options.maxTokens` is set
+/// (`openai-responses.ts:363-375`), which `buildBaseOptions` always fills
+/// (`simple-options.ts:78-84`).
+#[test]
+fn print_responses_body_carries_prompt_cache_key_and_max_output_tokens() {
+    let (port, captured) = spawn_capturing_responses_mock();
+    let temp = TempDir::new("responses-body-e2e");
+    write_responses_pipe_agent(&temp, port);
+    let output = run_print_subcommand(
+        &temp,
+        &[
+            "print",
+            "first prompt",
+            "--no-session",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bodies = captured.lock().expect("capture lock");
+    assert_eq!(bodies.len(), 1, "one provider request for the one prompt");
+    let one_shot: serde_json::Value =
+        serde_json::from_slice(&bodies[0]).expect("responses body is JSON");
+
+    // The model's declared maxTokens reaches the wire (pi: 4096).
+    assert_eq!(
+        one_shot["max_output_tokens"],
+        serde_json::json!(4096),
+        "max_output_tokens comes from the model budget: {one_shot}"
+    );
+    // A `--no-session` run mints an in-memory session id, like upstream.
+    let minted_key = one_shot["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be present on a one-shot run");
+    assert!(
+        !minted_key.is_empty(),
+        "the cache key is the minted session id"
+    );
+    // pi's exact field set for this request shape (the issue's expected keys):
+    // `{model,input,stream,prompt_cache_key,store,max_output_tokens,tools}`.
+    let mut keys: Vec<&str> = one_shot
+        .as_object()
+        .expect("object body")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "input",
+            "max_output_tokens",
+            "model",
+            "prompt_cache_key",
+            "store",
+            "stream",
+            "tools",
+        ],
+        "the responses body must carry exactly pi's request fields"
+    );
+    // Release the capture lock: the mock thread takes it before answering the
+    // next request, so holding it across the second run would deadlock until
+    // the client's idle timeout.
+    drop(bodies);
+
+    // A persisted print session sends ITS id, not the ephemeral fallback.
+    let output = run_print_subcommand(
+        &temp,
+        &[
+            "print",
+            "persisted",
+            "--provider",
+            "mock",
+            "--model",
+            "mock-model",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = captured.lock().expect("capture lock");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&bodies[1]).expect("persisted responses body is JSON");
+    let stored_key = persisted["prompt_cache_key"]
+        .as_str()
+        .expect("persisted runs send the stored session id");
+    assert!(!stored_key.is_empty());
+    assert_ne!(
+        stored_key, minted_key,
+        "a persisted run must use its stored id, not a minted one"
+    );
+    assert_eq!(persisted["max_output_tokens"], serde_json::json!(4096));
 }
 
 /// A missing `@file` is the same hard error as the argv path: exit 1, a

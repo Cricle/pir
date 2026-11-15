@@ -245,9 +245,15 @@ pub fn load_template_file(path: &Path) -> Result<PromptTemplate, String> {
         )
     })?;
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    let (frontmatter_yaml, body) = match crate::skills::frontmatter_parts(raw) {
+    // Upstream `extractFrontmatter`: the body is newline-normalized and
+    // trimmed (frontmatter.ts:19-21), so a trailing newline or a CRLF file
+    // expands to exactly the text pi sends (PIR-BIN-068).
+    let (frontmatter_yaml, body) = match crate::skills::extract_frontmatter(raw) {
         Some((yaml, body)) => (yaml, body),
-        None => ("", raw),
+        None => (
+            "",
+            crate::skills::normalize_newlines(raw).trim().to_string(),
+        ),
     };
     // A malformed frontmatter block rejects the file (upstream records a
     // warning and skips it); no frontmatter at all is fine.

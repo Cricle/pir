@@ -203,7 +203,7 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
             content_index: 0,
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "text_start", "content_index": 0 }),
+        json!({ "type": "text_start", "contentIndex": 0 }),
     );
     assert_wire(
         &AssistantMessageEvent::TextDelta {
@@ -211,7 +211,7 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
             delta: "hello".to_string(),
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "text_delta", "content_index": 0, "delta": "hello" }),
+        json!({ "type": "text_delta", "contentIndex": 0, "delta": "hello" }),
     );
     assert_wire(
         &AssistantMessageEvent::TextEnd {
@@ -219,14 +219,14 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
             content: "hello".to_string(),
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "text_end", "content_index": 0, "content": "hello" }),
+        json!({ "type": "text_end", "contentIndex": 0, "content": "hello" }),
     );
     assert_wire(
         &AssistantMessageEvent::ThinkingStart {
             content_index: 1,
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "thinking_start", "content_index": 1 }),
+        json!({ "type": "thinking_start", "contentIndex": 1 }),
     );
     assert_wire(
         &AssistantMessageEvent::ThinkingDelta {
@@ -234,7 +234,7 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
             delta: "hmm".to_string(),
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "thinking_delta", "content_index": 1, "delta": "hmm" }),
+        json!({ "type": "thinking_delta", "contentIndex": 1, "delta": "hmm" }),
     );
     assert_wire(
         &AssistantMessageEvent::ThinkingEnd {
@@ -242,7 +242,7 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
             content: "hmm".to_string(),
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "thinking_end", "content_index": 1, "content": "hmm" }),
+        json!({ "type": "thinking_end", "contentIndex": 1, "content": "hmm" }),
     );
     assert_wire(
         &AssistantMessageEvent::ToolCallStart {
@@ -251,7 +251,7 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
         },
         json!({
             "type": "toolcall_start",
-            "content_index": 2,
+            "contentIndex": 2,
             "id": "call-1",
             "toolName": "read",
         }),
@@ -262,7 +262,7 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
             delta: "{\"path\":".to_string(),
             partial: Arc::clone(&partial),
         },
-        json!({ "type": "toolcall_delta", "content_index": 2, "delta": "{\"path\":" }),
+        json!({ "type": "toolcall_delta", "contentIndex": 2, "delta": "{\"path\":" }),
     );
     assert_wire(
         &AssistantMessageEvent::ToolCallEnd {
@@ -272,8 +272,8 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
         },
         json!({
             "type": "toolcall_end",
-            "content_index": 2,
-            "tool_call": {
+            "contentIndex": 2,
+            "toolCall": {
                 "type": "toolCall",
                 "id": "call-1",
                 "name": "read",
@@ -308,8 +308,11 @@ fn every_assistant_event_keeps_todays_exact_wire_shape() {
 #[test]
 fn every_assistant_event_matches_the_derive_minus_partial() {
     // `message_update_payload` is the reference construction: the fully
-    // derived event tree (partial included). Removing `partial` yields exactly
-    // the bytes the pre-fix wire emitted for every variant.
+    // derived event tree (partial included). Removing `partial` yields the
+    // pre-fix wire bytes for every variant. PIR-BIN-044 changed only the
+    // extension/RPC spelling to upstream's camelCase
+    // (`contentIndex`/`toolCall`, packages/ai/src/types.ts:823-831), so the
+    // reference gets the same in-place rename before the comparison.
     for event in variants() {
         let reference = pir::agent::agent_loop::message_update_payload(&event);
         let mut expected = reference["assistantMessageEvent"].clone();
@@ -317,6 +320,10 @@ fn every_assistant_event_matches_the_derive_minus_partial() {
             .as_object_mut()
             .expect("assistantMessageEvent is an object");
         expected_object.remove("partial");
+        rename_wire_keys(&mut expected);
+        let expected_object = expected
+            .as_object_mut()
+            .expect("assistantMessageEvent is an object");
         // The JSON-mode post-processing adds the tool call's identity to
         // `toolcall_start` because the snapshot that held it is stripped.
         if let AssistantMessageEvent::ToolCallStart {
@@ -338,6 +345,25 @@ fn every_assistant_event_matches_the_derive_minus_partial() {
             event_name(&event)
         );
     }
+}
+
+/// Rename the derived event's snake_case carrier fields to upstream's
+/// camelCase without disturbing key order (`serde_json` keeps insertion
+/// order). Only the two fields upstream spells differently live here.
+fn rename_wire_keys(value: &mut Value) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    let mut renamed = serde_json::Map::with_capacity(map.len());
+    for (key, child) in std::mem::take(map) {
+        let key = match key.as_str() {
+            "content_index" => "contentIndex".to_owned(),
+            "tool_call" => "toolCall".to_owned(),
+            _ => key,
+        };
+        renamed.insert(key, child);
+    }
+    *map = renamed;
 }
 
 fn event_name(event: &AssistantMessageEvent) -> &'static str {
@@ -480,6 +506,7 @@ fn agent_event_corpus() -> Vec<AgentEvent> {
             Message::ToolResult(result_message.clone()),
         ],
         preamble: vec![user_message("preamble")],
+        start_messages: Vec::new(),
         turns: 2,
         aborted: false,
         usage_total: 9,
@@ -1524,6 +1551,7 @@ fn random_agent_event(
                     tool_results,
                     new_messages,
                     preamble,
+                    start_messages: Vec::new(),
                     turns: *rng.pick(TURNS),
                     aborted: rng.bool(),
                     usage_total: *rng.pick(U64_BOUNDARIES),
@@ -2164,6 +2192,7 @@ mod wire_size_tests {
                     tool_results: Vec::new(),
                     new_messages: vec![user],
                     preamble: Vec::new(),
+                    start_messages: Vec::new(),
                     turns: 1,
                     aborted: false,
                     usage_total: 0,

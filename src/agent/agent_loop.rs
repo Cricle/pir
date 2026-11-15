@@ -282,10 +282,17 @@ fn normalize_message_end_content(mut value: JsonValue) -> JsonValue {
     value
 }
 
-/// `context` event: handlers may replace the message list before the model
-/// request (upstream chaining semantics: each handler sees the previous
-/// replacement, and the final replacement is applied). A replacement that
-/// fails to deserialize is ignored (the loop keeps its own transcript).
+/// `context` event: handlers may replace the conversation, but never the
+/// prompt or tool state (upstream `ExtensionRunner.emitContext`,
+/// runner.ts:1305-1332, and the `ContextEvent` contract,
+/// extensions/types.ts:885-893).
+///
+/// Upstream filters system messages out of `event.messages` before every
+/// handler and restores them afterwards: an UNCHANGED return keeps the
+/// transcript (and every in-place system delta) exactly as it was, while a
+/// changed one is re-headed by [`restore_system_messages`] with the replayed
+/// system state, so windowing/pruning handlers cannot drop the tool
+/// declarations.
 ///
 /// Both faces observe the event exactly once: the native fan-out first (its
 /// in-place `messages` rewrite is visible to the JS handlers), then the JS
@@ -303,7 +310,15 @@ async fn apply_extension_context(deps: &LoopDeps, context: &mut Arc<Context>) {
     if !wants_native && !wants_js {
         return;
     }
-    let Ok(messages) = serde_json::to_value(&context.messages) else {
+    // Upstream `messages.filter((m) => m.role !== "system")`
+    // (runner.ts:1312): the prompt and tool state belong to Pi.
+    let visible: Vec<Message> = context
+        .messages
+        .iter()
+        .filter(|message| !matches!(message, Message::System(_)))
+        .cloned()
+        .collect();
+    let Ok(messages) = serde_json::to_value(&visible) else {
         return;
     };
     // Move the serialized transcript into the payload: a `json!` literal
@@ -330,13 +345,27 @@ async fn apply_extension_context(deps: &LoopDeps, context: &mut Arc<Context>) {
                 .then(|| payload.get("messages").cloned())
                 .flatten()
         });
-    if let Some(messages) = replacement {
-        if let Ok(replaced) = serde_json::from_value::<Vec<Message>>(messages) {
-            // Copy-on-write only on an actual replacement: a handler that
-            // returns no `messages` leaves the transcript allocation shared.
-            Arc::make_mut(context).messages = replaced;
-        }
+    let Some(replacement) = replacement else {
+        return;
+    };
+    let Ok(replaced) = serde_json::from_value::<Vec<Message>>(replacement) else {
+        return;
+    };
+    // Upstream `restoreSystemMessages` (runner.ts:292-300, called at
+    // runner.ts:1322): an unchanged conversation keeps every system message
+    // in place (`sameMessages`), a changed one gets the replayed prompt/tool
+    // state as the leading system message.
+    if replaced == visible {
+        return;
     }
+    let mut restored = crate::ai::types::get_current_system_message(&context.messages)
+        .into_iter()
+        .collect::<Vec<_>>();
+    restored.extend(replaced);
+    // Copy-on-write only on an actual replacement: a handler that returns no
+    // `messages` (or echoes its input) leaves the transcript allocation
+    // shared.
+    Arc::make_mut(context).messages = restored;
 }
 
 /// `context_with_system` event (upstream runner.ts two-phase emitContext):
@@ -1512,6 +1541,12 @@ pub struct LoopResult {
     /// ephemeral host extends its in-memory transcript with this list before
     /// [`Self::new_messages`].
     pub preamble: Vec<Message>,
+    /// Every starting message of THIS run — announce-only
+    /// (`preamble_messages`) and appended (`preamble`) alike, after any
+    /// `message_end` replacement. Upstream `newMessages` seeds with these
+    /// (agent-loop.ts:119-122), so the `agent_end` payload and the SDK
+    /// projection merge them before [`Self::new_messages`] (PIR-BIN-047).
+    pub start_messages: Vec<Message>,
     /// Number of turns executed.
     pub turns: usize,
     /// Whether the run stopped because it was aborted.
@@ -1664,6 +1699,14 @@ async fn run_with_options_in_span_inner(
     let mut first_turn_start_emitted = false;
     let mut preamble_failed = false;
     let mut finalized_preamble: Vec<Message> = Vec::new();
+    // Every starting message of THIS run, announce-only (`preamble_messages`)
+    // and appended (`preamble`) alike, after any `message_end` replacement.
+    // Upstream `runAgentLoop` seeds `newMessages` with these
+    // (agent-loop.ts:119-122) and `agent_end` carries that list
+    // (agent-loop.ts:329), so the extension payload is starting messages +
+    // produced messages; `LoopResult::new_messages` keeps its produced-only
+    // contract.
+    let mut starting_messages: Vec<Message> = Vec::new();
     let mut preamble = std::mem::take(&mut options.preamble);
     preamble.extend(
         std::mem::take(&mut options.preamble_messages)
@@ -1696,8 +1739,9 @@ async fn run_with_options_in_span_inner(
             match apply_preamble_message(&deps, &options, entry, &mut context).await {
                 Ok(finalized) => {
                     if appended {
-                        finalized_preamble.push(finalized);
+                        finalized_preamble.push(finalized.clone());
                     }
+                    starting_messages.push(finalized);
                 }
                 Err(error) => {
                     // A starting message that could not be stored fails the
@@ -3456,6 +3500,7 @@ async fn run_with_options_in_span_inner(
         // announce-only `preamble_messages` form): ephemeral hosts extend
         // their in-memory transcript with these before `new_messages`.
         preamble: finalized_preamble,
+        start_messages: starting_messages,
         turns,
         aborted,
         usage_total,
@@ -3468,15 +3513,32 @@ async fn run_with_options_in_span_inner(
         result: Arc::clone(&result),
     });
     emit_extension_lazy(&deps, "agent_end", || {
+        // Upstream `AgentEndEvent.messages` is `newMessages`, which starts
+        // with the run's initial messages (`declareToolChanges(context,
+        // prompts)`, agent-loop.ts:119-122) and ends with everything the
+        // loop produced (agent-loop.ts:329). `declareToolChanges` puts its
+        // tool-declaration system message BEFORE the prompts
+        // (agent-loop.ts:342-372), so the merge inserts the starting messages
+        // after the produced list's leading system message(s), not before
+        // them. pir keeps the starting messages out of
+        // `LoopResult::new_messages` (their historical produced-only
+        // contract), so the extension payload merges them here:
+        // declaration(s), prompt(s), then the assistant/tool results in
+        // produced order.
+        let leading_system = result
+            .new_messages
+            .iter()
+            .take_while(|message| matches!(message, Message::System(_)))
+            .count();
+        let messages: Vec<_> = result.new_messages[..leading_system]
+            .iter()
+            .chain(result.start_messages.iter())
+            .chain(result.new_messages[leading_system..].iter())
+            .map(message_payload)
+            .collect();
         serde_json::json!({
             "type": "agent_end",
-            // Upstream `agent_end` carries THIS run's produced messages (the
-            // new assistant + tool-result messages), not the full transcript.
-            "messages": result
-                .new_messages
-                .iter()
-                .map(message_payload)
-                .collect::<Vec<_>>(),
+            "messages": messages,
         })
     })
     .await;

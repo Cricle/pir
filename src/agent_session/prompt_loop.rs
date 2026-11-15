@@ -1159,8 +1159,22 @@ impl AgentSession {
     /// surface it after the loop — the pre-loop startup append used to
     /// propagate it directly.
     ///
-    /// `None` for a store-less (ephemeral) session: the loop's `LoopResult::
-    /// preamble` list is what the caller appends to the in-memory transcript.
+    /// A store-less (ephemeral) session keeps its transcript in memory
+    /// (`LoopResult::preamble` is what the caller appends there), but the sink
+    /// is still installed — see the PIR-TUI-044 note below.
+    ///
+    /// PIR-TUI-044: an ephemeral run still returns a sink, but it only
+    /// mirrors the append in memory — it emits the same `entry_appended`
+    /// session event the stored path emits, with a minted entry id and no
+    /// storage write. Upstream `--no-session` builds a real
+    /// `SessionManager.inMemory` (`main.ts:365`), so its `message_end`
+    /// persistence and the resulting `message_start`/`entry_appended`
+    /// surfaces still fire; the TUI renders the user bubble from the run's
+    /// starting `message_start` (`interactive-mode.ts:3457-3465`) and pir's
+    /// TUI bridge renders it from this event instead (`terminal.rs`
+    /// `session_event_bridge` → `EntryAppended`). Without the mirror an
+    /// extension-driven `pi.sendUserMessage` run on `--no-session` rendered
+    /// no user bubble at all.
     ///
     /// Storage-swap isolation (P1-01): `run_session_id` is the identity bound
     /// at `run_prompt` entry. A swap landing after that binding but before
@@ -1174,11 +1188,11 @@ impl AgentSession {
         failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
         run_session_id: Option<String>,
     ) -> Option<agent_loop::PreamblePersistFn> {
-        let session = self.session.clone()?;
+        let session = self.session.clone();
         let plugins = self.plugins.clone();
         let session_events = Arc::clone(&self.session_events);
         Some(Arc::new(move |message: Message| {
-            let session = Arc::clone(&session);
+            let session = session.clone();
             let plugins = plugins.clone();
             let session_events = Arc::clone(&session_events);
             let failure = Arc::clone(&failure);
@@ -1195,6 +1209,35 @@ impl AgentSession {
                     &session_events,
                     &message,
                 );
+                // PIR-TUI-044: a store-less (ephemeral) run has no session
+                // entry to append, but upstream's in-memory manager still
+                // announces the append. Mirror that announcement in memory:
+                // the final (post-`message_end`) message and a minted entry
+                // id, no file, no history write (the caller appends
+                // `LoopResult::preamble` to the in-memory transcript).
+                let Some(session) = session else {
+                    if dispatch_to_subscribers
+                        && super::notifications::entry_appended_user_only_subscriber_wants(
+                            &session_events,
+                            &message,
+                        )
+                    {
+                        crate::agent_session::events::note_entry_appended_wire_build();
+                        let message_wire = match &append.custom {
+                            Some(_) => append.wire.clone(),
+                            None => message_json(&message),
+                        };
+                        let entry_json = serde_json::json!({
+                            "id": crate::session_manager::new_entry_id(),
+                            "message": message_wire,
+                        });
+                        crate::agent_session::events::emit_session_event_to(
+                            &session_events,
+                            SessionEvent::EntryAppended { entry: entry_json },
+                        );
+                    }
+                    return Ok(());
+                };
                 let appended = match &append.custom {
                     Some(custom) => {
                         super::settle::append_custom_message_if_session(

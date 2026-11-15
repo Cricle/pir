@@ -3767,9 +3767,13 @@ fn list_sessions_scales_to_2000_files_with_stable_order_and_a_budget() {
     let base = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     for index in 0..COUNT {
         // The FILE NAME descends with the index (`row-01999` … `row-00001`)
-        // while the MTIME ascends by bucket, so mtime order, name order and id
-        // order all disagree; seven files share one mtime bucket.
+        // while the MTIME and the message activity ascend by bucket, so name
+        // order and id order disagree; seven files share one bucket.
         let path = dir.join(format!("row-{:05}.jsonl", COUNT - index));
+        // PIR-BIN-056: listing order is the newest in-file message timestamp,
+        // not mtime. Mirror the mtime buckets so this fixture keeps asserting
+        // the stable bucket/path order under the activity contract.
+        let activity = 1_700_000_000_000_u64 + ((index / 7) as u64) * 1_000;
         let mut content = String::new();
         if SKIPPED.contains(&index) {
             content.push_str("not json at all\n");
@@ -3794,7 +3798,7 @@ fn list_sessions_scales_to_2000_files_with_stable_order_and_a_budget() {
                     "message": {
                         "role": "user",
                         "content": [{"type": "text", "text": format!("scale {index:04}")}],
-                        "timestamp": 0,
+                        "timestamp": activity,
                     },
                 })
                 .to_string(),
@@ -4499,5 +4503,51 @@ fn windowed_readers_pin_the_flag_and_widening_restores_the_bridge() {
         windowed.projected_branch_path(None).len(),
         2,
         "widening must restore the whole-file bridge (PIR-BIN-092)"
+    );
+}
+
+/// PIR-BIN-056: listing/`-c` ordering uses the newest in-file entry
+/// timestamp, not the file mtime (upstream `SessionInfo.modified`,
+/// session-manager.ts:859-873). Mtimes are forced opposite to activity.
+#[test]
+fn listing_and_continue_recent_order_by_in_file_activity() {
+    let dir = temp_dir("activity-order");
+    let cwd = "C:\repo";
+    // B first (older activity), then A (newer activity).
+    let mut b = SessionManager::create_with_id(cwd, &dir, "0192f100-2222-4222-8222-222222222222")
+        .expect("create B");
+    b.append_message(user_message("B prompt"))
+        .expect("append B");
+    let b_path = b.path().to_path_buf();
+    std::thread::sleep(Duration::from_millis(5));
+    let mut a = SessionManager::create_with_id(cwd, &dir, "0192f100-1111-4111-8111-111111111111")
+        .expect("create A");
+    a.append_message(user_message("A prompt"))
+        .expect("append A");
+    let a_path = a.path().to_path_buf();
+
+    let set_mtime = |path: &Path, secs: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open session")
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .expect("set mtime");
+    };
+    // File mtimes disagree with activity: A is older on disk.
+    set_mtime(&a_path, 1_700_000_000);
+    set_mtime(&b_path, 1_700_000_100);
+
+    let listed = SessionManager::list_sessions(&dir, Some(cwd));
+    assert_eq!(
+        listed.first().map(|summary| summary.id.as_str()),
+        Some(a.id()),
+        "the newer in-file activity leads the listing: {listed:?}"
+    );
+    let recent = SessionManager::continue_recent(&dir, cwd).expect("continue recent");
+    assert_eq!(
+        recent.id(),
+        a.id(),
+        "-c must agree with activity order, not mtime"
     );
 }

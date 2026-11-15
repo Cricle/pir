@@ -627,16 +627,16 @@ fn extension_frame_signature(payload: &serde_json::Value) -> String {
             frame["type"].as_str().unwrap_or_default(),
             frame["delta"].as_str().unwrap_or_default()
         ),
-        "toolcall_start" => format!("toolcall_start:{}", frame["content_index"]),
+        "toolcall_start" => format!("toolcall_start:{}", frame["contentIndex"]),
         "toolcall_delta" => format!(
             "toolcall_delta:{}:{}",
-            frame["content_index"],
+            frame["contentIndex"],
             frame["delta"].as_str().unwrap_or_default()
         ),
         "toolcall_end" => format!(
             "toolcall_end:{}:{}",
-            frame["content_index"],
-            frame["tool_call"]["id"].as_str().unwrap_or_default()
+            frame["contentIndex"],
+            frame["toolCall"]["id"].as_str().unwrap_or_default()
         ),
         "done" => format!("done:{}", frame["reason"].as_str().unwrap_or_default()),
         "error" => format!("error:{}", frame["reason"].as_str().unwrap_or_default()),
@@ -860,7 +860,9 @@ async fn sdk_projects_toolcall_stream_frames_in_order_and_arguments() {
     assert_eq!(outcome.tool_result_texts(), vec!["2 words".to_owned()]);
 
     // Both public payloads stay live on this path: the per-run `AgentEnd`
-    // event and the terminal outcome carry the same produced-message slice.
+    // event carries upstream's `newMessages` (the leading tool declaration,
+    // the starting prompt, then produced messages; PIR-BIN-047), while the
+    // terminal outcome keeps pir's produced-only contract.
     let agent_end_messages = events
         .iter()
         .find_map(|event| match event {
@@ -869,8 +871,26 @@ async fn sdk_projects_toolcall_stream_frames_in_order_and_arguments() {
         })
         .expect("prompt_stream_with_outcome still carries agent_end");
     assert_eq!(
-        agent_end_messages, &outcome.messages,
-        "agent_end.messages and AgentOutcome.messages must describe the same run"
+        agent_end_messages.len(),
+        outcome.messages.len() + 1,
+        "agent_end adds the starting prompt to the produced list: {agent_end_messages:?}"
+    );
+    assert!(
+        matches!(agent_end_messages.first(), Some(Message::System(_))),
+        "the tool declaration leads agent_end.messages"
+    );
+    assert!(
+        matches!(agent_end_messages.get(1), Some(Message::User(_))),
+        "the starting prompt follows the declaration"
+    );
+    assert_eq!(
+        &agent_end_messages[0], &outcome.messages[0],
+        "the outcome starts with the same tool declaration"
+    );
+    assert_eq!(
+        &agent_end_messages[2..],
+        &outcome.messages[1..],
+        "agent_end.messages after the starting prompt equals the produced tail"
     );
 }
 
@@ -1520,6 +1540,42 @@ async fn sdk_discovers_workspace_system_md_and_explicit_prompt_wins() {
     assert!(
         system.contains("SDK APPEND MARKER"),
         "the workspace APPEND_SYSTEM.md renders as the addendum: {system}"
+    );
+
+    // PIR-BIN-065: an explicit append source replaces the discovered
+    // APPEND_SYSTEM.md (upstream resource-loader.ts:695-706); the preamble
+    // discovery is independent and still applies.
+    seen.lock().unwrap().clear();
+    let explicit_append = agent_builder(Arc::clone(&registry), &workspace)
+        .agent_dir(&agent_dir)
+        .discover_system_prompt(true)
+        .append_system_prompt("CLI APPEND WINS")
+        .no_session()
+        .build()
+        .await
+        .expect("build explicit-append agent");
+    explicit_append.prompt("hi").await.expect("prompt");
+    let context = seen
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("the provider saw one request");
+    let system = context
+        .system_prompt
+        .as_deref()
+        .expect("the request carries a system prompt");
+    assert!(
+        system.contains("CLI APPEND WINS"),
+        "the explicit append text is the addendum: {system}"
+    );
+    assert!(
+        !system.contains("SDK APPEND MARKER"),
+        "the discovered APPEND_SYSTEM.md must not stack under an explicit source: {system}"
+    );
+    assert!(
+        system.contains("SDK SYSTEM MARKER"),
+        "preamble discovery is independent: {system}"
     );
 
     // Explicit prompt: the pinned text wins, the discovered SYSTEM.md is out.
@@ -10355,4 +10411,108 @@ fn messages_only_projection_matches_full_projection_on_paged_manager() {
         paged.build_session_messages().len() <= 8,
         "the paged manager projects only its resident entry window"
     );
+}
+
+/// PIR-SDK-014 residual: the runtime fork lifecycle emits
+/// `session_before_fork` before the new session's `session_start`, observed by
+/// a plugin attached to the same `AgentSession` the runtime wraps.
+struct ForkOrderPlugin {
+    info: PluginInfo,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl AgentPlugin for ForkOrderPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(
+            ["session_before_fork", "session_start"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        self.events.lock().unwrap().push(event.name.to_string());
+        Box::pin(async { PluginEventOutcome::None })
+    }
+}
+
+#[tokio::test]
+async fn runtime_fork_emits_session_before_fork_then_session_start() {
+    let temp = TempDir::new("runtime-fork-hooks");
+    let cwd = temp.path();
+    let agent_dir = cwd.join("agent");
+    let session_dir = cwd.join("sessions");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let agent = agent_builder(
+        registry(Arc::new(|_index, _context| {
+            assistant(vec![text_block("ok")], StopReason::Stop)
+        })),
+        cwd,
+    )
+    .agent_dir(&agent_dir)
+    .session(SessionMode::Dir(session_dir.clone()))
+    .with_plugin(Arc::new(ForkOrderPlugin {
+        info: PluginInfo::inline("fork-order"),
+        events: Arc::clone(&events),
+    }))
+    .build()
+    .await
+    .expect("plugin-attached agent");
+    agent.prompt("first").await.expect("first prompt");
+    agent.prompt("second").await.expect("second prompt");
+
+    let session = agent.session_arc();
+    let first_user_id = {
+        let manager = session.session_manager().expect("session manager");
+        let guard = manager.lock().await;
+        guard
+            .entries()
+            .into_iter()
+            .find_map(|entry| match entry {
+                pir::session_manager::FileEntry::Message(message)
+                    if message.message.role() == "user" =>
+                {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            })
+            .expect("first user entry")
+    };
+    let runtime = pir::sdk::AgentSessionRuntime::new(
+        Arc::clone(&session),
+        cwd.to_path_buf(),
+        agent_dir,
+        Some(session_dir),
+    );
+    let outcome = runtime
+        .fork(&first_user_id, pir::agent_session::ForkPosition::Before)
+        .await
+        .expect("runtime fork");
+    assert!(matches!(
+        outcome,
+        pir::agent_session::ForkEntryOutcome::Branched { .. }
+    ));
+
+    let names = events.lock().unwrap().clone();
+    let fork_position = names
+        .iter()
+        .position(|name| name == "session_before_fork")
+        .unwrap_or_else(|| panic!("session_before_fork fired: {names:?}"));
+    let start_position = names
+        .iter()
+        .rposition(|name| name == "session_start")
+        .unwrap_or_else(|| panic!("the fork's session_start fired: {names:?}"));
+    assert!(
+        fork_position < start_position,
+        "session_before_fork must precede the new session_start: {names:?}"
+    );
+    session.shutdown().await;
 }

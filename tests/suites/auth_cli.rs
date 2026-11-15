@@ -338,3 +338,47 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
     );
     drop(guard);
 }
+
+/// PIR-BIN-033: a models.json provider `apiKey` is the credential the request
+/// path sends, so `auth check`/`print-api-key` and the `--model` configured-
+/// provider scan must see it (upstream resolves auth through the model
+/// runtime).
+#[test]
+fn models_json_api_key_is_a_printable_credential() {
+    let (runtime, guard) = env_guard("auth-models-json-key");
+    let agent_dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    std::fs::write(
+        agent_dir.join("models.json"),
+        r#"{
+            "providers": {
+                "zz-gw": {
+                    "name": "Gateway",
+                    "baseUrl": "http://127.0.0.1:9/v1",
+                    "api": "openai-chat",
+                    "apiKey": "sk-gw-key",
+                    "models": [{ "id": "zz-gw-model", "name": "GW Model" }]
+                }
+            }
+        }"#,
+    )
+    .expect("write models.json");
+
+    let resolved = runtime
+        .block_on(pir::ai::auth::cli::resolve_printable_credential(
+            "zz-gw", true,
+        ))
+        .expect("credential resolution")
+        .expect("models.json apiKey must resolve");
+    assert_eq!(resolved.0, "sk-gw-key");
+    assert_eq!(resolved.1, "api_key");
+    assert_eq!(
+        pir::ai::auth::cli::resolve_provider_from_flags(
+            None,
+            Some("zz-gw-model"),
+            "unused requirement"
+        )
+        .expect("the models.json provider is a configured credential"),
+        "zz-gw"
+    );
+    drop(guard);
+}

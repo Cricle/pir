@@ -2,8 +2,38 @@
 
 - 基线：`master` @ `b26a60fb23bd45306401190cacb5b6f2c1f5459c`
 - 结果日期：2026-11-02
-- 最新实测：2026-11-15（0.3.2 发版，见第一节；其下依次为 2026-11-12 A/B 轮、0.3.1-rc.1 与更早历史）
+- 最新实测：2026-11-15（0.3.2 后 backlog 清零 + 上游 v1.5.2 审计，见第一节；0.3.2 发版见第二节）
 - 本文件是唯一面向用户的结果文档；过程材料仅在 `.audit/` 保留为原始证据。
+
+## 2026-11-15 post-0.3.2 backlog closure
+
+0.3.2 之后的一轮全量收尾：本地 issue 面板中仍标 `reproduced` 的 19 项全部
+按上游行为修复或结案，TUI 两项、SDK runtime fork 夹具、QE-002 的重建也完成；
+同时把上游 pi 拉到 v1.5.2 并逐提交审计。
+
+**修复/结案（均有回归测试或行为探针）**
+
+| 类别 | issue | 结果 |
+|---|---|---|
+| 扩展事件线格式 | PIR-BIN-043/044/046/047/051 | context 事件对 handler 隐藏 system 并在替换后恢复工具声明；boundary context 五字段；`agent_end` = 工具声明 + 起始 prompt + 产出；stream 事件改用上游 `contentIndex`/`toolCall`；无 reason 的 blocked 工具使用上游固定句 |
+| 会话/CLI | PIR-BIN-026/029/032/038 | RPC 使用 CLI 解析出的 `--session-dir`；`pir print` 支持多个位置参数；print/RPC 恢复会话记录的 model/thinking |
+| 模型/凭据 | PIR-BIN-033/034/055/060 | models.json `apiKey` 参与 `auth check`/`--list-models`；`defaultThinkingLevel:"off"` 生效；compaction 摘要请求应用上下文预算；Responses 请求携带 session id / max output tokens |
+| 会话排序/身份 | PIR-BIN-056/059 | 列表与 `-c` 按文件内最新活动时间排序；host registry 安装 pi detailed User-Agent + 归因头 |
+| 提示词 | PIR-BIN-065/068 | 显式 append source 替换发现的 `APPEND_SYSTEM.md`；模板正文按上游 trim + LF 规范化 |
+| TUI | PIR-TUI-026/044 | 多键/粘贴批次一帧内落笔；`--no-session` 下扩展发起的用户消息渲染气泡 |
+| 测试/文档 | PIR-QE-002 / PIR-SDK-014 | 8 个 merged harness 重新生成且 `-Check` 绿；`docs/test-harness-map.md` 从真实 `#[path]` 图重推；runtime fork 的 `session_before_fork`→`session_start` 顺序有插件夹具 |
+| 上游同步 | drift | v1.5.2 共 641 commits，其中 130 个触及已移植面：12 Landed / 22 Partial / 54 Open / 40 N/A / 2 Unverified，逐条证据见 `docs/upstream-drift-status.md` |
+
+不破坏性变更：`--list-models` 现在按上游只列出有可用凭据的 provider（完整目录
+仍由 `pir models` 提供）；stream 事件的 JSON 字段改为上游 camelCase。
+
+**门禁（本机 GNU，2026-11-15 实测）**
+
+- 16 项本地门禁全部 EXIT 0：fmt、版本一致性、lib/bins、zz_merged_1..8、
+  standalone、extras、doctests、sdk_shape、clippy；nextest 合计 **7 525 tests，
+  0 failed，46 skipped**，doctests 33 passed / 0 failed / 7 ignored。证据：
+  `.play/evidence/final-20261115/`。
+- 版本仍为 0.3.2；本轮为未发布变更，未创建/移动标签。
 
 ## 0.3.2 release (2026-11-15)
 

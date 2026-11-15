@@ -891,12 +891,31 @@ pub(crate) fn from_loop_event(
             let outcome = capture_outcome.then(|| loop_outcome(&result));
             // Terminal settlement is the caller's job: the session may re-enter
             // the loop (`agent_before_settle` continuation) after this event.
-            let event = project_agent_end.then(|| SdkEvent::AgentEnd {
-                messages: result.new_messages.clone(),
-                // Same verdict the upstream session event carries: the loop
-                // already decided whether a retryable terminal is worth
-                // re-issuing at the session boundary.
-                will_retry: result.will_retry,
+            let event = project_agent_end.then(|| {
+                // Upstream `agent_end.messages` is `newMessages`: the run's
+                // starting messages (after the leading tool-declaration system
+                // message, agent-loop.ts:119-122/342-372) followed by what the
+                // loop produced (agent-loop.ts:329). PIR-BIN-047 keeps
+                // `LoopResult::new_messages` produced-only, so merge
+                // `start_messages` in the same order the extension payload
+                // uses.
+                let leading_system = result
+                    .new_messages
+                    .iter()
+                    .take_while(|message| matches!(message, Message::System(_)))
+                    .count();
+                let mut messages =
+                    Vec::with_capacity(result.new_messages.len() + result.start_messages.len());
+                messages.extend_from_slice(&result.new_messages[..leading_system]);
+                messages.extend_from_slice(&result.start_messages);
+                messages.extend_from_slice(&result.new_messages[leading_system..]);
+                SdkEvent::AgentEnd {
+                    messages,
+                    // Same verdict the upstream session event carries: the loop
+                    // already decided whether a retryable terminal is worth
+                    // re-issuing at the session boundary.
+                    will_retry: result.will_retry,
+                }
             });
             (event, outcome)
         }

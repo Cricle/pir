@@ -298,7 +298,8 @@ fn bearer_from_headers(headers: &BTreeMap<String, String>) -> Option<String> {
 /// value from resolved headers. OAuth credentials are refreshed when they
 /// expire soon (upstream `auth check`/`print-api-key` semantics; `no_refresh`
 /// skips the refresh for `auth check`).
-async fn resolve_printable_credential(
+#[doc(hidden)]
+pub async fn resolve_printable_credential(
     provider: &str,
     no_refresh: bool,
 ) -> AiResult<Option<(String, String)>> {
@@ -341,6 +342,19 @@ async fn resolve_printable_credential(
                 .map(|key| (key, "stored credential".to_string())))
         }
         None => {
+            // models.json `apiKey` providers are the same credentials the
+            // request path uses (docs/models.md); upstream's auth check
+            // resolves through the model runtime, so a custom provider with a
+            // literal key is ready (PIR-BIN-033).
+            if let Ok(environment) = crate::ai::providers::load_pi_environment(None) {
+                if let Some(key) = environment
+                    .api_keys
+                    .get(provider)
+                    .filter(|key| !key.trim().is_empty())
+                {
+                    return Ok(Some((key.clone(), "api_key".to_string())));
+                }
+            }
             // Ambient env resolution.
             for (provider_id, env_vars) in env_api_keys::all() {
                 if provider_id != provider {
@@ -489,6 +503,17 @@ fn configured_credential_providers() -> Vec<String> {
         }) {
             configured.insert(provider.to_string());
         }
+    }
+    // models.json `apiKey` providers are configured credentials too
+    // (PIR-BIN-033): `--model` resolution and `auth check` must see them.
+    if let Ok(environment) = crate::ai::providers::load_pi_environment(None) {
+        configured.extend(
+            environment
+                .api_keys
+                .into_iter()
+                .filter(|(_provider, key)| !key.trim().is_empty())
+                .map(|(provider, _key)| provider),
+        );
     }
     configured.into_iter().collect()
 }

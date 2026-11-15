@@ -94,12 +94,13 @@ fn images_to_content_blocks(images: &JsonValue) -> Vec<ContentBlock> {
 /// leave the prompt untouched.
 #[cfg(feature = "print")]
 pub(crate) async fn transform_prompt_input(runtime: &ExtensionHandle, text: &str) -> String {
+    // Same optional-key contract as `dispatch_prompt_input`: an idle prompt
+    // has no images and no streaming behavior, so neither key is present
+    // (upstream `InputEvent`, extensions/types.ts:1171-1185).
     let mut payload = serde_json::json!({
         "type": "input",
         "text": text,
-        "images": [],
         "source": DEFAULT_INPUT_SOURCE,
-        "streamingBehavior": null,
     });
     match runtime.emit("input", &mut payload).await {
         Ok(outcome) => {
@@ -147,19 +148,30 @@ pub(super) async fn dispatch_prompt_input(
             images,
         });
     }
+    // Upstream `InputEvent` (extensions/types.ts:1171-1185) declares `images`
+    // and `streamingBehavior` optional; the handler-visible object omits them
+    // when absent (the extension boundary drops `undefined` properties, and
+    // PIR-BIN-047 measured pi's handler view without either key). Serialize
+    // only what exists so `"images" in event` / `event.images === undefined`
+    // branches match upstream.
     let mut payload = serde_json::json!({
         "type": "input",
         "text": text,
-        "images": images
+        "source": source,
+    });
+    if !images.is_empty() {
+        payload["images"] = images
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::Image(image) => serde_json::to_value(image).ok(),
                 _ => None,
             })
-            .collect::<Vec<_>>(),
-        "source": source,
-        "streamingBehavior": streaming_behavior,
-    });
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if let Some(streaming_behavior) = streaming_behavior {
+        payload["streamingBehavior"] = streaming_behavior.into();
+    }
     match plugins.emit("input", &mut payload).await {
         Ok(outcome) => {
             let action = outcome

@@ -135,10 +135,16 @@ pub(super) fn run_list_models(
     if let Some(warning) = pir::ai::providers::take_models_json_load_warning() {
         eprintln!("{warning}");
     }
-    // The rest of this function reads only the model list (fuzzy filter, sort,
-    // table), so move it out of the environment instead of deep-cloning every
-    // model once more.
+    // Upstream `--list-models` lists only providers with a resolvable
+    // credential (`getAvailable` → `getAuthenticatedProviders`); the full
+    // catalog is pir's `pir models` view (PIR-BIN-033). Check each PROVIDER
+    // once (42 catalog ids) instead of each of the ~1,657 model rows.
+    let api_keys = environment.api_keys;
     let mut models = environment.models;
+    let mut providers: std::collections::BTreeSet<String> =
+        models.iter().map(|model| model.provider.clone()).collect();
+    providers.retain(|provider| pir::ai::providers::has_configured_auth(provider, &api_keys));
+    models.retain(|model| providers.contains(&model.provider));
     if models.is_empty() {
         // Upstream `formatNoModelsAvailableMessage` +
         // `getProviderLoginHelp` (core/auth-guidance.ts): pi resolves the two

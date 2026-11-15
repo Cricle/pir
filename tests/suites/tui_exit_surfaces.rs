@@ -317,9 +317,8 @@ fn prompt_submission_arms_the_first_token_window() {
 /// `reasoning_effort: "medium"` (measured in the request body) while the
 /// footer displayed `max`: the level the user chose never reached the
 /// provider, and `medium` is a level some models' `thinkingLevelMap` does not
-/// define at all (no reasoning stream). `off` is not a starting level
-/// upstream either (the resolver filters it), so it falls back to the shared
-/// default.
+/// define at all (no reasoning stream). `off` is a real starting level
+/// upstream (model-resolver.ts:571/584-585), so it is honored verbatim.
 #[test]
 fn interactive_session_starts_at_the_settings_thinking_level() {
     use pir::ai::types::ThinkingLevel;
@@ -343,8 +342,8 @@ fn interactive_session_starts_at_the_settings_thinking_level() {
     );
     assert_eq!(
         initial_interactive_thinking(Some(ThinkingLevel::Off)),
-        ThinkingLevel::Medium,
-        "`off` is not a starting level (upstream filters it out)"
+        ThinkingLevel::Off,
+        "`off` is a real starting level upstream (model-resolver.ts:571/584-585)"
     );
 }
 

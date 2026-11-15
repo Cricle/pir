@@ -48,3 +48,29 @@ fn empty_argument_does_not_shift_later_positional_arguments() {
         "Review src/index.ts. Focus: correctness."
     );
 }
+
+/// PIR-BIN-068: upstream `extractFrontmatter` trims the body and normalizes
+/// CRLF/CR to LF (frontmatter.ts:19-21), so a `/template` expansion carries no
+/// leading/trailing whitespace and no carriage returns.
+#[test]
+fn template_body_is_trimmed_and_lf_normalized() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("pir-template-body-{stamp}"));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let path = dir.join("greet.md");
+    std::fs::write(
+        &path,
+        "---\ndescription: Greet\nargument-hint: <name>\n---\n\nGREET-TEMPLATE-BODY $1 and $2\r\nSECOND-LINE\r\n",
+    )
+    .expect("write template");
+    let template =
+        pir::coding_agent::prompt_templates::load_template_file(&path).expect("load template");
+    assert_eq!(
+        template.content,
+        "GREET-TEMPLATE-BODY $1 and $2\nSECOND-LINE"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

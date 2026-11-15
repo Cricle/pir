@@ -128,7 +128,7 @@ export default function (pi) {
     input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
-  const delta = (index, text) => ({ type: "text_delta", content_index: index, delta: text });
+  const delta = (index, text) => ({ type: "text_delta", contentIndex: index, delta: text });
   const doneEvent = (model, text) => ({
     type: "done", reason: "stop",
     message: {

@@ -217,8 +217,9 @@ use crate::ai::types::{Message, Usage};
 use crate::ai::util::now_ms;
 use serde_json::Value as JsonValue;
 
-/// Trait import for line writes.
+/// Trait imports for line writes and the activity-tail read.
 use std::io::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 
 /// The error every file-backed constructor returns when the `session` feature
 /// is off: the in-memory data plane still works, but there is no JSONL reader/
@@ -1454,6 +1455,94 @@ struct SessionInfoPeek {
     first_message: String,
     all_messages_text: String,
     message_count: usize,
+    /// Newest entry `timestamp` (unix millis) seen while peeking. Upstream
+    /// `SessionInfo.modified` is the last in-file activity, not the file mtime
+    /// (session-manager.ts:859-873).
+    last_activity: Option<u64>,
+}
+
+/// The newest NUMERIC `timestamp` value on one JSONL line (unix millis).
+///
+/// Entry `timestamp` fields are ISO strings while the nested message
+/// `timestamp` is the numeric activity clock (upstream `msg.timestamp`); the
+/// scan therefore visits every occurrence and keeps the largest numeric one,
+/// skipping the quoted ISO values. No JSON parse: a tool-result line can be
+/// megabytes.
+fn line_timestamp(line: &[u8]) -> Option<u64> {
+    const KEY: &[u8] = b"\"timestamp\"";
+    let mut best: Option<u64> = None;
+    let mut offset = 0;
+    while let Some(found) = line[offset..]
+        .windows(KEY.len())
+        .position(|window| window == KEY)
+    {
+        let mut index = offset + found + KEY.len();
+        while line
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            index += 1;
+        }
+        if line.get(index) == Some(&b':') {
+            index += 1;
+            while line
+                .get(index)
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+            {
+                index += 1;
+            }
+            let start = index;
+            while line.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if index > start {
+                if let Ok(text) = std::str::from_utf8(&line[start..index]) {
+                    if let Ok(value) = text.parse::<u64>() {
+                        best = Some(best.map_or(value, |current| current.max(value)));
+                    }
+                }
+            }
+        }
+        offset = (offset + found + 1).max(index);
+    }
+    best
+}
+
+/// A session's last-activity time from the file tail: the newest entry
+/// `timestamp` in the last [`ACTIVITY_TAIL_BYTES`], falling back to `fallback`
+/// (the file mtime) when the tail carries none. Upstream `modified` is
+/// activity, not mtime (PIR-BIN-056); reading a bounded tail keeps `-c` and
+/// `--resume` cheap.
+const ACTIVITY_TAIL_BYTES: u64 = 256 * 1024;
+
+fn session_last_activity(path: &Path, file_len: u64, fallback: SystemTime) -> SystemTime {
+    let start = file_len.saturating_sub(ACTIVITY_TAIL_BYTES);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return fallback;
+    };
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return fallback;
+    }
+    let mut buffer = Vec::with_capacity((file_len - start) as usize);
+    if file
+        .take(ACTIVITY_TAIL_BYTES)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        return fallback;
+    }
+    // A mid-line first fragment cannot be parsed; start at the next newline.
+    let slice = if start > 0 {
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(index) => &buffer[index + 1..],
+            None => buffer.as_slice(),
+        }
+    } else {
+        buffer.as_slice()
+    };
+    line_timestamp(slice)
+        .map(|millis| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+        .unwrap_or(fallback)
 }
 
 /// Whether a serialized message line carries `"role":"<role>"` at the JSON
@@ -1671,6 +1760,7 @@ fn peek_session_info_mode(
         first_message: String::new(),
         all_messages_text: String::new(),
         message_count: 0,
+        last_activity: None,
     };
     let mut line = Vec::new();
     while let Ok((consumed, truncated)) =
@@ -1678,6 +1768,12 @@ fn peek_session_info_mode(
     {
         if !consumed {
             break;
+        }
+        if let Some(timestamp) = line_timestamp(&line) {
+            peek.last_activity = Some(
+                peek.last_activity
+                    .map_or(timestamp, |best| best.max(timestamp)),
+            );
         }
         if truncated {
             // The retained prefix is enough for the byte-level tag/role scan
@@ -1968,7 +2064,8 @@ fn find_most_recent_session(session_dir: &Path, cwd: Option<&str>) -> Option<Pat
                 return None;
             }
             let mtime = metadata.modified().ok()?;
-            Some((path, mtime))
+            let activity = session_last_activity(&path, metadata.len(), mtime);
+            Some((path, activity))
         })
         .collect();
     files.sort_by(|(path_a, time_a), (path_b, time_b)| {
@@ -4633,11 +4730,18 @@ impl SessionManager {
                     )
                 });
                 let all_messages_text = lazy_session_corpus_marker(&path, modified, file_len);
+                // Upstream `SessionInfo.modified`: the last in-file activity,
+                // not the file mtime (PIR-BIN-056). `modified` stays the
+                // corpus snapshot fingerprint.
+                let activity = peek
+                    .last_activity
+                    .map(|millis| std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis))
+                    .unwrap_or(modified);
                 sessions.push(SessionSummary {
                     path,
                     id: header.id,
                     cwd: header.cwd,
-                    modified,
+                    modified: activity,
                     name: peek.name,
                     first_message: peek.first_message,
                     all_messages_text,
@@ -4767,11 +4871,17 @@ impl SessionManager {
                             let (path, modified, file_len) = &candidates[index];
                             let all_messages_text =
                                 lazy_session_corpus_marker(path, *modified, *file_len);
+                            let activity = peek
+                                .last_activity
+                                .map(|millis| {
+                                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
+                                })
+                                .unwrap_or(*modified);
                             slots[index] = Some(SessionSummary {
                                 path: path.clone(),
                                 id: header.id,
                                 cwd: header.cwd,
-                                modified: *modified,
+                                modified: activity,
                                 name: peek.name,
                                 first_message: peek.first_message,
                                 all_messages_text,
@@ -4875,10 +4985,10 @@ impl SessionManager {
                 read_session_header_listing(&path, resolved_cwd.as_deref(), file_len)
             {
                 sessions.push(SessionHeaderSummary {
-                    path,
+                    path: path.clone(),
                     id: header.id,
                     cwd: header.cwd,
-                    modified,
+                    modified: session_last_activity(&path, file_len, modified),
                     name,
                 });
             }

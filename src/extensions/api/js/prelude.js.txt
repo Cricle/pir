@@ -4300,7 +4300,7 @@ function applyToolArgumentPatch(stream, index, patch) {
 function applyMessageUpdateDelta(stream, event, type) {
   const content = stream.message.content;
   if (!Array.isArray(content)) return "live message without a content array";
-  const index = event.content_index;
+  const index = event.contentIndex;
   const block = event[MESSAGE_UPDATE_BLOCK_KEY];
   switch (type) {
     case "start":
