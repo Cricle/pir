@@ -1259,7 +1259,11 @@ impl AgentSession {
                 cwd: self.cwd.display().to_string(),
                 ..SystemPromptOptions::default()
             }
-            .render(self.package_dir.as_deref());
+            .render_with_rules(
+                self.package_dir.as_deref(),
+                self.performance.profile()
+                    != crate::config::settings::PerformanceProfile::Efficient,
+            );
             let (default_head, _) = split_prompt_head(&default_head);
             let custom = if head.is_empty() || head == default_head {
                 None

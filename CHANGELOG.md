@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### performance
+
+- The `efficient` profile omits only the advisory final self-check `<rules>`
+  bullet; the three rules backed by a hard tool/agent gate (read-before-edit,
+  literal paths, broad-search) stay in both profiles. `balanced` is unchanged.
+  This removes the extra post-test verification turn that the clean A/B measured
+  in roughly half of the coding runs.
+
 ## 0.3.1-rc.1 (2026-11-14)
 
 Pre-release candidate carrying the post-0.3.1 batch: read-path performance work

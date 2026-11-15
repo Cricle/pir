@@ -43,6 +43,16 @@ measurements. It selects these defaults (each field can be overridden):
 | bash command timeout | 30s default |
 | broad-search guard | **on by default in every profile**; reject `find /`, recursive grep/rg over `/tmp`/home, and `cd /tmp` + project search/test |
 
+The profile also changes the four pir-only `<rules>` bullets: `efficient` keeps
+the three that mirror hard gates (read-before-edit, literal paths,
+broad-search) and omits only the advisory final self-check
+("Before finishing, re-read the task specification…"). That bullet has no
+matching tool/agent gate and upstream `buildRules` has no equivalent. `balanced`
+keeps all four. The omission is implemented as prompt rule options, not as a
+fixture-specific or tool-specific exception; the read gate itself stays active
+(`efficient` uses `EditWarn`: a partial/stale edit warns, a never-read file is
+still refused).
+
 The guard is controlled by `tools.broadSearchGuard` (default `true`). Set it
 to `false` only when a workflow intentionally needs whole-filesystem searches:
 

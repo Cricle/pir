@@ -98,7 +98,7 @@ use crate::extensions::{ExtensionConfig, SessionContextSnapshot};
 #[cfg(feature = "mcp")]
 use crate::plugins::builtin::McpPlugin;
 use crate::plugins::PluginHost;
-use crate::system_prompt::{build_system_prompt_sections, render_sections};
+use crate::system_prompt::render_sections;
 
 /// The print host's shared session storage: per-message persistence and the
 /// compaction hook both append during the run, so a mid-run crash (or a
@@ -904,6 +904,27 @@ pub async fn dispatch_print_before_agent_start(
     system_prompt: String,
     system_prompt_options: JsonValue,
 ) -> PrintBeforeAgentStartOutcome {
+    dispatch_print_before_agent_start_with_rules(
+        plugins,
+        prompt,
+        images,
+        system_prompt,
+        system_prompt_options,
+        true,
+    )
+    .await
+}
+
+/// [`dispatch_print_before_agent_start`] with the advisory prompt-rule switch
+/// (production passes `false` on the `efficient` profile).
+pub async fn dispatch_print_before_agent_start_with_rules(
+    plugins: Option<&PluginHost>,
+    prompt: &str,
+    images: &[ContentBlock],
+    system_prompt: String,
+    system_prompt_options: JsonValue,
+    self_check: bool,
+) -> PrintBeforeAgentStartOutcome {
     let Some(plugins) = plugins else {
         return PrintBeforeAgentStartOutcome::default();
     };
@@ -911,7 +932,7 @@ pub async fn dispatch_print_before_agent_start(
         return PrintBeforeAgentStartOutcome::default();
     }
     let package_dir = crate::config::env::package_dir();
-    let outcome = crate::agent_session::dispatch_before_agent_start(
+    let outcome = crate::agent_session::dispatch_before_agent_start_with_rules(
         plugins,
         crate::agent_session::BeforeAgentStartDispatch {
             prompt: Some(prompt),
@@ -921,6 +942,7 @@ pub async fn dispatch_print_before_agent_start(
             images,
         },
         package_dir.as_deref(),
+        self_check,
     )
     .await;
     PrintBeforeAgentStartOutcome {
@@ -2505,6 +2527,8 @@ pub struct PrintPromptCache {
     /// `extensions/mcp/index.ts:1176-1184`). `None` when MCP is off or has no
     /// enabled servers, so an MCP-less prompt keeps its previous bytes.
     mcp_servers: Option<String>,
+    /// Emit the advisory final self-check rule (`efficient` = false).
+    self_check: bool,
     /// The last render, if any.
     rendered: Option<PrintedPrompt>,
 }
@@ -2540,6 +2564,16 @@ impl PrintPromptCache {
     /// prompt through [`Self::set_mcp_servers`], so a `pending` -> `ready`
     /// transition lands on the next prompt.
     pub fn new_with_mcp_servers(inputs: PrintPromptCacheInputs) -> Self {
+        Self::new_with_mcp_servers_and_rules(inputs, true)
+    }
+
+    /// [`Self::new_with_mcp_servers`] with the advisory-rule switch: `false`
+    /// on the `efficient` performance profile omits only the final self-check
+    /// bullet; the three enforced rules stay.
+    pub fn new_with_mcp_servers_and_rules(
+        inputs: PrintPromptCacheInputs,
+        self_check: bool,
+    ) -> Self {
         Self {
             preamble_override: inputs.preamble_override,
             append: inputs.append,
@@ -2548,6 +2582,7 @@ impl PrintPromptCache {
             cwd: inputs.cwd,
             package_dir: inputs.package_dir,
             mcp_servers: inputs.mcp_servers,
+            self_check,
             rendered: None,
         }
     }
@@ -2678,19 +2713,24 @@ impl PrintPromptCache {
             .filter_map(|name| registry.get(name))
             .map(|tool| crate::system_prompt::ToolInfo::from_agent_tool(tool.as_ref()))
             .collect();
-        let sections = build_system_prompt_sections(&crate::system_prompt::SystemPromptInput {
-            preamble_override: self.preamble_override.clone(),
-            append: self.append.clone(),
-            tools: &tools,
-            hidden_tools: &hidden,
-            project_files: &self.project_files,
-            skills: &self.skills,
-            cwd: &self.cwd,
-            package_dir: self.package_dir.as_deref(),
-            custom_sections: crate::coding_agent::context::mcp_custom_sections(
-                self.mcp_servers.as_deref(),
-            ),
-        });
+        let sections = crate::system_prompt::build_system_prompt_sections_with_rules(
+            &crate::system_prompt::SystemPromptInput {
+                preamble_override: self.preamble_override.clone(),
+                append: self.append.clone(),
+                tools: &tools,
+                hidden_tools: &hidden,
+                project_files: &self.project_files,
+                skills: &self.skills,
+                cwd: &self.cwd,
+                package_dir: self.package_dir.as_deref(),
+                custom_sections: crate::coding_agent::context::mcp_custom_sections(
+                    self.mcp_servers.as_deref(),
+                ),
+            },
+            crate::system_prompt::PromptRuleOptions {
+                self_check: self.self_check,
+            },
+        );
         let prompt = render_sections(&sections);
         self.rendered = Some(PrintedPrompt {
             active: effective.to_vec(),
@@ -3831,15 +3871,18 @@ pub async fn run_print_with_environment(
     // of the status mirror, never a connect. `None` when MCP is off or has no
     // enabled server, which keeps the prompt byte-identical to before.
     let mcp_servers = crate::coding_agent::context::mcp_servers_prompt_section(plugins.as_deref());
-    let mut prompt_cache = PrintPromptCache::new_with_mcp_servers(PrintPromptCacheInputs {
-        preamble_override,
-        append,
-        project_files: context_files,
-        skills: resources.skills.clone(),
-        cwd: cwd.clone(),
-        package_dir,
-        mcp_servers,
-    });
+    let mut prompt_cache = PrintPromptCache::new_with_mcp_servers_and_rules(
+        PrintPromptCacheInputs {
+            preamble_override,
+            append,
+            project_files: context_files,
+            skills: resources.skills.clone(),
+            cwd: cwd.clone(),
+            package_dir,
+            mcp_servers,
+        },
+        performance.profile() != crate::config::settings::PerformanceProfile::Efficient,
+    );
     let prompt_build_started = crate::config::timings::start_phase();
     prompt_cache.sync(&registry, &active, None);
     crate::config::timings::log_phase_once_opt(
@@ -4664,12 +4707,13 @@ pub async fn run_print_with_environment(
         // AgentSession steering queue provides.
         let mut before_agent_injected: Vec<Message> = Vec::new();
         if let Some(host) = plugins.as_deref() {
-            let before = dispatch_print_before_agent_start(
+            let before = dispatch_print_before_agent_start_with_rules(
                 Some(host),
                 &prompt,
                 &input_images,
                 run_system_prompt.clone(),
                 prompt_options,
+                performance.profile() != crate::config::settings::PerformanceProfile::Efficient,
             )
             .await;
             if let Some(prompt) = before.system_prompt {

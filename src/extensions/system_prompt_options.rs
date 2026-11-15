@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::skills::SkillInfo;
-use crate::system_prompt::{build_system_prompt, SystemPromptInput, ToolInfo};
+use crate::system_prompt::{
+    build_system_prompt_with_rules, PromptRuleOptions, SystemPromptInput, ToolInfo,
+};
 
 /// Upstream `normalizeBuildSystemPromptOptions`'s default `selectedTools`
 /// (`system-prompt.ts:64`).
@@ -183,6 +185,12 @@ impl SystemPromptOptions {
     /// Render the complete prompt from these options with the ordered section
     /// builder (upstream `buildSystemPrompt`, `system-prompt.ts:208`).
     pub fn render(&self, package_dir: Option<&Path>) -> String {
+        self.render_with_rules(package_dir, true)
+    }
+
+    /// [`Self::render`] with the advisory-rule switch: `efficient` omits only
+    /// the final self-check bullet; the enforced rules stay.
+    pub fn render_with_rules(&self, package_dir: Option<&Path>, self_check: bool) -> String {
         if let Some(forced) = self.forced_prompt() {
             return forced.to_owned();
         }
@@ -233,21 +241,24 @@ impl SystemPromptOptions {
                     .filter(|(_, text)| !text.is_empty())
             })
             .collect();
-        build_system_prompt(&SystemPromptInput {
-            preamble_override: self.custom_prompt.clone(),
-            append: if self.append_system_prompt.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.append_system_prompt.clone()]
+        build_system_prompt_with_rules(
+            &SystemPromptInput {
+                preamble_override: self.custom_prompt.clone(),
+                append: if self.append_system_prompt.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.append_system_prompt.clone()]
+                },
+                tools: &tools,
+                hidden_tools: &self.hidden_tools,
+                project_files: &project_files,
+                skills: &skills,
+                custom_sections,
+                cwd: Path::new(&self.cwd),
+                package_dir,
             },
-            tools: &tools,
-            hidden_tools: &self.hidden_tools,
-            project_files: &project_files,
-            skills: &skills,
-            custom_sections,
-            cwd: Path::new(&self.cwd),
-            package_dir,
-        })
+            PromptRuleOptions { self_check },
+        )
     }
 }
 
@@ -255,7 +266,12 @@ impl SystemPromptOptions {
 /// `ctx.getSystemPrompt()` / `event.systemPrompt` re-rendering). `None` on a
 /// shape that is not a JSON object.
 pub fn render_json(value: &JsonValue, package_dir: Option<&Path>) -> Option<String> {
-    value
-        .is_object()
-        .then(|| SystemPromptOptions::from_json(value).render(package_dir))
+    value.is_object().then(|| {
+        // This host function has no session handle; the process-level profile
+        // (PIR_PERF_PROFILE) is the best available signal. Session hosts pass
+        // their resolved profile explicitly through `render_with_rules`.
+        let self_check = crate::config::settings::PerformanceSettings::from_env().profile()
+            != crate::config::settings::PerformanceProfile::Efficient;
+        SystemPromptOptions::from_json(value).render_with_rules(package_dir, self_check)
+    })
 }

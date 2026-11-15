@@ -149,6 +149,23 @@ fn is_valid_section_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// Optional rule-section behavior. The default keeps every rule, including
+/// the advisory final self-check. `efficient` turns the self-check off; the
+/// three rules that mirror a hard tool/agent gate are never optional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptRuleOptions {
+    /// Emit "Before finishing, re-read the task specification…". This rule has
+    /// no matching tool gate: it is purely advisory (the read-before-edit,
+    /// literal-path and broad-search rules are enforced by tools and stay).
+    pub self_check: bool,
+}
+
+impl Default for PromptRuleOptions {
+    fn default() -> Self {
+        Self { self_check: true }
+    }
+}
+
 /// Inputs for [`build_system_prompt_sections`].
 #[derive(Debug, Clone)]
 pub struct SystemPromptInput<'a> {
@@ -224,7 +241,7 @@ depending on the project."
 
 /// Upstream `buildRules`: the conditional file-operations rule, then each
 /// declared tool's guidelines in order, then the fixed rules — all dedup'd.
-fn render_rules_section(tools: &[ToolInfo]) -> String {
+fn render_rules_section(tools: &[ToolInfo], rule_options: PromptRuleOptions) -> String {
     let mut rules: Vec<String> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     let mut add_rule = |rule: &str, rules: &mut Vec<String>| {
@@ -283,7 +300,7 @@ fn render_rules_section(tools: &[ToolInfo]) -> String {
             &mut rules,
         );
     }
-    if has_edit_or_write || has_bash {
+    if rule_options.self_check && (has_edit_or_write || has_bash) {
         add_rule(
             "Before finishing, re-read the task specification and verify the edge cases it names (empty input, trailing newlines, ranges, and error exits); run the relevant tests, not only the visible ones",
             &mut rules,
@@ -506,6 +523,17 @@ API details)"
 
 /// Build the ordered, independently replaceable sections of the structured system prompt.
 pub fn build_system_prompt_sections(input: &SystemPromptInput<'_>) -> SystemPromptSections {
+    build_system_prompt_sections_with_rules(input, PromptRuleOptions::default())
+}
+
+/// [`build_system_prompt_sections`] with explicit rule options. The default
+/// entry point keeps every rule; hosts on the `efficient` performance profile
+/// pass `PromptRuleOptions { self_check: false }` to omit only the advisory
+/// final self-check.
+pub fn build_system_prompt_sections_with_rules(
+    input: &SystemPromptInput<'_>,
+    rules: PromptRuleOptions,
+) -> SystemPromptSections {
     let mut sections = SystemPromptSections::default();
 
     // Extension-supplied custom sections are regex-validated (upstream
@@ -540,7 +568,10 @@ pub fn build_system_prompt_sections(input: &SystemPromptInput<'_>) -> SystemProm
         _ => {
             sections.insert(SystemPromptSection::Preamble, DEFAULT_PREAMBLE.to_string());
             sections.insert(SystemPromptSection::Tools, render_tools_section(&declared));
-            sections.insert(SystemPromptSection::Rules, render_rules_section(&declared));
+            sections.insert(
+                SystemPromptSection::Rules,
+                render_rules_section(&declared, rules),
+            );
             if let Some(docs) = render_docs_section(input.package_dir) {
                 sections.insert(SystemPromptSection::Docs, docs);
             }
@@ -618,6 +649,15 @@ fn prompt_skills_text(input: &SystemPromptInput<'_>, declared: &[ToolInfo]) -> S
 /// replays it: sections joined by a blank line, preamble untagged.
 pub fn build_system_prompt(input: &SystemPromptInput<'_>) -> String {
     render_sections(&build_system_prompt_sections(input))
+}
+
+/// [`build_system_prompt`] with explicit rule options. The default entry point
+/// keeps every rule; see [`PromptRuleOptions`].
+pub fn build_system_prompt_with_rules(
+    input: &SystemPromptInput<'_>,
+    rules: PromptRuleOptions,
+) -> String {
+    render_sections(&build_system_prompt_sections_with_rules(input, rules))
 }
 
 /// Render an already-built section set as the prompt text (the join rule

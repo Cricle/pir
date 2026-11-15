@@ -418,11 +418,17 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         );
         let prompt_tools = declared_tool_infos(&child_tools, &active);
         let hidden_tools = rust_hidden_declarations(&child_tools, &active);
+        // The child inherits the process performance profile (the same value
+        // its session config carries below); `efficient` drops only the
+        // advisory final self-check rule.
+        let self_check = crate::config::settings::PerformanceSettings::from_env().profile()
+            != crate::config::settings::PerformanceProfile::Efficient;
         let base_prompt = crate::coding_agent::context::context_system_prompt_with_hidden_in(
             &cwd,
             &prompt_tools,
             &hidden_tools,
             &agent_dir,
+            self_check,
         );
         let body = agent.system_prompt.trim();
         let system_prompt = match (base_prompt, body.is_empty()) {
@@ -440,6 +446,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
                         &prompt_tools,
                         &hidden_tools,
                         &agent_dir,
+                        self_check,
                     );
                 Some(format!("{base}\n\n{body}"))
             }

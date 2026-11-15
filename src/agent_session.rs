@@ -102,7 +102,7 @@ pub(crate) use notifications::drain_extension_notifications;
 pub(crate) use prompt_input::transform_prompt_input;
 #[cfg(feature = "print")]
 pub(crate) use prompt_loop::{
-    dispatch_before_agent_start, project_optional_session_messages_off_thread,
+    dispatch_before_agent_start_with_rules, project_optional_session_messages_off_thread,
     BeforeAgentStartDispatch,
 };
 #[cfg(feature = "print")]

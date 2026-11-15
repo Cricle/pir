@@ -75,10 +75,14 @@ pub(crate) struct BeforeAgentStartOutcome {
 /// `systemPromptOptions`), in-place options mutation followed by a render with
 /// the ordered prompt builder, and both the modern `messages` array and the
 /// legacy single `message` result shape.
-pub(crate) async fn dispatch_before_agent_start(
+/// [`dispatch_before_agent_start_with_rules`] keeps the payload/render
+/// contract; the production hosts pass `self_check = false` on the `efficient`
+/// profile.
+pub(crate) async fn dispatch_before_agent_start_with_rules(
     plugins: &PluginHost,
     request: BeforeAgentStartDispatch<'_>,
     package_dir: Option<&std::path::Path>,
+    self_check: bool,
 ) -> BeforeAgentStartOutcome {
     use crate::extensions::system_prompt_options::SystemPromptOptions;
 
@@ -128,7 +132,8 @@ pub(crate) async fn dispatch_before_agent_start(
     // systemPromptOptions)`).
     if let Some(options) = payload.get("systemPromptOptions") {
         if options != &request.system_prompt_options {
-            let rendered = SystemPromptOptions::from_json(options).render(package_dir);
+            let rendered =
+                SystemPromptOptions::from_json(options).render_with_rules(package_dir, self_check);
             system_prompt = Some(rendered);
         }
     }
@@ -1706,7 +1711,7 @@ impl AgentSession {
         };
         if let Some(plugins) = &self.plugins {
             if plugins.has_handlers("before_agent_start") {
-                let before = dispatch_before_agent_start(
+                let before = dispatch_before_agent_start_with_rules(
                     plugins,
                     BeforeAgentStartDispatch {
                         prompt: match &trigger {
@@ -1722,6 +1727,8 @@ impl AgentSession {
                         images: &input_images,
                     },
                     self.package_dir.as_deref(),
+                    self.performance.profile()
+                        != crate::config::settings::PerformanceProfile::Efficient,
                 )
                 .await;
                 if let Some(prompt) = before.system_prompt {

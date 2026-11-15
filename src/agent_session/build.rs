@@ -585,21 +585,23 @@ impl AgentSession {
                 crate::coding_agent::context::mcp_servers_prompt_section(plugins.as_deref());
             let (prompt, inputs) = if discover_prompt_skills {
                 crate::coding_agent::context::
-                    session_system_prompt_with_hidden_and_options_and_inputs_and_mcp(
+                    session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_with_rules(
                         &cwd,
                         &prompt_tools,
                         &hidden_tools,
                         &context_options,
                         mcp_servers,
+                        performance.profile() != PerformanceProfile::Efficient,
                     )
             } else {
                 crate::coding_agent::context::
-                    session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic(
+                    session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic_with_rules(
                         &cwd,
                         &prompt_tools,
                         &hidden_tools,
                         &context_options,
                         mcp_servers,
+                        performance.profile() != PerformanceProfile::Efficient,
                     )
             };
             // P7/U4: the SESSION hosts always send the base prompt (preamble,
@@ -1027,8 +1029,9 @@ impl AgentSession {
         // build-time ones. P7: the rebuild ALWAYS reinstalls the prompt and
         // its cache (never `None`), so a reload on a bare workspace cannot
         // silently drop the base prompt the build installed.
+        let self_check = self.performance.profile() != PerformanceProfile::Efficient;
         let rebuilt = if cache.preamble_override.is_some() || !cache.append_sections.is_empty() {
-            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides(
+            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides_with_rules(
                 &self.cwd,
                 &prompt_tools,
                 &hidden_tools,
@@ -1036,14 +1039,16 @@ impl AgentSession {
                 self.package_dir.as_deref(),
                 cache.preamble_override.as_deref(),
                 &cache.append_sections,
+                self_check,
             )
         } else {
-            crate::coding_agent::context::session_system_prompt_from_inputs(
+            crate::coding_agent::context::session_system_prompt_from_inputs_with_rules(
                 &self.cwd,
                 &prompt_tools,
                 &hidden_tools,
                 &cache.inputs,
                 self.package_dir.as_deref(),
+                self_check,
             )
         };
         let rebuilt = with_prompt_addendum(rebuilt, cache.append.as_deref());
@@ -1128,7 +1133,7 @@ impl AgentSession {
         cache.preamble_override = preamble;
         cache.append_sections = append;
         let rebuilt =
-            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides(
+            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides_with_rules(
                 &self.cwd,
                 &prompt_tools,
                 &hidden_tools,
@@ -1136,6 +1141,7 @@ impl AgentSession {
                 self.package_dir.as_deref(),
                 cache.preamble_override.as_deref(),
                 &cache.append_sections,
+                self.performance.profile() != PerformanceProfile::Efficient,
             );
         let rebuilt = with_prompt_addendum(rebuilt, cache.append.as_deref());
         cache.active = active;
@@ -1212,8 +1218,9 @@ impl AgentSession {
         // prompt), so a bare-workspace session keeps following the declared
         // set instead of falling back to "no system prompt".
         cache.inputs.mcp_servers = mcp_servers;
+        let self_check = self.performance.profile() != PerformanceProfile::Efficient;
         let rebuilt = if cache.preamble_override.is_some() || !cache.append_sections.is_empty() {
-            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides(
+            crate::coding_agent::context::session_system_prompt_from_inputs_with_overrides_with_rules(
                 &self.cwd,
                 &prompt_tools,
                 &hidden_names,
@@ -1221,14 +1228,16 @@ impl AgentSession {
                 self.package_dir.as_deref(),
                 cache.preamble_override.as_deref(),
                 &cache.append_sections,
+                self_check,
             )
         } else {
-            crate::coding_agent::context::session_system_prompt_from_inputs(
+            crate::coding_agent::context::session_system_prompt_from_inputs_with_rules(
                 &self.cwd,
                 &prompt_tools,
                 &hidden_names,
                 &cache.inputs,
                 self.package_dir.as_deref(),
+                self_check,
             )
         };
         let rebuilt = with_prompt_addendum(rebuilt, cache.append.as_deref());

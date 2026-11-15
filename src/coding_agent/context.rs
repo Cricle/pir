@@ -26,7 +26,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::system_prompt::{build_system_prompt, SystemPromptInput, ToolInfo};
+use crate::system_prompt::{
+    build_system_prompt_with_rules, PromptRuleOptions, SystemPromptInput, ToolInfo,
+};
 
 /// Set to `1`/`true` (or via `--no-context-files`) to disable discovery.
 pub const NO_CONTEXT_FILES_ENV: &str = "PIR_NO_CONTEXT_FILES";
@@ -331,6 +333,7 @@ pub fn context_system_prompt_with_hidden_and_options_and_inputs(
         &skills,
         options.package_dir,
         None,
+        true,
     );
     (
         prompt,
@@ -367,6 +370,7 @@ pub fn session_system_prompt_with_hidden_and_options_and_inputs(
         &skills,
         options.package_dir,
         None,
+        true,
     );
     (
         prompt,
@@ -401,6 +405,31 @@ pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp(
         options,
         mcp_servers,
         skills,
+        true,
+    )
+}
+
+/// [`session_system_prompt_with_hidden_and_options_and_inputs_and_mcp`] with
+/// an explicit advisory-rule switch. The SESSION host passes `false` on the
+/// `efficient` performance profile; the three rules backed by a tool/agent
+/// gate stay in every profile.
+pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_with_rules(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    options: &ContextOptions<'_>,
+    mcp_servers: Option<String>,
+    self_check: bool,
+) -> (String, PromptContextInputs) {
+    let skills = discover_prompt_skills_with(cwd, options);
+    session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
+        cwd,
+        tools,
+        hidden_tools,
+        options,
+        mcp_servers,
+        skills,
+        self_check,
     )
 }
 
@@ -428,6 +457,28 @@ pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic
         options,
         mcp_servers,
         Vec::new(),
+        true,
+    )
+}
+
+/// [`session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic`]
+/// with the explicit advisory-rule switch (see the non-hermetic variant).
+pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_hermetic_with_rules(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    options: &ContextOptions<'_>,
+    mcp_servers: Option<String>,
+    self_check: bool,
+) -> (String, PromptContextInputs) {
+    session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
+        cwd,
+        tools,
+        hidden_tools,
+        options,
+        mcp_servers,
+        Vec::new(),
+        self_check,
     )
 }
 
@@ -439,6 +490,7 @@ fn session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
     options: &ContextOptions<'_>,
     mcp_servers: Option<String>,
     skills: Vec<crate::skills::SkillInfo>,
+    self_check: bool,
 ) -> (String, PromptContextInputs) {
     let files = resolve_context_files_with(cwd, options);
     let prompt = context_system_prompt_unconditional(
@@ -449,6 +501,7 @@ fn session_system_prompt_with_explicit_skills_and_options_and_inputs_and_mcp(
         &skills,
         options.package_dir,
         mcp_servers.as_deref(),
+        self_check,
     );
     (
         prompt,
@@ -485,6 +538,7 @@ pub fn session_system_prompt_with_hidden_and_options_and_inputs_and_mcp_with_ove
             skills: &skills,
             package_dir: options.package_dir,
             mcp_servers: mcp_servers.as_deref(),
+            self_check: true,
         },
         PromptOverrides {
             preamble_override,
@@ -532,6 +586,7 @@ pub(crate) fn context_system_prompt_with_hidden_in(
     tools: &[ToolInfo],
     hidden_tools: &[String],
     agent_dir: &Path,
+    self_check: bool,
 ) -> Option<String> {
     let package_dir = crate::config::env::package_dir();
     let options = ContextOptions {
@@ -541,7 +596,7 @@ pub(crate) fn context_system_prompt_with_hidden_in(
         max_total_bytes: 0,
     };
     let skills = discover_prompt_skills_with(cwd, &options);
-    build_context_prompt(cwd, tools, hidden_tools, &skills, &options)
+    build_context_prompt_with_rules(cwd, tools, hidden_tools, &skills, &options, self_check)
 }
 
 /// [`context_system_prompt_with_hidden_in`] with NO "nothing to inject"
@@ -558,6 +613,7 @@ pub(crate) fn context_system_prompt_with_hidden_in_unconditional(
     tools: &[ToolInfo],
     hidden_tools: &[String],
     agent_dir: &Path,
+    self_check: bool,
 ) -> String {
     let package_dir = crate::config::env::package_dir();
     let options = ContextOptions {
@@ -576,6 +632,7 @@ pub(crate) fn context_system_prompt_with_hidden_in_unconditional(
         &skills,
         package_dir.as_deref(),
         None,
+        self_check,
     )
 }
 
@@ -639,6 +696,7 @@ pub fn context_system_prompt_with_skills_and_options_and_inputs(
         skills,
         options.package_dir,
         None,
+        true,
     );
     (
         prompt,
@@ -670,6 +728,7 @@ pub fn session_system_prompt_with_skills_and_options_and_inputs(
         skills,
         options.package_dir,
         None,
+        true,
     );
     (
         prompt,
@@ -703,6 +762,7 @@ pub fn session_system_prompt_with_skills_and_options_and_inputs_and_mcp(
         skills,
         options.package_dir,
         mcp_servers.as_deref(),
+        true,
     );
     (
         prompt,
@@ -734,6 +794,7 @@ pub fn context_system_prompt_from_inputs(
         &inputs.skills,
         package_dir,
         inputs.mcp_servers.as_deref(),
+        true,
     )
 }
 
@@ -747,6 +808,26 @@ pub fn session_system_prompt_from_inputs(
     inputs: &PromptContextInputs,
     package_dir: Option<&Path>,
 ) -> String {
+    session_system_prompt_from_inputs_with_rules(
+        cwd,
+        tools,
+        hidden_tools,
+        inputs,
+        package_dir,
+        true,
+    )
+}
+
+/// [`session_system_prompt_from_inputs`] with the explicit advisory-rule
+/// switch used by the `efficient` performance profile.
+pub fn session_system_prompt_from_inputs_with_rules(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    inputs: &PromptContextInputs,
+    package_dir: Option<&Path>,
+    self_check: bool,
+) -> String {
     context_system_prompt_unconditional(
         cwd,
         tools,
@@ -755,6 +836,7 @@ pub fn session_system_prompt_from_inputs(
         &inputs.skills,
         package_dir,
         inputs.mcp_servers.as_deref(),
+        self_check,
     )
 }
 
@@ -770,6 +852,31 @@ pub fn session_system_prompt_from_inputs_with_overrides(
     preamble_override: Option<&str>,
     append: &[String],
 ) -> String {
+    session_system_prompt_from_inputs_with_overrides_with_rules(
+        cwd,
+        tools,
+        hidden_tools,
+        inputs,
+        package_dir,
+        preamble_override,
+        append,
+        true,
+    )
+}
+
+/// [`session_system_prompt_from_inputs_with_overrides`] with the explicit
+/// advisory-rule switch used by the `efficient` performance profile.
+#[allow(clippy::too_many_arguments)]
+pub fn session_system_prompt_from_inputs_with_overrides_with_rules(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    inputs: &PromptContextInputs,
+    package_dir: Option<&Path>,
+    preamble_override: Option<&str>,
+    append: &[String],
+    self_check: bool,
+) -> String {
     context_system_prompt_unconditional_with(
         &PromptSources {
             cwd,
@@ -779,6 +886,7 @@ pub fn session_system_prompt_from_inputs_with_overrides(
             skills: &inputs.skills,
             package_dir,
             mcp_servers: inputs.mcp_servers.as_deref(),
+            self_check,
         },
         PromptOverrides {
             preamble_override,
@@ -797,6 +905,17 @@ fn build_context_prompt(
     skills: &[crate::skills::SkillInfo],
     options: &ContextOptions<'_>,
 ) -> Option<String> {
+    build_context_prompt_with_rules(cwd, tools, hidden_tools, skills, options, true)
+}
+
+fn build_context_prompt_with_rules(
+    cwd: &Path,
+    tools: &[ToolInfo],
+    hidden_tools: &[String],
+    skills: &[crate::skills::SkillInfo],
+    options: &ContextOptions<'_>,
+    self_check: bool,
+) -> Option<String> {
     let files = resolve_context_files_with(cwd, options);
     context_system_prompt_from_parts(
         cwd,
@@ -806,6 +925,7 @@ fn build_context_prompt(
         skills,
         options.package_dir,
         None,
+        self_check,
     )
 }
 
@@ -813,6 +933,7 @@ fn build_context_prompt(
 /// the "nothing to inject → no prompt" rule shared by every variant. Borrows
 /// its inputs (no discovery, no clone), so an active-set rebuild can pass a
 /// cache's slices directly.
+#[allow(clippy::too_many_arguments)]
 fn context_system_prompt_from_parts(
     cwd: &Path,
     tools: &[ToolInfo],
@@ -821,6 +942,7 @@ fn context_system_prompt_from_parts(
     skills: &[crate::skills::SkillInfo],
     package_dir: Option<&Path>,
     mcp_servers: Option<&str>,
+    self_check: bool,
 ) -> Option<String> {
     if files.is_empty() && skills.is_empty() && mcp_servers.is_none() {
         return None;
@@ -833,6 +955,7 @@ fn context_system_prompt_from_parts(
         skills,
         package_dir,
         mcp_servers,
+        self_check,
     ))
 }
 
@@ -845,6 +968,9 @@ struct PromptSources<'a> {
     skills: &'a [crate::skills::SkillInfo],
     package_dir: Option<&'a Path>,
     mcp_servers: Option<&'a str>,
+    /// Emit the advisory final self-check rule. The three rules backed by a
+    /// tool/agent gate are always emitted.
+    self_check: bool,
 }
 
 /// CLI prompt overrides applied on top of [`PromptSources`].
@@ -867,6 +993,7 @@ struct PromptOverrides<'a> {
 /// (`coding_agent/print.rs`) and the subagent child body-bearing prompt now
 /// uses the explicit `_in` unconditional wrapper below, so both produce a
 /// full prompt on a bare workspace too.
+#[allow(clippy::too_many_arguments)]
 fn context_system_prompt_unconditional(
     cwd: &Path,
     tools: &[ToolInfo],
@@ -875,6 +1002,7 @@ fn context_system_prompt_unconditional(
     skills: &[crate::skills::SkillInfo],
     package_dir: Option<&Path>,
     mcp_servers: Option<&str>,
+    self_check: bool,
 ) -> String {
     context_system_prompt_unconditional_with(
         &PromptSources {
@@ -885,6 +1013,7 @@ fn context_system_prompt_unconditional(
             skills,
             package_dir,
             mcp_servers,
+            self_check,
         },
         PromptOverrides::default(),
     )
@@ -897,20 +1026,25 @@ fn context_system_prompt_unconditional_with(
     sources: &PromptSources<'_>,
     overrides: PromptOverrides<'_>,
 ) -> String {
-    build_system_prompt(&SystemPromptInput {
-        preamble_override: overrides.preamble_override.map(str::to_owned),
-        append: overrides.append.to_vec(),
-        tools: sources.tools,
-        hidden_tools: sources.hidden_tools,
-        project_files: sources.files,
-        skills: sources.skills,
-        cwd: sources.cwd,
-        // The package asset dir is a resolved option (upstream
-        // `getPackageDir`; read once at the boundary); the builder itself
-        // never reads the process environment.
-        package_dir: sources.package_dir,
-        custom_sections: mcp_custom_sections(sources.mcp_servers),
-    })
+    build_system_prompt_with_rules(
+        &SystemPromptInput {
+            preamble_override: overrides.preamble_override.map(str::to_owned),
+            append: overrides.append.to_vec(),
+            tools: sources.tools,
+            hidden_tools: sources.hidden_tools,
+            project_files: sources.files,
+            skills: sources.skills,
+            cwd: sources.cwd,
+            // The package asset dir is a resolved option (upstream
+            // `getPackageDir`; read once at the boundary); the builder itself
+            // never reads the process environment.
+            package_dir: sources.package_dir,
+            custom_sections: mcp_custom_sections(sources.mcp_servers),
+        },
+        PromptRuleOptions {
+            self_check: sources.self_check,
+        },
+    )
 }
 
 /// Skills that join the system prompt when a caller builds the default prompt

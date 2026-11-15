@@ -37,7 +37,8 @@ use pir::agent::tool_execution::{AgentTool, BoxFuture, ToolContext, ToolRegistry
 use pir::coding_agent::print::print_tool_loadout_with_profile;
 use pir::config::settings::PerformanceProfile;
 use pir::system_prompt::{
-    build_system_prompt_sections, SystemPromptInput, SystemPromptSection, ToolInfo,
+    build_system_prompt_sections, build_system_prompt_sections_with_rules, PromptRuleOptions,
+    SystemPromptInput, SystemPromptSection, ToolInfo,
 };
 
 /// A snippet-carrying probe tool: the `<tools>` section only lists tools with a
@@ -246,17 +247,24 @@ const PIR_ONLY_RULES: [&str; 4] = [
 ];
 
 fn rules_of(tools: &[ToolInfo]) -> Vec<String> {
-    let sections = build_system_prompt_sections(&SystemPromptInput {
-        preamble_override: None,
-        append: Vec::new(),
-        tools,
-        hidden_tools: &[],
-        project_files: &[],
-        skills: &[],
-        custom_sections: Vec::new(),
-        cwd: std::path::Path::new("/w"),
-        package_dir: None,
-    });
+    rules_of_with_rules(tools, PromptRuleOptions::default())
+}
+
+fn rules_of_with_rules(tools: &[ToolInfo], rules: PromptRuleOptions) -> Vec<String> {
+    let sections = build_system_prompt_sections_with_rules(
+        &SystemPromptInput {
+            preamble_override: None,
+            append: Vec::new(),
+            tools,
+            hidden_tools: &[],
+            project_files: &[],
+            skills: &[],
+            custom_sections: Vec::new(),
+            cwd: std::path::Path::new("/w"),
+            package_dir: None,
+        },
+        rules,
+    );
     sections
         .get(SystemPromptSection::Rules)
         .expect("<rules> section")
@@ -320,6 +328,59 @@ fn pir_only_rules_are_gated_on_the_tools_that_trigger_them() {
     assert!(read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[1]));
     assert!(read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[3]));
     assert!(!read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[2]));
+}
+
+/// The `efficient` performance profile omits ONLY the advisory finish rule.
+///
+/// The other three pir-only bullets mirror a hard tool/agent gate and must stay
+/// in every profile. The finish rule is purely advisory, and upstream
+/// `buildRules` (`system-prompt.ts:88-127`) has no equivalent bullet at all.
+/// `balanced` (the `PromptRuleOptions::default`) stays byte-identical.
+#[test]
+fn efficient_profile_omits_only_the_advisory_finish_rule() {
+    let core = [tool("read"), tool("bash"), tool("edit"), tool("write")];
+    let balanced = rules_of_with_rules(&core, PromptRuleOptions { self_check: true });
+    let efficient = rules_of_with_rules(&core, PromptRuleOptions { self_check: false });
+
+    for rule in &PIR_ONLY_RULES[..3] {
+        assert_eq!(
+            balanced
+                .iter()
+                .filter(|candidate| candidate.as_str() == *rule)
+                .count(),
+            1,
+            "balanced must keep the enforced rule `{rule}`: {balanced:#?}"
+        );
+        assert_eq!(
+            efficient
+                .iter()
+                .filter(|candidate| candidate.as_str() == *rule)
+                .count(),
+            1,
+            "efficient must keep the enforced rule `{rule}`: {efficient:#?}"
+        );
+    }
+    assert_eq!(
+        balanced
+            .iter()
+            .filter(|candidate| candidate.as_str() == PIR_ONLY_RULES[3])
+            .count(),
+        1,
+        "balanced must keep the advisory finish rule: {balanced:#?}"
+    );
+    assert!(
+        !efficient.iter().any(|rule| rule == PIR_ONLY_RULES[3]),
+        "efficient must omit the advisory finish rule: {efficient:#?}"
+    );
+    assert_eq!(efficient.len() + 1, balanced.len());
+    assert_eq!(
+        efficient[efficient.len() - 2],
+        "Be concise in your responses"
+    );
+    assert_eq!(
+        efficient[efficient.len() - 1],
+        "Show file paths clearly when working with files"
+    );
 }
 
 // ---------------------------------------------------------------------------
