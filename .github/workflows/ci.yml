@@ -184,19 +184,25 @@ jobs:
             # for the failure annotations below (the job log needs a token to
             # read; annotations do not).
             group_log="/tmp/nextest-group-${shard}.log"
-            if ! cargo nextest run --locked --profile ci "${args[@]}" 2>&1 | tee "$group_log"; then
+            cargo nextest run --locked --profile ci "${args[@]}" 2>&1 | tee "$group_log"
+            group_exit=${PIPESTATUS[0]}
+            echo "::notice title=Nextest group ${shard}::exit=${group_exit}"
+            if [ "$group_exit" -ne 0 ]; then
               status=1
+              # Strip ANSI so the annotation greps also match colored nextest
+              # output, and so the check-run text is readable.
+              sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' "$group_log" > "$group_log.clean" || cp "$group_log" "$group_log.clean"
               {
-                echo "### Test group ${shard}/8 failed"
+                echo "### Test group ${shard}/8 failed (exit ${group_exit})"
                 echo '```'
-                grep -E "^\s*(FAIL|TIMEOUT)|^ *Summary|^error" "$group_log" | head -60
-                tail -30 "$group_log"
+                grep -E "^\s*(FAIL|TIMEOUT)|^ *Summary|^error" "$group_log.clean" | head -60
+                tail -30 "$group_log.clean"
                 echo '```'
               } >> "$GITHUB_STEP_SUMMARY"
-              grep -E "^\s*(FAIL|TIMEOUT)" "$group_log" | head -20 | while IFS= read -r line; do
+              grep -E "^\s*(FAIL|TIMEOUT)" "$group_log.clean" | head -20 | while IFS= read -r line; do
                 [ -n "$line" ] && echo "::error title=Nextest group ${shard}::$line"
               done
-              tail -c 4000 "$group_log" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+              tail -c 4000 "$group_log.clean" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
                 | awk '{printf "%s%%0A", $0}' | cut -c1-40000 > /tmp/nextest-group-tail.txt
               echo "::error title=Nextest group ${shard} log tail::$(cat /tmp/nextest-group-tail.txt)"
             fi
