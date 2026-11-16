@@ -507,6 +507,42 @@ fn context_with2(base: &Context, tools: Vec<Tool>) -> Context {
     }
 }
 
+/// Upstream #11959: a non-strict `input_schema` keeps root `$defs` and
+/// `definitions` so property `$ref`s resolve. Root combinators still stay
+/// out because Anthropic rejects them with a 400.
+#[test]
+fn anthropic_non_strict_schema_keeps_root_definitions() {
+    let model = anthropic_model();
+    let context = context_with(vec![user_message("Hi")]);
+    let options = StreamOptions::default();
+    let settings = json!({"type": "object", "properties": {"verbose": {"type": "boolean"}}});
+    for keyword in ["$defs", "definitions"] {
+        let ref_path = format!("#/{keyword}/Settings");
+        let mut parameters = json!({
+            "type": "object",
+            "properties": {"settings": {"$ref": ref_path}},
+            "required": ["settings"],
+            "anyOf": [{"type": "object"}],
+        });
+        parameters[keyword] = json!({"Settings": settings});
+        let (body, _) = build_anthropic_request(
+            &model,
+            &context_with2(&context, vec![tool("config", parameters, None)]),
+            &options,
+        )
+        .unwrap();
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["properties"]["settings"]["$ref"], json!(ref_path));
+        assert_eq!(schema["required"], json!(["settings"]));
+        assert_eq!(schema[keyword], json!({"Settings": settings}));
+        assert!(
+            schema.get("anyOf").is_none(),
+            "root anyOf still stays out: {schema}"
+        );
+    }
+}
+
 #[test]
 fn anthropic_strict_require_tool_fails_closed() {
     let mut model = anthropic_model();

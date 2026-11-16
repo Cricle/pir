@@ -1489,14 +1489,23 @@ fn convert_tools(
         .collect()
 }
 
-/// Legacy `input_schema` shape: `{type, properties, required}` extracted from
-/// the parameters JSON schema (upstream `legacyInputSchema`).
+/// Legacy `input_schema` shape: `{type, properties, required}` plus root
+/// `$defs`/`definitions` from the parameters JSON schema (upstream
+/// `legacyInputSchema`). Shared definitions stay because property `$ref`s
+/// point into them; other root keywords (anyOf/oneOf/allOf) are still left
+/// out because Anthropic rejects them with a 400 (#11959).
 fn legacy_input_schema(parameters: &Value) -> Value {
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": parameters.get("properties").cloned().unwrap_or_else(|| json!({})),
         "required": parameters.get("required").cloned().unwrap_or_else(|| json!([])),
-    })
+    });
+    for keyword in ["$defs", "definitions"] {
+        if let Some(definitions) = parameters.get(keyword) {
+            schema[keyword] = definitions.clone();
+        }
+    }
+    schema
 }
 
 fn user_message_blocks(message: &UserMessage) -> Option<Value> {
