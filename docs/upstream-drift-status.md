@@ -243,14 +243,14 @@ unchanged-version warning (#11469/#11571); prompt-template apostrophes and
 escaped quotes (#11873); tool-search name-first ranking (#11331); `pi.exec`
 `maxBuffer`/`truncated` (#11546); MCP `login`/`logout` `-l` with a name
 suggestion (upstream `be15fe3c1`); `requiresNonNullAssistantContent`
-(#8118); `promptCacheKeyMode` (#9442); and grep context/limit semantics from
-the engine (#11705).
+(#8118); `promptCacheKeyMode` (#9442); grep context/limit semantics from the
+engine (#11705); branch-summary context edits (#11680); and tool-search
+field weighting and coverage ranking (#11625/#11632).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
-audit tables): branch-summary context edits (#11680); tool-search coverage
-ranking; helper spawn cwd; MCP refresh-only guard; `pi auth login/logout`
-flags; case-insensitive Windows resource keys; and the remaining queue/window
-edge items.
+audit tables): helper spawn cwd; MCP refresh-only guard; `pi auth
+login/logout` flags; case-insensitive Windows resource keys; and the
+remaining queue/window edge items.
 
 **Deferred / large (not a parity bug)**: Anthropic message threads,
 Bedrock strict-tool fallback, the pi-schema coercion superset, extension

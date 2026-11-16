@@ -156,7 +156,7 @@ fn visit_entry_context_messages(entry: &FileEntry, visit: &mut impl FnMut(Messag
 /// aggregate list. `replacement: null` omits the entry entirely; a
 /// replacement rewrites each message's editable content exactly like
 /// [`replace_message_content`].
-fn push_context_entry_messages(
+pub(crate) fn push_context_entry_messages(
     entry: &FileEntry,
     edit: Option<&ContextEditEntry>,
     out: &mut Vec<Message>,

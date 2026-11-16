@@ -471,9 +471,10 @@ fn bm25_keeps_score_descending_as_the_primary_key() {
     );
 }
 
-/// `ae823bc0b` #11331: a query that names a tool ranks it first, even when
-/// BM25 length normalization would rank another document higher (upstream
-/// `tool.ts:133-183`, `isNameQuery`).
+/// `ae823bc0b` #11331: a query that names a tool ranks it first (upstream
+/// `tool.ts`, `isExactNameQuery`); after #11625 the name field also outweighs
+/// description mentions, so a name term keeps the tool first for a partial
+/// name query.
 #[cfg(feature = "tool-search")]
 #[test]
 fn bm25_ranks_a_tool_first_when_the_query_is_its_name() {
@@ -490,18 +491,15 @@ fn bm25_ranks_a_tool_first_when_the_query_is_its_name() {
     let ranked = ranker.rank("thread_read", 8);
     assert_eq!(
         ranked[0].0, "thread_read",
-        "the name match ranks first: {ranked:?}"
-    );
-    assert!(
-        ranked[1].1 > ranked[0].1,
-        "the fixture must give the name match a lower BM25 score: {ranked:?}"
+        "the exact-name query ranks the tool first: {ranked:?}"
     );
 
-    // The same fixture without the name query keeps score first.
+    // A partial name query keeps the tool first too: its name field outweighs
+    // the repeated description mentions (#11625).
     let ranked = ranker.rank("thread", 8);
     assert_eq!(
-        ranked[0].0, "aaa",
-        "a non-name query stays score-ordered: {ranked:?}"
+        ranked[0].0, "thread_read",
+        "a name term outweighs description mentions: {ranked:?}"
     );
 }
 
@@ -549,6 +547,82 @@ fn bm25_name_query_matches_mcp_suffixes_and_normalized_names() {
             .map(|(name, _)| name.as_str()),
         Some("dev-radius"),
         "`-` normalizes to `_` before the name comparison"
+    );
+}
+
+/// `e033f255f` #11632: a tool matching more of the query's distinct terms in
+/// any field ranks above one matching fewer, whatever the BM25 scores.
+#[cfg(feature = "tool-search")]
+#[test]
+fn bm25_ranks_more_query_term_coverage_first() {
+    use pir::plugins::builtin::Bm25Ranker;
+
+    let ranker = Bm25Ranker::new(vec![
+        // Name covers `window` only.
+        (
+            "peekaboo__window".to_owned(),
+            "window management".to_owned(),
+        ),
+        // Description covers both query terms.
+        (
+            "peekaboo__image".to_owned(),
+            "Take a screenshot of the screen, an app, or a window.".to_owned(),
+        ),
+    ]);
+    let names: Vec<String> = ranker
+        .rank("screenshot window", 8)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("peekaboo__image"),
+        "the tool matching both query terms wins: {names:?}"
+    );
+
+    // Namespace text is its own field: a query matching the server name and
+    // description outranks a tool matching only one term there.
+    let ranker = Bm25Ranker::new(vec![
+        (
+            "tool_a".to_owned(),
+            "alpha".to_owned(),
+            "server beta".to_owned(),
+        ),
+        ("tool_b".to_owned(), "beta alpha".to_owned(), String::new()),
+    ]);
+    let names: Vec<String> = ranker
+        .rank("server beta", 8)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("tool_a"),
+        "namespace matches count toward coverage: {names:?}"
+    );
+}
+
+/// `cc44fa216` #11625: a query term in the tool's name outweighs any number
+/// of mentions in the description.
+#[cfg(feature = "tool-search")]
+#[test]
+fn bm25_weighs_names_above_descriptions() {
+    use pir::plugins::builtin::Bm25Ranker;
+
+    let ranker = Bm25Ranker::new(vec![
+        ("mcp__peekaboo__app".to_owned(), "applications".to_owned()),
+        // Six description mentions of the same term.
+        ("zzz".to_owned(), "app app app app app app".to_owned()),
+    ]);
+    let names: Vec<String> = ranker
+        .rank("app", 8)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("mcp__peekaboo__app"),
+        "the name match outranks description mentions: {names:?}"
     );
 }
 

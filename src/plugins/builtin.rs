@@ -337,7 +337,7 @@ pub(crate) mod tool_search;
 /// [`Bm25Ranker`](tool_search::Bm25Ranker) rides along for the
 /// ordering-determinism tests (the documented score-desc/name-asc key).
 #[cfg(feature = "tool-search")]
-pub use tool_search::{Bm25Ranker, ToolSearchPlugin};
+pub use tool_search::{Bm25Document, Bm25Ranker, ToolSearchPlugin};
 
 #[cfg(feature = "tool-search")]
 fn new_tool_search_plugin() -> Arc<dyn AgentPlugin> {

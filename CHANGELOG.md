@@ -53,6 +53,13 @@ v1.5.2, and the generated test harnesses were rebuilt.
   matched files, merges overlapping windows, keeps a lone CR as content, and
   reports the match limit only after proof of one more match; the public
   `GrepOperations` loses `read_file` as upstream did (`#11705`).
+- Branch summaries apply the latest `context_edit` per target, so a failed
+  attempt hidden by a retry or a replaced message no longer reaches the
+  summarizer (`#11680`).
+- Tool search scores the name, description/schema, and namespace as separate
+  fields: more query-term coverage ranks first, a name term outweighs
+  description mentions, and an exact-name query still ranks the tool first
+  (`#11625`/`#11632`).
 
 ### correctness
 

@@ -14,7 +14,9 @@
 //!   messages are collected NEWEST-first until the token budget is hit, so the
 //!   most recent context survives a too-long branch. File operations are
 //!   accumulated from ALL entries (even ones dropped by the budget) so nested
-//!   `branch_summary` details carry over cumulatively.
+//!   `branch_summary` details carry over cumulatively. The latest
+//!   `context_edit` per target is applied, so hidden or replaced entries never
+//!   reach the summarizer (upstream #11680).
 //! - [`generate_branch_summary`] mirrors upstream `generateBranchSummary`:
 //!   one summarizer request over the serialized conversation, with the same
 //!   prompt text, the same preamble, and the same response guards. Failures
@@ -37,11 +39,12 @@ use serde_json::Value as JsonValue;
 
 use crate::ai::types::{Message, Model, Usage};
 use crate::session_manager::projection::{
-    custom_message_text, framed_user_message, user_text_message, BRANCH_SUMMARY_PREFIX,
-    BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
+    custom_message_text, framed_user_message, push_context_entry_messages, user_text_message,
+    BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX,
+    COMPACTION_SUMMARY_SUFFIX,
 };
 use crate::session_manager::types::ms_from_iso;
-use crate::session_manager::{FileEntry, SessionManager};
+use crate::session_manager::{ContextEditEntry, FileEntry, SessionManager};
 
 use super::algorithm::estimate_message_tokens;
 use super::{
@@ -189,26 +192,44 @@ pub fn ensure_leaf_unchanged(
 // Entry to message conversion (upstream `getMessageFromEntry`)
 // ============================================================================
 
+/// Render one entry through its context edit: zero messages for an omission,
+/// one for a replacement (the same [`push_context_entry_messages`] projection
+/// the live context uses).
+fn projected_messages(entry: &FileEntry, edit: &ContextEditEntry) -> Vec<Message> {
+    let mut messages = Vec::new();
+    push_context_entry_messages(entry, Some(edit), &mut messages);
+    messages
+}
+
 /// Extract the model message from a session entry (upstream
 /// `getMessageFromEntry`): message entries skip tool results (the context
 /// lives in the assistant's tool call); custom-message, branch-summary, and
 /// compaction entries contribute their framed user text; state entries
 /// contribute nothing.
-fn get_message_from_entry(entry: &FileEntry) -> Option<Message> {
+///
+/// `edit` is the latest `context_edit` targeting this entry: an omission
+/// (`replacement: null`) drops it and a replacement swaps its content, using
+/// the same projection as the live context (upstream #11680).
+fn get_message_from_entry(entry: &FileEntry, edit: Option<&ContextEditEntry>) -> Option<Message> {
     match entry {
         FileEntry::Message(inner) => {
             let message: Message = inner.message.clone().into();
             // Skip tool results - context is in assistant's tool call.
             if matches!(message, Message::ToolResult(_)) {
-                None
-            } else {
-                Some(message)
+                return None;
+            }
+            match edit {
+                None => Some(message),
+                Some(edit) => projected_messages(entry, edit).into_iter().next(),
             }
         }
-        FileEntry::CustomMessage(inner) => Some(user_text_message(
-            &custom_message_text(&inner.content),
-            ms_from_iso(entry.timestamp()).unwrap_or(0),
-        )),
+        FileEntry::CustomMessage(inner) => match edit {
+            Some(edit) => projected_messages(entry, edit).into_iter().next(),
+            None => Some(user_text_message(
+                &custom_message_text(&inner.content),
+                ms_from_iso(entry.timestamp()).unwrap_or(0),
+            )),
+        },
         FileEntry::BranchSummary(inner) if !inner.summary.is_empty() => Some(framed_user_message(
             BRANCH_SUMMARY_PREFIX,
             &inner.summary,
@@ -272,9 +293,20 @@ pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> Branc
         }
     }
 
+    // Context edits hide or replace earlier entries in model context; honor
+    // the latest edit per target (upstream #11680).
+    let mut edits: std::collections::HashMap<&str, &ContextEditEntry> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        if let FileEntry::ContextEdit(edit) = entry {
+            edits.insert(edit.target_id.as_str(), edit);
+        }
+    }
+
     // Second pass: newest to oldest, until the budget.
     for entry in entries.iter().rev() {
-        let Some(message) = get_message_from_entry(entry) else {
+        let edit = entry.id().and_then(|id| edits.get(id).copied());
+        let Some(message) = get_message_from_entry(entry, edit) else {
             continue;
         };
 

@@ -22,7 +22,8 @@ use pir::compaction::branch_summarization::{
 use pir::compaction::prompts::SUMMARIZATION_SYSTEM_PROMPT;
 use pir::compaction::{compute_file_lists, CompleteFn};
 use pir::session_manager::{
-    BranchSummaryEntry, CompactionEntry, FileEntry, MessageEntry, SessionManager, StoredMessage,
+    BranchSummaryEntry, CompactionEntry, ContextEditEntry, ContextEditReplacement, FileEntry,
+    MessageEntry, SessionManager, StoredMessage,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +137,23 @@ fn message_entry(id: &str, parent: Option<&str>, message: Message) -> FileEntry 
         parent_id: parent.map(str::to_owned),
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         message: StoredMessage::from(message),
+    })
+}
+
+/// One `context_edit` entry: `replacement: None` omits the target from
+/// context, `Some(content)` swaps its content.
+fn context_edit_entry(
+    id: &str,
+    parent: Option<&str>,
+    target: &str,
+    replacement: Option<serde_json::Value>,
+) -> FileEntry {
+    FileEntry::ContextEdit(ContextEditEntry {
+        id: id.into(),
+        parent_id: parent.map(str::to_owned),
+        timestamp: "2026-01-01T00:00:00.000Z".into(),
+        target_id: target.into(),
+        replacement: replacement.map(|content| ContextEditReplacement { content }),
     })
 }
 
@@ -284,6 +302,76 @@ fn prepare_keeps_the_most_recent_messages_within_the_token_budget() {
     let preparation = prepare_branch_entries(&entries, 0);
     assert_eq!(preparation.messages.len(), 3);
     assert_eq!(preparation.total_tokens, 300);
+}
+
+/// `d0fe21308` #11680: the branch-summary input honors `context_edit`
+/// entries — an omission drops the target, a replacement swaps its content,
+/// and the latest edit per target wins.
+#[test]
+fn prepare_applies_context_edits_to_branch_entries() {
+    let entries = vec![
+        message_entry("m1", None, user_msg("first")),
+        // A failed attempt hidden from model context.
+        message_entry(
+            "m2",
+            Some("m1"),
+            Message::Assistant(assistant_text("failed attempt", StopReason::Stop)),
+        ),
+        context_edit_entry("e1", Some("m2"), "m2", None),
+        // A successful retry whose content was replaced.
+        message_entry(
+            "m3",
+            Some("e1"),
+            Message::Assistant(assistant_text("original retry", StopReason::Stop)),
+        ),
+        context_edit_entry(
+            "e2",
+            Some("m3"),
+            "m3",
+            Some(serde_json::json!("replacement text")),
+        ),
+        // A newer edit for the same target wins over the earlier one.
+        message_entry(
+            "m4",
+            Some("e2"),
+            Message::Assistant(assistant_text("newer attempt", StopReason::Stop)),
+        ),
+        context_edit_entry(
+            "e3",
+            Some("m4"),
+            "m4",
+            Some(serde_json::json!("latest replacement")),
+        ),
+        context_edit_entry(
+            "e4",
+            Some("e3"),
+            "m4",
+            Some(serde_json::json!("newest replacement")),
+        ),
+        message_entry("m5", Some("e4"), user_msg("go on")),
+    ];
+
+    let preparation = prepare_branch_entries(&entries, 0);
+    let texts: Vec<String> = preparation
+        .messages
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => match &user.content[0] {
+                ContentBlock::Text(text) => text.text.clone(),
+                other => panic!("expected user text, got {other:?}"),
+            },
+            Message::Assistant(assistant) => match &assistant.content[0] {
+                ContentBlock::Text(text) => text.text.clone(),
+                other => panic!("expected assistant text, got {other:?}"),
+            },
+            other => panic!("unexpected message {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["first", "replacement text", "newest replacement", "go on"],
+        "the omitted attempt is dropped and replacements apply"
+    );
 }
 
 #[test]

@@ -220,28 +220,126 @@ fn is_name_query(query: &str, name: &str) -> bool {
     normalized == query || normalized.ends_with(&format!("__{query}"))
 }
 
-/// Okapi BM25 over the candidate documents (upstream `Bm25Ranker`,
-/// tool.ts:133-183; k1=1.2, b=0.75). A query that names a tool ranks that
-/// tool first — BM25 length normalization could otherwise rank a shorter
-/// description sharing the name's words above it (upstream #11331). The rank
-/// order is a documented total key: name match, then score descending, then
-/// tool name ascending ([`Self::rank`]).
+/// A tool as the ranker sees it (upstream `ToolSearchDocument`): the name is
+/// scored as its own field, `text` is the description plus the recursive
+/// schema text, and `namespace_text` is the server-level text shared by every
+/// tool of the namespace.
+#[derive(Debug, Clone)]
+pub struct Bm25Document {
+    pub name: String,
+    /// Description, schema descriptions, and property names.
+    pub text: String,
+    /// Name, description, and instructions of the tool's namespace.
+    pub namespace_text: String,
+}
+
+impl Bm25Document {
+    pub fn new(name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            text: text.into(),
+            namespace_text: String::new(),
+        }
+    }
+
+    pub fn with_namespace(mut self, namespace_text: impl Into<String>) -> Self {
+        self.namespace_text = namespace_text.into();
+        self
+    }
+}
+
+impl From<(String, String)> for Bm25Document {
+    fn from((name, text): (String, String)) -> Self {
+        Self::new(name, text)
+    }
+}
+
+impl From<(String, String, String)> for Bm25Document {
+    fn from((name, text, namespace_text): (String, String, String)) -> Self {
+        Self::new(name, text).with_namespace(namespace_text)
+    }
+}
+
+/// One document split into the fields the ranker weighs differently
+/// (upstream `indexDocument`).
+struct IndexedDocument {
+    name: String,
+    /// Terms of the name, e.g. `mcp`, `app`, `thread`, `read` for
+    /// `mcp__app__thread_read`.
+    name_terms: std::collections::BTreeSet<String>,
+    /// Terms of the last `__` segment, the part models say: `thread`, `read`.
+    local_name_terms: Vec<String>,
+    text_counts: BTreeMap<String, usize>,
+    text_length: usize,
+    namespace_terms: std::collections::BTreeSet<String>,
+}
+
+fn index_document(document: Bm25Document) -> IndexedDocument {
+    let mut text_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for term in tokenize(&document.text) {
+        *text_counts.entry(term).or_default() += 1;
+    }
+    let text_length = text_counts.values().sum();
+    let segments: Vec<&str> = document.name.split("__").collect();
+    let local = segments.last().copied().unwrap_or(&document.name);
+    IndexedDocument {
+        name: document.name.clone(),
+        name_terms: tokenize(&document.name).into_iter().collect(),
+        local_name_terms: tokenize(local)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        text_counts,
+        text_length,
+        namespace_terms: tokenize(&document.namespace_text).into_iter().collect(),
+    }
+}
+
+/// A query term in the name counts this many times its IDF. The text part of
+/// a term is at most `k1 + 1` (2.2) times its IDF and about 1 for a single
+/// mention, so a name match beats any number of description mentions
+/// (upstream `NAME_WEIGHT`, #11625).
+const NAME_WEIGHT: f64 = 3.0;
+
+/// A query term in the namespace text counts this many times its IDF. They
+/// are shared by every tool of the server, so they help find the server but
+/// not the tool in it (upstream `NAMESPACE_WEIGHT`, #11625).
+const NAMESPACE_WEIGHT: f64 = 0.5;
+
+/// Okapi BM25 over the description, with the name and namespace as separate
+/// fields (upstream `Bm25Ranker`, tool.ts:133-260; k1=1.2, b=0.75):
+///
+/// - a tool matching more of the query's distinct terms (in any field) ranks
+///   above one matching fewer, whatever the scores (#11632);
+/// - a query term in the name outweighs description mentions (#11625);
+/// - a tool whose whole local name is in the query gets a bonus worth one
+///   more match of every query term;
+/// - a query that is exactly a tool's name ranks that tool first (#11331),
+///   before coverage.
+///
+/// The rank order is a documented total key: name query, coverage, score,
+/// then tool name ascending ([`Self::rank`]).
 pub struct Bm25Ranker {
-    documents: Vec<(Vec<String>, String)>, // (tokens, id)
+    documents: Vec<IndexedDocument>,
     document_frequency: BTreeMap<String, usize>,
     average_length: f64,
 }
 
 impl Bm25Ranker {
-    pub fn new(documents: Vec<(String, String)>) -> Self {
-        let documents: Vec<(Vec<String>, String)> = documents
+    pub fn new<D: Into<Bm25Document>>(documents: Vec<D>) -> Self {
+        let documents: Vec<IndexedDocument> = documents
             .into_iter()
-            .map(|(id, text)| (tokenize(&text), id))
+            .map(|document| index_document(document.into()))
             .collect();
         let mut document_frequency: BTreeMap<String, usize> = BTreeMap::new();
-        for (tokens, _) in &documents {
-            for token in tokens.iter().collect::<std::collections::BTreeSet<_>>() {
-                *document_frequency.entry(token.clone()).or_default() += 1;
+        for document in &documents {
+            let mut terms: std::collections::BTreeSet<&String> =
+                document.name_terms.iter().collect();
+            terms.extend(document.text_counts.keys());
+            terms.extend(document.namespace_terms.iter());
+            for term in terms {
+                *document_frequency.entry(term.clone()).or_default() += 1;
             }
         }
         let average_length = if documents.is_empty() {
@@ -249,7 +347,7 @@ impl Bm25Ranker {
         } else {
             documents
                 .iter()
-                .map(|(tokens, _)| tokens.len())
+                .map(|document| document.text_length)
                 .sum::<usize>() as f64
                 / documents.len() as f64
         };
@@ -260,7 +358,7 @@ impl Bm25Ranker {
         }
     }
 
-    /// Ranked ids with score > 0, truncated to `limit` (upstream `rank`).
+    /// Ranked ids, truncated to `limit` (upstream `rank`).
     pub fn rank(&self, query: &str, limit: usize) -> Vec<(String, f64)> {
         let terms: Vec<String> = {
             let mut seen = std::collections::BTreeSet::new();
@@ -269,70 +367,107 @@ impl Bm25Ranker {
                 .filter(|token| seen.insert(token.clone()))
                 .collect()
         };
+        if terms.is_empty() || self.documents.is_empty() || limit == 0 {
+            return Vec::new();
+        }
         let count = self.documents.len() as f64;
         let k1 = 1.2_f64;
         let b = 0.75_f64;
+        let idf: BTreeMap<&str, f64> = terms
+            .iter()
+            .map(|term| {
+                let frequency = self.document_frequency.get(term).copied().unwrap_or(0) as f64;
+                (
+                    term.as_str(),
+                    (1.0 + (count - frequency + 0.5) / (frequency + 0.5)).ln(),
+                )
+            })
+            .collect();
+        let full_name_bonus: f64 = idf.values().sum();
         let name_query = normalize_name(query);
-        let mut scored: Vec<(String, f64, bool)> = Vec::new();
-        for (tokens, id) in &self.documents {
+        let average_length = self.average_length.max(1.0);
+        // (name, score, covered, exact-name query)
+        let mut scored: Vec<(String, f64, usize, bool)> = Vec::new();
+        for document in &self.documents {
+            let norm = k1 * (1.0 - b + b * document.text_length as f64 / average_length);
             let mut score = 0.0;
+            let mut covered = 0usize;
             for term in &terms {
-                let frequency = tokens.iter().filter(|token| *token == term).count() as f64;
-                if frequency == 0.0 {
-                    continue;
+                let frequency = document.text_counts.get(term).copied().unwrap_or(0) as f64;
+                let weight = f64::from(document.name_terms.contains(term)) * NAME_WEIGHT
+                    + f64::from(document.namespace_terms.contains(term)) * NAMESPACE_WEIGHT
+                    + (frequency * (k1 + 1.0)) / (frequency + norm);
+                if weight > 0.0 {
+                    covered += 1;
                 }
-                let df = self.document_frequency.get(term).copied().unwrap_or(0) as f64;
-                let idf = (1.0 + (count - df + 0.5) / (df + 0.5)).ln();
-                let norm = k1 * (1.0 - b + b * tokens.len() as f64 / self.average_length.max(1.0));
-                score += idf * (frequency * (k1 + 1.0)) / (frequency + norm);
+                score += idf.get(term.as_str()).copied().unwrap_or(0.0) * weight;
             }
-            if score > 0.0 {
-                scored.push((id.clone(), score, is_name_query(&name_query, id)));
+            if score == 0.0 {
+                continue;
             }
+            if !document.local_name_terms.is_empty()
+                && document
+                    .local_name_terms
+                    .iter()
+                    .all(|term| terms.contains(term))
+            {
+                score += full_name_bonus;
+            }
+            scored.push((
+                document.name.clone(),
+                score,
+                covered,
+                is_name_query(&name_query, &document.name),
+            ));
         }
-        // Deterministic ordering (upstream's sort is by `named`, then score,
-        // and is stable, so equal scores keep its registration-ordered
-        // document list; pir's candidate source is a HashMap-backed registry,
-        // whose iteration order varies per run). The documented total key is:
+        // Deterministic ordering (upstream's sort is by `exact`, coverage and
+        // score and is stable, so ties keep its registration-ordered document
+        // list; pir's candidate source is a HashMap-backed registry, whose
+        // iteration order varies per run). The documented total key is:
         //
         //   primary:   query names the tool, first
-        //   secondary: score, descending
+        //   secondary: coverage, descending (more query terms matched)
+        //   tertiary:  score, descending
         //   tie-break: tool name, ascending (byte order)
         //
         // `sort_by` is a stable sort, and names are unique in the merged
         // registry, so the result is independent of document/input order —
         // never of hashing.
-        scored.sort_by(|(id_a, score_a, named_a), (id_b, score_b, named_b)| {
-            named_b
-                .cmp(named_a)
-                .then_with(|| {
-                    score_b
-                        .partial_cmp(score_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| id_a.cmp(id_b))
-        });
+        scored.sort_by(
+            |(id_a, score_a, covered_a, exact_a), (id_b, score_b, covered_b, exact_b)| {
+                exact_b
+                    .cmp(exact_a)
+                    .then_with(|| covered_b.cmp(covered_a))
+                    .then_with(|| {
+                        score_b
+                            .partial_cmp(score_a)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| id_a.cmp(id_b))
+            },
+        );
         scored.truncate(limit);
         scored
             .into_iter()
-            .map(|(id, score, _)| (id, score))
+            .map(|(id, score, _, _)| (id, score))
             .collect()
     }
 }
 
-/// The searchable document text: tool name (+ space-separated), description,
-/// the recursive schema text, and the namespace's name/description/
-/// instructions (upstream `createToolSearchDocument`, tool.ts:103-116).
+/// The searchable text and namespace text (upstream
+/// `createToolSearchDocument`, tool.ts:103-116): the description and the
+/// recursive schema text are scored separately from the namespace's
+/// name/description/instructions.
 fn tool_document(
-    name: &str,
     description: &str,
     parameters: Option<&Value>,
     namespace: Option<&ToolNamespace>,
-) -> String {
-    let mut document = format!("{name} {} {description}", name.replace('_', " "));
+) -> (String, String) {
+    let mut text = description.to_owned();
     if let Some(schema) = parameters {
-        append_schema_text(schema, &mut document);
+        append_schema_text(schema, &mut text);
     }
+    let mut namespace_text = String::new();
     if let Some(namespace) = namespace {
         for part in [
             Some(namespace.name.as_str()),
@@ -343,12 +478,14 @@ fn tool_document(
         .flatten()
         {
             if !part.trim().is_empty() {
-                document.push(' ');
-                document.push_str(part);
+                if !namespace_text.is_empty() {
+                    namespace_text.push(' ');
+                }
+                namespace_text.push_str(part);
             }
         }
     }
-    document
+    (text, namespace_text)
 }
 
 /// Recursive schema text (upstream `schemaText`, tool.ts:86-101): only object
@@ -624,18 +761,15 @@ impl AgentTool for ToolSearchTool {
                 })
                 .collect();
             candidates.sort_by(|left, right| left.name().cmp(right.name()));
-            let documents: Vec<(String, String)> = candidates
+            let documents: Vec<Bm25Document> = candidates
                 .into_iter()
                 .map(|tool| {
-                    (
-                        tool.name().to_owned(),
-                        tool_document(
-                            tool.name(),
-                            tool.description(),
-                            tool.parameters().as_ref(),
-                            tool.namespace().as_ref(),
-                        ),
-                    )
+                    let (text, namespace_text) = tool_document(
+                        tool.description(),
+                        tool.parameters().as_ref(),
+                        tool.namespace().as_ref(),
+                    );
+                    Bm25Document::new(tool.name().to_owned(), text).with_namespace(namespace_text)
                 })
                 .collect();
             if documents.is_empty() {
