@@ -12,7 +12,9 @@ use pir::ai::auth::oauth::github_copilot::{
 use pir::ai::auth::oauth::openai_chatgpt::{agent_host_id, result_from_manual_input};
 use pir::ai::auth::oauth::radius::normalize_radius_gateway_url;
 use pir::ai::auth::oauth::xai::validate_verification_uri;
-use pir::ai::auth::oauth::{decode_jwt_payload, parse_authorization_input, OAuthCredential};
+use pir::ai::auth::oauth::{
+    decode_jwt_payload, display_url_or_text, parse_authorization_input, web_url, OAuthCredential,
+};
 use pir::ai::auth::oauth_page::{oauth_error_html, oauth_success_html};
 use pir::ai::auth::pkce::{base64url_decode, base64url_encode, challenge_for, generate_pkce};
 use pir::ai::auth::resolve::{oauth_expires_soon, oauth_flow_for, OAUTH_PROVIDERS};
@@ -21,6 +23,47 @@ use pir::ai::auth::CredentialStore;
 use pir::ai::error::AiError;
 use pir::ai::types::ApiKeyCredential;
 use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// OAuth login URL/display hardening (#11849)
+// ---------------------------------------------------------------------------
+
+/// Server-supplied sign-in URLs are opened/printed only as web URLs; other
+/// schemes never reach the shared launcher, and untrusted text is stripped of
+/// control characters before display.
+#[test]
+fn login_urls_are_limited_to_http_and_controls_are_stripped() {
+    assert_eq!(
+        web_url("https://pi.dev/oauth"),
+        Some("https://pi.dev/oauth".to_string())
+    );
+    assert_eq!(
+        web_url("http://127.0.0.1:1456/oauth/callback"),
+        Some("http://127.0.0.1:1456/oauth/callback".to_string())
+    );
+    assert_eq!(web_url("file:///C:/Windows/System32/calc.exe"), None);
+    assert_eq!(web_url("javascript:alert(1)"), None);
+    assert_eq!(web_url("not a url"), None);
+
+    assert_eq!(
+        display_url_or_text("https://pi.dev/oauth"),
+        "https://pi.dev/oauth"
+    );
+    let hostile = display_url_or_text("https://evil.example/\x1b]8;;https://x\x07");
+    assert!(
+        !hostile.chars().any(char::is_control),
+        "display text never carries control characters: {hostile:?}"
+    );
+    assert_eq!(
+        pir::text::replace_control_characters("code\x00with\u{9b}controls"),
+        "code with controls"
+    );
+    assert_eq!(
+        pir::text::replace_control_characters("\x1b\x07"),
+        " ",
+        "a run of controls becomes one space"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // device_code.rs — RFC 8628 polling

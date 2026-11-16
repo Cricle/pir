@@ -171,6 +171,22 @@ pub fn decode_jwt_payload(token: &str) -> Option<Value> {
     serde_json::from_slice(&payload).ok()
 }
 
+/// The `http:`/`https:` URL `value` names, normalized, or `None` (upstream
+/// `webUrl`): the shared launcher also opens files and custom protocols, so a
+/// sign-in must only open web URLs. Normalizing percent-encodes control
+/// characters that would otherwise end a terminal hyperlink early.
+pub fn web_url(value: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(value).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
+/// A server-supplied URL for display: normalized when it is a web URL, else
+/// with C0/C1 control characters replaced so it cannot inject terminal
+/// sequences (upstream `displayUrl`).
+pub fn display_url_or_text(value: &str) -> String {
+    web_url(value).unwrap_or_else(|| crate::text::replace_control_characters(value))
+}
+
 /// Open the given URL in the user's browser: `rundll32 url.dll,FileProtocolHandler`
 /// on Windows, `open` on macOS, `xdg-open` elsewhere. Best-effort — failures
 /// are logged, never fatal, because the manual paste path always remains.
@@ -180,17 +196,22 @@ pub fn decode_jwt_payload(token: &str) -> Option<Value> {
 /// injection). `rundll32` gets the URL as a single, unparsed argv element; no
 /// branch goes through a shell.
 pub fn open_browser(url: &str) {
+    // Only web URLs: the launchers open files and custom protocols too
+    // (upstream login-dialog `openBrowser(target)` only for `webUrl`).
+    let Some(url) = web_url(url) else {
+        return;
+    };
     let mut command = if cfg!(target_os = "windows") {
         let mut command = std::process::Command::new("rundll32");
-        command.args(["url.dll,FileProtocolHandler", url]);
+        command.args(["url.dll,FileProtocolHandler", url.as_str()]);
         command
     } else if cfg!(target_os = "macos") {
         let mut command = std::process::Command::new("open");
-        command.arg(url);
+        command.arg(url.as_str());
         command
     } else {
         let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
+        command.arg(url.as_str());
         command
     };
     // Upstream spawn options (`open-browser.ts`): `stdio: "ignore"` — the

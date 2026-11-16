@@ -416,3 +416,30 @@ fn consume_control_string(chars: &mut Peekable<CharIndices<'_>>) {
         prev_esc = c == '\x1b';
     }
 }
+
+/// Replace runs of C0/C1 control characters with a single space (upstream
+/// `replaceControlCharacters`). Untrusted login text printed as is could send
+/// its own escape sequences or end a terminal hyperlink early.
+pub fn replace_control_characters(text: &str) -> String {
+    let is_control = |c: char| {
+        let code = c as u32;
+        code <= 0x1f || (0x7f..=0x9f).contains(&code)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut in_control_run = false;
+    for c in text.chars() {
+        if is_control(c) {
+            in_control_run = true;
+        } else {
+            if in_control_run {
+                out.push(' ');
+                in_control_run = false;
+            }
+            out.push(c);
+        }
+    }
+    if in_control_run {
+        out.push(' ');
+    }
+    out
+}

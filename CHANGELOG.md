@@ -115,6 +115,10 @@ v1.5.2, and the generated test harnesses were rebuilt.
   UAX #29 word boundaries and NFC normalization, so Chinese/Japanese/Thai
   queries and canonically equivalent accents (`café`/`cafe\u0301`) match; only
   ASCII words get the naive plural stem (`#10816`/`#11037`).
+- OAuth sign-in only opens and prints http(s) URLs: Radius validates its
+  authorization endpoint and device verification URI, and the CLI/TUI replace
+  control characters in server-supplied sign-in, device-code, and info text
+  before displaying it (`#11849`).
 
 ### correctness
 

@@ -87,18 +87,24 @@ impl AuthInteraction for CliInteraction {
     fn notify(&self, event: AuthEvent) {
         match event {
             AuthEvent::Info { message, links } => {
-                eprintln!("{message}");
+                eprintln!("{}", crate::text::replace_control_characters(&message));
                 for link in links {
+                    let url = crate::ai::auth::oauth::display_url_or_text(&link.url);
                     match link.label {
-                        Some(label) => eprintln!("  {label}: {}", link.url),
-                        None => eprintln!("  {}", link.url),
+                        Some(label) => eprintln!(
+                            "  {}: {url}",
+                            crate::text::replace_control_characters(&label)
+                        ),
+                        None => eprintln!("  {url}"),
                     }
                 }
             }
             AuthEvent::AuthUrl { url, instructions } => {
-                eprintln!("{url}");
+                // Only web URLs are opened and printed (upstream login dialog).
+                let shown = crate::ai::auth::oauth::display_url_or_text(&url);
+                eprintln!("{shown}");
                 if let Some(instructions) = instructions {
-                    eprintln!("{instructions}");
+                    eprintln!("{}", crate::text::replace_control_characters(&instructions));
                 }
                 (self.opener)(&url);
             }
@@ -107,7 +113,11 @@ impl AuthInteraction for CliInteraction {
                 verification_uri,
                 ..
             } => {
-                eprintln!("Open {verification_uri} and enter code: {user_code}");
+                eprintln!(
+                    "Open {} and enter code: {}",
+                    crate::ai::auth::oauth::display_url_or_text(&verification_uri),
+                    crate::text::replace_control_characters(&user_code)
+                );
             }
             AuthEvent::Progress { message } => {
                 eprintln!("{message}");

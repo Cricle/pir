@@ -14966,19 +14966,28 @@ impl crate::ai::auth::AuthInteraction for TuiLoginInteraction {
         let mut device_code = None;
         let message = match event {
             crate::ai::auth::AuthEvent::Info { message, links } => {
-                let mut text = message;
+                let mut text = crate::text::replace_control_characters(&message);
                 for link in links {
                     text.push_str("  ");
-                    text.push_str(&link.url);
+                    if let Some(label) = link.label {
+                        text.push_str(&crate::text::replace_control_characters(&label));
+                        text.push_str(": ");
+                    }
+                    text.push_str(&crate::ai::auth::oauth::display_url_or_text(&link.url));
                 }
                 text
             }
             crate::ai::auth::AuthEvent::AuthUrl { url, instructions } => {
-                // Open the browser like the CLI flow does.
+                // Open the browser like the CLI flow does (open_browser itself
+                // rejects non-web URLs).
                 crate::ai::auth::oauth::open_browser(&url);
+                let shown = crate::ai::auth::oauth::display_url_or_text(&url);
                 match instructions {
-                    Some(instructions) => format!("Open {url} — {instructions}"),
-                    None => format!("Open {url} in your browser to continue…"),
+                    Some(instructions) => format!(
+                        "Open {shown} — {}",
+                        crate::text::replace_control_characters(&instructions)
+                    ),
+                    None => format!("Open {shown} in your browser to continue…"),
                 }
             }
             crate::ai::auth::AuthEvent::DeviceCode {
@@ -14994,7 +15003,13 @@ impl crate::ai::auth::AuthInteraction for TuiLoginInteraction {
                     open_browser_on_confirm,
                     copy_code_on_confirm,
                 ));
-                format!("Open {verification_uri} and enter code: {user_code}")
+                // Both strings come from the server: never print their control
+                // characters (they could send terminal escapes).
+                format!(
+                    "Open {} and enter code: {}",
+                    crate::ai::auth::oauth::display_url_or_text(&verification_uri),
+                    crate::text::replace_control_characters(&user_code)
+                )
             }
             crate::ai::auth::AuthEvent::Progress { message } => message,
         };

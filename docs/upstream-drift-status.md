@@ -259,13 +259,13 @@ backend's `limit + 1` proof (#11747); case-folded Windows resource, package,
 and project-trust path keys (#11588); local `$ref` following in tool search
 (#11850); the refresh-only MCP refresh guard plus sign-in's stored-client
 refresh (#11743); root `$defs`/`definitions` in non-strict Anthropic schemas
-(#9557); and Unicode word segmentation in both tool-search tokenizers
-(#11037).
+(#9557); Unicode word segmentation in both tool-search tokenizers (#11037);
+and web-URL-only OAuth opening plus control-character stripping in the
+CLI/TUI sign-in displays and Radius endpoints (#11849).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP
-refresh redirect/cancel guards; `pi auth login/logout` flags; untrusted
-URL/terminal-text hardening; and the
+refresh redirect/cancel guards; `pi auth login/logout` flags; and the
 remaining queue/window/DX items (keybinding hints, page keys, SDK dispose,
 package-update summary).
 The prioritized Wave A/B/C breakdown with `file:line` evidence is

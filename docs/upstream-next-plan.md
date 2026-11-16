@@ -26,7 +26,8 @@ Dart/Nix/Groovy highlighting, Windows PowerShell 5.1 exit suffix, transport
 cause chains, diff indentation, custom find `limit + 1`, Windows case-folded
 resource/package/project-trust keys, the refresh-only MCP refresh guard and
 sign-in's stored-client refresh, root `$defs` in non-strict Anthropic
-schemas, and Unicode tool-search segmentation in both tokenizers.
+schemas, Unicode tool-search segmentation in both tokenizers, and web-URL-only
+OAuth opening with control-character stripping in sign-in displays.
 
 Gate evidence for the latest commits: full nextest **7570 passed / 0 failed /
 46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, 43 catalog
@@ -61,10 +62,6 @@ test that cites the upstream commit.
 3. **SDK dispose settles (#9126).** `AgentSessionRuntime::dispose` shuts down
    extensions without awaiting `session.abort()`; request the abort and wait
    for the run/compaction claim to clear before shutdown.
-4. **Untrusted URL/terminal text (#11849).** Validate Radius
-   `authorizationEndpoint`/`verification_uri` with the same http/https helper
-   as OAuth metadata, and strip control characters before displaying device
-   codes/URLs.
 
 ## Wave B — medium, needs a small design pass
 

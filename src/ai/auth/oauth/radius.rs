@@ -150,7 +150,9 @@ async fn load_discovery(gateway: &str) -> AiResult<String> {
     let json: Value = response.json()?;
     json.get("authorizationEndpoint")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        // The gateway supplies the URL the browser is sent to; only web
+        // URLs are opened (upstream `trustedHttpUrl`).
+        .and_then(super::web_url)
         .ok_or_else(|| {
             AiError::Authentication(format!("Invalid Radius OAuth config from {gateway}"))
         })
@@ -346,7 +348,8 @@ async fn request_device_authorization(
         .get("verification_uri")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        // The user's browser opens this URL; only web URLs are trusted.
+        .and_then(super::web_url);
     let expires_in = json
         .get("expires_in")
         .and_then(Value::as_u64)
