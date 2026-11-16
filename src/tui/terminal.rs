@@ -13612,18 +13612,57 @@ fn external_editor_command(configured: &Option<PiConfiguredModel>) -> String {
     }
 }
 
+/// The user-facing reason an external editor run failed (upstream
+/// `ExternalEditorResult`'s `message`, external-editor.ts): a launcher
+/// failure names the command, an exit failure reports the code or signal.
+#[doc(hidden)]
+pub fn external_editor_exit_message(status: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!(
+                "External editor exited with {}; prompt unchanged",
+                external_editor_signal_name(signal)
+            );
+        }
+    }
+    match status.code() {
+        Some(code) => format!("External editor exited with code {code}; prompt unchanged"),
+        None => "External editor exited with an unknown status; prompt unchanged".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn external_editor_signal_name(signal: i32) -> String {
+    let name = match signal {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => return format!("signal {signal}"),
+    };
+    name.to_string()
+}
+
 /// Round-trip `content` through the user's external editor (upstream
 /// `editInExternalEditor`, external-editor.ts): save to a temp file, suspend
 /// the TUI (leave raw mode + the alternate screen), spawn the editor, then
-/// re-import. `Ok(None)` = the editor exited non-zero (content unchanged,
-/// upstream `{ status: "failed" }`).
-fn open_external_editor(app: &App, content: &str) -> std::io::Result<Option<String>> {
+/// re-import. `Ok(None)` = the editor was not launched (content unchanged);
+/// `Err` carries the user-facing failure message.
+fn open_external_editor(app: &App, content: &str) -> Result<Option<String>, String> {
     let command = external_editor_command(&app.configured);
     let fullscreen = app.fullscreen;
     let directory = std::env::temp_dir().join(format!("pir-editor-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("External editor failed: {error}"))?;
     let file_path = directory.join("prompt.md");
-    std::fs::write(&file_path, content)?;
+    std::fs::write(&file_path, content)
+        .map_err(|error| format!("External editor failed: {error}"))?;
 
     // FIX-B18: drain the async frame writer before the synchronous leave
     // sequence (same race as `suspend_to_background`: a queued frame would be
@@ -13668,16 +13707,21 @@ fn open_external_editor(app: &App, content: &str) -> std::io::Result<Option<Stri
         let _ = out.execute(EnterAlternateScreen);
     }
     let result = match spawn_result {
-        Ok(status) if status.success() => {
-            let read = std::fs::read_to_string(&file_path)?;
-            // Upstream strips a BOM and one trailing newline.
-            let trimmed = read.strip_prefix('\u{feff}').unwrap_or(&read);
-            Some(trimmed.strip_suffix('\n').unwrap_or(trimmed).to_string())
-        }
-        _ => None,
+        Ok(status) if status.success() => std::fs::read_to_string(&file_path)
+            .map(|read| {
+                // Upstream strips a BOM and one trailing newline.
+                let trimmed = read.strip_prefix('\u{feff}').unwrap_or(&read);
+                Some(trimmed.strip_suffix('\n').unwrap_or(trimmed).to_string())
+            })
+            .map_err(|error| format!("External editor failed: {error}")),
+        Ok(status) => Err(external_editor_exit_message(&status)),
+        // The editor could not be launched (missing binary, PATH, or a WSL
+        // cwd too deep for a Windows editor; upstream #11627). The cwd is
+        // intentionally kept so project-relative paths still work.
+        Err(_) => Err(format!("Failed to launch external editor: {command}")),
     };
     let _ = std::fs::remove_dir_all(&directory);
-    Ok(result)
+    result
 }
 
 /// Spawn the git-branch HEAD watcher (upstream `FooterDataProvider`'s
@@ -14006,7 +14050,7 @@ fn handle_key(
                         Ok(None) => {}
                         Err(error) => entries.push(ChatEntry::Notice {
                             kind: super::app::NoticeKind::Error,
-                            text: format!("External editor failed: {error}"),
+                            text: error,
                         }),
                     }
                     // The screen was left and re-entered: force a full
@@ -14229,7 +14273,7 @@ fn handle_key(
             Ok(None) => {}
             Err(error) => entries.push(ChatEntry::Notice {
                 kind: super::app::NoticeKind::Error,
-                text: format!("External editor failed: {error}"),
+                text: error,
             }),
         }
         app.core.invalidate_frame();

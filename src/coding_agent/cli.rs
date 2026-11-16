@@ -3398,6 +3398,20 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
 static COLLECTED_UNKNOWN_FLAGS: std::sync::OnceLock<BTreeMap<String, String>> =
     std::sync::OnceLock::new();
 
+/// The startup `current_dir()` check (upstream `main.ts:591-603`): a working
+/// directory that no longer exists becomes one actionable error line, while
+/// unrelated errors are rethrown unchanged. The binary calls this before it
+/// spawns the worker thread.
+pub fn check_startup_cwd(cwd: std::io::Result<std::path::PathBuf>) -> anyhow::Result<()> {
+    match cwd {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+            "The current working directory no longer exists. Change to an existing directory and try again."
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Names of the collected unknown flags written WITHOUT a value (the upstream
 /// `unknownFlags` map stores boolean `true` for these). A registered string
 /// flag in this set is the upstream `Extension flag "--name" requires a

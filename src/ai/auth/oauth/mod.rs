@@ -198,7 +198,11 @@ pub fn open_browser(url: &str) {
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // Run from the filesystem root: the launcher never uses the cwd, and
+        // on WSL a deep `\\wsl.localhost\...` cwd makes Windows launchers
+        // (explorer.exe) fail past MAX_PATH (upstream #11627).
+        .current_dir("/");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

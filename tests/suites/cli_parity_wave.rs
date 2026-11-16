@@ -1675,3 +1675,31 @@ fn print_subcommand_accepts_multiple_positional_prompts() {
         other => panic!("expected the print subcommand, got {other:?}"),
     }
 }
+
+/// `88ffcdc73` #11511: a deleted working directory is one actionable error
+/// line, and unrelated `current_dir` errors are rethrown unchanged
+/// (upstream main.ts:591-603).
+#[test]
+fn deleted_working_directory_is_an_actionable_startup_error() {
+    use std::io::{Error, ErrorKind};
+
+    let message = pir::coding_agent::cli::check_startup_cwd(Err(Error::from(ErrorKind::NotFound)))
+        .expect_err("a missing cwd must fail")
+        .to_string();
+    assert_eq!(
+        message,
+        "The current working directory no longer exists. Change to an existing directory and try again."
+    );
+    pir::coding_agent::cli::check_startup_cwd(Ok(std::path::PathBuf::from(".")))
+        .expect("an existing cwd passes");
+
+    let error =
+        pir::coding_agent::cli::check_startup_cwd(Err(Error::from(ErrorKind::PermissionDenied)))
+            .expect_err("unrelated errors are rethrown");
+    assert!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == ErrorKind::PermissionDenied),
+        "the original io error is preserved: {error}"
+    );
+}

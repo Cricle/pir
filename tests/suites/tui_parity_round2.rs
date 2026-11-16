@@ -690,3 +690,36 @@ fn win32_hint_chords_match_real_events() {
     let paste = bindings.hint_key_text("app.clipboard.pasteImage");
     assert!(!paste.is_empty(), "paste hint never renders unbound");
 }
+
+/// `6454d07ec` #11627: an external editor that exits nonzero or dies from a
+/// signal reports why instead of failing silently (upstream
+/// external-editor.ts `{status:"failed", message}`).
+#[test]
+fn external_editor_failures_report_the_exit_reason() {
+    #[cfg(windows)]
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "exit", "3"])
+        .status()
+        .expect("spawn cmd");
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("sh")
+        .args(["-c", "exit 3"])
+        .status()
+        .expect("spawn sh");
+    assert_eq!(
+        pir::tui::terminal::external_editor_exit_message(&status),
+        "External editor exited with code 3; prompt unchanged"
+    );
+
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .expect("spawn sh");
+        assert_eq!(
+            pir::tui::terminal::external_editor_exit_message(&status),
+            "External editor exited with SIGTERM; prompt unchanged"
+        );
+    }
+}

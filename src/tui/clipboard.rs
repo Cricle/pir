@@ -312,7 +312,11 @@ fn run_clipboard_command(program: &str, args: &[impl AsRef<std::ffi::OsStr>], te
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // Clipboard tools ignore the cwd; running from the root also keeps a
+        // daemonized writer from pinning the project directory and lets WSL
+        // start Windows helpers past MAX_PATH (upstream #11627).
+        .current_dir("/");
     // CREATE_NO_WINDOW (0x08000000): the helper must not flash a console.
     #[cfg(windows)]
     {
@@ -911,7 +915,9 @@ fn run_clipboard_capture(program: &str, args: &[&str], timeout: Duration) -> Opt
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // Same WSL/daemon rule as the writer path (upstream #11627).
+        .current_dir("/");
     // CREATE_NO_WINDOW (0x08000000): no console flash from helper processes.
     #[cfg(windows)]
     {

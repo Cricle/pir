@@ -60,6 +60,11 @@ v1.5.2, and the generated test harnesses were rebuilt.
   fields: more query-term coverage ranks first, a name term outweighs
   description mentions, and an exact-name query still ranks the tool first
   (`#11625`/`#11632`).
+- Clipboard helpers and the browser launcher start from the filesystem root so
+  WSL can launch Windows helpers from deep paths, and external-editor launch
+  and exit failures are reported instead of discarded (`#11627`); starting in
+  a deleted working directory prints one actionable error and exits 1
+  (`#11511`).
 
 ### correctness
 

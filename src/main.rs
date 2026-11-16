@@ -58,6 +58,9 @@ pub(crate) fn missing_feature(name: &str, feature: &str) -> anyhow::Error {
 /// (`env_daemon::stack_budget_bytes`), so the two deeply-recursive entry
 /// points cannot drift apart.
 fn main() -> Result<()> {
+    // A deleted working directory must not crash startup with an opaque OS
+    // error (upstream main.ts:591-603).
+    pir::coding_agent::cli::check_startup_cwd(std::env::current_dir())?;
     let worker = std::thread::Builder::new()
         .name("pir-main".to_owned())
         .stack_size(pir::env_daemon::stack_budget_bytes(cfg!(debug_assertions)))
