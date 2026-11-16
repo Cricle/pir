@@ -10,7 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use pir::mcp::oauth::{McpOAuthCredentialStore, McpOAuthError, McpOAuthState, OAuthTokens};
+use pir::mcp::oauth::{
+    refresh_access_token, AuthorizationServerMetadata, McpOAuthCredentialStore, McpOAuthError,
+    McpOAuthSettings, McpOAuthState, OAuthDiscoveryState, OAuthTokens,
+};
 
 struct TempDir(PathBuf);
 
@@ -216,5 +219,74 @@ async fn a_save_replaces_the_store_atomically_and_privately() {
             .as_ref()
             .map(|tokens| tokens.access_token.as_str()),
         Some("token-two")
+    );
+}
+
+/// Upstream #11743 (`bb266bf35`): a failed connection refresh is refresh-only.
+/// Without a stored client it must not register one or replace a pending
+/// sign-in's verifier/state; it reports that a sign-in is required instead.
+#[tokio::test]
+async fn a_refresh_without_a_client_keeps_a_pending_signin() {
+    let dir = TempDir::new("refresh-only");
+    let store = McpOAuthCredentialStore::new(dir.path().join("mcp-auth.json"));
+    let server = store.for_server("alpha", "https://alpha.example/mcp");
+    server
+        .save(&McpOAuthState {
+            server_url: "https://alpha.example/mcp".to_owned(),
+            tokens: Some(OAuthTokens {
+                access_token: "stale".to_owned(),
+                token_type: "Bearer".to_owned(),
+                refresh_token: Some("refresh".to_owned()),
+                ..OAuthTokens::default()
+            }),
+            code_verifier: Some("pending-verifier".to_owned()),
+            oauth_state: Some("pending-state".to_owned()),
+            discovery: Some(OAuthDiscoveryState {
+                authorization_server_url: "https://auth.example".to_owned(),
+                authorization_server_metadata: Some(AuthorizationServerMetadata {
+                    issuer: "https://auth.example".to_owned(),
+                    authorization_endpoint: "https://auth.example/authorize".to_owned(),
+                    token_endpoint: "https://auth.example/token".to_owned(),
+                    ..AuthorizationServerMetadata::default()
+                }),
+                resource_metadata: None,
+                resource_metadata_url: None,
+            }),
+            ..McpOAuthState::default()
+        })
+        .await
+        .expect("seed state");
+
+    let settings = McpOAuthSettings::default();
+    let error = refresh_access_token(&server, &settings, "https://alpha.example/mcp", None)
+        .await
+        .expect_err("a refresh without a client cannot authorize");
+    assert!(
+        matches!(error, McpOAuthError::AuthorizationRequired),
+        "refresh reports that a sign-in is needed: {error:?}"
+    );
+
+    let after = server.load().await.expect("load").expect("stored state");
+    assert!(
+        after.client_information.is_none(),
+        "the refresh must not register a client: {after:?}"
+    );
+    assert_eq!(
+        after.code_verifier.as_deref(),
+        Some("pending-verifier"),
+        "the pending sign-in's verifier stays usable"
+    );
+    assert_eq!(
+        after.oauth_state.as_deref(),
+        Some("pending-state"),
+        "the pending sign-in's state stays usable"
+    );
+    assert_eq!(
+        after
+            .tokens
+            .as_ref()
+            .map(|tokens| tokens.access_token.as_str()),
+        Some("stale"),
+        "a refresh-only failure leaves the stored tokens for the sign-in"
     );
 }

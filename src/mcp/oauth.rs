@@ -89,6 +89,11 @@ pub enum McpOAuthError {
     /// `McpOAuthAuthorizationRequiredError`).
     #[error("MCP OAuth authorization requires user interaction")]
     AuthorizationRequired,
+    /// Another process held the refresh lock for the whole wait (upstream
+    /// `McpRefreshLockBusyError`). A sign-in falls back to the browser step;
+    /// a connection refresh reports the failure as before.
+    #[error("MCP OAuth refresh lock is busy")]
+    RefreshLockBusy,
     /// The sign-in was aborted or not completed in time (upstream
     /// `McpSignInCancelledError`).
     #[error("sign-in cancelled")]
@@ -1210,6 +1215,11 @@ fn callback_id(server_url: &str) -> String {
 enum CredentialKind {
     All,
     Tokens,
+    /// A refresh-only failure with a still-current stored client: drop the
+    /// client, tokens, and discovery, but keep a pending sign-in's verifier
+    /// and state (upstream `authorizeMcp` invalidates `client`, `tokens`, and
+    /// `discovery`, never the sign-in state).
+    RefreshClient,
 }
 
 /// The flow's view of one server's credentials (upstream `McpOAuthProvider`):
@@ -1315,6 +1325,12 @@ impl FlowProvider<'_> {
                     state.tokens = None;
                     state.tokens_expire_at = None;
                 }
+                CredentialKind::RefreshClient => {
+                    state.client_information = None;
+                    state.tokens = None;
+                    state.tokens_expire_at = None;
+                    state.discovery = None;
+                }
             })
             .await
     }
@@ -1386,6 +1402,20 @@ struct FlowOptions<'a> {
     resource_metadata_url: Option<&'a str>,
     authorization_server_metadata_url: Option<&'a str>,
     skip_refresh: bool,
+    /// Only refresh the stored tokens: return [`FlowResult::Redirect`]
+    /// instead of registering a client or preparing an authorization
+    /// request, so a pending sign-in's verifier and state stay usable
+    /// (upstream `refreshOnly`).
+    refresh_only: bool,
+}
+
+/// What one flow pass used, for deciding what to invalidate after it failed
+/// (upstream `FlowUse`).
+#[derive(Default)]
+struct FlowUse {
+    /// `client_id` of the stored client the flow used; `None` when none was
+    /// stored.
+    stored_client_id: Option<String>,
 }
 
 /// The outcome of one flow pass (upstream `OAuthFlowResult`).
@@ -1434,6 +1464,7 @@ async fn run_flow(
     provider: &FlowProvider<'_>,
     server_url: &reqwest::Url,
     options: &FlowOptions<'_>,
+    use_: &mut FlowUse,
     on_redirect: &mut (dyn FnMut(String) + Send),
 ) -> OAuthResult<FlowResult> {
     let metadata_url = options
@@ -1510,6 +1541,9 @@ async fn run_flow(
                 .map(str::to_owned)
         });
     let stored_client = provider.client_information().await?;
+    use_.stored_client_id = stored_client
+        .as_ref()
+        .map(|information| information.client_id.clone());
     let client_document = if stored_client.is_none() {
         provider.client_metadata_document(metadata)?
     } else {
@@ -1531,6 +1565,11 @@ async fn run_flow(
             })
     });
     if client.is_none() {
+        // A refresh must not register a client: that would replace the one a
+        // sign-in in progress is waiting for (upstream flow.ts:395-396).
+        if options.refresh_only {
+            return Ok(FlowResult::Redirect);
+        }
         if options.authorization_code.is_some() {
             return Err(fatal(
                 "OAuth client information is missing during code exchange",
@@ -1613,6 +1652,12 @@ async fn run_flow(
             },
         }
     }
+    // A refresh that cannot use the stored tokens reports that a sign-in is
+    // needed instead of preparing a new authorization request, which would
+    // replace the pending verifier and state (upstream flow.ts:453).
+    if options.refresh_only {
+        return Ok(FlowResult::Redirect);
+    }
     let state = provider.state().await?;
     let authorization = start_authorization(
         &discovered.authorization_server_url,
@@ -1638,19 +1683,38 @@ async fn authorize_mcp(
     options: &FlowOptions<'_>,
     on_redirect: &mut (dyn FnMut(String) + Send),
 ) -> OAuthResult<FlowResult> {
-    match run_flow(provider, server_url, options, on_redirect).await {
+    let mut use_ = FlowUse::default();
+    match run_flow(provider, server_url, options, &mut use_, on_redirect).await {
         Ok(result) => Ok(result),
         Err(McpOAuthError::OAuth { ref code, .. })
             if code == "invalid_client" || code == "unauthorized_client" =>
         {
-            provider.invalidate_credentials(CredentialKind::All).await?;
-            run_flow(provider, server_url, options, on_redirect).await
+            // A refresh keeps a pending sign-in's state and verifier. A
+            // client stored meanwhile (by a sign-in that completed) is not
+            // the one the server rejected, so it stays
+            // (upstream flow.ts:474-483).
+            if options.refresh_only {
+                let current = provider.client_information().await?;
+                let current_id = current
+                    .as_ref()
+                    .map(|information| information.client_id.as_str());
+                if current_id == use_.stored_client_id.as_deref() {
+                    provider
+                        .invalidate_credentials(CredentialKind::RefreshClient)
+                        .await?;
+                }
+            } else {
+                provider.invalidate_credentials(CredentialKind::All).await?;
+            }
+            let mut retry_use = FlowUse::default();
+            run_flow(provider, server_url, options, &mut retry_use, on_redirect).await
         }
         Err(McpOAuthError::OAuth { ref code, .. }) if code == "invalid_grant" => {
             provider
                 .invalidate_credentials(CredentialKind::Tokens)
                 .await?;
-            run_flow(provider, server_url, options, on_redirect).await
+            let mut retry_use = FlowUse::default();
+            run_flow(provider, server_url, options, &mut retry_use, on_redirect).await
         }
         Err(error) => Err(error),
     }
@@ -2047,11 +2111,7 @@ async fn acquire_lock(lock_path: &Path, wait: Duration, stale: Duration) -> OAut
                     continue;
                 }
                 if Instant::now() >= deadline {
-                    return Err(fatal(format!(
-                        "Failed to acquire MCP OAuth lock after {}s: {}",
-                        wait.as_secs(),
-                        lock_path.display()
-                    )));
+                    return Err(McpOAuthError::RefreshLockBusy);
                 }
                 tokio::time::sleep(LOCK_RETRY_DELAY).await;
             }
@@ -2261,9 +2321,11 @@ pub async fn refresh_access_token(
             let callback = settings.callback_settings()?;
             let redirect_url = refresh_redirect_url(store, &callback).await;
             let provider = flow_provider(store, settings, server_url.as_str(), &redirect_url)?;
-            match authorize_mcp(&provider, &server_url, &FlowOptions::default(), &mut |_| {})
-                .await?
-            {
+            let options = FlowOptions {
+                refresh_only: true,
+                ..FlowOptions::default()
+            };
+            match authorize_mcp(&provider, &server_url, &options, &mut |_| {}).await? {
                 FlowResult::Authorized => store
                     .load()
                     .await?
@@ -2440,11 +2502,39 @@ pub async fn sign_in(
     let server_url = reqwest::Url::parse(server_url)
         .map_err(|error| fatal(format!("invalid MCP server URL \"{server_url}\": {error}")))?;
     let deadline = Instant::now() + timeout;
-    let stored = store.load().await?;
     let step_up =
         challenge.and_then(|challenge| challenge.error.as_deref()) == Some("insufficient_scope");
     let callback = settings.callback_settings()?;
     let cimd = settings.client_registration == Some(McpClientRegistration::Cimd);
+    // A sign-in first tries the stored refresh token with the stored client,
+    // even when the callback redirect URI changed: a refresh keeps the grant
+    // without dropping the client or opening the browser (upstream
+    // `startMcpSignIn` -> `refreshBeforeSignIn`). A step-up needs the browser
+    // flow, and `cimd` replaces a registered client, so both skip this.
+    if !step_up {
+        let snapshot = store.load().await?;
+        let has_refresh_token = snapshot
+            .as_ref()
+            .and_then(|state| state.tokens.as_ref())
+            .and_then(|tokens| tokens.refresh_token.as_ref())
+            .is_some();
+        let cimd_replaces_registered = cimd
+            && snapshot
+                .as_ref()
+                .is_some_and(|state| state.client_information.is_some())
+            && settings.client_id.as_deref().is_none_or(str::is_empty);
+        if has_refresh_token && !cimd_replaces_registered {
+            match refresh_access_token(store, settings, server_url.as_str(), None).await {
+                Ok(_) => return Ok(()),
+                // No usable grant, or another process is refreshing: sign in.
+                Err(McpOAuthError::AuthorizationRequired | McpOAuthError::RefreshLockBusy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    // The refresh attempt may have invalidated credentials; the browser step
+    // must see the current state (upstream reloads in `startBrowserStep`).
+    let stored = store.load().await?;
     // Reuse the port of the registered redirect URI so the registered client
     // stays valid (upstream oauth.ts:487).
     let registered_redirect = stored
@@ -2554,9 +2644,10 @@ pub async fn sign_in(
             scope: merge_scopes(settings.scope.as_deref(), challenged.as_deref()),
             resource_metadata_url: challenge
                 .and_then(|challenge| challenge.resource_metadata_url.as_deref()),
-            // A refresh keeps the granted scope; a server asking for more
-            // needs the browser flow.
-            skip_refresh: step_up,
+            // The pre-refresh above already ran (or was skipped for a
+            // step-up), so the browser step never refreshes again
+            // (upstream `startBrowserStep` passes `skipRefresh: true`).
+            skip_refresh: true,
             ..FlowOptions::default()
         };
         let mut authorization_url: Option<String> = None;
