@@ -566,6 +566,34 @@ fn type_to_search_filters_the_settings_rows() {
     assert_eq!(menu.rows().len(), all);
 }
 
+/// #7629: PageDown/PageUp move the settings highlight by one visible page
+/// (10 rows), clamped at the list ends.
+#[test]
+fn settings_page_keys_move_by_one_visible_page() {
+    let settings = pir::config::settings::Settings::default();
+    let menu = SettingsMenu::new(&settings, menu_context());
+    let sequential = SettingsMenu::new(&settings, menu_context());
+    let rows = menu.rows().len();
+    assert!(rows > 10, "fixture needs more than one page: {rows}");
+
+    menu.handle_key(MenuKey::PageDown);
+    for _ in 0..10 {
+        sequential.handle_key(MenuKey::Down);
+    }
+    assert_eq!(
+        menu.selected_label(),
+        sequential.selected_label(),
+        "PageDown moves exactly one visible page"
+    );
+
+    menu.handle_key(MenuKey::PageUp);
+    assert_eq!(
+        menu.selected_label(),
+        SettingsMenu::new(&settings, menu_context()).selected_label(),
+        "PageUp clamps at the first row"
+    );
+}
+
 /// Regression (S2 `2026-11-06T0415-settings-nomatch-enter`): Enter/←/→ on a
 /// search with zero rows must be a no-op. Before the fix `current_index`
 /// clamped to the unfiltered row count, so Enter cycled the hidden first row

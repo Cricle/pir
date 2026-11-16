@@ -27,8 +27,9 @@ cause chains, diff indentation, custom find `limit + 1`, Windows case-folded
 resource/package/project-trust keys, the refresh-only MCP refresh guard and
 sign-in's stored-client refresh, root `$defs` in non-strict Anthropic
 schemas, Unicode tool-search segmentation in both tokenizers, web-URL-only
-OAuth opening with control-character stripping in sign-in displays, and SDK
-runtime disposal that settles an aborted run.
+OAuth opening with control-character stripping in sign-in displays, SDK
+runtime disposal that settles an aborted run, and autocomplete/`/settings`
+PageUp/PageDown.
 
 Gate evidence for the latest commits: full nextest **7570 passed / 0 failed /
 46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, 43 catalog
@@ -58,8 +59,6 @@ test that cites the upstream commit.
 1. **Extension keybinding hints (#11630).** The JS render/message context
    lacks `keyHint`/`keyText`; inject the host's resolved bindings instead of
    the static shim table.
-2. **Selection page keys (#7629 residual).** Autocomplete and the settings
-   submenu lack PageUp/PageDown while the other lists have them.
 
 ## Wave B — medium, needs a small design pass
 

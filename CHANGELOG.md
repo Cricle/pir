@@ -122,6 +122,9 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - Disposing an SDK session runtime aborts an in-flight run and waits for it to
   settle, so the interrupted tool result and final assistant message are
   persisted before extensions shut down (`#9124`/`#9126`).
+- PageUp/PageDown move the editor autocomplete menu and the `/settings` list by
+  one visible page, clamped at the list ends and honoring remapped
+  `tui.select.pageUp`/`tui.select.pageDown` bindings (`#7629`).
 
 ### correctness
 

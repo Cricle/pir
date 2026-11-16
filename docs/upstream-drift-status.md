@@ -261,15 +261,14 @@ and project-trust path keys (#11588); local `$ref` following in tool search
 refresh (#11743); root `$defs`/`definitions` in non-strict Anthropic schemas
 (#9557); Unicode word segmentation in both tool-search tokenizers (#11037);
 and web-URL-only OAuth opening plus control-character stripping in the
-CLI/TUI sign-in displays and Radius endpoints (#11849); and SDK runtime
-disposal that aborts and settles an in-flight run before extension shutdown
-(#9126).
+CLI/TUI sign-in displays and Radius endpoints (#11849); SDK runtime disposal
+that aborts and settles an in-flight run before extension shutdown (#9126);
+and PageUp/PageDown in autocomplete and `/settings` (#7629).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP
 refresh redirect/cancel guards; `pi auth login/logout` flags; and the
-remaining queue/window/DX items (keybinding hints, page keys, package-update
-summary).
+remaining queue/window/DX items (keybinding hints, package-update summary).
 The prioritized Wave A/B/C breakdown with `file:line` evidence is
 [`upstream-next-plan.md`](upstream-next-plan.md).
 

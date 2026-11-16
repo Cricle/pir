@@ -22,6 +22,10 @@ use serde_json::Value as JsonValue;
 use super::core::{Component, Container, DynamicBorder, Spacer, Text};
 use super::theme::{with_theme, ThemeColor};
 
+/// Rows visible in the menu viewport; also the `PageUp`/`PageDown` step
+/// (upstream `SettingsList`'s `maxVisible`).
+const MAX_VISIBLE: usize = 10;
+
 /// What one value change asks the host to do (upstream `SettingsCallbacks`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingsAction {
@@ -800,6 +804,10 @@ fn warning_items(warnings: &crate::config::settings::WarningSettings) -> Vec<Set
 pub enum MenuKey {
     Up,
     Down,
+    /// Move the highlight by one visible page (upstream `tui.select.pageUp`).
+    PageUp,
+    /// Move the highlight by one visible page (upstream `tui.select.pageDown`).
+    PageDown,
     Left,
     Right,
     Enter,
@@ -986,7 +994,6 @@ impl SettingsMenu {
         let Some(offset) = row.checked_sub(header) else {
             return false;
         };
-        const MAX_VISIBLE: usize = 10;
         let next = {
             let (rows, visible) = state.display_rows();
             let selected = state
@@ -1068,6 +1075,14 @@ impl SettingsMenu {
             }
             MenuKey::Down => {
                 Self::step(&mut state, 1);
+                MenuOutcome::None
+            }
+            MenuKey::PageUp => {
+                Self::step(&mut state, -(MAX_VISIBLE as isize));
+                MenuOutcome::None
+            }
+            MenuKey::PageDown => {
+                Self::step(&mut state, MAX_VISIBLE as isize);
                 MenuOutcome::None
             }
             MenuKey::Left => Self::cycle(&mut state, -1),
@@ -1767,7 +1782,6 @@ impl Component for SettingsMenu {
             .and_then(|current| visible.iter().position(|index| *index == current))
             .unwrap_or(0);
         // Windowed list, upstream `SettingsList` visible-window rule.
-        const MAX_VISIBLE: usize = 10;
         let start = selected
             .saturating_sub(MAX_VISIBLE / 2)
             .min(rows.len().saturating_sub(MAX_VISIBLE.min(rows.len())));

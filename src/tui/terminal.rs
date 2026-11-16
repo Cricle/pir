@@ -14166,6 +14166,30 @@ fn handle_key(
             }
             return false;
         }
+        // PageUp/PageDown move the menu by one visible page (upstream
+        // `getSelectPageIndex`), before any app action bound to the same key.
+        if kb.matches_id("tui.select.pageUp", key) {
+            if let Some(popup) = app
+                .autocomplete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                popup.move_page_up();
+            }
+            return false;
+        }
+        if kb.matches_id("tui.select.pageDown", key) {
+            if let Some(popup) = app
+                .autocomplete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                popup.move_page_down();
+            }
+            return false;
+        }
         if kb.matches(TuiAction::AutocompleteAccept, key) {
             accept_autocomplete(app);
             return false;
@@ -16223,25 +16247,31 @@ fn handle_settings_menu_key(
     entries: &mut Vec<ChatEntry>,
     worker: &WorkerHandle,
 ) {
-    let menu_key = match key.code {
-        KeyCode::Up => Some(MenuKey::Up),
-        KeyCode::Down => Some(MenuKey::Down),
-        KeyCode::Left => Some(MenuKey::Left),
-        KeyCode::Right => Some(MenuKey::Right),
-        KeyCode::Enter => Some(MenuKey::Enter),
-        KeyCode::Esc => Some(MenuKey::Esc),
-        KeyCode::Backspace => Some(MenuKey::Backspace),
-        // Type-to-search (upstream `SettingsList` with `enableSearch`):
-        // printable chars filter the row list; modified chords stay with the
-        // host.
-        KeyCode::Char(c)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            Some(MenuKey::Char(c))
+    let menu_key = if app.keybindings.matches_id("tui.select.pageUp", key) {
+        Some(MenuKey::PageUp)
+    } else if app.keybindings.matches_id("tui.select.pageDown", key) {
+        Some(MenuKey::PageDown)
+    } else {
+        match key.code {
+            KeyCode::Up => Some(MenuKey::Up),
+            KeyCode::Down => Some(MenuKey::Down),
+            KeyCode::Left => Some(MenuKey::Left),
+            KeyCode::Right => Some(MenuKey::Right),
+            KeyCode::Enter => Some(MenuKey::Enter),
+            KeyCode::Esc => Some(MenuKey::Esc),
+            KeyCode::Backspace => Some(MenuKey::Backspace),
+            // Type-to-search (upstream `SettingsList` with `enableSearch`):
+            // printable chars filter the row list; modified chords stay with
+            // the host.
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                Some(MenuKey::Char(c))
+            }
+            _ => None,
         }
-        _ => None,
     };
     let Some(menu_key) = menu_key else {
         return;

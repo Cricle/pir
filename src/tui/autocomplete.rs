@@ -1421,6 +1421,29 @@ impl AutocompletePopup {
         self.selected = (self.selected + 1) % self.suggestions.items.len();
     }
 
+    /// Move the highlight up one visible page, clamped to the first item
+    /// (upstream `getSelectPageIndex` with `tui.select.pageUp`).
+    pub fn move_page_up(&mut self) {
+        if self.suggestions.items.is_empty() {
+            return;
+        }
+        self.selected = self.selected.saturating_sub(self.page_size());
+    }
+
+    /// Move the highlight down one visible page, clamped to the last item
+    /// (upstream `getSelectPageIndex` with `tui.select.pageDown`).
+    pub fn move_page_down(&mut self) {
+        if self.suggestions.items.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + self.page_size()).min(self.suggestions.items.len() - 1);
+    }
+
+    fn page_size(&self) -> usize {
+        self.max_visible
+            .clamp(AUTOCOMPLETE_MAX_VISIBLE_MIN, AUTOCOMPLETE_MAX_VISIBLE_MAX)
+    }
+
     /// The visible item window `(start, end)` the popup paints (upstream
     /// `SelectList.getVisibleRange`), shared by [`Self::render_lines`] and the
     /// mouse hit-test.

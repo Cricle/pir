@@ -485,6 +485,37 @@ fn popup_render_and_navigation() {
     assert!(lines[2].contains('\u{2192}'));
 }
 
+/// #7629: PageUp/PageDown move the autocomplete highlight by one visible
+/// page and clamp at the list bounds (upstream `getSelectPageIndex`).
+#[test]
+fn popup_page_keys_move_by_one_visible_page() {
+    let suggestions = AutocompleteSuggestions {
+        items: (0..12)
+            .map(|index| AutocompleteItem::new(format!("item{index}"), format!("item{index}")))
+            .collect(),
+        prefix: "/".to_string(),
+    };
+    let mut popup = AutocompletePopup::new(suggestions);
+    let selected = |popup: &AutocompletePopup| {
+        popup
+            .selected_item()
+            .map(|item| item.value.clone())
+            .expect("a selected item")
+    };
+    assert_eq!(selected(&popup), "item0");
+    popup.move_page_down();
+    assert_eq!(selected(&popup), "item5", "the default page is 5 rows");
+    popup.move_page_down();
+    assert_eq!(selected(&popup), "item10");
+    popup.move_page_down();
+    assert_eq!(selected(&popup), "item11", "clamped at the last item");
+    popup.move_page_up();
+    assert_eq!(selected(&popup), "item6");
+    popup.move_page_up();
+    popup.move_page_up();
+    assert_eq!(selected(&popup), "item0", "clamped at the first item");
+}
+
 /// PIR-TUI-014: the popup window must follow `autocompleteMaxVisible`
 /// (upstream editor.ts:380-381): unset = 5, configured 15/3 applied live,
 /// out-of-range values clamp to 3..=20.
