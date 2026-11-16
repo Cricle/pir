@@ -65,7 +65,12 @@ struct TemplateFrontmatter {
 }
 
 /// Parse command arguments respecting quoted strings, bash-style (upstream
-/// `parseCommandArgs`).
+/// `parseCommandArgs`, prompt-templates.ts:25-73).
+///
+/// A quote only opens a quoted argument at the start of an argument, so
+/// apostrophes inside words stay literal (#11873). Inside a quoted argument a
+/// backslash before that quote character is a literal quote; an unclosed
+/// quote is re-read as literal text from its opening position.
 pub fn parse_command_args(args_string: &str) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -73,26 +78,50 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
     // are kept as arguments (upstream #10867).
     let mut has_token = false;
     let mut in_quote: Option<char> = None;
+    // Where the open quote started, so an unclosed quote can be re-read as
+    // literal text (prompt-templates.ts:31-32).
+    let mut quote_start = 0usize;
+    let chars: Vec<char> = args_string.chars().collect();
+    let mut index = 0usize;
 
-    for char in args_string.chars() {
+    while index < chars.len() {
+        let ch = chars[index];
         if let Some(quote) = in_quote {
-            if char == quote {
+            if ch == '\\' && chars.get(index + 1) == Some(&quote) {
+                // A backslash before the open quote's character keeps it as
+                // text: "say \"hi\"" gives `say "hi"`.
+                current.push(quote);
+                index += 1;
+            } else if ch == quote {
                 in_quote = None;
             } else {
-                current.push(char);
+                current.push(ch);
             }
-        } else if char == '"' || char == '\'' {
-            in_quote = Some(char);
+        } else if (ch == '"' || ch == '\'') && !has_token {
+            // Quotes only open at the start of an argument, so apostrophes
+            // inside words stay literal.
+            in_quote = Some(ch);
+            quote_start = index;
             has_token = true;
-        } else if char.is_whitespace() {
+        } else if ch.is_whitespace() {
             if has_token {
                 args.push(std::mem::take(&mut current));
                 has_token = false;
             }
         } else {
-            current.push(char);
+            current.push(ch);
             has_token = true;
         }
+
+        if in_quote.is_some() && index == chars.len() - 1 {
+            // Unclosed quote: keep the quote character as text and parse the
+            // rest normally (current was empty when the quote opened, because
+            // quotes only open a new argument).
+            in_quote = None;
+            current = String::from(chars[quote_start]);
+            index = quote_start;
+        }
+        index += 1;
     }
 
     if has_token {

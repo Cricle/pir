@@ -961,7 +961,9 @@ mod shim_deflate {
             // arguments did not move).
             // PIR-BIN-044: the accumulator reads upstream's camelCase
             // `event.contentIndex` (packages/ai/src/types.ts:823-831).
-            "a5e0d0dd1a39d8667287d79e89d30b014cf6be011f1ccd202d8f996eef384d80",
+            // #11546: `pi.exec` forwards `options.maxBuffer` and turns the
+            // host's RangeError carrier into a JS error.
+            "93fa8a2969da7ab50b88b8d6e3ea8c62a62ba15a3fb2f5d510532f38892db26e",
         ),
         (
             "process_global_stub.js.txt",

@@ -35,6 +35,50 @@ fn keeps_trailing_empty_argument() {
     assert_eq!(parse_command_args("a \"\""), vec!["a", ""]);
 }
 
+/// `96667f342` #11873: a quote only opens a quoted argument at the start of an
+/// argument, so apostrophes inside words stay literal (upstream
+/// `prompt-templates.ts:44-47`).
+#[test]
+fn keeps_apostrophes_inside_words() {
+    assert_eq!(
+        parse_command_args("why doesn't the user's cache work"),
+        vec!["why", "doesn't", "the", "user's", "cache", "work"]
+    );
+}
+
+/// An unclosed quote is re-read as literal text from its opening position
+/// (upstream `prompt-templates.ts:62-69`).
+#[test]
+fn unclosed_quote_is_literal_text() {
+    assert_eq!(
+        parse_command_args("'tis the season"),
+        vec!["'tis", "the", "season"]
+    );
+}
+
+/// Backslash before the open quote character yields a literal quote; other
+/// backslashes stay as typed (upstream `prompt-templates.ts:38-42`).
+#[test]
+fn quoted_argument_supports_escaped_quotes_and_paths() {
+    assert_eq!(
+        parse_command_args("\"quoted \\\"text\\\"\""),
+        vec!["quoted \"text\""]
+    );
+    assert_eq!(parse_command_args("'it\\'s here'"), vec!["it's here"]);
+    assert_eq!(
+        parse_command_args("\"C:\\dir\\file\""),
+        vec!["C:\\dir\\file"]
+    );
+    assert_eq!(
+        parse_command_args("'\\\\server\\share'"),
+        vec!["\\\\server\\share"]
+    );
+    // A quoted argument ending in a backslash reads the final `\"` as an
+    // escaped quote, so the quote never closes and the whole argument is kept
+    // literally, quotes included (upstream changelog edge case).
+    assert_eq!(parse_command_args("\"C:\\dir\\\""), vec!["\"C:\\dir\\\""]);
+}
+
 #[test]
 fn empty_argument_does_not_shift_later_positional_arguments() {
     let template = review_template();

@@ -1346,9 +1346,11 @@ pub fn real_install_root(root: &Path) -> PathBuf {
 }
 
 /// The npm-family install argv for a managed install (upstream
-/// `getNpmInstallArgs`, `package-manager.ts:1845-1866`): peer dependency
+/// `getNpmInstallArgs`, `package-manager.ts:1939-1963`): peer dependency
 /// resolution is disabled so the package manager never installs or solves
-/// host-provided pi peers.
+/// host-provided pi peers, and npm's audit/fund advice is skipped because
+/// following it would reinstall those peers without `--legacy-peer-deps`
+/// (upstream #11469).
 fn npm_install_args(package_manager: &str, specs: &[String], install_root: &Path) -> Vec<String> {
     // npm writes broken nested package-lock.json paths when --prefix goes
     // through a symlink (upstream resolves the root first).
@@ -1364,7 +1366,13 @@ fn npm_install_args(package_manager: &str, specs: &[String], install_root: &Path
             "--config.strict-peer-dependencies=false".to_owned(),
             "--config.strict-dep-builds=false".to_owned(),
         ]),
-        _ => args.extend(["--prefix".to_owned(), root, "--legacy-peer-deps".to_owned()]),
+        _ => args.extend([
+            "--prefix".to_owned(),
+            root,
+            "--legacy-peer-deps".to_owned(),
+            "--no-audit".to_owned(),
+            "--no-fund".to_owned(),
+        ]),
     }
     args
 }
@@ -1647,7 +1655,7 @@ fn install_npm_captured(
 }
 
 /// Uninstall one npm source from the scope root (upstream `uninstallNpm`,
-/// `package-manager.ts:1874-1889`); a missing install root is a no-op.
+/// `package-manager.ts:1971-1990`); a missing install root is a no-op.
 fn uninstall_npm(
     npm: &NpmSource,
     local: bool,
@@ -1671,7 +1679,11 @@ fn uninstall_npm(
     } else {
         uninstall_args.extend(["--prefix".to_owned(), root]);
         if package_manager != "pnpm" {
-            uninstall_args.push("--legacy-peer-deps".to_owned());
+            uninstall_args.extend([
+                "--legacy-peer-deps".to_owned(),
+                "--no-audit".to_owned(),
+                "--no-fund".to_owned(),
+            ]);
         }
     }
     run_command(&command, &npm_argv(args, uninstall_args), None)
@@ -1738,8 +1750,27 @@ fn get_latest_npm_version(
     Err(anyhow::anyhow!("Unexpected response from npm view"))
 }
 
-/// Whether an npm source has a newer version to install (upstream
-/// `shouldUpdateNpmSource`, package-manager.ts:1181-1195): a missing install
+/// The result of the update check for one npm source (upstream
+/// `shouldUpdateNpmSource`, package-manager.ts:1240-1260): the decision plus
+/// the installed and registry versions, so the update path can report a
+/// no-op install (#11571).
+struct NpmUpdateCheck {
+    should_update: bool,
+    installed_version: Option<String>,
+    target_version: Option<String>,
+}
+
+impl NpmUpdateCheck {
+    fn update_anyway(installed_version: Option<String>) -> Self {
+        Self {
+            should_update: true,
+            installed_version,
+            target_version: None,
+        }
+    }
+}
+
+/// Whether an npm source has a newer version to install. A missing install
 /// always updates; lookup failures preserve upstream's update-anyway behavior.
 fn should_update_npm(
     npm: &NpmSource,
@@ -1747,14 +1778,14 @@ fn should_update_npm(
     settings: &SettingsManager,
     agent_dir: &Path,
     cwd: &Path,
-) -> bool {
+) -> NpmUpdateCheck {
     let Some(install_path) = managed_npm_install_path(&npm.name, local, agent_dir, cwd) else {
         // An unsafe name cannot be inspected or installed; let the caller's
         // install path report it.
-        return true;
+        return NpmUpdateCheck::update_anyway(None);
     };
     let Some(installed) = installed_npm_version(&install_path) else {
-        return true;
+        return NpmUpdateCheck::update_anyway(None);
     };
     let package_spec = if npm.version.is_some() {
         &npm.spec
@@ -1762,8 +1793,12 @@ fn should_update_npm(
         &npm.name
     };
     match get_latest_npm_version(settings, package_spec, cwd) {
-        Ok(latest) => compare_npm_versions(&latest, &installed) == Some(Ordering::Greater),
-        Err(_) => true,
+        Ok(latest) => NpmUpdateCheck {
+            should_update: compare_npm_versions(&latest, &installed) == Some(Ordering::Greater),
+            installed_version: Some(installed),
+            target_version: Some(latest),
+        },
+        Err(_) => NpmUpdateCheck::update_anyway(Some(installed)),
     }
 }
 
@@ -2149,7 +2184,8 @@ fn update_configured_source(
             if npm.pinned {
                 return Ok(());
             }
-            if !should_update_npm(&npm, local, settings, agent_dir, cwd) {
+            let check = should_update_npm(&npm, local, settings, agent_dir, cwd);
+            if !check.should_update {
                 return Ok(());
             }
             // `updateNpmBatch`: `<name>@latest` for unpinned unversioned
@@ -2165,7 +2201,23 @@ fn update_configured_source(
             let package_manager = package_manager_name(&command, &args)?;
             let install_args =
                 npm_install_args(&package_manager, std::slice::from_ref(&spec), &install_root);
-            run_command(&command, &npm_argv(args, install_args), None)
+            run_command(&command, &npm_argv(args, install_args), None)?;
+            // npm can resolve stale registry metadata after a publish and
+            // install the old version without an error; warn when the
+            // announced update did not change the installed version
+            // (upstream `reportUnchangedNpmUpdates`, package-manager.ts:1264-1289,
+            // #11571).
+            if let (Some(before), Some(target)) = (&check.installed_version, &check.target_version)
+            {
+                let after = managed_npm_install_path(&npm.name, local, agent_dir, cwd)
+                    .and_then(|path| installed_npm_version(&path));
+                if after.as_deref() == Some(before.as_str()) {
+                    println!(
+                        "{entry_source} is still {before} (registry reports {target}); npm registry metadata may be stale, try again in a few minutes"
+                    );
+                }
+            }
+            Ok(())
         }
         ParsedSource::Git {
             host,
@@ -2472,9 +2524,10 @@ fn sync_git_checkout(target: &Path, reference: Option<&str>) -> crate::Result<()
 }
 
 /// The dependency-install argv for a cloned git package (upstream
-/// `getGitDependencyInstallArgs`, package-manager.ts:1846-1864): production
-/// dependencies only, without installing or solving host-provided pi peers.
-/// Exposed for the parity tests.
+/// `getGitDependencyInstallArgs`, package-manager.ts:1915-1937): production
+/// dependencies only, without installing or solving host-provided pi peers,
+/// and without npm's audit/fund advice (upstream #11469). Exposed for the
+/// parity tests.
 #[doc(hidden)]
 pub fn git_dependency_install_args(package_manager: &str) -> Vec<String> {
     let args: &[&str] = match package_manager {
@@ -2486,7 +2539,13 @@ pub fn git_dependency_install_args(package_manager: &str) -> Vec<String> {
             "--config.strict-peer-dependencies=false",
             "--config.strict-dep-builds=false",
         ],
-        "npm" => &["install", "--omit=dev", "--legacy-peer-deps"],
+        "npm" => &[
+            "install",
+            "--omit=dev",
+            "--legacy-peer-deps",
+            "--no-audit",
+            "--no-fund",
+        ],
         _ => &["install"],
     };
     args.iter().map(|arg| (*arg).to_owned()).collect()

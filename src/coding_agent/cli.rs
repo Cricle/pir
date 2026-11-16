@@ -1316,19 +1316,27 @@ pub enum McpCommand {
         json: bool,
     },
     /// Sign in to an OAuth MCP server through the browser (upstream
-    /// `pi mcp login <server> [--timeout <seconds>]`)
+    /// `pi mcp login <server> [-l] [--timeout <seconds>]`)
     Login {
         /// Server name from mcp.json
         server: String,
+        /// Use `.pi/mcp.json` in the current project instead of the global
+        /// file (the server must be defined there; upstream `-l, --local`)
+        #[arg(short = 'l', long = "local")]
+        local: bool,
         /// How long login waits for the browser (default: 300)
         #[arg(long = "timeout", default_value_t = 300)]
         timeout_seconds: u64,
     },
     /// Delete the stored OAuth credentials of a server (upstream
-    /// `pi mcp logout <server>`)
+    /// `pi mcp logout <server> [-l]`)
     Logout {
         /// Server name from mcp.json
         server: String,
+        /// Use `.pi/mcp.json` in the current project instead of the global
+        /// file (the server must be defined there; upstream `-l, --local`)
+        #[arg(short = 'l', long = "local")]
+        local: bool,
     },
 }
 
@@ -2076,14 +2084,15 @@ pub async fn run_mcp_command_code_with_trust(
         #[cfg(feature = "mcp")]
         McpCommand::Login {
             server,
+            local,
             timeout_seconds,
         } => {
-            run_mcp_login(&server, timeout_seconds, project_trusted).await?;
+            run_mcp_login(&server, local, timeout_seconds, project_trusted).await?;
             Ok(0)
         }
         #[cfg(feature = "mcp")]
-        McpCommand::Logout { server } => {
-            run_mcp_logout(&server, project_trusted).await?;
+        McpCommand::Logout { server, local } => {
+            run_mcp_logout(&server, local, project_trusted).await?;
             Ok(0)
         }
         #[cfg(not(feature = "mcp"))]
@@ -2631,13 +2640,66 @@ impl crate::mcp::oauth::McpSignInPrompt for McpCliSignInPrompt {
     }
 }
 
-/// `pir mcp login <server> [--timeout <seconds>]` (upstream `login`,
-/// `extensions/mcp/cli.ts:521`): connect first (a stored refresh token may
-/// already suffice), run the OAuth flow when the server demands a sign-in,
-/// then reconnect and report the tool count.
+/// Levenshtein distance, to suggest a configured server name for a mistyped
+/// one (upstream `editDistance`, `extensions/mcp/cli.ts:276-286`).
+#[cfg(all(feature = "mcp", feature = "cli"))]
+fn mcp_edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    for (i, a_char) in a.chars().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, b_char) in b.iter().enumerate() {
+            current.push(
+                (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + usize::from(a_char != *b_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+
+/// The "No MCP server named" error shared by login/logout, suggesting a
+/// configured name within edit distance 2 (upstream `extensions/mcp/cli.ts:237-243`).
+#[cfg(all(feature = "mcp", feature = "cli"))]
+fn mcp_missing_server_error(server: &str, configured: &[String], note: &str) -> anyhow::Error {
+    let suggestion = configured
+        .iter()
+        .find(|candidate| mcp_edit_distance(candidate, server) <= 2)
+        .map(|candidate| format!(" Did you mean \"{candidate}\"?"))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "No MCP server named \"{server}\".{suggestion}{note} Configured: {}.",
+        if configured.is_empty() {
+            "none".to_owned()
+        } else {
+            configured.join(", ")
+        }
+    )
+}
+
+/// A user-facing label for where a server was defined (upstream
+/// `entry.source`, which is the config file path or extension source).
+#[cfg(all(feature = "mcp", feature = "cli"))]
+fn mcp_source_label(source: &crate::mcp::registry::McpServerSource) -> String {
+    use crate::mcp::registry::McpServerSource;
+    match source {
+        McpServerSource::GlobalConfig(path) | McpServerSource::ProjectConfig(path) => {
+            path.display().to_string()
+        }
+        McpServerSource::Extension(name) => format!("extension \"{name}\""),
+    }
+}
+
+/// `pir mcp login <server> [-l] [--timeout <seconds>]` (upstream `login`,
+/// `extensions/mcp/cli.ts:221-265`): connect first (a stored refresh token
+/// may already suffice), run the OAuth flow when the server demands a
+/// sign-in, then reconnect and report the tool count.
 #[cfg(all(feature = "mcp", feature = "cli"))]
 async fn run_mcp_login(
     server: &str,
+    local: bool,
     timeout_seconds: u64,
     project_trusted: bool,
 ) -> crate::Result<()> {
@@ -2657,11 +2719,21 @@ async fn run_mcp_login(
         } else {
             format!(" ({})", config_errors.join("; "))
         };
-        return Err(anyhow::anyhow!(
-            "No MCP server named \"{server}\"{note}. Configured: {}.",
-            configured.join(", ")
-        ));
+        return Err(mcp_missing_server_error(server, &configured, &note));
     };
+    // `-l` signs in only a server defined in the project config (upstream
+    // cli.ts:244-247).
+    if local
+        && !matches!(
+            entry.source,
+            crate::mcp::registry::McpServerSource::ProjectConfig(_)
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "MCP server \"{server}\" is defined in {}, not in the project; omit --local.",
+            mcp_source_label(&entry.source)
+        ));
+    }
     let Some(url) = crate::mcp::oauth::oauth_server_url(&entry.config) else {
         return Err(anyhow::anyhow!(
             "MCP server \"{server}\" does not use OAuth. Only HTTP servers without an Authorization header do."
@@ -2740,17 +2812,39 @@ async fn run_mcp_login(
     Ok(())
 }
 
-/// `pir mcp logout <server>` (upstream `logout`): delete the stored OAuth
-/// credentials of the server.
+/// `pir mcp logout <server> [-l]` (upstream `logout`): delete the stored
+/// OAuth credentials of the server.
 #[cfg(all(feature = "mcp", feature = "cli"))]
-async fn run_mcp_logout(server: &str, project_trusted: bool) -> crate::Result<()> {
+async fn run_mcp_logout(server: &str, local: bool, project_trusted: bool) -> crate::Result<()> {
     let agent_dir = crate::coding_agent::context::agent_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let manager = crate::mcp::manager::McpManager::new(&agent_dir, &cwd);
-    manager.load_config_files(&agent_dir, project_trusted);
+    let config_errors = manager.load_config_files(&agent_dir, project_trusted);
     let Some(entry) = manager.registry().get(server) else {
-        return Err(anyhow::anyhow!("No MCP server named \"{server}\"."));
+        let configured: Vec<String> = manager
+            .registry()
+            .list()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        let note = if config_errors.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", config_errors.join("; "))
+        };
+        return Err(mcp_missing_server_error(server, &configured, &note));
     };
+    if local
+        && !matches!(
+            entry.source,
+            crate::mcp::registry::McpServerSource::ProjectConfig(_)
+        )
+    {
+        return Err(anyhow::anyhow!(
+            "MCP server \"{server}\" is defined in {}, not in the project; omit --local.",
+            mcp_source_label(&entry.source)
+        ));
+    }
     let Some(url) = crate::mcp::oauth::oauth_server_url(&entry.config) else {
         return Err(anyhow::anyhow!(
             "MCP server \"{server}\" does not use OAuth. Only HTTP servers without an Authorization header do."

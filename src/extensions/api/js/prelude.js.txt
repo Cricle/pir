@@ -3035,9 +3035,16 @@ function makePi(extId) {
           JSON.stringify(argv),
           options?.cwd ?? null,
           options?.timeout == null ? null : Number(options.timeout),
+          // Combined stdout/stderr byte cap (upstream `ExecOptions.maxBuffer`,
+          // exec.ts:20-26); the host validates it and rejects before spawning.
+          options?.maxBuffer == null ? null : Number(options.maxBuffer),
           callId,
         );
-        return JSON.parse(out);
+        const result = JSON.parse(out);
+        if (result && result.errorName === "RangeError") {
+          throw new RangeError(result.error);
+        }
+        return result;
       } finally {
         if (onAbort) {
           try { signal.removeEventListener?.("abort", onAbort); } catch { /* best-effort */ }

@@ -672,7 +672,8 @@ async fn pi_exec_runs_subprocess() {
     rt.seeded_load("pir-ext:exec-user.ts").await.expect("load");
 
     let mut payload = json!({ "reason": "startup" });
-    rt.emit("session_start", &mut payload).await.expect("emit");
+    let outcome = rt.emit("session_start", &mut payload).await.expect("emit");
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
 
     let result: serde_json::Value = rt
         .eval_json("JSON.stringify(globalThis.__exec_result)")
@@ -680,6 +681,8 @@ async fn pi_exec_runs_subprocess() {
         .expect("eval");
     assert_eq!(result["code"], 0);
     assert_eq!(result["killed"], false);
+    // `ExecResult.truncated` is a required field upstream (exec.ts:32-40).
+    assert_eq!(result["truncated"], false);
     assert!(result["stdout"]
         .as_str()
         .unwrap_or("")
@@ -1179,16 +1182,19 @@ async fn with_file_mutation_queue_serializes_per_path() {
 // pi.exec output bounding
 // ---------------------------------------------------------------------------
 
+/// `c466a3595` #11546: `maxBuffer` caps combined stdout+stderr, terminates
+/// the command, and reports `truncated: true` with a nonzero exit code
+/// (upstream `exec.ts:90-102,130-140`). The output carries no textual notice.
 #[tokio::test(flavor = "current_thread")]
-async fn exec_output_is_bounded() {
+async fn exec_output_respects_max_buffer_and_reports_truncation() {
     let rt = new_runtime().await;
     let exec_call = if cfg!(windows) {
         r#"await pi.exec("cmd", [
                     "/C",
                     `for /L %i in (1,1,3000) do @echo ${line}`,
-                ])"#
+                ], { maxBuffer: 1024 })"#
     } else {
-        r#"await pi.exec("sh", ["-c", `yes ${line} | head -n 3000`])"#
+        r#"await pi.exec("sh", ["-c", `yes ${line} | head -n 3000`], { maxBuffer: 1024 })"#
     };
     let source = r#"
         export default (pi) => {
@@ -1219,16 +1225,112 @@ async fn exec_output_is_bounded() {
         .await
         .expect("eval");
     let stdout = result["stdout"].as_str().unwrap_or("");
-    assert!(
-        stdout.contains("[output truncated]"),
-        "expected truncation notice, got {} bytes",
-        stdout.len()
+    let stderr = result["stderr"].as_str().unwrap_or("");
+    assert_eq!(
+        result["truncated"], true,
+        "truncation is reported: {result}"
+    );
+    assert_eq!(
+        result["killed"], true,
+        "the command was terminated: {result}"
+    );
+    assert_ne!(
+        result["code"], 0,
+        "a truncated result is not success: {result}"
     );
     assert!(
-        stdout.len() < 2 * 1024 * 1024,
-        "output must stay bounded: {} bytes",
-        stdout.len()
+        stdout.len() + stderr.len() <= 1024,
+        "combined output must stay within maxBuffer: {} bytes",
+        stdout.len() + stderr.len()
     );
+    assert!(
+        !stdout.contains("[output truncated]") && !stderr.contains("[output truncated]"),
+        "upstream returns incomplete output without a notice"
+    );
+}
+
+/// `maxBuffer: 0` truncates every byte; the command is still terminated and
+/// the result never reads as success (upstream `exec.test.ts`, #11360).
+#[tokio::test(flavor = "current_thread")]
+async fn exec_zero_max_buffer_truncates_all_output() {
+    let rt = new_runtime().await;
+    let exec_call = if cfg!(windows) {
+        r#"await pi.exec("cmd", ["/C", "echo", "x"], { maxBuffer: 0 })"#
+    } else {
+        r#"await pi.exec("sh", ["-c", "printf x"], { maxBuffer: 0 })"#
+    };
+    let source = r#"
+        export default (pi) => {
+            pi.on("session_start", async () => {
+                globalThis.__exec_zero = __EXEC_CALL__;
+            });
+        };
+        "#
+    .replace("__EXEC_CALL__", exec_call);
+    rt.seed_module("pir-ext:zero-buffer.ts", &source)
+        .expect("seed");
+    rt.seeded_load("pir-ext:zero-buffer.ts")
+        .await
+        .expect("load");
+
+    let mut payload = json!({ "reason": "startup" });
+    rt.emit("session_start", &mut payload).await.expect("emit");
+
+    let result: serde_json::Value = rt
+        .eval_json("JSON.stringify(globalThis.__exec_zero)")
+        .await
+        .expect("eval");
+    assert_eq!(result["stdout"], "");
+    assert_eq!(result["stderr"], "");
+    assert_eq!(result["truncated"], true);
+    assert_eq!(result["killed"], true);
+    assert_ne!(result["code"], 0);
+}
+
+/// An invalid `maxBuffer` rejects with `RangeError` before the command is
+/// spawned; a missing command would otherwise resolve to a `code: 1` result
+/// (upstream `exec.ts:53-57`, `exec.test.ts`).
+#[tokio::test(flavor = "current_thread")]
+async fn exec_rejects_invalid_max_buffer_before_spawning() {
+    let rt = new_runtime().await;
+    let source = r#"
+        export default (pi) => {
+            pi.on("session_start", async () => {
+                const outcomes = [];
+                for (const maxBuffer of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+                    try {
+                        await pi.exec("pir-command-that-does-not-exist-11360", [], { maxBuffer });
+                        outcomes.push("no-error");
+                    } catch (error) {
+                        outcomes.push(error.name + ": " + error.message);
+                    }
+                }
+                globalThis.__exec_invalid = outcomes;
+            });
+        };
+        "#;
+    rt.seed_module("pir-ext:invalid-buffer.ts", source)
+        .expect("seed");
+    rt.seeded_load("pir-ext:invalid-buffer.ts")
+        .await
+        .expect("load");
+
+    let mut payload = json!({ "reason": "startup" });
+    rt.emit("session_start", &mut payload).await.expect("emit");
+
+    let outcomes: serde_json::Value = rt
+        .eval_json("JSON.stringify(globalThis.__exec_invalid)")
+        .await
+        .expect("eval");
+    let outcomes = outcomes.as_array().expect("outcomes array");
+    assert_eq!(outcomes.len(), 4);
+    for outcome in outcomes {
+        let outcome = outcome.as_str().unwrap_or("");
+        assert!(
+            outcome.starts_with("RangeError: maxBuffer must be an integer between 0 and"),
+            "expected a RangeError from option validation, got {outcome:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

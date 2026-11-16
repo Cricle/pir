@@ -237,18 +237,19 @@ containing `/` (#11397); active-tool order on same-set re-apply (#11495);
 branch-summary thinking level and live thinking-level recording
 (#11482/#11888); default-model map refresh (#11467); cache-warming
 `idle` default; `CLAUDE_CODE_VERSION` bump; OpenCode endpoint catalog
-(#11434); Copilot classifier (#11679); Codex display name (#36142c1c); and the
-`qwen-token-plan-individual-cn` provider.
+(#11434); Copilot classifier (#11679); Codex display name (#36142c1c); the
+`qwen-token-plan-individual-cn` provider; npm `--no-audit --no-fund` and the
+unchanged-version warning (#11469/#11571); prompt-template apostrophes and
+escaped quotes (#11873); tool-search name-first ranking (#11331); `pi.exec`
+`maxBuffer`/`truncated` (#11546); and MCP `login`/`logout` `-l` with a name
+suggestion (upstream `be15fe3c1`).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): grep limit-notice edge (engine-supplied context, #11705);
-npm `--no-audit --no-fund`; branch-summary context edits (#11680);
-tool-search name/coverage ranking; npm unchanged-version warning;
-helper spawn cwd; `pi.exec` `truncated` result; MCP `-l`; MCP refresh-only
-guard; `requiresNonNullAssistantContent`; `promptCacheKeyMode`;
-apostrophes in prompt-template args; `pi auth login/logout` flags;
-case-insensitive Windows resource keys; and the remaining queue/window
-edge items.
+branch-summary context edits (#11680); tool-search coverage ranking;
+helper spawn cwd; MCP refresh-only guard; `requiresNonNullAssistantContent`;
+`promptCacheKeyMode`; `pi auth login/logout` flags; case-insensitive Windows
+resource keys; and the remaining queue/window edge items.
 
 **Deferred / large (not a parity bug)**: Anthropic message threads,
 Bedrock strict-tool fallback, the pi-schema coercion superset, extension

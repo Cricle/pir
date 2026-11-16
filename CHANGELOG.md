@@ -31,6 +31,20 @@ v1.5.2, and the generated test harnesses were rebuilt.
   rows (`#11470`); resized images use whichever of PNG/JPEG is smaller
   (`#11577`); npm installs resolve a symlinked agent dir to its real `--prefix`
   (`#11396`).
+- Every npm install/uninstall passes `--no-audit --no-fund` so npm cannot
+  advise a fix that reinstalls pi's peers, and an update whose registry version
+  did not actually install warns instead of claiming success
+  (`#11469`/`#11571`).
+- Prompt-template arguments keep apostrophes inside words, support escaped
+  quotes, and read an unclosed quote as literal text (`#11873`); tool search
+  ranks a tool first when the query names it, including a `__` suffix
+  (`#11331`).
+- `pi.exec` accepts `maxBuffer` (default 256 MiB, combined stdout+stderr),
+  terminates oversized commands, and returns the required `truncated` flag
+  with a nonzero exit code (`#11546`).
+- `pir mcp login`/`logout` accept `-l`/`--local`, reject a server that is not
+  defined in the project config, and suggest a configured name within edit
+  distance 2 (upstream `be15fe3c1`).
 
 ### correctness
 

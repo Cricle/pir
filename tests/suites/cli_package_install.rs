@@ -871,6 +871,10 @@ fn npm_command_prefix_argv_reaches_install_uninstall_and_update() {
     assert_eq!(installed_version(&package_root), "1.0.0");
     let recorded = std::fs::read_to_string(&log).expect("install invocation log");
     assert_prefixed_invocation(&recorded, "install", prefix_tag);
+    assert!(
+        recorded.contains("--no-audit") && recorded.contains("--no-fund"),
+        "npm installs must skip audit/fund advice (upstream #11469): {recorded}"
+    );
     std::fs::remove_file(&log).expect("reset invocation log");
 
     // `pir remove` — the uninstall path (uninstall_npm).
@@ -882,6 +886,10 @@ fn npm_command_prefix_argv_reaches_install_uninstall_and_update() {
     );
     let recorded = std::fs::read_to_string(&log).expect("uninstall invocation log");
     assert_prefixed_invocation(&recorded, "uninstall", prefix_tag);
+    assert!(
+        recorded.contains("--no-audit") && recorded.contains("--no-fund"),
+        "npm uninstalls must skip audit/fund advice (upstream #11469): {recorded}"
+    );
     std::fs::remove_file(&log).expect("reset invocation log");
 
     // `pir update` — update_configured_source reinstalls a missing managed
@@ -910,6 +918,94 @@ fn npm_command_prefix_argv_reaches_install_uninstall_and_update() {
     assert!(
         recorded.contains("prefix-pkg@latest"),
         "an unpinned update installs `<name>@latest`: {recorded}"
+    );
+}
+
+/// `0d23d5345` #11571: when the registry lookup reports a newer version but
+/// the install leaves the package unchanged (stale npm metadata), the update
+/// warns instead of quietly claiming success (upstream
+/// `reportUnchangedNpmUpdates`, package-manager.ts:1264-1289).
+#[test]
+fn npm_update_warns_when_the_installed_version_does_not_change() {
+    let home = unique_dir("npm-unchanged");
+    let agent = home.join("agent");
+    let cwd = home.join("project");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    std::fs::create_dir_all(&cwd).expect("project dir");
+    let log = home.join("noop-npm.log");
+    let install_root = agent.join("npm");
+    let package_root = install_root.join("node_modules").join("noop-pkg");
+    write_file(
+        &package_root,
+        "package.json",
+        &json!({ "name": "noop-pkg", "version": "1.0.0" }).to_string(),
+    );
+
+    // `npm view` reports 1.0.1; `npm install` succeeds without changing the
+    // installed copy.
+    #[cfg(windows)]
+    let npm = {
+        let script = home.join("noop-npm.bat");
+        std::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 echo INVOKED %*>>\"{}\"\r\n\
+                 if \"%1\"==\"view\" echo \"1.0.1\"\r\n\
+                 exit /b 0\r\n",
+                log.display()
+            ),
+        )
+        .expect("fake npm script");
+        vec![script.display().to_string()]
+    };
+    #[cfg(not(windows))]
+    let npm = {
+        use std::os::unix::fs::PermissionsExt;
+        let script = home.join("noop-npm.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"INVOKED $*\" >> \"{}\"\n\
+                 if [ \"$1\" = \"view\" ]; then printf '\"1.0.1\"\\n'; exit 0; fi\n\
+                 exit 0\n",
+                log.display()
+            ),
+        )
+        .expect("fake npm script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake npm");
+        vec![script.display().to_string()]
+    };
+    std::fs::write(
+        agent.join("settings.json"),
+        serde_json::to_string_pretty(&json!({
+            "packages": ["npm:noop-pkg"],
+            "npmCommand": npm,
+        }))
+        .expect("settings json"),
+    )
+    .expect("settings");
+
+    let output = run_pir_in(&cwd, &agent, &home, &["update", "npm:noop-pkg"]);
+    assert!(
+        output.status.success(),
+        "update failed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "npm:noop-pkg is still 1.0.0 (registry reports 1.0.1); npm registry metadata may be stale, try again in a few minutes"
+        ),
+        "the unchanged update is reported: {stdout}"
+    );
+    let recorded = std::fs::read_to_string(&log).expect("npm invocation log");
+    assert!(
+        recorded.contains(" view noop-pkg version --json")
+            && recorded.contains(" install noop-pkg@latest"),
+        "the flow checks the registry then installs @latest: {recorded}"
     );
 }
 

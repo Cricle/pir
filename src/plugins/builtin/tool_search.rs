@@ -195,9 +195,37 @@ fn stem(token: &str) -> String {
     token.to_owned()
 }
 
+/// Lowercase, with characters invalid in script identifiers as `_`, so
+/// `dev-radius` matches `dev_radius` (upstream `normalizeName`,
+/// tool.ts:118-123).
+fn normalize_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '$' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Whether `query` names the tool: its full name or a suffix after a `__`
+/// separator, so `thread_read` and `app__thread_read` both name
+/// `mcp__app__thread_read` (upstream `isNameQuery`, tool.ts:125-131).
+fn is_name_query(query: &str, name: &str) -> bool {
+    let normalized = normalize_name(name);
+    normalized == query || normalized.ends_with(&format!("__{query}"))
+}
+
 /// Okapi BM25 over the candidate documents (upstream `Bm25Ranker`,
-/// tool.ts:119-157; k1=1.2, b=0.75). The rank order is a documented total
-/// key: score descending, then tool name ascending ([`Self::rank`]).
+/// tool.ts:133-183; k1=1.2, b=0.75). A query that names a tool ranks that
+/// tool first — BM25 length normalization could otherwise rank a shorter
+/// description sharing the name's words above it (upstream #11331). The rank
+/// order is a documented total key: name match, then score descending, then
+/// tool name ascending ([`Self::rank`]).
 pub struct Bm25Ranker {
     documents: Vec<(Vec<String>, String)>, // (tokens, id)
     document_frequency: BTreeMap<String, usize>,
@@ -244,7 +272,8 @@ impl Bm25Ranker {
         let count = self.documents.len() as f64;
         let k1 = 1.2_f64;
         let b = 0.75_f64;
-        let mut scored: Vec<(String, f64)> = Vec::new();
+        let name_query = normalize_name(query);
+        let mut scored: Vec<(String, f64, bool)> = Vec::new();
         for (tokens, id) in &self.documents {
             let mut score = 0.0;
             for term in &terms {
@@ -258,28 +287,36 @@ impl Bm25Ranker {
                 score += idf * (frequency * (k1 + 1.0)) / (frequency + norm);
             }
             if score > 0.0 {
-                scored.push((id.clone(), score));
+                scored.push((id.clone(), score, is_name_query(&name_query, id)));
             }
         }
-        // Deterministic ordering (upstream's sort is by score only and stable,
-        // so equal scores keep its registration-ordered document list; pir's
-        // candidate source is a HashMap-backed registry, whose iteration order
-        // varies per run). The documented total key is:
+        // Deterministic ordering (upstream's sort is by `named`, then score,
+        // and is stable, so equal scores keep its registration-ordered
+        // document list; pir's candidate source is a HashMap-backed registry,
+        // whose iteration order varies per run). The documented total key is:
         //
-        //   primary:   score, descending
+        //   primary:   query names the tool, first
+        //   secondary: score, descending
         //   tie-break: tool name, ascending (byte order)
         //
         // `sort_by` is a stable sort, and names are unique in the merged
         // registry, so the result is independent of document/input order —
         // never of hashing.
-        scored.sort_by(|(id_a, score_a), (id_b, score_b)| {
-            score_b
-                .partial_cmp(score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        scored.sort_by(|(id_a, score_a, named_a), (id_b, score_b, named_b)| {
+            named_b
+                .cmp(named_a)
+                .then_with(|| {
+                    score_b
+                        .partial_cmp(score_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| id_a.cmp(id_b))
         });
         scored.truncate(limit);
         scored
+            .into_iter()
+            .map(|(id, score, _)| (id, score))
+            .collect()
     }
 }
 

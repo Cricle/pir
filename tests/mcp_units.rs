@@ -1428,10 +1428,12 @@ async fn mcp_login_and_logout_require_configured_servers() {
     for command in [
         pir::coding_agent::cli::McpCommand::Login {
             server: "pir-test-not-configured".into(),
+            local: false,
             timeout_seconds: 300,
         },
         pir::coding_agent::cli::McpCommand::Logout {
             server: "pir-test-not-configured".into(),
+            local: false,
         },
     ] {
         let error = pir::coding_agent::cli::run_mcp_command(command)

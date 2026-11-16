@@ -471,6 +471,87 @@ fn bm25_keeps_score_descending_as_the_primary_key() {
     );
 }
 
+/// `ae823bc0b` #11331: a query that names a tool ranks it first, even when
+/// BM25 length normalization would rank another document higher (upstream
+/// `tool.ts:133-183`, `isNameQuery`).
+#[cfg(feature = "tool-search")]
+#[test]
+fn bm25_ranks_a_tool_first_when_the_query_is_its_name() {
+    use pir::plugins::builtin::Bm25Ranker;
+
+    let ranker = Bm25Ranker::new(vec![
+        (
+            "thread_read".to_owned(),
+            "thread read with many extra words that make this document long".to_owned(),
+        ),
+        // Shorter and more frequent: a higher BM25 score for `thread_read`.
+        ("aaa".to_owned(), "thread read thread read".to_owned()),
+    ]);
+    let ranked = ranker.rank("thread_read", 8);
+    assert_eq!(
+        ranked[0].0, "thread_read",
+        "the name match ranks first: {ranked:?}"
+    );
+    assert!(
+        ranked[1].1 > ranked[0].1,
+        "the fixture must give the name match a lower BM25 score: {ranked:?}"
+    );
+
+    // The same fixture without the name query keeps score first.
+    let ranked = ranker.rank("thread", 8);
+    assert_eq!(
+        ranked[0].0, "aaa",
+        "a non-name query stays score-ordered: {ranked:?}"
+    );
+}
+
+/// A query naming the suffix after a `__` separator names the tool too, and
+/// identifier-invalid characters normalize to `_` (upstream `isNameQuery` /
+/// `normalizeName`, tool.ts:118-131).
+#[cfg(feature = "tool-search")]
+#[test]
+fn bm25_name_query_matches_mcp_suffixes_and_normalized_names() {
+    use pir::plugins::builtin::Bm25Ranker;
+
+    let ranker = Bm25Ranker::new(vec![
+        (
+            "mcp__app__thread_read".to_owned(),
+            "mcp app thread read thread messages".to_owned(),
+        ),
+        ("aaa".to_owned(), "thread read".to_owned()),
+    ]);
+    let names = |query: &str| -> Vec<String> {
+        ranker
+            .rank(query, 8)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    assert_eq!(
+        names("thread_read").first().map(String::as_str),
+        Some("mcp__app__thread_read"),
+        "the part after `__` names the tool"
+    );
+    assert_eq!(
+        names("app__thread_read").first().map(String::as_str),
+        Some("mcp__app__thread_read"),
+        "a longer `__` suffix names the tool"
+    );
+
+    let ranker = Bm25Ranker::new(vec![
+        ("dev-radius".to_owned(), "dev radius utilities".to_owned()),
+        ("aaa".to_owned(), "dev radius".to_owned()),
+    ]);
+    assert_eq!(
+        ranker
+            .rank("dev_radius", 8)
+            .first()
+            .map(|(name, _)| name.as_str()),
+        Some("dev-radius"),
+        "`-` normalizes to `_` before the name comparison"
+    );
+}
+
 /// The `limit` truncation happens AFTER the total ordering, so the returned
 /// prefix is the same for every document order (a limit applied before the
 /// sort would let insertion order pick the window).

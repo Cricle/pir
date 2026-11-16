@@ -448,6 +448,7 @@ pub(super) fn register_tool_exec_host_fns(
                       args_json: String,
                       cwd: Option<String>,
                       timeout_ms: Option<f64>,
+                      max_buffer: Option<f64>,
                       abort_id: Option<String>| {
                     let st = st.clone();
                     let exec_aborts = exec_aborts.clone();
@@ -487,15 +488,27 @@ pub(super) fn register_tool_exec_host_fns(
                             &args,
                             cwd.as_deref(),
                             timeout_ms,
+                            max_buffer,
                             abort.as_ref().map(|(_, handle)| handle.clone()),
                         )
                         .await;
                         if let Some((id, _)) = &abort {
                             lock_state(&exec_aborts).remove(id);
                         }
-                        serde_json::to_string(&result).unwrap_or_else(|_| {
-                            r#"{"stdout":"","stderr":"","code":1,"killed":false}"#.into()
-                        })
+                        match result {
+                            Ok(result) => serde_json::to_string(&result).unwrap_or_else(|_| {
+                                r#"{"stdout":"","stderr":"","code":1,"killed":false,"truncated":false}"#
+                                    .into()
+                            }),
+                            // Invalid options reject before spawning (upstream
+                            // `RangeError`, exec.ts:53-57); the prelude turns
+                            // this carrier into the JS error.
+                            Err(message) => serde_json::json!({
+                                "error": message,
+                                "errorName": "RangeError",
+                            })
+                            .to_string(),
+                        }
                     }
                 },
             )),

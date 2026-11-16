@@ -755,7 +755,13 @@ fn git_dependency_install_args_match_upstream_package_managers() {
     use pir::coding_agent::package_manager::git_dependency_install_args;
     assert_eq!(
         git_dependency_install_args("npm"),
-        vec!["install", "--omit=dev", "--legacy-peer-deps"]
+        vec![
+            "install",
+            "--omit=dev",
+            "--legacy-peer-deps",
+            "--no-audit",
+            "--no-fund"
+        ]
     );
     assert_eq!(
         git_dependency_install_args("pnpm"),

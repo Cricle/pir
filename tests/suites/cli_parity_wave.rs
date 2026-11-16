@@ -378,6 +378,105 @@ fn mcp_add_parses_upstream_option_surface() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
+    // `be15fe3c1`: login/logout accept `-l`/`--local` too.
+    let cli = Cli::try_parse_from(["pir", "mcp", "login", "weather", "-l", "--timeout", "60"])
+        .expect("mcp login -l should parse");
+    match cli.command {
+        Some(Command::Mcp {
+            command:
+                Some(McpCommand::Login {
+                    server,
+                    local,
+                    timeout_seconds,
+                }),
+        }) => {
+            assert_eq!(server, "weather");
+            assert!(local);
+            assert_eq!(timeout_seconds, 60);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    let cli = Cli::try_parse_from(["pir", "mcp", "logout", "weather", "--local"])
+        .expect("mcp logout --local should parse");
+    match cli.command {
+        Some(Command::Mcp {
+            command: Some(McpCommand::Logout { server, local }),
+        }) => {
+            assert_eq!(server, "weather");
+            assert!(local);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+/// `be15fe3c1`: `-l` only signs in/out servers defined in the project
+/// `mcp.json`, and a mistyped name suggests a configured one (upstream
+/// `extensions/mcp/cli.ts:237-247`).
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_login_logout_local_scope_and_name_suggestion() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let previous_agent_dir = std::env::var("PIR_AGENT_DIR").ok();
+    let agent_dir = temp_agent_dir("mcp-login-scope");
+    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
+    let global = pir::config::mcp::global_mcp_path(&agent_dir);
+    pir::coding_agent::cli::mcp_config_upsert(
+        &global,
+        "scope-probe",
+        &serde_json::json!({ "command": "true" }),
+    )
+    .expect("seed global entry");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    for command in [
+        McpCommand::Login {
+            server: "scope-probe".to_string(),
+            local: true,
+            timeout_seconds: 300,
+        },
+        McpCommand::Logout {
+            server: "scope-probe".to_string(),
+            local: true,
+        },
+    ] {
+        let error = runtime
+            .block_on(pir::coding_agent::cli::run_mcp_command(command))
+            .expect_err("a global server cannot be addressed with --local");
+        let message = error.to_string();
+        assert!(
+            message.contains("is defined in")
+                && message.contains("not in the project; omit --local."),
+            "the error names the defining file and the fix: {message}"
+        );
+    }
+
+    // A mistyped server name suggests the closest configured one.
+    let error = runtime
+        .block_on(pir::coding_agent::cli::run_mcp_command(
+            McpCommand::Logout {
+                server: "scope-prob".to_string(),
+                local: false,
+            },
+        ))
+        .expect_err("the mistyped server is not configured");
+    let message = error.to_string();
+    assert!(
+        message.contains("Did you mean \"scope-probe\"?"),
+        "a name within edit distance 2 is suggested: {message}"
+    );
+    assert!(
+        message.contains("Configured: scope-probe."),
+        "the configured list is still shown: {message}"
+    );
+
+    let _ = pir::coding_agent::cli::mcp_config_remove(&global, "scope-probe");
+    match previous_agent_dir {
+        Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
+        None => std::env::remove_var("PIR_AGENT_DIR"),
+    }
 }
 
 #[test]
