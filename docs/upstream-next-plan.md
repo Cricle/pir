@@ -24,7 +24,9 @@ suggestion and `authProvider` reporting, WSL helper cwd, external-editor
 failure text, deleted-cwd startup diagnostic, canonical `auth.json` lock,
 Dart/Nix/Groovy highlighting, Windows PowerShell 5.1 exit suffix, transport
 cause chains, diff indentation, custom find `limit + 1`, Windows case-folded
-resource/package/project-trust keys.
+resource/package/project-trust keys, the refresh-only MCP refresh guard and
+sign-in's stored-client refresh, root `$defs` in non-strict Anthropic
+schemas, and Unicode tool-search segmentation in both tokenizers.
 
 Gate evidence for the latest commits: full nextest **7570 passed / 0 failed /
 46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, 43 catalog
@@ -32,50 +34,34 @@ files canonical, CI green on `ab28770` and rerun for the newer commits.
 
 ## A/B extended validation
 
-Status: **blocked on providers**. ZCode `new-provider-2` answers
-`401 Invalid token`; `new-provider-1`/`new-provider-4` report insufficient
-quota; `new-provider-3` works but intermittently drops connections, which
-made the three-way-concurrent N=5 campaign retry/fail (2–7 of 10 cells per
-task). Partial provider-3 results are local under
-`.play/ab/results/runs-ab-n5-qa-final2-q*.jsonl` and are **not** final
-evidence. `run_ab_pi.py` now takes `AB_PROVIDER_ID`/`AB_MODEL` and rewrites
-both arms' `models.json` without storing the key.
+Status: **done for one model** (2026-11-16). The sequential N=5 campaign ran
+with `new-provider-3` (`tinygate`, Anthropic messages,
+`deepseek-v4.1-flash`): Q&A q1/q2/q3 and coding c1/c2/c3, both arms alternating
+per repetition, no concurrency. Raw data:
+`.play/ab/results/runs-ab-n5-{qa,coding}-final5.jsonl`; user-facing medians and
+caveats: [`RESULTS.md`](../RESULTS.md). Three Q&A cells hit provider transport
+failures in rep1 (recorded; retried up to three attempts); the other 27 cells
+completed, so the campaign is final evidence for this one model only.
 
-Plan once a working key/quota is available:
-
-1. Sequential (no concurrency) `--reps 5` Q&A for q1/q2/q3, then `--reps 5`
-   coding for c1/c2/c3, with both arms alternating per repetition.
-2. If provider-2 is restored, use it for a second-model leg; otherwise record
-   the single-model limitation.
-3. Summarize success rate, keyword hits, valid citations, tokens and elapsed
-   medians; keep raw data in `.play/` and land only the conclusions in
-   `RESULTS.md`.
+`run_ab_pi.py` takes `AB_PROVIDER_ID`/`AB_MODEL`/`AB_BASE_URL`/`AB_WIRE_API`
+and rewrites both arms' `models.json` without storing the key. A second-model
+leg remains possible if another provider is restored; record the single-model
+limitation until then.
 
 ## Wave A — small, ready to implement
 
 Each item is independent and should stay a separate commit with a regression
 test that cites the upstream commit.
 
-1. **MCP refresh-only guard (#11743, `bb266bf35`).** A failed refresh calls
-   `authorize_mcp(..., FlowOptions::default())` and can re-enter the browser
-   flow / overwrite a pending verifier. Add a refresh-only flow option and use
-   the sign-in document's redirect URI; make the refresh lock wait abortable
-   (`797e122cb`).
-2. **Anthropic root `$defs` (#11959, `4a6a58eb5`).** `legacy_input_schema`
-   drops `$defs`; keep the root `$defs` alongside
-   `type`/`properties`/`required` for non-strict tools.
-3. **Unicode tool-search segmentation (#11037).** `tokenize` is ASCII-only;
-   normalize + segment non-ASCII words so non-English tool descriptions match
-   (also check the durable copy).
-4. **Extension keybinding hints (#11630).** The JS render/message context
+1. **Extension keybinding hints (#11630).** The JS render/message context
    lacks `keyHint`/`keyText`; inject the host's resolved bindings instead of
    the static shim table.
-5. **Selection page keys (#7629 residual).** Autocomplete and the settings
+2. **Selection page keys (#7629 residual).** Autocomplete and the settings
    submenu lack PageUp/PageDown while the other lists have them.
-6. **SDK dispose settles (#9126).** `AgentSessionRuntime::dispose` shuts down
+3. **SDK dispose settles (#9126).** `AgentSessionRuntime::dispose` shuts down
    extensions without awaiting `session.abort()`; request the abort and wait
    for the run/compaction claim to clear before shutdown.
-7. **Untrusted URL/terminal text (#11849).** Validate Radius
+4. **Untrusted URL/terminal text (#11849).** Validate Radius
    `authorizationEndpoint`/`verification_uri` with the same http/https helper
    as OAuth metadata, and strip control characters before displaying device
    codes/URLs.

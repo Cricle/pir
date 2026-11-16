@@ -103,6 +103,18 @@ v1.5.2, and the generated test harnesses were rebuilt.
   included) once per definition, so MCP/Pydantic nested-model descriptions
   are searchable without recursive or shared definitions inflating BM25
   counts (`#11850`).
+- A failed MCP token refresh is refresh-only: it never registers a client or
+  replaces a pending sign-in's PKCE verifier/state, a sign-in first refreshes
+  the stored tokens with the stored client even when the callback port changed,
+  and a busy refresh lock falls back to the browser instead of failing the
+  sign-in (`#11743`).
+- Anthropic non-strict tool schemas keep root `$defs`/`definitions`, so
+  property `$ref`s into shared definitions resolve; root combinators still
+  stay out (`#9557`).
+- Tool search, including codemode `searchTools()`, tokenizes any script with
+  UAX #29 word boundaries and NFC normalization, so Chinese/Japanese/Thai
+  queries and canonically equivalent accents (`café`/`cafe\u0301`) match; only
+  ASCII words get the naive plural stem (`#10816`/`#11037`).
 
 ### correctness
 

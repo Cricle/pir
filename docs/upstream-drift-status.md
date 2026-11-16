@@ -256,15 +256,18 @@ provider-login redirect for `auth.provider` servers (#11791);
 transport errors that retain the deepest cause (#11783); shared
 indentation preserved in single-line edit diffs (#9274); the custom find
 backend's `limit + 1` proof (#11747); case-folded Windows resource, package,
-and project-trust path keys (#11588); and local `$ref` following in tool
-search (#11850).
+and project-trust path keys (#11588); local `$ref` following in tool search
+(#11850); the refresh-only MCP refresh guard plus sign-in's stored-client
+refresh (#11743); root `$defs`/`definitions` in non-strict Anthropic schemas
+(#9557); and Unicode word segmentation in both tool-search tokenizers
+(#11037).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP
-refresh-only/redirect/cancel guards; `pi auth login/logout` flags; untrusted
+refresh redirect/cancel guards; `pi auth login/logout` flags; untrusted
 URL/terminal-text hardening; and the
-remaining queue/window/DX items (keybinding hints, page keys, Unicode
-segmentation, SDK dispose, Anthropic root `$defs`, package-update summary).
+remaining queue/window/DX items (keybinding hints, page keys, SDK dispose,
+package-update summary).
 The prioritized Wave A/B/C breakdown with `file:line` evidence is
 [`upstream-next-plan.md`](upstream-next-plan.md).
 
