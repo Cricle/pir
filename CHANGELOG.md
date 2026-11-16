@@ -94,9 +94,11 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - A custom find backend is asked for `limit + 1` results; the tool shows at
   most `limit` and only prints the limit notice when the extra result exists
   (`#11747`).
-- Windows resource dedupe and package source matching fold path casing, so a
-  project directory reached through a differently-cased path is not loaded
-  twice or treated as another package (`#11588`).
+- Windows resource dedupe, package source matching, and project-trust lookups
+  fold path casing, so a directory reached through a differently-cased path is
+  not loaded twice, treated as another package, or denied a saved trust
+  decision; writing a decision through another casing replaces the old entry
+  (`#11588`).
 - Tool search follows local `$ref`s into `$defs` (escaped/percent segments
   included) once per definition, so MCP/Pydantic nested-model descriptions
   are searchable without recursive or shared definitions inflating BM25

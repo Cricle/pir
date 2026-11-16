@@ -24,7 +24,7 @@ suggestion and `authProvider` reporting, WSL helper cwd, external-editor
 failure text, deleted-cwd startup diagnostic, canonical `auth.json` lock,
 Dart/Nix/Groovy highlighting, Windows PowerShell 5.1 exit suffix, transport
 cause chains, diff indentation, custom find `limit + 1`, Windows case-folded
-resource/package keys.
+resource/package/project-trust keys.
 
 Gate evidence for the latest commits: full nextest **7570 passed / 0 failed /
 46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, 43 catalog
@@ -56,30 +56,26 @@ Plan once a working key/quota is available:
 Each item is independent and should stay a separate commit with a regression
 test that cites the upstream commit.
 
-1. **Trust-store path casing (#11588 residual).** `ProjectTrustStore::get`/
-   `set_many` still use `normalize_cwd` without folding; a saved decision
-   misses a differently-cased cwd. Reuse `path_comparison_key` for lookups and
-   replace existing keys when setting (no rewrite of displayed paths).
-2. **MCP refresh-only guard (#11743, `bb266bf35`).** A failed refresh calls
+1. **MCP refresh-only guard (#11743, `bb266bf35`).** A failed refresh calls
    `authorize_mcp(..., FlowOptions::default())` and can re-enter the browser
    flow / overwrite a pending verifier. Add a refresh-only flow option and use
    the sign-in document's redirect URI; make the refresh lock wait abortable
    (`797e122cb`).
-3. **Anthropic root `$defs` (#11959, `4a6a58eb5`).** `legacy_input_schema`
+2. **Anthropic root `$defs` (#11959, `4a6a58eb5`).** `legacy_input_schema`
    drops `$defs`; keep the root `$defs` alongside
    `type`/`properties`/`required` for non-strict tools.
-4. **Unicode tool-search segmentation (#11037).** `tokenize` is ASCII-only;
+3. **Unicode tool-search segmentation (#11037).** `tokenize` is ASCII-only;
    normalize + segment non-ASCII words so non-English tool descriptions match
    (also check the durable copy).
-5. **Extension keybinding hints (#11630).** The JS render/message context
+4. **Extension keybinding hints (#11630).** The JS render/message context
    lacks `keyHint`/`keyText`; inject the host's resolved bindings instead of
    the static shim table.
-6. **Selection page keys (#7629 residual).** Autocomplete and the settings
+5. **Selection page keys (#7629 residual).** Autocomplete and the settings
    submenu lack PageUp/PageDown while the other lists have them.
-7. **SDK dispose settles (#9126).** `AgentSessionRuntime::dispose` shuts down
+6. **SDK dispose settles (#9126).** `AgentSessionRuntime::dispose` shuts down
    extensions without awaiting `session.abort()`; request the abort and wait
    for the run/compaction claim to clear before shutdown.
-8. **Untrusted URL/terminal text (#11849).** Validate Radius
+7. **Untrusted URL/terminal text (#11849).** Validate Radius
    `authorizationEndpoint`/`verification_uri` with the same http/https helper
    as OAuth metadata, and strip control characters before displaying device
    codes/URLs.

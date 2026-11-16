@@ -883,6 +883,36 @@ fn saved_do_not_trust_wins_without_trust_requiring_resources() {
     let _ = fs::remove_dir_all(&project);
 }
 
+/// Upstream #11588: a decision stored under a differently-cased Windows path
+/// must be found by `get` and superseded by `set` instead of duplicated.
+#[cfg(windows)]
+#[test]
+fn trust_store_reads_and_replaces_case_variant_keys() {
+    let agent = temp_trust_dir("agent-case");
+    let project = temp_trust_dir("repo-case");
+    let store = ProjectTrustStore::new(&agent);
+    let stored_key = normalize_cwd(&project).to_string_lossy().to_uppercase();
+    let seeded = std::collections::BTreeMap::from([(stored_key, serde_json::Value::Bool(true))]);
+    fs::write(
+        store.path(),
+        serde_json::to_string(&seeded).expect("serialize"),
+    )
+    .expect("seed trust store");
+
+    // Lookup from the on-disk casing lands on the uppercased entry.
+    let entry = store.get(&project).expect("case-insensitive lookup");
+    assert!(entry.decision);
+
+    // Writing through the on-disk casing supersedes the uppercased entry.
+    store.set(&project, Some(false)).expect("write trust");
+    let data = read_trust_file(store.path()).expect("read");
+    assert_eq!(data.len(), 1, "case variant must not survive: {data:?}");
+    assert!(!store.get(&project).expect("lookup").decision);
+
+    let _ = fs::remove_dir_all(&agent);
+    let _ = fs::remove_dir_all(&project);
+}
+
 /// Upstream #11588: comparison keys fold Windows path casing, while POSIX
 /// paths stay case-sensitive. Stored/displayed paths are untouched.
 #[test]

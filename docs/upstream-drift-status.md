@@ -255,14 +255,14 @@ provider-login redirect for `auth.provider` servers (#11791);
 (#11891); the Windows PowerShell 5.1 native exit-code suffix (#11964);
 transport errors that retain the deepest cause (#11783); shared
 indentation preserved in single-line edit diffs (#9274); the custom find
-backend's `limit + 1` proof (#11747); case-folded Windows resource and
-package path keys (#11588); and local `$ref` following in tool search
-(#11850).
+backend's `limit + 1` proof (#11747); case-folded Windows resource, package,
+and project-trust path keys (#11588); and local `$ref` following in tool
+search (#11850).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP
-refresh-only/redirect/cancel guards; `pi auth login/logout` flags;
-trust-store path casing; untrusted URL/terminal-text hardening; and the
+refresh-only/redirect/cancel guards; `pi auth login/logout` flags; untrusted
+URL/terminal-text hardening; and the
 remaining queue/window/DX items (keybinding hints, page keys, Unicode
 segmentation, SDK dispose, Anthropic root `$defs`, package-update summary).
 The prioritized Wave A/B/C breakdown with `file:line` evidence is

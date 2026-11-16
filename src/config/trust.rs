@@ -71,6 +71,19 @@ pub fn path_comparison_key_for(path: &Path, windows: bool) -> PathBuf {
     }
 }
 
+/// The stored `trust.json` key matching `target`: the exact key first, then a
+/// key equal under [`path_comparison_key`] (Windows casing, #11588).
+fn matching_trust_key(data: &BTreeMap<String, Value>, target: &Path) -> Option<String> {
+    let exact = target.to_string_lossy().into_owned();
+    if data.contains_key(&exact) {
+        return Some(exact);
+    }
+    let wanted = path_comparison_key(target);
+    data.keys()
+        .find(|key| path_comparison_key(Path::new(key.as_str())) == wanted)
+        .cloned()
+}
+
 /// The trust options offered by the interactive selector (upstream
 /// `getProjectTrustOptions`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,12 +297,14 @@ impl ProjectTrustStore {
         };
         let mut current = normalize_cwd(cwd);
         loop {
-            if let Some(value) = data.get(&current.to_string_lossy().into_owned()) {
-                if let Some(decision) = value.as_bool() {
-                    return Some(ProjectTrustStoreEntry {
-                        path: current,
-                        decision,
-                    });
+            if let Some(key) = matching_trust_key(&data, &current) {
+                if let Some(value) = data.get(&key) {
+                    if let Some(decision) = value.as_bool() {
+                        return Some(ProjectTrustStoreEntry {
+                            path: current,
+                            decision,
+                        });
+                    }
                 }
             }
             let parent = current.parent()?;
@@ -316,13 +331,23 @@ impl ProjectTrustStore {
             let mut data = read_trust_file(&self.path)?;
             for (path, decision) in decisions {
                 let key = normalize_cwd(&path).to_string_lossy().into_owned();
-                match decision {
-                    Some(decision) => {
-                        data.insert(key, Value::Bool(decision));
-                    }
-                    None => {
-                        data.remove(&key);
-                    }
+                // Windows paths compare case-insensitively, so a decision
+                // stored through one casing must also be replaced or cleared
+                // when written through another (upstream `setMany` keys by the
+                // resolved cwd string and relies on a single canonical casing).
+                let comparison = path_comparison_key(&path);
+                let stale: Vec<String> = data
+                    .keys()
+                    .filter(|existing| {
+                        path_comparison_key(Path::new(existing.as_str())) == comparison
+                    })
+                    .cloned()
+                    .collect();
+                for existing in stale {
+                    data.remove(&existing);
+                }
+                if let Some(decision) = decision {
+                    data.insert(key, Value::Bool(decision));
                 }
             }
             write_trust_file(&self.path, &data)
