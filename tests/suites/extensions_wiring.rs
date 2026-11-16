@@ -886,11 +886,11 @@ mod shim_deflate {
         ),
         (
             "pi_ai_providers_all_shim.js.txt",
-            "3a7f240a45f70a6411df12b60dcf0367567cd768fb9bc03737f6b67af232149c",
+            "3384ccc3e25473017d2bae4c5d9772a2738105ec8c5f892ca11dd28c399f63ca",
         ),
         (
             "pi_ai_shim.js.txt",
-            "d80861e10393676ab34871b494ad6df25b8aaa9b0826f1b858930bc89e040cf6",
+            "bbd0ffb9bb4590d5a1111a198ad8aed8c31fe77fd17f1a118b705c51a6acf9df",
         ),
         (
             "pi_chord_node_shim.js.txt",

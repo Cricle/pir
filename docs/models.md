@@ -2,7 +2,7 @@
 
 pir resolves models through (in order): `--provider/--model`, `--models` patterns (or the settings
 `enabledModels` scope), settings `defaultProvider`/`defaultModel`, and the built-in catalog
-(`src/ai/providers/catalog/*.json`, 42 providers).
+(`src/ai/providers/catalog/*.json`, 43 providers).
 
 ## models.json
 

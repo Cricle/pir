@@ -1791,6 +1791,13 @@ impl AgentSession {
             self.apply_extension_notifications().await;
         }
 
+        // Upstream `_startRun` calls `_recordSelection()` right after
+        // `_prepareRun` (compaction + start handlers) and before
+        // `agent.prompt()`: tree navigation can leave the latest
+        // `thinking_level_change` on an abandoned branch, so the live level is
+        // recorded on the branch this turn continues (#11888).
+        self.record_thinking_level_selection().await;
+
         let stream_options = self.stream_options(Some(signal.clone()));
 
         // `before_provider_headers` rides the per-request transport hooks

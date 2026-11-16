@@ -481,6 +481,7 @@ pub const CATALOG_FILES: &[(&str, &str)] = &catalog_files![
     "qwen-token-plan" => "qwen-token-plan.json",
     "qwen-token-plan-cn" => "qwen-token-plan-cn.json",
     "qwen-token-plan-individual" => "qwen-token-plan-individual.json",
+    "qwen-token-plan-individual-cn" => "qwen-token-plan-individual-cn.json",
     "radius" => "radius.json",
     "together" => "together.json",
     "typesafe" => "typesafe.json",

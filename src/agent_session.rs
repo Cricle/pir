@@ -62,6 +62,7 @@ mod models;
 /// Native extension host interface: typed/cancellable session replacement and
 /// floating custom overlays (`NativeSessionHost`).
 pub mod native_host;
+pub use models::cycle_index;
 pub(crate) use models::scoped_cycle_target;
 mod notifications;
 // The only consumer is print mode's plugin session-event bridge
@@ -659,6 +660,11 @@ pub struct AgentSession {
     /// loadout precedence chain, before the plugin-host override and the
     /// host-resolved `tool_selection`.
     active_tools_override: Arc<RwLock<Option<Vec<String>>>>,
+    /// The active names the last loadout declared, in declaration order
+    /// (upstream `agent.state.tools`). It is the "current order" a
+    /// `setActiveTools` call keeps for the tools it leaves active, so
+    /// reordering the same set is a prompt no-op (#11495).
+    active_tool_order: Arc<RwLock<Option<Vec<String>>>>,
     /// Host-registered live partial-result sink (the TUI's tool-block
     /// streaming): receives the call-id-carrying payloads the scheduler
     /// wraps, independent of any extension runtime.

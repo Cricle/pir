@@ -834,9 +834,24 @@ impl Component for AssistantMessageComponent {
         // Cache-slot cursor: body segments in render order.
         let mut segment = 0usize;
 
+        // `hideThinkingBlock` plus a whitespace-only live label renders NO
+        // thinking row (upstream assistant-message.ts, issue #11402): the old
+        // path still emitted the label component, whose theme escapes left a
+        // blank row behind. Such a run is invisible for the spacer decision
+        // too, so a hidden-thinking-only message before a tool call renders
+        // nothing at all.
+        let hidden_label_empty = state.hide_thinking && {
+            let label = state
+                .hidden_label
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            label.as_deref().unwrap_or("Thinking...").trim().is_empty()
+        };
         let has_visible_content = state.message.content.iter().any(|block| match block {
             ContentBlock::Text(text) => !text.text.trim().is_empty(),
-            ContentBlock::Thinking(thinking) => !thinking.thinking.trim().is_empty(),
+            ContentBlock::Thinking(thinking) => {
+                !thinking.thinking.trim().is_empty() && !hidden_label_empty
+            }
             // An image block always occupies at least the fallback line.
             ContentBlock::Image(_) => true,
             _ => false,
@@ -932,6 +947,13 @@ impl Component for AssistantMessageComponent {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let label = label_guard.as_deref().unwrap_or("Thinking...");
+                    // Hidden posture with no label text: skip the run entirely
+                    // so it contributes neither a row nor a spacer (upstream
+                    // `hidden && !hiddenThinkingLabel.trim()` continue).
+                    if hidden && label.trim().is_empty() {
+                        let _ = run;
+                        continue;
+                    }
                     // Thinking text: outputPad as paddingX like the text
                     // blocks (upstream `new Markdown(thinkingBlocks…,
                     // this.outputPad, 0, …)`); lines are already full-width
@@ -955,7 +977,7 @@ impl Component for AssistantMessageComponent {
                             .any(|block| match block {
                                 ContentBlock::Text(text) => !text.text.trim().is_empty(),
                                 ContentBlock::Thinking(thinking) => {
-                                    !thinking.thinking.trim().is_empty()
+                                    !thinking.thinking.trim().is_empty() && !hidden_label_empty
                                 }
                                 _ => false,
                             });
@@ -1308,6 +1330,12 @@ impl Component for StreamingThinking {
             // The live label (upstream `hiddenThinkingLabel`), the default
             // ("Thinking...", upstream `defaultHiddenThinkingLabel`) otherwise.
             let label_text = label.as_deref().unwrap_or("Thinking...");
+            // A whitespace-only label renders no row at all (upstream
+            // assistant-message.ts, issue #11402): without this the hidden
+            // posture painted an escape-only blank row.
+            if label_text.trim().is_empty() {
+                return;
+            }
             // One palette generation per render, like the tool-result memo: a
             // generation that moved mid-render misses on the next frame.
             let generation = Theme::generation();

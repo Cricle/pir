@@ -217,7 +217,7 @@ fn classifier_entries_deserialize() {
         let model = catalog::load_classifier_model("opencode", id)
             .expect("catalog parse")
             .expect(id);
-        assert_eq!(model.base_url, "https://opencode.ai/inference/v1");
+        assert_eq!(model.base_url, "https://opencode.ai/inference/systemone/v1");
         assert_eq!(model.context_window, 32000);
         assert!((model.cost.rates.input - input_cost).abs() < f64::EPSILON);
     }

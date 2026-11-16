@@ -793,7 +793,7 @@ const ONBOARDING_TEXT: &str =
 /// resolved from the LIVE keybinding registry like upstream's `keyText`
 /// (keybinding-hints.ts:34-36): settings overrides win, then the
 /// platform-resolved upstream defaults (Windows: `ctrl+q` follow-up,
-/// `alt+q` dequeue, `alt+v` paste — `core/keybindings.ts:67-78`).
+/// `alt+q` dequeue, `alt+v`/`ctrl+v` paste — `core/keybindings.ts:67-78`).
 pub fn expanded_key_hints(kb: &super::keybindings::Keybindings) -> Vec<(String, String)> {
     let cycle_models = format!(
         "{}/{}",

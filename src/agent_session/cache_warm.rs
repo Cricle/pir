@@ -221,7 +221,7 @@ impl AgentSession {
         }
     }
     /// Install the cache-warming configuration (upstream `cacheWarming`,
-    /// default `"streaming"`). `None` disables warming — the default for
+    /// default `"idle"`). `None` disables warming — the default for
     /// direct SDK sessions, so warming is strictly opt-in per host. Hosts
     /// resolve the mode from settings via
     /// [`crate::cache_warmer::mode_from_settings`].

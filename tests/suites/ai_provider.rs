@@ -2540,3 +2540,55 @@ fn host_identity_is_the_detailed_pi_client() {
         "enabled install telemetry carries pi attribution"
     );
 }
+
+#[test]
+fn simple_max_tokens_clamp_leaves_openrouter_input_overcount_room() {
+    use pir::ai::provider::{
+        clamp_max_tokens_to_context, CONTEXT_SAFETY_RATIO, MIN_OUTPUT_WITH_RATIO_MARGIN,
+    };
+    use pir::ai::types::Context;
+
+    assert_eq!(CONTEXT_SAFETY_RATIO, 0.15);
+    assert_eq!(MIN_OUTPUT_WITH_RATIO_MARGIN, 32_768);
+
+    let mut model = reasoning_model();
+    // 100k estimated input tokens (400k chars at the 4:1 estimate): the 15%
+    // margin (15k) replaces the fixed 4096 and leaves 85k of output room
+    // (#11712, simple-options.ts:19-33).
+    model.context_window = 200_000;
+    let context = Context {
+        messages: vec![user_message(&"x".repeat(400_000))],
+        ..Context::default()
+    };
+    assert_eq!(
+        clamp_max_tokens_to_context(&model, &context, 100_000),
+        85_000
+    );
+
+    // Near a full large window the ratio margin leaves less than 32768
+    // output: fall back to the fixed 4096 reserve and cap output at 32768.
+    let context = Context {
+        messages: vec![user_message(&"x".repeat(720_000))],
+        ..Context::default()
+    };
+    assert_eq!(
+        clamp_max_tokens_to_context(&model, &context, 100_000),
+        15_904
+    );
+
+    // A small window always takes the fixed-margin branch, so the output cap
+    // is the window minus the reserve.
+    model.context_window = 32_768;
+    assert_eq!(
+        clamp_max_tokens_to_context(&model, &Context::default(), 100_000),
+        28_672
+    );
+
+    // The ratio margin never raises output beyond the explicit request.
+    model.context_window = 200_000;
+    let context = Context {
+        messages: vec![user_message(&"x".repeat(40_000))],
+        ..Context::default()
+    };
+    assert_eq!(clamp_max_tokens_to_context(&model, &context, 1_000), 1_000);
+}

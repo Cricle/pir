@@ -107,8 +107,29 @@ impl AgentSession {
                 Arc::new(registry)
             }
         };
-        let active = registry.active_names(self.resolve_active_override(plugins).as_deref());
+        let previous = self.active_tool_order_snapshot();
+        let active = registry.active_names_after(
+            self.resolve_active_override(plugins).as_deref(),
+            previous.as_deref(),
+        );
         (registry, active)
+    }
+
+    /// The declared order the previous loadout applied (upstream
+    /// `getActiveToolNames()`), the "current order" half of
+    /// [`crate::agent::tool_execution::ToolRegistry::active_names_after`].
+    pub(super) fn active_tool_order_snapshot(&self) -> Option<Vec<String>> {
+        self.active_tool_order
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Record the active names a loadout just declared, in declaration order.
+    pub(super) fn record_active_tool_order(&self, active: &[String]) {
+        if let Ok(mut order) = self.active_tool_order.write() {
+            *order = Some(active.to_vec());
+        }
     }
 
     /// Extension-tool rows `(name, default_active, activates_on_registration)`
@@ -305,7 +326,10 @@ impl AgentSession {
         // creates exactly the selected tools); an extension `setActiveTools`
         // override wins over it.
         let override_names = self.resolve_active_override(plugins);
-        let active = registry.active_names(override_names.as_deref());
+        // Same-set re-apply keeps the current order; new names append (#11495).
+        let previous = self.active_tool_order_snapshot();
+        let active = registry.active_names_after(override_names.as_deref(), previous.as_deref());
+        self.record_active_tool_order(&active);
         let declared = declared_tools(&registry, &active);
         let callable = callable_tools(&registry, &active);
 

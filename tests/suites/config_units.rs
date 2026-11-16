@@ -425,7 +425,8 @@ fn typed_accessors_apply_upstream_defaults() {
     );
     let manager = SettingsManager::load(&explicit, &explicit.join(".pi"), &explicit, true);
     assert_eq!(manager.http_idle_timeout_ms(), 45_000);
-    assert_eq!(manager.cache_warming_mode(), CacheWarmingMode::Streaming);
+    // settings-defaults.ts at v1.5.2 defaults cacheWarming to "idle".
+    assert_eq!(manager.cache_warming_mode(), CacheWarmingMode::Idle);
     assert_eq!(manager.default_project_trust(), DefaultProjectTrust::Ask);
     assert!(!manager.clear_on_shrink());
     assert!(manager.install_telemetry_enabled());
@@ -846,4 +847,38 @@ fn provider_retry_overrides_never_override_an_explicit_request_option() {
     assert_eq!(untouched.max_retries, Some(0));
     assert_eq!(untouched.max_retry_delay_ms, None);
     assert_eq!(untouched.timeout_ms, None);
+}
+
+#[test]
+fn saved_do_not_trust_wins_without_trust_requiring_resources() {
+    // project-trust.ts:49 (#10947): auto-trust for a project with no
+    // trust-requiring resources only applies when no decision is saved. A
+    // saved "Do not trust" is honored even for a folder with only AGENTS.md.
+    let agent = temp_trust_dir("agent");
+    let project = temp_trust_dir("project");
+    fs::write(project.join("AGENTS.md"), "# untrusted\n").expect("write agents");
+    assert!(!has_trust_requiring_project_resources(&project));
+
+    let store = ProjectTrustStore::new(&agent);
+    store.set(&project, Some(false)).expect("store");
+    assert_eq!(
+        resolve_project_trusted(&project, &store, None, DefaultProjectTrust::Always, false),
+        ProjectTrustResolution::Resolved(false)
+    );
+
+    // A saved "trust" also wins, and clearing the decision restores
+    // auto-trust.
+    store.set(&project, Some(true)).expect("store");
+    assert_eq!(
+        resolve_project_trusted(&project, &store, None, DefaultProjectTrust::Never, false),
+        ProjectTrustResolution::Resolved(true)
+    );
+    store.set(&project, None).expect("clear");
+    assert_eq!(
+        resolve_project_trusted(&project, &store, None, DefaultProjectTrust::Never, false),
+        ProjectTrustResolution::Resolved(true)
+    );
+
+    let _ = fs::remove_dir_all(&agent);
+    let _ = fs::remove_dir_all(&project);
 }

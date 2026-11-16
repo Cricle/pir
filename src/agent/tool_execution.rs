@@ -1198,18 +1198,54 @@ impl ToolRegistry {
     /// agent-session.ts:1580-1584), otherwise every tool whose exposure
     /// activates on registration with its `default_active` flag.
     pub fn active_names(&self, override_names: Option<&[String]>) -> Vec<String> {
+        self.active_names_after(override_names, None)
+    }
+
+    /// [`ToolRegistry::active_names`] with the order the last loadout declared
+    /// (upstream `getActiveToolNames()`).
+    ///
+    /// The override is treated as a SET (#11495): tools that stay active keep
+    /// their current order and newly activated ones are appended, so calling
+    /// `setActiveTools` with the same names in a different order leaves the
+    /// declared loadout (and therefore the prompt) unchanged. `previous: None`
+    /// (the first application) keeps the requested order.
+    pub fn active_names_after(
+        &self,
+        override_names: Option<&[String]>,
+        previous: Option<&[String]>,
+    ) -> Vec<String> {
         match override_names {
             Some(names) => {
-                let mut seen = std::collections::BTreeSet::new();
-                names
-                    .iter()
-                    .filter(|name| seen.insert(name.as_str()))
-                    .filter(|name| {
-                        self.get(name.as_str())
+                let requested: std::collections::BTreeSet<&str> =
+                    names.iter().map(String::as_str).collect();
+                let mut active: Vec<String> = Vec::new();
+                let mut seen: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                // Tools that stay active keep their current order.
+                if let Some(previous) = previous {
+                    for name in previous {
+                        let name_str = name.as_str();
+                        if requested.contains(name_str)
+                            && self
+                                .get(name_str)
+                                .is_some_and(|tool| tool.exposure() != ToolExposure::Hidden)
+                            && seen.insert(name.clone())
+                        {
+                            active.push(name.clone());
+                        }
+                    }
+                }
+                // Newly activated tools append in request order.
+                for name in names {
+                    if seen.insert(name.clone())
+                        && self
+                            .get(name.as_str())
                             .is_some_and(|tool| tool.exposure() != ToolExposure::Hidden)
-                    })
-                    .cloned()
-                    .collect()
+                    {
+                        active.push(name.clone());
+                    }
+                }
+                active
             }
             None => {
                 let mut names: Vec<String> = self

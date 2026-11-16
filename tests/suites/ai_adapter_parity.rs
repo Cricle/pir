@@ -412,14 +412,15 @@ fn anthropic_oauth_identity_and_stealth_version() {
         ..StreamOptions::default()
     };
     let (body, headers) = build_anthropic_request(&model, &context, &options).unwrap();
-    // Claude Code identity headers with the 2.1.280 stealth version.
+    // Claude Code identity headers with the current stealth version
+    // (anthropic-messages.ts:109).
     assert_eq!(
         headers.get("user-agent").map(String::as_str),
         Some(CLAUDE_CODE_VERSION)
             .map(|v| format!("claude-cli/{v}"))
             .as_deref()
     );
-    assert_eq!(CLAUDE_CODE_VERSION, "2.1.280");
+    assert_eq!(CLAUDE_CODE_VERSION, "2.1.322");
     assert_eq!(headers.get("x-app").unwrap(), "cli");
     assert!(headers
         .get("authorization")

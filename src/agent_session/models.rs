@@ -104,8 +104,9 @@ impl AgentSession {
     /// scoped-model list is set (`--models` / `/scoped-models`), cycling
     /// walks the scope (filtered to what the registry can serve) and
     /// reports `is_scoped: true`; otherwise it walks every available model.
-    /// Returns `None` when fewer than two models are available in the
-    /// effective set.
+    /// A current model outside the effective set selects its first entry
+    /// (#11832); `None` means nothing to switch to (empty set, or a single
+    /// entry that is already current).
     pub async fn cycle_model(&self) -> crate::Result<Option<ModelCycle>> {
         let scoped = self.scoped_models();
         let available: Vec<(String, String)> = self
@@ -114,8 +115,8 @@ impl AgentSession {
             .map(|model| (model.provider.clone(), model.id.clone()))
             .collect();
         if !scoped.is_empty() {
-            // Upstream `_cycleScopedModel`: filter to available models, bail
-            // on a single-entry scope, step forward with wrap-around.
+            // Upstream `_cycleScopedModel`: filter to available models, use
+            // `getNextCycleIndex`, step forward with wrap-around.
             let current = self.current_model();
             let scoped_refs: Vec<(String, String)> = scoped
                 .iter()
@@ -139,15 +140,14 @@ impl AgentSession {
             return Ok(None);
         }
         let models = self.available_models();
-        if models.len() < 2 {
-            return Ok(None);
-        }
         let current = self.current_model();
-        let index = models
+        let current_index = models
             .iter()
-            .position(|model| model.provider == current.provider && model.id == current.id)
-            .unwrap_or(0);
-        let next = models[(index + 1) % models.len()].clone();
+            .position(|model| model.provider == current.provider && model.id == current.id);
+        let Some(next_index) = cycle_index(models.len(), current_index, true) else {
+            return Ok(None);
+        };
+        let next = models[next_index].clone();
         self.set_model_with_source(next.clone(), "cycle").await?;
         Ok(Some(ModelCycle {
             model: next,
@@ -242,6 +242,50 @@ impl AgentSession {
         let next = levels[(index + 1) % levels.len()];
         self.set_thinking_level(next).await;
         Some(next)
+    }
+
+    /// Record the live thinking level on the current branch (upstream
+    /// `_recordThinkingLevel`, #11888). Tree navigation can leave the latest
+    /// `thinking_level_change` on an abandoned branch, so resuming from this
+    /// branch would restore a stale level; the entry is written before the
+    /// prompt so it lands on the branch the turn actually continues.
+    ///
+    /// The recorded level is compared AFTER clamping to the current model:
+    /// a level clamped on resume (`xhigh` running as `high`) must not be
+    /// recorded over the requested one. A branch with no recorded level keeps
+    /// its absence (there is nothing stale to correct).
+    pub(crate) async fn record_thinking_level_selection(&self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let current = self.current_thinking();
+        let available = self.available_thinking_levels();
+        let mut session = session.lock().await;
+        // Owned `Option<ThinkingLevel>`: the path borrow must end before the
+        // append below takes the manager mutably.
+        let recorded: Option<ThinkingLevel> = {
+            let path = session.projected_branch_path(session.leaf_id());
+            path.iter().rev().find_map(|entry| match entry {
+                crate::session_manager::FileEntry::ThinkingLevelChange(change) => {
+                    change.thinking_level.parse().ok()
+                }
+                _ => None,
+            })
+        };
+        let Some(recorded) = recorded else {
+            return;
+        };
+        let effective = if available.contains(&recorded) {
+            recorded
+        } else {
+            clamp_thinking_level(recorded, &available)
+        };
+        if effective == current {
+            return;
+        }
+        if let Err(error) = session.append_thinking_level_change(current.wire_key()) {
+            tracing::debug!(%error, "failed to record the live thinking level on the branch");
+        }
     }
 
     /// The thinking levels the current model supports (upstream
@@ -427,9 +471,26 @@ impl AgentSession {
     }
 }
 
+/// Index to select when cycling through a model set (upstream
+/// `getNextCycleIndex`, `getNextCycleIndex.ts:10-17`): `None` when the set is
+/// empty or its only entry is already current; a current model outside the
+/// set selects the first entry (#11832).
+#[doc(hidden)]
+pub fn cycle_index(len: usize, current_index: Option<usize>, forward: bool) -> Option<usize> {
+    match (len, current_index) {
+        (0, _) => None,
+        (1, Some(_)) => None,
+        (1, None) => Some(0),
+        (_, Some(index)) if forward => Some((index + 1) % len),
+        (_, Some(index)) => Some((index + len - 1) % len),
+        (_, None) => Some(0),
+    }
+}
+
 /// Next model in the scoped-model list (`/model` cycling): the available
-/// scoped entries in order, walking forward with wrap-around. `None` when
-/// fewer than two scoped entries are available.
+/// scoped entries in order, stepping forward with wrap-around. A current
+/// model outside the list selects the first entry (#11832). `None` only when
+/// the list is empty or its single entry is already the current model.
 pub fn scoped_cycle_target(
     scoped: &[(String, String)],
     available: &[(String, String)],
@@ -439,13 +500,8 @@ pub fn scoped_cycle_target(
         .iter()
         .filter(|model| available.contains(model))
         .collect();
-    if in_scope.len() < 2 {
-        return None;
-    }
     let current_index = in_scope
         .iter()
-        .position(|(provider, id)| provider.as_str() == current.0 && id.as_str() == current.1)
-        .unwrap_or(0);
-    let next = in_scope[(current_index + 1) % in_scope.len()];
-    Some(next.clone())
+        .position(|(provider, id)| provider.as_str() == current.0 && id.as_str() == current.1);
+    cycle_index(in_scope.len(), current_index, true).map(|index| in_scope[index].clone())
 }

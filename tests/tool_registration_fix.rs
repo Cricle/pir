@@ -181,7 +181,8 @@ fn settings_default_tools_still_override_the_defaults() {
 /// process. The provider tools array is built from it; a moving prefix defeats
 /// prompt caching and makes two identical runs send different requests. Both
 /// `names()` and `iter()` must expose a stable name order (an explicit active
-/// list still keeps its caller-provided order).
+/// list keeps that stable order for the tools it keeps active; only newly
+/// activated tools follow the caller's order).
 #[test]
 fn registry_iteration_and_names_are_deterministic() {
     let registry = core_registry();
@@ -197,5 +198,49 @@ fn registry_iteration_and_names_are_deterministic() {
         registry.active_names(None),
         registry.active_names(None),
         "the default active list is stable too"
+    );
+}
+
+/// #11495: `setActiveTools` with the same names in a different order used to
+/// reorder the declared loadout, which rewrote the prompt head and lost the
+/// provider cache even though the active set had not changed. The override is
+/// a set: kept tools hold their stable order, new ones append.
+#[test]
+fn reordering_the_same_active_tools_keeps_the_declared_order() {
+    let registry = core_registry();
+    let baseline = registry.active_names(None);
+    assert!(!baseline.is_empty());
+    // The first application has no previous order, so it keeps the request.
+    let first = registry.active_names_after(Some(&baseline), None);
+    assert_eq!(first, baseline);
+
+    let mut reversed = baseline.clone();
+    reversed.reverse();
+    assert_eq!(
+        registry.active_names_after(Some(&reversed), Some(&first)),
+        baseline,
+        "the same set in reverse order must declare the same loadout"
+    );
+
+    // A newly activated tool (powershell is registered but default-off) is
+    // appended instead of moving the kept tools.
+    let mut extended = reversed;
+    extended.push("powershell".to_owned());
+    let mut expected = baseline.clone();
+    expected.push("powershell".to_owned());
+    assert_eq!(
+        registry.active_names_after(Some(&extended), Some(&first)),
+        expected,
+        "a new tool appends its bullet without reordering the rest"
+    );
+
+    // Unknown and hidden names still drop out, duplicates collapse; with no
+    // previous order the request order is kept.
+    let with_unknown = tools(&["powershell", "nope", "bash", "bash"]);
+    let active = registry.active_names_after(Some(&with_unknown), None);
+    assert_eq!(
+        active,
+        vec!["powershell".to_owned(), "bash".to_owned()],
+        "unknown names drop, duplicates collapse, request order holds"
     );
 }

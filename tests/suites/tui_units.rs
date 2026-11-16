@@ -794,11 +794,16 @@ fn keybinding_defaults_match_previous_hardcoded_behavior() {
         TuiAction::HistoryPrevious,
         &key(KeyCode::Up, KeyModifiers::ALT)
     ));
-    // Upstream win32 variant (core/keybindings.ts:75-78): paste is alt+v.
+    // Upstream win32 variant (core/keybindings.ts:75-78): paste is
+    // ["alt+v", "ctrl+v"] (#11780).
     if pir::config::keybindings::use_windows_keybindings() {
         assert!(kb.matches(
             TuiAction::Paste,
             &key(KeyCode::Char('v'), KeyModifiers::ALT)
+        ));
+        assert!(kb.matches(
+            TuiAction::Paste,
+            &key(KeyCode::Char('v'), KeyModifiers::CONTROL)
         ));
     } else {
         assert!(kb.matches(

@@ -4,7 +4,8 @@
 //! `utils/image-resize-core.ts`: sniff a supported inline-image MIME type from
 //! a file head, normalize to a supported format (BMP re-encodes to PNG), and
 //! resize to fit the model's inline image limits, trying PNG and JPEG
-//! encodings and progressively shrinking until the base64 payload fits.
+//! encodings (preferring the smaller one) and progressively shrinking until
+//! the base64 payload fits.
 
 // This module has two halves:
 //
@@ -372,24 +373,13 @@ pub(crate) fn process_image(
 
     // Quality steps: the configured quality plus upstream's ladder, deduped
     // in insertion order (`Array.from(new Set([opts.jpegQuality, 85, 70, 55, 40]))`
-    // keeps the first occurrence, so the configured quality leads the ladder),
-    // and candidates are tried in order (see [`CandidateOrder`]).
+    // keeps the first occurrence, so the configured quality leads the ladder).
+    // Candidate selection then compares the PNG and configured-quality JPEG
+    // encodings and tries the smaller one first (see
+    // [`first_fitting_candidate`]).
     let mut qualities = vec![jpeg_quality, 85, 70, 55, 40];
     let mut seen = std::collections::HashSet::new();
     qualities.retain(|quality| seen.insert(*quality));
-
-    // Large opaque payloads are re-encoded from scratch: trying the PNG
-    // candidate first costs the most expensive encode and is the least
-    // likely to fit, so lead with JPEG (configured quality 80 first). JPEG
-    // inputs are already lossy, so a PNG re-encode can only grow them; alpha
-    // PNGs stay PNG-first so transparency is preserved.
-    let prefer_jpeg =
-        !input_has_alpha && (input_base64_size >= max_bytes || normalized_mime == "image/jpeg");
-    let order = if prefer_jpeg {
-        CandidateOrder::JpegFirst
-    } else {
-        CandidateOrder::PngFirst
-    };
 
     loop {
         let resized = decoded.resize(
@@ -398,7 +388,7 @@ pub(crate) fn process_image(
             image::imageops::FilterType::Lanczos3,
         );
         if let Some((data_base64, mime)) =
-            first_fitting_candidate(&resized, &qualities, order, max_bytes)
+            first_fitting_candidate(&resized, &qualities, input_has_alpha, max_bytes)
         {
             let mut hints = conversion_hint(converted_from, &mime);
             hints.extend(format_dimension_note(
@@ -427,43 +417,62 @@ pub(crate) fn process_image(
     }
 }
 
-/// Candidate order for the resize ladder. `PngFirst` is the upstream order
-/// (PNG, then the JPEG quality ladder); `JpegFirst` is the large-payload fast
-/// path (JPEG ladder, then PNG only when no JPEG fits).
-#[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
-#[derive(Clone, Copy)]
-enum CandidateOrder {
-    PngFirst,
-    JpegFirst,
-}
-
-/// Encode candidates lazily in `order` and return the first one under
-/// `max_bytes`. Returning as soon as one fits is equivalent to encoding the
-/// whole candidate list and picking the first fit, but skips the PNG encode
-/// (and the unused JPEG qualities) whenever an earlier candidate already
-/// fits - the dominant cost on the large-image path.
+/// Encode the PNG candidate and the configured-quality JPEG candidate, lead
+/// with the smaller of the two, and fall back to the remaining JPEG quality
+/// steps. This is upstream's `resizeImageCore` candidate rule:
+///
+/// ```text
+/// const preferred = jpeg && jpeg.encodedSize < png.encodedSize
+///   ? [jpeg, png] : [png, jpeg];
+/// const candidates = [...preferred, ...jpegs.slice(1)];
+/// ```
+///
+/// A source alpha channel keeps PNG first so transparency survives whenever
+/// the PNG fits (JPEG has no alpha and `to_rgb8` drops it).
+///
+/// Encoding the two preferred candidates eagerly is required: their relative
+/// size decides the order, so both must be materialized. Lower JPEG
+/// qualities stay lazy and are only encoded when neither preferred candidate
+/// fits - the same first-match result as upstream's full candidate list.
 #[cfg(any(feature = "image-tools", all(feature = "print", feature = "tui")))]
 fn first_fitting_candidate(
     image: &image::DynamicImage,
     qualities: &[u8],
-    order: CandidateOrder,
+    preserve_alpha: bool,
     max_bytes: usize,
 ) -> Option<(String, String)> {
     let fits = |candidate: &(String, String)| candidate.0.len() < max_bytes;
-    let jpeg_ladder = || {
-        qualities.iter().find_map(|quality| {
-            let candidate = encode_jpeg_candidate(image, *quality)?;
-            fits(&candidate).then_some(candidate)
-        })
+    let png = encode_png_candidate(image);
+    let preferred_jpeg = qualities
+        .first()
+        .and_then(|quality| encode_jpeg_candidate(image, *quality));
+
+    let jpeg_leads = !preserve_alpha
+        && match (&png, &preferred_jpeg) {
+            (Some(png), Some(jpeg)) => jpeg.0.len() < png.0.len(),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+    let first = if jpeg_leads {
+        preferred_jpeg.as_ref()
+    } else {
+        png.as_ref()
     };
-    match order {
-        CandidateOrder::PngFirst => encode_png_candidate(image)
-            .filter(fits)
-            .or_else(jpeg_ladder),
-        CandidateOrder::JpegFirst => {
-            jpeg_ladder().or_else(|| encode_png_candidate(image).filter(fits))
+    let second = if jpeg_leads {
+        png.as_ref()
+    } else {
+        preferred_jpeg.as_ref()
+    };
+    for candidate in [first, second].into_iter().flatten() {
+        if fits(candidate) {
+            return Some(candidate.clone());
         }
     }
+
+    qualities.iter().skip(1).find_map(|quality| {
+        let candidate = encode_jpeg_candidate(image, *quality)?;
+        fits(&candidate).then_some(candidate)
+    })
 }
 
 /// `Math.round(value * factor / divisor)` with the saturating arithmetic the

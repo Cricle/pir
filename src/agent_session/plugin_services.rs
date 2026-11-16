@@ -914,7 +914,8 @@ impl SessionService for LiveSessionService {
         let names: Vec<String> = match (self.state.session(), self.state.host()) {
             (Some(session), Some(host)) => {
                 let registry = session.merged_tool_registry(&host);
-                registry.active_names(override_names.as_deref())
+                let previous = session.active_tool_order_snapshot();
+                registry.active_names_after(override_names.as_deref(), previous.as_deref())
             }
             _ => {
                 let defs = self.state.all_tools();

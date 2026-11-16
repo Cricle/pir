@@ -227,19 +227,26 @@ Full per-commit tables with `file:line` evidence:
 `.play/evidence/upstream-v152/audit-half1.md` and `audit-half2.md` (local
 working evidence; the counts above are their exact totals).
 
+**Landed since the audit (2026-11-16)**, each with a regression test:
+LiteLLM `context window exceeded` overflow, Zhipu 1308 non-retryable and
+mid-reply stream-cut-short retry patterns (#11494/#11572/#11885); project-trust
+"do not trust" precedence (#10947); OpenRouter max-token input margin (#11712);
+grep lone-CR alignment (#11465); hidden-thinking empty label (#11470); smaller
+PNG/JPEG selection (#11577); npm `realpath` prefix (#11396); provider ids
+containing `/` (#11397); active-tool order on same-set re-apply (#11495);
+branch-summary thinking level and live thinking-level recording
+(#11482/#11888); default-model map refresh (#11467); cache-warming
+`idle` default; `CLAUDE_CODE_VERSION` bump; OpenCode endpoint catalog
+(#11434); Copilot classifier (#11679); Codex display name (#36142c1c); and the
+`qwen-token-plan-individual-cn` provider.
+
 **Open items worth a follow-up lane** (all small, upstream citations in the
-audit tables): active-tool order on same-set re-apply; branch-summary thinking
-level; LiteLLM `context window exceeded` overflow pattern; project-trust
-"do not trust" precedence; OpenRouter max-token input margin; grep lone-CR and
-limit-notice edge; hidden-thinking empty label; smaller PNG/JPEG selection;
-npm `--no-audit --no-fund` and realpath prefix; provider ids containing `/`;
-branch-summary context edits; default-model map refresh; Zhipu 1308
-non-retryable; tool-search name/coverage ranking; npm unchanged-version
-warning; OpenCode endpoint catalog; Copilot classifier; helper spawn cwd;
-`pi.exec` `truncated` result; MCP `-l`; MCP refresh-only guard;
-`requiresNonNullAssistantContent`; `promptCacheKeyMode`; cache-warming
-idle default; apostrophes in prompt-template args; live thinking-level
-recording; grep context from the engine; `pi auth login/logout` flags;
+audit tables): grep limit-notice edge (engine-supplied context, #11705);
+npm `--no-audit --no-fund`; branch-summary context edits (#11680);
+tool-search name/coverage ranking; npm unchanged-version warning;
+helper spawn cwd; `pi.exec` `truncated` result; MCP `-l`; MCP refresh-only
+guard; `requiresNonNullAssistantContent`; `promptCacheKeyMode`;
+apostrophes in prompt-template args; `pi auth login/logout` flags;
 case-insensitive Windows resource keys; and the remaining queue/window
 edge items.
 

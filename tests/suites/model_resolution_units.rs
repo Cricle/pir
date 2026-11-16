@@ -198,3 +198,126 @@ fn glob_matches_patterns() {
     assert!(!glob_matches("a/*", "b/c"));
     assert!(glob_matches("a?c", "abc"));
 }
+
+#[test]
+fn default_model_map_matches_upstream_v152() {
+    // model-resolver.ts:20-59 at v1.5.2. Every id
+    // also exists in the bundled catalog (`catalog_includes_default_models`
+    // below), so the fallback path can actually select it.
+    use pir::ai::providers::resolution::default_model_per_provider;
+
+    let defaults = default_model_per_provider();
+    let expected = [
+        ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
+        ("anthropic", "claude-opus-5-5"),
+        ("openai", "gpt-6.1-sol"),
+        ("azure", "gpt-6.1-sol"),
+        ("google", "gemini-4-argon"),
+        ("google-vertex", "gemini-4-argon"),
+        ("openrouter", "moonshotai/kimi-k2.7-code"),
+        ("vercel-ai-gateway", "zai/glm-5.3"),
+        ("minimax", "MiniMax-M3"),
+        ("minimax-cn", "MiniMax-M3"),
+        ("moonshotai", "kimi-k2.7-code"),
+        ("moonshotai-cn", "kimi-k2.7-code"),
+        ("huggingface", "moonshotai/Kimi-K2.7-Code"),
+        ("baseten", "zai-org/GLM-5.3"),
+        ("opencode", "kimi-k2.7-code"),
+        ("opencode-go", "kimi-k3.1-pro"),
+        ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
+        (
+            "cloudflare-ai-gateway",
+            "workers-ai/@cf/moonshotai/kimi-k2.7-code",
+        ),
+        ("qwen-token-plan", "qwen3.8-max"),
+        ("qwen-token-plan-cn", "qwen3.8-max"),
+        ("qwen-token-plan-individual", "qwen3.8-max"),
+        ("qwen-token-plan-individual-cn", "qwen3.8-max"),
+    ];
+    for (provider, id) in expected {
+        assert_eq!(
+            defaults.get(provider).copied(),
+            Some(id),
+            "default for {provider}"
+        );
+    }
+    assert_eq!(defaults.len(), 42, "upstream map lists 42 providers");
+}
+
+#[test]
+fn default_models_exist_in_the_bundled_catalog() {
+    // The audit verified every target id exists in the catalog; the fallback
+    // selection step only fires when the catalog carries the id.
+    let providers = pir::ai::providers::catalog::load_all_shared().expect("embedded catalog");
+    for (provider, id) in pir::ai::providers::resolution::default_model_per_provider() {
+        let matched = providers
+            .iter()
+            .find(|entry| entry.id == provider)
+            .is_some_and(|entry| entry.models.iter().any(|model| model.id == id));
+        assert!(matched, "catalog is missing {provider}/{id}");
+    }
+}
+
+#[test]
+fn provider_id_containing_a_slash_resolves() {
+    // model-resolver.ts:128-143 (#11397): the provider prefix is matched
+    // against known ids longest-first, so URL-derived provider ids keep their
+    // slashes.
+    use pir::ai::providers::resolution::{
+        resolve_model_reference, ModelReferenceRequest, ModelReferenceResult, ThinkingSuffixMode,
+    };
+
+    let models = vec![
+        model(ModelSpec {
+            provider: "openai",
+            id: "gpt-6.1-sol",
+            name: "GPT",
+            api: "openai-completions",
+            base_url: "https://api.openai.com",
+            context_window: 128_000,
+            max_tokens: 16_384,
+            input: vec!["text"],
+        }),
+        model(ModelSpec {
+            provider: "llama=http://host:10800",
+            id: "unsloth/qwen-gguf:BF16",
+            name: "Local Qwen",
+            api: "openai-completions",
+            base_url: "http://host:10800",
+            context_window: 32_768,
+            max_tokens: 8_192,
+            input: vec!["text"],
+        }),
+    ];
+
+    for (text, expected_level) in [
+        ("llama=http://host:10800/unsloth/qwen-gguf:BF16", None),
+        (
+            "llama=http://host:10800/unsloth/qwen-gguf:BF16:high",
+            Some(ThinkingLevel::High),
+        ),
+    ] {
+        let result = resolve_model_reference(
+            ModelReferenceRequest {
+                text,
+                provider: None,
+                thinking_suffix: ThinkingSuffixMode::Lenient,
+                fuzzy: false,
+            },
+            &models,
+            &always_auth,
+        );
+        match result {
+            ModelReferenceResult::Resolved {
+                model,
+                thinking_level,
+                ..
+            } => {
+                assert_eq!(model.provider, "llama=http://host:10800");
+                assert_eq!(model.id, "unsloth/qwen-gguf:BF16");
+                assert_eq!(thinking_level, expected_level);
+            }
+            other => panic!("expected resolved for {text}: {other:?}"),
+        }
+    }
+}

@@ -1198,7 +1198,11 @@ impl AgentSession {
             Some(plugins) => self.merged_tool_registry(plugins),
             None => std::sync::Arc::new((*self.tools).clone()),
         };
-        let active = registry.active_names(self.resolve_active_override(plugins).as_deref());
+        let previous = self.active_tool_order_snapshot();
+        let active = registry.active_names_after(
+            self.resolve_active_override(plugins).as_deref(),
+            previous.as_deref(),
+        );
         let mcp_servers =
             crate::coding_agent::context::mcp_servers_prompt_section(self.plugins.as_deref());
         let live_prompt = self.effective_system_prompt();

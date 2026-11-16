@@ -1086,13 +1086,15 @@ impl SettingsManager {
     }
 
     /// Cache-warming mode, read from the global scope only because each
-    /// refresh costs money (upstream `getCacheWarmingMode`).
+    /// refresh costs money (upstream `getCacheWarmingMode`). Unset defaults to
+    /// `idle` (settings-defaults.ts at v1.5.2), so eligible caches also stay
+    /// warm between agent runs while continuation stays profitable.
     pub fn cache_warming_mode(&self) -> CacheWarmingMode {
         self.global_raw
             .get("cacheWarming")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or(CacheWarmingMode::Streaming)
+            .unwrap_or(CacheWarmingMode::Idle)
     }
 
     /// The default project trust policy, read from the global scope only

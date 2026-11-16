@@ -1,5 +1,5 @@
 //! Prompt-cache warming (upstream `packages/coding-agent/src/core/
-//! cache-warmer.ts` + the `cacheWarming` setting, default `"streaming"`).
+//! cache-warmer.ts` + the `cacheWarming` setting, default `"idle"`).
 //!
 //! After a successful conversational response whose usage reports a prompt
 //! cache write, ONE warm-up request replays the projected conversation with
@@ -67,7 +67,7 @@ impl CacheWarmingSettings {
 /// The host-side settings consumer (upstream reads `cacheWarming` in the
 /// session host): resolve the mode from the merged settings snapshot the
 /// hosts already load. `SettingsManager::cache_warming_mode()` applies the
-/// upstream default `"streaming"` when the setting is unset.
+/// upstream default `"idle"` when the setting is unset.
 pub fn mode_from_settings(
     manager: &crate::config::settings::SettingsManager,
 ) -> crate::config::settings::CacheWarmingMode {

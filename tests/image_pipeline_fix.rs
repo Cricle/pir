@@ -49,6 +49,23 @@ fn decode(bytes: &[u8]) -> ::image::DynamicImage {
         .expect("decode")
 }
 
+/// A flat two-colour image: PNG compresses it far below any JPEG candidate,
+/// so the smaller-encoding rule must keep PNG.
+fn flat_png(width: u32, height: u32) -> Vec<u8> {
+    let source = ::image::RgbImage::from_fn(width, height, |x, _y| {
+        if x < width / 2 {
+            ::image::Rgb([240, 40, 90])
+        } else {
+            ::image::Rgb([16, 120, 200])
+        }
+    });
+    let mut png = Vec::new();
+    ::image::DynamicImage::ImageRgb8(source)
+        .write_to(&mut Cursor::new(&mut png), ::image::ImageFormat::Png)
+        .expect("png encode");
+    png
+}
+
 /// `process_image` resizes a 256x200 source to exactly 64x50 for the 64x64
 /// limits (`200 * 64 / 256 == 50`) with Lanczos3.
 fn resized_to_target(image: &::image::DynamicImage) -> ::image::DynamicImage {
@@ -171,4 +188,56 @@ fn decode_rejects_images_over_the_dimension_limit() {
         matches!(result, Err(image_impl::ProcessImageError::Convert)),
         "an over-limit image must be rejected at decode"
     );
+}
+
+/// Upstream `image-resize-core.ts` picks the SMALLER of the PNG and
+/// configured-quality JPEG encodings and tries it first (#11577). The old
+/// order tried PNG first whenever it fit, so photo-like images went out as
+/// multi-MB PNGs even though the JPEG was much smaller.
+#[test]
+fn resize_prefers_the_smaller_png_or_jpeg_encoding() {
+    // Photo-like noise: PNG cannot compress it, the JPEG at quality 80 is
+    // much smaller. Both fit the generous limit, so the smaller one must win.
+    let noisy = noise_png(256, 200);
+    let resized = resized_to_target(&decode(&noisy));
+    let png_candidate = png_base64(&resized);
+    let jpeg_80 = jpeg_base64(&resized, image_impl::DEFAULT_JPEG_QUALITY);
+    assert!(
+        jpeg_80.len() < png_candidate.len(),
+        "fixture: the JPEG encoding must be smaller than PNG"
+    );
+
+    let processed = image_impl::process_image(
+        &noisy,
+        "image/png",
+        64,
+        64,
+        4_500_000,
+        image_impl::DEFAULT_JPEG_QUALITY,
+    )
+    .expect("processed");
+    assert_eq!(
+        processed.mime_type, "image/jpeg",
+        "a photo-like image must use the smaller JPEG encoding"
+    );
+    assert_eq!(processed.data_base64, jpeg_80);
+
+    // Flat artwork is the other direction: PNG is far smaller than JPEG and
+    // must stay PNG (the rule must not blindly prefer JPEG).
+    let flat = flat_png(256, 200);
+    let resized = resized_to_target(&decode(&flat));
+    assert!(
+        png_base64(&resized).len() < jpeg_base64(&resized, image_impl::DEFAULT_JPEG_QUALITY).len(),
+        "fixture: the PNG encoding must be smaller than JPEG"
+    );
+    let processed = image_impl::process_image(
+        &flat,
+        "image/png",
+        64,
+        64,
+        4_500_000,
+        image_impl::DEFAULT_JPEG_QUALITY,
+    )
+    .expect("processed");
+    assert_eq!(processed.mime_type, "image/png");
 }

@@ -339,15 +339,15 @@ fn embedded_providers_all_blob_matches_the_rust_catalog() {
         .expect("manifest files object");
     assert_eq!(
         files.len(),
-        42,
-        "the shim must pin the 42 built-in provider catalogs"
+        43,
+        "the shim must pin the 43 built-in provider catalogs"
     );
     assert_eq!(files.len(), CATALOG_FILES.len());
     assert_eq!(
         builtin_catalog_structure()
             .expect("catalog structure")
             .len(),
-        42
+        43
     );
 
     let mut rust_ids: Vec<String> = CATALOG_FILES
@@ -386,4 +386,88 @@ fn context_tool_infos_extracts_names_and_descriptions() {
     assert!(!infos.is_empty());
     assert!(infos.iter().any(|tool| tool.name == "read"));
     assert!(infos.iter().all(|tool| !tool.description.is_empty()));
+}
+
+/// Upstream #11434: OpenCode Zen serves each protocol on its own path
+/// (`/inference/openai/v1`, `/inference/anthropic`, `/inference/google/v1beta`,
+/// `/inference/systemone/v1`); OpenCode Go mirrors them under
+/// `/inference/go/...`. Every model must carry the URL its api needs.
+#[test]
+fn opencode_catalog_uses_protocol_specific_endpoints() {
+    for (provider_id, root) in [
+        ("opencode", "https://opencode.ai/inference"),
+        ("opencode-go", "https://opencode.ai/inference/go"),
+    ] {
+        let provider = load_provider(provider_id)
+            .unwrap()
+            .expect("catalog provider");
+        let expected_root = format!("{root}/openai/v1");
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some(expected_root.as_str()),
+            "{provider_id}: OpenAI-compatible models use the /openai/v1 root"
+        );
+        for model in &provider.models {
+            let expected = match model.api.as_str() {
+                "openai-completions" | "openai-responses" => format!("{root}/openai/v1"),
+                "anthropic-messages" => format!("{root}/anthropic"),
+                "google-generative-ai" => format!("{root}/google/v1beta"),
+                other => panic!("{provider_id}: unexpected api {other}"),
+            };
+            assert_eq!(
+                model.base_url, expected,
+                "{provider_id}/{} must use the endpoint for its api",
+                model.id
+            );
+        }
+    }
+
+    // The OpenCode Zen classifiers use the same protocol split.
+    let jev = catalog::load_classifier_model("opencode", "jev-1.13")
+        .unwrap()
+        .expect("jev classifier");
+    assert_eq!(
+        jev.base_url, "https://opencode.ai/inference/systemone/v1",
+        "System One classifiers use the systemone/v1 endpoint"
+    );
+}
+
+/// Upstream #11679: GitHub Copilot ships the Microsoft-Decision-1 classifier
+/// on its System One endpoint (`<account>/v1/systemone`), while the chat APIs
+/// keep the account root without a version prefix.
+#[test]
+fn github_copilot_catalog_includes_the_decision_classifier() {
+    let provider = load_provider("github-copilot")
+        .unwrap()
+        .expect("catalog provider");
+    let classifier = catalog::load_classifier_model("github-copilot", "microsoft-decision-1")
+        .unwrap()
+        .expect("Microsoft-Decision-1 classifier");
+    assert_eq!(
+        classifier.api,
+        pir::ai::types::ClassifierApi::TypesafeSystemOne
+    );
+    assert_eq!(
+        classifier.base_url,
+        "https://api.individual.githubcopilot.com/v1"
+    );
+    assert_eq!(classifier.input, vec![pir::ai::types::InputModality::Text]);
+    assert_eq!(classifier.context_window, 32_768);
+    assert!(
+        !provider
+            .models
+            .iter()
+            .any(|model| model.id == "microsoft-decision-1"),
+        "the decision model is a classifier, not a chat model"
+    );
+}
+
+/// Upstream 36142c1c: the Codex provider is called "OpenAI Codex", without the
+/// "(legacy)" marker.
+#[test]
+fn codex_provider_uses_its_current_display_name() {
+    let provider = load_provider("openai-codex")
+        .unwrap()
+        .expect("catalog provider");
+    assert_eq!(provider.display_name, "OpenAI Codex");
 }

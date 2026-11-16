@@ -846,3 +846,69 @@ async fn d2_transport_401_and_403_stay_non_retryable() {
             .is_none()
     );
 }
+
+// ---------------------------------------------------------------------------
+// v1.5.2 additions — #11494 LiteLLM overflow, #11572 Zhipu 1308, #11885
+// mid-reply stream cut short
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d2_litellm_pre_call_context_window_error_is_overflow() {
+    // overflow.ts:46 (#11494): LiteLLM's pre-call ContextWindowExceededError
+    // reports overflow with wording none of the older patterns matched.
+    let message = error_message(
+        "openai-completions",
+        r#"400: {"message":"litellm.ContextWindowExceededError: litellm.BadRequestError: litellm._pre_call_checks: Context Window exceeded for given call. No models have context window large enough for this call.\nModel=Qwen3.8-Flash-Next, Max Input Tokens=262144, Got=265262\nmodel=Qwen3.8-Flash-Next. context_window_fallbacks=None. fallbacks=[]."}"#,
+    );
+    assert!(is_context_overflow(&message, Some(262_144)));
+}
+
+#[test]
+fn d2_zhipu_1308_usage_limit_fails_fast() {
+    use pir::ai::util::is_retryable_assistant_error;
+
+    // retry.ts:31 (#11572): Zhipu/Z.ai plan usage limits arrive as HTTP 429
+    // with JSON code 1308 and reset after hours, so they must not be retried
+    // just because the message also carries a retryable status code.
+    for text in [
+        r#"429 {"code":"1308","message":"已达到 5 小时的使用上限。"}"#,
+        r#"{"code": 1308, "message":"usage limit"}"#,
+        r#"API error (429): {"code":"1308"}"#,
+    ] {
+        assert!(
+            !is_retryable_assistant_error(&error_message("zai", text)),
+            "expected fail-fast: {text}"
+        );
+    }
+
+    // The pattern matches the JSON code field, not a bare number: request ids
+    // and byte counts that happen to contain 1308 stay retryable.
+    for text in [
+        "request id req_1308 failed with 429, please retry",
+        "received 13080 bytes while reading a 429 response",
+    ] {
+        assert!(
+            is_retryable_assistant_error(&error_message("zai", text)),
+            "expected retryable: {text}"
+        );
+    }
+}
+
+#[test]
+fn d2_mid_reply_stream_cut_short_is_retryable() {
+    use pir::ai::util::is_retryable_assistant_error;
+
+    // retry.ts:103 (#11885): Magpie relayed a dropped upstream Anthropic
+    // stream.
+    assert!(is_retryable_assistant_error(&error_message(
+        "anthropic",
+        "Claude Code's stream from Anthropic was cut short after the reply had begun",
+    )));
+
+    // The phrase is intentionally specific: a bare "cut short" is not
+    // retryable.
+    assert!(!is_retryable_assistant_error(&error_message(
+        "anthropic",
+        "the request was cut short",
+    )));
+}

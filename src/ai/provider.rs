@@ -3588,25 +3588,49 @@ pub fn simple_stream_options(model: &Model, mut options: StreamOptions) -> Strea
 /// remaining context (upstream `simple-options.ts` `CONTEXT_SAFETY_TOKENS`).
 pub const CONTEXT_SAFETY_TOKENS: u64 = 4096;
 
+/// Share of the estimated input left unused when clamping `max_tokens`
+/// (upstream `CONTEXT_SAFETY_RATIO`): OpenRouter counts the input with its
+/// own tokenizer, which measured up to 12% above the provider's count, and
+/// rejects `input + max_tokens` above the window before routing (#11712).
+pub const CONTEXT_SAFETY_RATIO: f64 = 0.15;
+
+/// The ratio margin is kept only while it leaves at least this much output;
+/// otherwise (a nearly full large window, or any small window such as a 32k
+/// local model) only the fixed margin is kept and output is capped here, so
+/// an OpenRouter overcount still fits for a while before compaction
+/// (upstream `MIN_OUTPUT_WITH_RATIO_MARGIN`).
+pub const MIN_OUTPUT_WITH_RATIO_MARGIN: u64 = 32_768;
+
 /// Floor for a context-clamped `max_tokens` (upstream `MIN_MAX_TOKENS`).
 pub const MIN_MAX_TOKENS: u64 = 1;
 
 /// Clamp a requested `max_tokens` to the context window left after the
 /// estimated transcript (upstream `clampMaxTokensToContext`,
-/// `simple-options.ts:18-22`):
-/// `min(maxTokens, max(1, contextWindow - estimateContextTokens - 4096))`.
-/// A non-positive context window disables the clamp (the model declares no
-/// limit), matching upstream's early return. Public for tests/.
+/// `simple-options.ts:19-33`). The safety reserve is the larger of 4096 and
+/// 15% of the estimated input; when that leaves less than 32768 tokens of
+/// output, only the fixed 4096 reserve is used and output is capped at
+/// 32768. A non-positive context window disables the clamp (the model
+/// declares no limit), matching upstream's early return. Public for tests/.
 pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens: u64) -> u64 {
     if model.context_window == 0 {
         return max_tokens.max(MIN_MAX_TOKENS);
     }
-    let estimated = crate::compaction::estimate_request_context_tokens(context).tokens;
-    let available = model
+    let input = crate::compaction::estimate_request_context_tokens(context).tokens;
+    let ratio_margin = (input as f64 * CONTEXT_SAFETY_RATIO).ceil() as u64;
+    let margin = CONTEXT_SAFETY_TOKENS.max(ratio_margin);
+    let mut room = model
         .context_window
-        .saturating_sub(estimated)
-        .saturating_sub(CONTEXT_SAFETY_TOKENS);
-    max_tokens.min(available.max(MIN_MAX_TOKENS))
+        .saturating_sub(input)
+        .saturating_sub(margin);
+    if room < MIN_OUTPUT_WITH_RATIO_MARGIN {
+        room = MIN_OUTPUT_WITH_RATIO_MARGIN.min(
+            model
+                .context_window
+                .saturating_sub(input)
+                .saturating_sub(CONTEXT_SAFETY_TOKENS),
+        );
+    }
+    max_tokens.min(room.max(MIN_MAX_TOKENS))
 }
 
 /// [`simple_stream_options`] plus the context clamp every simple entry applies

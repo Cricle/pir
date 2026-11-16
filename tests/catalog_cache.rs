@@ -19,11 +19,11 @@ fn load_all_twice_returns_identical_content() {
     let second = load_all().unwrap();
 
     // The embedded snapshot ships exactly the providers in `CATALOG_FILES`
-    // (42 at this revision). Pinning the count and representative ids makes a
+    // (43 at this revision). Pinning the count and representative ids makes a
     // parse that silently drops a provider fail here instead of being masked
     // by the second call agreeing with the first.
     let ids: Vec<&str> = first.iter().map(|provider| provider.id.as_str()).collect();
-    assert_eq!(ids.len(), 42, "catalog provider count: {ids:?}");
+    assert_eq!(ids.len(), 43, "catalog provider count: {ids:?}");
     assert_eq!(
         ids.first(),
         Some(&"amazon-bedrock"),

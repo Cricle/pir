@@ -1036,3 +1036,40 @@ fn package_subcommands_do_not_install_configured_packages() {
         "`pir list` must not install configured packages"
     );
 }
+
+/// Upstream #11358: the npm `--prefix` is the agent dir's real path, so a
+/// symlinked (dotfiles-managed) agent dir cannot accumulate nested
+/// `package-lock.json` entries. A missing root is returned unchanged so npm
+/// can create it.
+#[test]
+fn npm_install_root_resolves_symlinks() {
+    use pir::coding_agent::package_manager::real_install_root;
+
+    let missing = unique_dir("npm-root-missing").join("does-not-exist");
+    assert_eq!(real_install_root(&missing), missing);
+
+    let existing = unique_dir("npm-root-existing");
+    let resolved = real_install_root(&existing);
+    assert_eq!(resolved, pir::config::trust::normalize_cwd(&existing));
+    let text = resolved.display().to_string();
+    assert!(
+        !text.starts_with(r"\?\"),
+        "npm must not receive an extended-length path: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&existing);
+
+    // The actual symlink case only runs where creating one needs no extra
+    // privilege (unix). Windows needs Developer Mode/junction support.
+    #[cfg(unix)]
+    {
+        let target = unique_dir("npm-root-target");
+        let link = unique_dir("npm-root-link-parent").join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        assert_eq!(
+            real_install_root(&link),
+            pir::config::trust::normalize_cwd(&target)
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+}

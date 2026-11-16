@@ -76,7 +76,11 @@ impl AgentSession {
         // hidden tools removed, the JS override's prune applied — the exact
         // surface the loadout's active set is drawn from.
         let registry = self.merged_tool_registry(plugins);
-        let active = registry.active_names(self.resolve_active_override(Some(plugins)).as_deref());
+        let previous = self.active_tool_order_snapshot();
+        let active = registry.active_names_after(
+            self.resolve_active_override(Some(plugins)).as_deref(),
+            previous.as_deref(),
+        );
         let mut decision = mcp.discovery_activation(&registry, &active);
         // An explicit `--exclude-tools` / `-name` exclusion outranks discovery
         // activation (upstream applies `_excludedTools` at registration, so

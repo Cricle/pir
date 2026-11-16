@@ -886,10 +886,10 @@ fn settings_consumer_resolves_the_mode() {
     ));
     std::fs::create_dir_all(&scratch).expect("create scratch dir");
     let manager = pir::config::settings::SettingsManager::load(&scratch, &scratch, &scratch, false);
-    // Upstream default when the setting is unset: "streaming".
+    // Upstream default when the setting is unset: "idle" (7bcc15c9).
     assert_eq!(
         pir::cache_warmer::mode_from_settings(&manager),
-        CacheWarmingMode::Streaming
+        CacheWarmingMode::Idle
     );
 }
 

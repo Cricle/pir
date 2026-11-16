@@ -72,7 +72,7 @@ fn catalog_loads_with_upstream_identity() {
     assert_eq!(provider.display_name, "OpenCode Go");
     assert_eq!(
         provider.base_url.as_deref(),
-        Some("https://opencode.ai/inference/go/v1")
+        Some("https://opencode.ai/inference/go/openai/v1")
     );
     assert_eq!(provider.models.len(), UPSTREAM_MODELS.len());
 
@@ -116,19 +116,12 @@ fn protocol_selection_matches_upstream_per_model() {
     for (id, api) in UPSTREAM_MODELS {
         let model = model(&provider, id);
         assert_eq!(model.api, *api, "{id} api");
-        if *api == "anthropic-messages" {
-            // The Anthropic SDK appends /v1/messages; upstream keeps the
-            // provider root without the OpenAI-compatible /v1 suffix.
-            assert_eq!(
-                model.base_url, "https://opencode.ai/inference/go",
-                "{id} anthropic base url"
-            );
-        } else {
-            assert_eq!(
-                model.base_url, "https://opencode.ai/inference/go/v1",
-                "{id} base url"
-            );
-        }
+        let expected = match *api {
+            "anthropic-messages" => "https://opencode.ai/inference/go/anthropic",
+            "google-generative-ai" => "https://opencode.ai/inference/go/google/v1beta",
+            _ => "https://opencode.ai/inference/go/openai/v1",
+        };
+        assert_eq!(model.base_url, expected, "{id} base url");
     }
 
     let count = |api: &str| {

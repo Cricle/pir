@@ -93,7 +93,7 @@ fn expanded_hints_resolve_the_platform_chords() {
         // Upstream core/keybindings.ts:67-78 win32 variants.
         assert_eq!(by_description("follow-up"), "ctrl+q");
         assert_eq!(by_description("queued messages"), "alt+q");
-        assert_eq!(by_description("paste files"), "alt+v");
+        assert_eq!(by_description("paste files"), "alt+v/ctrl+v");
         assert_eq!(by_description("cycle models"), "ctrl+p/alt+p");
         // app.suspend keeps an EMPTY win32 default: the hint renders with an
         // empty key text (upstream keyText over an empty getKeys list).

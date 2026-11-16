@@ -426,12 +426,16 @@ fn previous_hardcoded_behavior_preserved() {
             TuiAction::HistoryNext,
             &key(KeyCode::Down, KeyModifiers::ALT)
         ));
-        // `app.clipboard.pasteImage` resolves to alt+v on Windows (upstream
-        // windowsKeybindings), ctrl+v elsewhere.
+        // `app.clipboard.pasteImage` resolves to ["alt+v", "ctrl+v"] on
+        // Windows (upstream windowsKeybindings, #11780), ctrl+v elsewhere.
         if pir::config::keybindings::use_windows_keybindings() {
             assert!(kb.matches(
                 TuiAction::Paste,
                 &key(KeyCode::Char('v'), KeyModifiers::ALT)
+            ));
+            assert!(kb.matches(
+                TuiAction::Paste,
+                &key(KeyCode::Char('v'), KeyModifiers::CONTROL)
             ));
         } else {
             assert!(kb.matches(

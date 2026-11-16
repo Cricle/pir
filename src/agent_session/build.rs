@@ -760,6 +760,7 @@ impl AgentSession {
             tools: Arc::new(tools),
             tool_selection,
             active_tools_override: Arc::new(std::sync::RwLock::new(None)),
+            active_tool_order: Arc::new(std::sync::RwLock::new(None)),
             host_tool_updates: Arc::new(Mutex::new(None)),
             scheduler,
             background,

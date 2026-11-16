@@ -29,7 +29,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pir::ai::types::{AssistantMessage, ContentBlock, TextContent, ThinkingContent};
+use pir::ai::types::{AssistantMessage, ContentBlock, TextContent, ThinkingContent, ToolCall};
 use pir::config::settings::MermaidRenderingMode;
 use pir::tui::core::Component;
 use pir::tui::markdown::{Markdown, MarkdownOptions, MarkdownTheme};
@@ -679,10 +679,83 @@ fn live_thinking_rows_match_the_settled_thinking_segment() {
     }
 }
 
+/// Hidden thinking with a whitespace-only label renders NOTHING (upstream
+/// assistant-message.ts, issue #11402): the label row was an escape-only blank,
+/// and the hidden run still counted as visible for the leading/trailing
+/// spacers. The three cases pin the empty-label behaviour and the unchanged
+/// default label, exactly upstream `assistant-message.test.ts`.
+#[test]
+fn hidden_thinking_with_an_empty_label_renders_no_rows() {
+    let _guard = pin_theme();
+    let empty_label = Arc::new(Mutex::new(Some(String::new())));
+    let default_label = Arc::new(Mutex::new(None));
+
+    let thinking = || {
+        ContentBlock::Thinking(ThinkingContent {
+            thinking: "reasoning".to_string(),
+            thinking_signature: None,
+            redacted: false,
+        })
+    };
+    let answer = || {
+        ContentBlock::Text(TextContent {
+            text: "answer".to_string(),
+            text_signature: None,
+        })
+    };
+    let tool_call = ContentBlock::ToolCall(ToolCall {
+        id: "tool-1".to_string(),
+        name: "read".to_string(),
+        arguments: std::collections::BTreeMap::new(),
+        thought_signature: None,
+        namespace: None,
+        arguments_error: None,
+    });
+    let message = |blocks: Vec<ContentBlock>| {
+        Arc::new(AssistantMessage {
+            content: blocks,
+            ..AssistantMessage::default()
+        })
+    };
+    let plain = |rows: Vec<String>| {
+        rows.iter()
+            .map(|row| pir::tui::ansi::strip_ansi(row).trim().to_string())
+            .collect::<Vec<String>>()
+    };
+
+    // Thinking followed by a tool call: nothing renders (was two blank rows).
+    let rows = AssistantMessageComponent::new_from(message(vec![thinking(), tool_call]), true, 1)
+        .with_hidden_label(Arc::clone(&empty_label))
+        .render(80);
+    assert!(
+        rows.is_empty(),
+        "empty-label hidden thinking + tool call: {rows:?}"
+    );
+
+    // Thinking followed by text: one leading spacer, then the text.
+    let rows = AssistantMessageComponent::new_from(message(vec![thinking(), answer()]), true, 1)
+        .with_hidden_label(Arc::clone(&empty_label))
+        .render(80);
+    assert_eq!(plain(rows), vec!["", "answer"]);
+
+    // The default label keeps both its row and the spacer before the text.
+    let rows = AssistantMessageComponent::new_from(message(vec![thinking(), answer()]), true, 1)
+        .with_hidden_label(Arc::clone(&default_label))
+        .render(80);
+    assert_eq!(plain(rows), vec!["", "Thinking...", "", "answer"]);
+
+    // The live component skips the same empty-label row.
+    let live = StreamingThinking::new("reasoning", 1, true, Arc::clone(&empty_label));
+    assert!(
+        live.render(80).is_empty(),
+        "live hidden row: {:?}",
+        live.render(80)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. Mermaid on the live stream (upstream components/mermaid.ts:60-75)
 // ---------------------------------------------------------------------------
-
 fn streaming_options(mode: MermaidRenderingMode) -> MarkdownOptions {
     MarkdownOptions {
         mermaid: mode,

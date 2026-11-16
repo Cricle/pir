@@ -46,7 +46,8 @@ pub fn now_ms() -> u64 {
 /// Regex patterns detecting context overflow errors per provider (upstream
 /// `OVERFLOW_PATTERNS`; keep in sync with its provider table: Anthropic
 /// "prompt is too long", z.ai CN code-1261 "Prompt too long"/"Prompt exceeds
-/// max length", Anthropic 413 `request_too_large`, OpenAI/LiteLLM, Google
+/// max length", Anthropic 413 `request_too_large`, OpenAI/LiteLLM (including
+/// the LiteLLM pre-call `ContextWindowExceededError`), Google
 /// Gemini, xAI, Groq, OpenRouter (incl. Poolside), Together AI, llama.cpp,
 /// LM Studio, GitHub Copilot, MiniMax, Kimi For Coding, DS4, Mistral,
 /// Xiaomi MiMo, DashScope/Qwen, Ollama, a provider-independent HTTP 413
@@ -61,10 +62,11 @@ fn overflow_patterns() -> &'static [StaticRegex] {
             r"input is too long for requested model", // Amazon Bedrock
             r"exceeds the context window", // OpenAI (Completions & Responses API)
             r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI-compatible proxies (LiteLLM)
+            r"context window exceeded", // LiteLLM pre-call check (ContextWindowExceededError, #11494)
             r"input token count.*exceeds the maximum", // Google (Gemini)
-            r"maximum prompt length is \d+",           // xAI (Grok)
-            r"reduce the length of the messages",      // Groq
-            r"maximum context length is \d+ tokens",   // OpenRouter (most backends)
+            r"maximum prompt length is \d+", // xAI (Grok)
+            r"reduce the length of the messages", // Groq
+            r"maximum context length is \d+ tokens", // OpenRouter (most backends)
             r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?", // OpenRouter/Poolside
             r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)", // Together AI
             r"exceeds the limit of \d+",           // GitHub Copilot
@@ -217,6 +219,13 @@ fn non_retryable_provider_limit_pattern() -> &'static StaticRegex {
             // set by the workspace admin; only the admin can raise it
             // (retry.ts:30).
             "subscription_sharing_workplace_individual_usage_limit_exceeded",
+            // Zhipu/Z.ai (open.bigmodel.cn) error code 1308: the plan's usage
+            // limit is reached, sent as HTTP 429. It resets after hours, not
+            // seconds (#11537). Match the JSON code field, not a bare number,
+            // so request ids or byte counts containing 1308 are unaffected;
+            // the `(?:[^0-9]|$)` tail replaces upstream's `(?![0-9])`
+            // lookahead.
+            r#""code"\s*:\s*"?1308(?:[^0-9]|$)"#,
         ])
     })
 }
@@ -297,6 +306,11 @@ fn retryable_provider_error_pattern() -> &'static StaticRegex {
             // it, e.g. "stream disconnected before completion: stream closed
             // before response.completed" (#11057, retry.ts:99).
             "stream disconnected before completion",
+            // Magpie gateway relaying a dropped upstream Anthropic stream,
+            // e.g. "Claude Code's stream from Anthropic was cut short after
+            // the reply had begun" (#11879). Kept specific on purpose: a bare
+            // "cut short" would match unrelated errors.
+            "cut short after the reply had begun",
             "pending stream has been canceled",
             // Provider-requested retry delay cap failures flow through the
             // outer retry policy so callers can surface/abort the backoff.

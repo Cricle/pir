@@ -1235,8 +1235,8 @@ async fn pi_ai_and_agent_core_surface_and_behaviour() {
     );
     assert_eq!(
         shim_providers.len(),
-        42,
-        "getBuiltinProviders() must expose all 42 catalog ids: {v}"
+        43,
+        "getBuiltinProviders() must expose all 43 catalog ids: {v}"
     );
     assert!(
         shim_providers.iter().any(|id| id == "openai")
@@ -1298,8 +1298,8 @@ async fn pi_ai_and_agent_core_surface_and_behaviour() {
     );
     assert_eq!(
         blob_manifest["files"].as_object().map(|files| files.len()),
-        Some(42),
-        "embedded blob must pin 42 provider catalog files"
+        Some(43),
+        "embedded blob must pin 43 provider catalog files"
     );
     for key in [
         "modelError",

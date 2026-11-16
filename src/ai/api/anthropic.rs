@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 /// Stealth mode: mimic Claude Code's client identity on OAuth tokens
 /// (upstream `claudeCodeVersion`).
-pub const CLAUDE_CODE_VERSION: &str = "2.1.280";
+pub const CLAUDE_CODE_VERSION: &str = "2.1.322";
 const CLAUDE_CODE_SYSTEM_TEXT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";

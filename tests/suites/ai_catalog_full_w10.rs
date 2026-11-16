@@ -243,7 +243,7 @@ fn representative_provider_counts_match_snapshot() {
             models_of(&raw, provider_id).len()
         })
         .sum();
-    assert_eq!(total_models, 1756, "whole catalog model count");
+    assert_eq!(total_models, 1767, "whole catalog model count");
 }
 
 /// Upstream 1.4.0 removed `gpt-5.5` and `gpt-5.3-codex-spark` from
@@ -522,7 +522,7 @@ const CATALOG_COMPACT_SHA256: &[(&str, &str)] = &[
     ),
     (
         "github-copilot.json",
-        "245f2ccb0d58f5edde86137aed2e848406f7302dec4ff22e0b3d37763763d738",
+        "3c79c9bdac53e16ea4ea4847d898f7fa4aad4f96c239bc608447ed43399058ca",
     ),
     (
         "google-vertex.json",
@@ -574,7 +574,7 @@ const CATALOG_COMPACT_SHA256: &[(&str, &str)] = &[
     ),
     (
         "openai-codex.json",
-        "eb76782563ad736c20fd7a9918cbd7918008c76bdb088482c9242baea4be5aa2",
+        "07845c5aa6ffab2703aafa3cb3e01b841aa02a80432e56bc04f520218acdd4b9",
     ),
     (
         "openai.json",
@@ -582,11 +582,11 @@ const CATALOG_COMPACT_SHA256: &[(&str, &str)] = &[
     ),
     (
         "opencode-go.json",
-        "456c957449a266817201463c841841beb0361478443a240e576b5d2c30b78ee9",
+        "5246164983cb16f712309d4c4f1f2548d0425d3fb66a26a78b05750a0428996a",
     ),
     (
         "opencode.json",
-        "696b3b40140864fd505c6a4ad81ce08ce285d27a61716ac841c0e2d720b8ea57",
+        "093a028739a11cf851916ce043a01e78451b31d7aa18e2c833d22fe582681e11",
     ),
     (
         "openrouter.json",
@@ -599,6 +599,10 @@ const CATALOG_COMPACT_SHA256: &[(&str, &str)] = &[
     (
         "qwen-token-plan-individual.json",
         "c3ad99862a62e3b36215a3cdb0eee0a963227b35f1cd0ae9448727fb0ca115a0",
+    ),
+    (
+        "qwen-token-plan-individual-cn.json",
+        "727ca713e9f134ae06a56d2f3981fe724efa872b1388909a2f89835f3842f7f5",
     ),
     (
         "qwen-token-plan.json",

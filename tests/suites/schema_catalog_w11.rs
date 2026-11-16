@@ -1123,7 +1123,7 @@ fn catalog_files_are_canonical() {
 
         checked += 1;
     }
-    assert_eq!(checked, 42, "the snapshot ships 42 provider files");
+    assert_eq!(checked, 43, "the snapshot ships 43 provider files");
 }
 
 #[test]
@@ -1164,8 +1164,8 @@ fn catalog_files_load_through_the_production_loader() {
         chat_models += provider.models.len();
     }
     assert_eq!(
-        chat_models, 1656,
-        "the snapshot exposes 1656 chat models to the registry"
+        chat_models, 1666,
+        "the snapshot exposes 1666 chat models to the registry"
     );
 }
 

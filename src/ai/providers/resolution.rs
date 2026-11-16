@@ -27,49 +27,50 @@ use crate::ai::types::{Model, ThinkingLevel};
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
 /// Default chat model ids per provider (upstream `defaultModelPerProvider`,
-/// model-resolver.ts:20-59).
+/// model-resolver.ts:20-59 at v1.5.2).
 pub fn default_model_per_provider() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
+        ("amazon-bedrock", "us.anthropic.claude-opus-5-5"),
         ("ant-ling", "Ring-2.6-1T"),
-        ("anthropic", "claude-opus-4-8"),
-        ("openai", "gpt-5.5"),
-        ("azure", "gpt-5.4"),
+        ("anthropic", "claude-opus-5-5"),
+        ("openai", "gpt-6.1-sol"),
+        ("azure", "gpt-6.1-sol"),
         ("openai-codex", "gpt-6.1-sol"),
         ("radius", "balanced"),
         ("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b"),
         ("deepseek", "deepseek-v4-pro"),
-        ("google", "gemini-3.1-pro-preview"),
-        ("google-vertex", "gemini-3.1-pro-preview"),
+        ("google", "gemini-4-argon"),
+        ("google-vertex", "gemini-4-argon"),
         ("github-copilot", "gpt-6.1-sol"),
-        ("openrouter", "moonshotai/kimi-k2.6"),
-        ("vercel-ai-gateway", "zai/glm-5.1"),
+        ("openrouter", "moonshotai/kimi-k2.7-code"),
+        ("vercel-ai-gateway", "zai/glm-5.3"),
         ("xai", "grok-4.7"),
         ("groq", "openai/gpt-oss-120b"),
         ("cerebras", "gpt-oss-120b"),
         ("zai", "glm-5.3"),
         ("zai-coding-cn", "glm-5.3"),
         ("mistral", "devstral-medium-latest"),
-        ("minimax", "MiniMax-M2.7"),
-        ("minimax-cn", "MiniMax-M2.7"),
-        ("moonshotai", "kimi-k2.6"),
-        ("moonshotai-cn", "kimi-k2.6"),
-        ("huggingface", "moonshotai/Kimi-K2.6"),
+        ("minimax", "MiniMax-M3"),
+        ("minimax-cn", "MiniMax-M3"),
+        ("moonshotai", "kimi-k2.7-code"),
+        ("moonshotai-cn", "kimi-k2.7-code"),
+        ("huggingface", "moonshotai/Kimi-K2.7-Code"),
         ("fireworks", "accounts/fireworks/models/kimi-k3"),
         ("together", "moonshotai/Kimi-K3"),
-        ("baseten", "zai-org/GLM-5.2"),
-        ("opencode", "kimi-k2.6"),
-        ("opencode-go", "kimi-k3"),
+        ("baseten", "zai-org/GLM-5.3"),
+        ("opencode", "kimi-k2.7-code"),
+        ("opencode-go", "kimi-k3.1-pro"),
         ("kimi-coding", "kimi-for-coding"),
         ("meta", "muse-spark-1.3"),
-        ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
+        ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
         (
             "cloudflare-ai-gateway",
-            "workers-ai/@cf/moonshotai/kimi-k2.6",
+            "workers-ai/@cf/moonshotai/kimi-k2.7-code",
         ),
-        ("qwen-token-plan", "qwen3.7-max"),
-        ("qwen-token-plan-cn", "qwen3.7-max"),
+        ("qwen-token-plan", "qwen3.8-max"),
+        ("qwen-token-plan-cn", "qwen3.8-max"),
         ("qwen-token-plan-individual", "qwen3.8-max"),
+        ("qwen-token-plan-individual-cn", "qwen3.8-max"),
         ("xiaomi", "mimo-v2.6-pro"),
         ("xiaomi-token-plan-cn", "mimo-v2.6-pro"),
         ("xiaomi-token-plan-ams", "mimo-v2.6-pro"),
@@ -210,19 +211,35 @@ fn split_thinking_suffix(text: &str) -> Option<(String, ThinkingLevel)> {
 }
 
 /// Split `provider/rest` when `provider` names a known provider.
+///
+/// Provider ids may contain `/` themselves (URL-derived ids such as
+/// `llama-server=http://host:10800`), so the split tries every known id and
+/// lets the longest match win (#11397, model-resolver.ts:128-143).
 fn split_provider_prefix(text: &str, models: &[Model]) -> Option<(String, String)> {
-    let (prefix, model_text) = text.split_once('/')?;
-    let prefix = prefix.trim().to_lowercase();
-    let model_text = model_text.trim();
-    if prefix.is_empty() || model_text.is_empty() {
-        return None;
+    let mut best: Option<(String, String)> = None;
+    for model in models {
+        let provider = model.provider.trim();
+        let lower = provider.to_lowercase();
+        if lower.is_empty()
+            || best
+                .as_ref()
+                .is_some_and(|(candidate, _)| candidate.len() >= provider.len())
+        {
+            continue;
+        }
+        let Some((slash, _)) = text
+            .match_indices('/')
+            .find(|(index, _)| text[..*index].trim().to_lowercase() == lower)
+        else {
+            continue;
+        };
+        let model_text = text[slash + 1..].trim();
+        if model_text.is_empty() {
+            continue;
+        }
+        best = Some((provider.to_string(), model_text.to_string()));
     }
-    let provider = models
-        .iter()
-        .find(|model| model.provider.to_lowercase() == prefix)?
-        .provider
-        .clone();
-    Some((provider, model_text.to_string()))
+    best
 }
 
 fn all_same_provider(models: &[&Model]) -> bool {

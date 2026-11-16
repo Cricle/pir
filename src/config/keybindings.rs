@@ -101,7 +101,7 @@ pub fn use_windows_keybindings() -> bool {
 /// - `windows_keybindings`: upstream `useWindowsKeybindings()` (line 16-21) —
 ///   `native_windows` OR a Linux host under WSL. It selects the
 ///   `app.model.cycleBackward` (`alt+p`), `app.message.followUp` (`ctrl+q`),
-///   `app.message.dequeue` (`alt+q`), `app.clipboard.pasteImage` (`alt+v`),
+///   `app.message.dequeue` (`alt+q`), `app.clipboard.pasteImage` (`alt+v`, `ctrl+v`),
 ///   the `tui.altScreen.*` prompt/search chords, and `tui.editor.undo`
 ///   (`alt+z` on WSL).
 ///

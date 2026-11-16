@@ -25219,8 +25219,10 @@ pub fn tree_entries_streamed(
 /// forward walk, so the backward step is built from the same public
 /// accessors: the session's scoped list (filtered to what the registry can
 /// serve, like the forward path) or every available model, stepping back one
-/// with wrap-around. `None` when the effective set has fewer than two models
-/// — the caller's "Only one model available/in scope" status.
+/// with wrap-around through the shared `cycle_index` (a current model outside
+/// the set selects its first entry, #11832). `None` when the effective set is
+/// empty or holds only the current model — the caller's "Only one model
+/// available/in scope" status.
 async fn cycle_model_backward(
     session: &crate::agent_session::AgentSession,
 ) -> Option<crate::agent_session::ModelCycle> {
@@ -25241,14 +25243,11 @@ async fn cycle_model_backward(
     } else {
         available
     };
-    if candidates.len() < 2 {
-        return None;
-    }
-    let index = candidates
+    let current_index = candidates
         .iter()
-        .position(|model| model.provider == current.provider && model.id == current.id)
-        .unwrap_or(0);
-    let next = candidates[(index + candidates.len() - 1) % candidates.len()].clone();
+        .position(|model| model.provider == current.provider && model.id == current.id);
+    let next_index = crate::agent_session::cycle_index(candidates.len(), current_index, false)?;
+    let next = candidates[next_index].clone();
     // The backward half of `cycleModel` reports the same `source: "cycle"` as
     // the forward walk (`AgentSession::cycle_model`).
     session

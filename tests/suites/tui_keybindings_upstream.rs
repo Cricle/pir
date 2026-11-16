@@ -498,8 +498,10 @@ fn upstream_app_effective(id: &str, platform: KeybindingPlatform) -> Vec<&'stati
         // `windowsKeybindings ? "alt+q" : "alt+up"`
         "app.message.dequeue" if platform.windows_keybindings => vec!["alt+q"],
         "app.message.dequeue" => vec!["alt+up"],
-        // `windowsKeybindings ? "alt+v" : "ctrl+v"`
-        "app.clipboard.pasteImage" if platform.windows_keybindings => vec!["alt+v"],
+        // `windowsKeybindings ? ["alt+v", "ctrl+v"] : "ctrl+v"`
+        "app.clipboard.pasteImage" if platform.windows_keybindings => {
+            vec!["alt+v", "ctrl+v"]
+        }
         "app.clipboard.pasteImage" => vec!["ctrl+v"],
         _ => upstream_app_row(id).unwrap_or_default(),
     }
@@ -931,7 +933,11 @@ fn action_layer_defaults_are_the_documented_table() {
         // upstream `app.clipboard.pasteImage` / `app.message.followUp`
         (
             TuiAction::Paste,
-            if windows { &["alt+v"] } else { &["ctrl+v"] },
+            if windows {
+                &["alt+v", "ctrl+v"]
+            } else {
+                &["ctrl+v"]
+            },
             "app.clipboard.pasteImage",
         ),
         (
@@ -951,9 +957,10 @@ fn action_layer_defaults_are_the_documented_table() {
             );
         }
     }
-    // The platform pairs must NOT cross over.
+    // The platform pairs must NOT cross over, except the Windows paste pair:
+    // `ctrl+v` is a second paste chord there (#11780).
     if windows {
-        assert!(!kb.matches(TuiAction::Paste, &event("ctrl+v")));
+        assert!(kb.matches(TuiAction::Paste, &event("ctrl+v")));
         assert!(!kb.matches(TuiAction::FollowUp, &event("alt+enter")));
     } else {
         assert!(!kb.matches(TuiAction::Paste, &event("alt+v")));
@@ -1069,6 +1076,7 @@ fn app_chords_dispatch_to_their_upstream_ids() {
         assert!(kb.matches(TuiAction::FollowUp, &event("ctrl+q")));
         assert!(kb.matches_app_id("app.message.dequeue", &event("alt+q")));
         assert!(kb.matches(TuiAction::Paste, &event("alt+v")));
+        assert!(kb.matches(TuiAction::Paste, &event("ctrl+v")));
         assert!(kb.matches_app_id("app.model.cycleBackward", &event("alt+p")));
     } else {
         assert!(kb.matches(TuiAction::FollowUp, &event("alt+enter")));

@@ -30,7 +30,7 @@ export function builtinModels() { return catalogUnavailable("builtinModels"); }
 // Upstream `getBuiltinProviders(): BuiltinProvider[]` returns `Object.keys(MODELS)`
 // — the catalog provider **id strings**, not provider objects. The ids are
 // exactly the manifest's catalog file names without the `.json` suffix (the
-// same 42 built-in catalog ids the Rust host registers), so this is a real
+// same 43 built-in catalog ids the Rust host registers), so this is a real
 // read, not a placeholder. Provider *objects* stay unavailable: the
 // implementations live in the Rust host (`builtinProviders()` below throws).
 export function getBuiltinProviders() {
@@ -51,7 +51,7 @@ export function getBuiltinProviders() {
 const PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON = `{
   "schemaVersion": 6,
   "generatedAt": "2026-10-25T00:00:00.000Z",
-  "structureHash": "2ed3dbf07782cc96275367b02fdcfbd22f92427ef2051ac447356426c9f320fc",
+  "structureHash": "305aad049f7072474c1e58bd6049d9fc42ee2000fce850ee2fa78f8117f06296",
   "files": {
     "amazon-bedrock.json": "91e6ac138f1274720788af67cd7518b6dc05869f6f64b4e32d5fbdb3d14d11f0",
     "ant-ling.json": "a13ffcfc4da96be48049c5a521390747b4eec1966f3039d02cbaf8ec53aba47f",
@@ -63,7 +63,7 @@ const PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON = `{
     "cloudflare-workers-ai.json": "915eb65008ab57afe2eeea747c216f0f678e19b7f7416b01434a8ccf97404020",
     "deepseek.json": "77c64ca04d89fdc87e956e985d1572feaa30ecfb51ed8bcfa45adb6e0d827009",
     "fireworks.json": "885a181a468ab3b4b532a60acf1aea2a3a8df72701e2d9d60214da2e114b5ace",
-    "github-copilot.json": "909f7c1baa75f18944e6790fc44e9960496987ba9a74a326de891350d02884b4",
+    "github-copilot.json": "73980d153c929876ced3a0172a1b12b36dc3e7e95e9a6dd62ca3dff509697f3b",
     "google-vertex.json": "c4b174a6d41e2cd064c5e6aeb3dd99fd21ba62c0900672682effc89e18d62a71",
     "google.json": "c6665bf3e1b46f1d667946c011ccf6d81fb9d780f7229253304a0ab8b55e5492",
     "groq.json": "967a985ec41d9dadc6618959a40bcf59f5328cd92118721edb8abeb8c0c6619e",
@@ -76,12 +76,13 @@ const PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON = `{
     "moonshotai-cn.json": "e773cb478d7731a6024b0f004894a04bc11e30df41ef7ec81d58d9e88abb844a",
     "moonshotai.json": "4116350aada4dc9c1ee07b2cc0be7c5ef54eb0c11be9ed96580d27a32b734c05",
     "nvidia.json": "76846a933e91c726bb54ebd0cf397d093357b1ab2a08db34ec8ace11bfcc111b",
-    "openai-codex.json": "ffd499fc12034c5b24695b8bfbb6cab77c5167e16d0c7862ff4d6e5b009b9877",
+    "openai-codex.json": "c76ee11d792b4a4fa6d3a03545dc43a900b890f6a715e887c39bca86377f1a6f",
     "openai.json": "39a39ce10e3c4444bd8815cacc2b16d4a53ef689e0163aeed3f62e61f3af4f0c",
-    "opencode-go.json": "c10e24dd681b54768eccc509f29d14fbdea87c6d50384747e7b98efacbc9109c",
-    "opencode.json": "14e95cd5b8a99ace32fe78f36d78b49264960c0c0be8edc8218324e62b827889",
+    "opencode-go.json": "9a368a88c1bd704ebf1cbe09ae8f4f2b5385a39d8416ac2f88bd0e08ae0da1bd",
+    "opencode.json": "0bfa2ec3628648302684999dd6ab97b9c5a1967df1d8808e2e54b57992b85315",
     "openrouter.json": "617c4e5878278b85e9a811e7b0cb0f9e013fd4783b60125f90671a27d8f432e6",
     "qwen-token-plan-cn.json": "b5a751dedaf5e51d74cb45a2151aa6c513f0e73020cd947589839c9225fc31e1",
+    "qwen-token-plan-individual-cn.json": "efb1ce23f7197b0f1baaa7192381e6da3f1c6531e40427a12336323bb771628c",
     "qwen-token-plan-individual.json": "c4c2b8ced5b34e26348b5db89619860c2dd9aa806c87e3b33fd2d45b9b21faf1",
     "qwen-token-plan.json": "04d603b0bbbc11b210a7bee8c9804ca4a4f8687049e5120c5950cd88393310e3",
     "radius.json": "0d9967f601ce4f17546093c1611a8cbc5f64541e2fdf0004f61d5a2b252315ab",
@@ -100,7 +101,7 @@ const PIR_BUILTIN_MODEL_DATA_MANIFEST_JSON = `{
 
 // FNV-1a 64 content fingerprint of every embedded catalog resource
 // (`builtin_catalog_version()`, same value as `getBuiltinModelDataVersion`).
-const PIR_BUILTIN_MODEL_DATA_VERSION = "c1625812d2db0645";
+const PIR_BUILTIN_MODEL_DATA_VERSION = "a42815e3964c9807";
 
 /** Upstream `getBuiltinModelDataGeneratedAt`: `generatedAt` in Unix ms. */
 export function getBuiltinModelDataGeneratedAt() {

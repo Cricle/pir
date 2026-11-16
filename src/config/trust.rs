@@ -429,10 +429,10 @@ pub enum ProjectTrustResolution {
 
 /// Resolve whether `cwd` is trusted (upstream `resolveProjectTrusted`):
 /// explicit override first, then the resource check (a project with no
-/// trust-requiring resources is implicitly trusted), the store's
-/// nearest-ancestor decision, and finally the `defaultProjectTrust` setting —
-/// `ask` becomes a selector prompt when a UI is available and "not trusted"
-/// in headless mode.
+/// trust-requiring resources is implicitly trusted unless a saved decision
+/// exists), the store's nearest-ancestor decision, and finally the
+/// `defaultProjectTrust` setting — `ask` becomes a selector prompt when a UI
+/// is available and "not trusted" in headless mode.
 pub fn resolve_project_trusted(
     cwd: &Path,
     store: &ProjectTrustStore,
@@ -444,7 +444,10 @@ pub fn resolve_project_trusted(
         return ProjectTrustResolution::Resolved(over);
     }
     if !has_trust_requiring_project_resources(cwd) {
-        return ProjectTrustResolution::Resolved(true);
+        // A saved "Do not trust" decision takes precedence over auto-trust
+        // (#10947, project-trust.ts:49): projects without trust-requiring
+        // resources are implicitly trusted only when no decision is saved.
+        return ProjectTrustResolution::Resolved(store.get(cwd).is_none_or(|entry| entry.decision));
     }
     if let Some(entry) = store.get(cwd) {
         return ProjectTrustResolution::Resolved(entry.decision);

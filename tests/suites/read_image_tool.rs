@@ -187,11 +187,19 @@ fn oversized_image_is_resized_to_the_inline_limits() {
 
     let image = &result.images[0];
     let decoded = base64_decode(&image.data);
-    let (width, height) = match image.mime_type.as_str() {
-        "image/png" => png_dimensions(&decoded),
-        other => panic!("expected a PNG candidate to fit, got {other}"),
-    };
-    assert_eq!((width, height), (2000, 1), "must be resized below 2000px");
+    // The resize picks whichever of PNG and JPEG is smaller (upstream
+    // #11577), so either format is a valid result here.
+    assert!(
+        matches!(image.mime_type.as_str(), "image/png" | "image/jpeg"),
+        "unexpected resized mime type: {}",
+        image.mime_type
+    );
+    let decoded_image = ::image::load_from_memory(&decoded).expect("decode resized image");
+    assert_eq!(
+        (decoded_image.width(), decoded_image.height()),
+        (2000, 1),
+        "must be resized below 2000px"
+    );
 
     // Upstream `formatDimensionNote` tells the model how to map coordinates.
     assert!(
@@ -202,7 +210,8 @@ fn oversized_image_is_resized_to_the_inline_limits() {
         result.content
     );
     assert!(
-        result.content.starts_with("Read image file [image/png]"),
+        result.content.starts_with("Read image file [image/png]")
+            || result.content.starts_with("Read image file [image/jpeg]"),
         "unexpected note: {}",
         result.content
     );

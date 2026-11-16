@@ -550,6 +550,11 @@ impl AgentTool for GrepTool {
 /// (upstream `getFileLines`). A failed or oversized read yields a clear error
 /// that is rendered in place of the context block.
 ///
+/// Only CRLF is normalized: a lone CR is NOT a line break to ripgrep (it
+/// counts lines at LF only), so turning it into one shifted every later
+/// context line by one (upstream grep.ts, issue #11398). The lone CR stays in
+/// the line and is stripped at display time by the context formatter.
+///
 /// The file is read as bytes and decoded with `String::from_utf8_lossy`, not
 /// `read_to_string`: ripgrep matches files that are not valid UTF-8, so a
 /// lossily-grepped file must still render its context instead of degrading to
@@ -586,7 +591,6 @@ async fn read_file_lines(
         let lines = Arc::new(
             content
                 .replace("\r\n", "\n")
-                .replace('\r', "\n")
                 .split('\n')
                 .map(str::to_owned)
                 .collect::<Vec<String>>(),
@@ -623,7 +627,6 @@ async fn read_file_lines(
     let lines = Arc::new(
         content
             .replace("\r\n", "\n")
-            .replace('\r', "\n")
             .split('\n')
             .map(str::to_owned)
             .collect::<Vec<String>>(),

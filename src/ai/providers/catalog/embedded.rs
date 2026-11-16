@@ -35,6 +35,7 @@ pub fn embedded_catalog(file: &str) -> crate::ai::error::AiResult<&'static str> 
         "qwen-token-plan.json" => Ok(include_str!("qwen-token-plan.json")),
         "qwen-token-plan-cn.json" => Ok(include_str!("qwen-token-plan-cn.json")),
         "qwen-token-plan-individual.json" => Ok(include_str!("qwen-token-plan-individual.json")),
+        "qwen-token-plan-individual-cn.json" => Ok(include_str!("qwen-token-plan-individual-cn.json")),
         "radius.json" => Ok(include_str!("radius.json")),
         "together.json" => Ok(include_str!("together.json")),
         "typesafe.json" => Ok(include_str!("typesafe.json")),

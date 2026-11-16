@@ -116,7 +116,7 @@ impl TuiAction {
     /// Defaults equal to the previously hardcoded pir key handling — with
     /// the upstream Windows/WSL variants for the two ids whose win32 chords
     /// differ (core/keybindings.ts:67-78): follow-up `ctrl+q` (win) /
-    /// `alt+enter`, paste `alt+v` (win) / `ctrl+v`.
+    /// `alt+enter`, paste `alt+v`+`ctrl+v` (win) / `ctrl+v`.
     fn default_bindings(self) -> Vec<KeyCombo> {
         let windows = crate::config::keybindings::use_windows_keybindings();
         let combos = match self {
@@ -149,7 +149,10 @@ impl TuiAction {
             // instead of dead.
             TuiAction::ThinkingSelector => vec!["ctrl+shift+p"],
             TuiAction::ToolExpand => vec!["ctrl+o"],
-            TuiAction::Paste if windows => vec!["alt+v"],
+            // Windows terminals that pass Ctrl+V through keep it as a
+            // second paste chord (#11780); terminals that handle it never
+            // deliver the key.
+            TuiAction::Paste if windows => vec!["alt+v", "ctrl+v"],
             TuiAction::Paste => vec!["ctrl+v"],
             TuiAction::FollowUp if windows => vec!["ctrl+q"],
             TuiAction::FollowUp => vec!["alt+enter"],
@@ -1005,7 +1008,8 @@ impl Keybindings {
 /// ids and the whole `app.session.*` family (new/tree/fork/resume, the
 /// session-selector toggles and the session mutation ids). Windows/WSL
 /// variants resolve at call time (keybindings.ts:29-32, 45-48, 67-78):
-/// follow-up `ctrl+q`, dequeue `alt+q`, paste `alt+v`, model backward `alt+p`;
+/// follow-up `ctrl+q`, dequeue `alt+q`, paste `alt+v`+`ctrl+v`, model
+/// backward `alt+p`;
 /// `app.suspend` keeps an EMPTY default on native win32 (its hint renders
 /// with an empty key text).
 ///
@@ -1043,7 +1047,7 @@ pub fn hint_default_keys_for(
         "app.tools.expand" => &["ctrl+o"],
         "app.message.followUp" if windows => &["ctrl+q"],
         "app.message.followUp" => &["alt+enter"],
-        "app.clipboard.pasteImage" if windows => &["alt+v"],
+        "app.clipboard.pasteImage" if windows => &["alt+v", "ctrl+v"],
         "app.clipboard.pasteImage" => &["ctrl+v"],
         // `app.session.*` (core/keybindings.ts:79-118). Upstream registers
         // these on the session selector / default editor; pir resolves the

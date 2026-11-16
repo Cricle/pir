@@ -348,10 +348,11 @@ fn scoped_cycle_target_walks_the_available_scope_with_wraparound() {
         pir::tui::slash::scoped_cycle_target(&scope, &available, ("google", "c")),
         Some(("anthropic".to_owned(), "a".to_owned()))
     );
-    // A current model outside the scope starts from the scope head.
+    // A current model outside the scope selects the first entry, not the
+    // second (#11832): forward cycling must not skip the scope head.
     assert_eq!(
         pir::tui::slash::scoped_cycle_target(&scope, &available, ("mistral", "z")),
-        Some(("openai".to_owned(), "b".to_owned()))
+        Some(("anthropic".to_owned(), "a".to_owned()))
     );
 }
 
@@ -372,11 +373,17 @@ fn scoped_cycle_target_filters_unavailable_and_bails_on_tiny_scopes() {
         pir::tui::slash::scoped_cycle_target(&scope, &available, ("anthropic", "a")),
         Some(("google".to_owned(), "c".to_owned()))
     );
-    // A single remaining model never cycles (upstream `<= 1 → undefined`).
+    // A single remaining model that is already current never cycles
+    // (upstream `getNextCycleIndex` → undefined)…
     let available = vec![("anthropic".to_owned(), "a".to_owned())];
     assert_eq!(
         pir::tui::slash::scoped_cycle_target(&scope, &available, ("anthropic", "a")),
         None
+    );
+    // …but a different current model still switches to it (#11832).
+    assert_eq!(
+        pir::tui::slash::scoped_cycle_target(&scope, &available, ("mistral", "z")),
+        Some(("anthropic".to_owned(), "a".to_owned()))
     );
     // An empty scope never cycles.
     assert_eq!(
@@ -403,4 +410,28 @@ fn hotkeys_renders_sectioned_rows() {
     // Empty sections are dropped.
     assert!(!text.contains("Editing"));
     assert!(text.contains("Other\n! — Run bash command"));
+}
+
+/// Upstream `getNextCycleIndex` (#11832): cycling with a single model switches
+/// when that model is not the active one, and a current model outside the list
+/// enters at the head instead of skipping it.
+#[test]
+fn cycle_index_matches_upstream_get_next_cycle_index() {
+    use pir::agent_session::cycle_index;
+
+    // Empty set: nothing to select.
+    assert_eq!(cycle_index(0, None, true), None);
+    // A single current entry: no cycle; a current model outside it selects
+    // the head instead of skipping it.
+    assert_eq!(cycle_index(1, Some(0), true), None);
+    assert_eq!(cycle_index(1, None, true), Some(0));
+    assert_eq!(cycle_index(1, None, false), Some(0));
+    // Multi-entry sets wrap in both directions.
+    assert_eq!(cycle_index(3, Some(0), true), Some(1));
+    assert_eq!(cycle_index(3, Some(2), true), Some(0));
+    assert_eq!(cycle_index(3, Some(0), false), Some(2));
+    assert_eq!(cycle_index(3, Some(1), false), Some(0));
+    // An out-of-set current model always starts at the head.
+    assert_eq!(cycle_index(3, None, true), Some(0));
+    assert_eq!(cycle_index(3, None, false), Some(0));
 }

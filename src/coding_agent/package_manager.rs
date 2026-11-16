@@ -1330,12 +1330,29 @@ fn npm_argv(prefix: Vec<String>, args: Vec<String>) -> Vec<String> {
     argv
 }
 
+/// The root handed to npm as `--prefix`/`--cwd`.
+///
+/// An agent directory reached through a symlink (a dotfiles-managed `~/.pi`)
+/// must be resolved to its real path: npm writes package-lock entries relative
+/// to the prefix it is given, so a symlinked prefix nests them one level per
+/// install and the lock file keeps growing (upstream #11358).
+#[doc(hidden)]
+pub fn real_install_root(root: &Path) -> PathBuf {
+    if root.exists() {
+        crate::config::trust::normalize_cwd(root)
+    } else {
+        root.to_path_buf()
+    }
+}
+
 /// The npm-family install argv for a managed install (upstream
 /// `getNpmInstallArgs`, `package-manager.ts:1845-1866`): peer dependency
 /// resolution is disabled so the package manager never installs or solves
 /// host-provided pi peers.
 fn npm_install_args(package_manager: &str, specs: &[String], install_root: &Path) -> Vec<String> {
-    let root = install_root.display().to_string();
+    // npm writes broken nested package-lock.json paths when --prefix goes
+    // through a symlink (upstream resolves the root first).
+    let root = real_install_root(install_root).display().to_string();
     let mut args = vec!["install".to_owned()];
     args.extend(specs.iter().cloned());
     match package_manager {
@@ -1643,6 +1660,8 @@ fn uninstall_npm(
     if !install_root.exists() {
         return Ok(());
     }
+    // Same symlinked-prefix rule as the install path (upstream #11358).
+    let install_root = real_install_root(&install_root);
     let (command, args) = npm_command_parts(settings)?;
     let package_manager = package_manager_name(&command, &args)?;
     let root = install_root.display().to_string();

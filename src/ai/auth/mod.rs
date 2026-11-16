@@ -628,6 +628,7 @@ pub mod env_api_keys {
     const QWEN_TOKEN_PLAN: &[&str] = &["QWEN_TOKEN_PLAN_API_KEY"];
     const QWEN_TOKEN_PLAN_CN: &[&str] = &["QWEN_TOKEN_PLAN_CN_API_KEY"];
     const QWEN_TOKEN_PLAN_INDIVIDUAL: &[&str] = &["QWEN_TOKEN_PLAN_API_KEY"];
+    const QWEN_TOKEN_PLAN_INDIVIDUAL_CN: &[&str] = &["QWEN_TOKEN_PLAN_CN_API_KEY"];
     const CEREBRAS: &[&str] = &["CEREBRAS_API_KEY"];
     const TYPESAFE: &[&str] = &["TYPESAFE_API_KEY"];
     const RADIUS: &[&str] = &["RADIUS_API_KEY"];
@@ -685,6 +686,10 @@ pub mod env_api_keys {
             ("qwen-token-plan", QWEN_TOKEN_PLAN),
             ("qwen-token-plan-cn", QWEN_TOKEN_PLAN_CN),
             ("qwen-token-plan-individual", QWEN_TOKEN_PLAN_INDIVIDUAL),
+            (
+                "qwen-token-plan-individual-cn",
+                QWEN_TOKEN_PLAN_INDIVIDUAL_CN,
+            ),
             ("radius", RADIUS),
             ("together", TOGETHER),
             ("typesafe", TYPESAFE),

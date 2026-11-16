@@ -6,6 +6,32 @@ Post-0.3.2 backlog closure: every verified `reproduced` item in the local issue
 board was fixed against upstream pi, the upstream tree was audited through
 v1.5.2, and the generated test harnesses were rebuilt.
 
+### upstream parity (v1.5.2 follow-ups)
+
+- Overflow/retry classification learns LiteLLM's pre-call
+  `ContextWindowExceededError`, Zhipu's JSON code 1308, and gateway streams cut
+  short after the reply began (`#11494`/`#11572`/`#11885`).
+- A saved "Do not trust" wins over auto-trust for projects without
+  trust-requiring resources (`#10947`).
+- The default-model map and `CLAUDE_CODE_VERSION` follow upstream, the bundled
+  catalog gains `qwen-token-plan-individual-cn` plus OpenCode's
+  protocol-specific endpoints and Copilot's `microsoft-decision-1` classifier,
+  the Codex provider drops its "(legacy)" name, and cache warming defaults to
+  `idle` (`#11467`/`#11434`/`#11679`).
+- `max_tokens` clamping leaves OpenRouter's input overcount a 15% margin
+  (`#11712`); model cycling reaches the only model in scope (`#11832`); Windows
+  accepts `ctrl+v` for paste (`#11780`).
+- Branch summaries carry the live thinking level, and the level is recorded on
+  the branch before each prompt so a resume after `/tree` no longer restores a
+  stale one (`#11482`/`#11888`).
+- `setActiveTools` treats the names as a set, so reordering the same tools no
+  longer rewrites the prompt and loses the provider cache (`#11495`).
+- grep context lines split on LF only, matching ripgrep's numbering for files
+  with a lone CR (`#11465`); hidden thinking with an empty label renders no
+  rows (`#11470`); resized images use whichever of PNG/JPEG is smaller
+  (`#11577`); npm installs resolve a symlinked agent dir to its real `--prefix`
+  (`#11396`).
+
 ### correctness
 
 - Extension/RPC stream events use upstream's camelCase carrier fields

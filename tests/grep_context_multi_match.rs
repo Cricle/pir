@@ -63,3 +63,42 @@ async fn context_output_is_unchanged_for_a_multi_match_file() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A lone CR is not a line break to ripgrep, which numbers lines at LF only
+/// (upstream issue #11398). Context reads must split the same way: splitting
+/// on a bare CR too put the following lines one number too high, so the
+/// context block showed `progress` as the match and dropped `after`. The CR
+/// is stripped for display, joining the two halves of the line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_line_numbers_align_with_ripgrep_for_a_lone_cr() {
+    let (dir, _file) = fixture_file();
+    let file = dir.join("lone-cr.txt");
+    std::fs::write(&file, "before\rprogress\nneedle\nafter").expect("write lone-CR fixture");
+
+    let mut registry = ToolRegistry::new();
+    pir::coding_agent::tools::register_core_tools(&mut registry);
+    let tool = registry.get("grep").expect("the grep tool is registered");
+    let context = ToolContext::new(dir.to_string_lossy().into_owned());
+    let result = tool
+        .run(
+            &json!({
+                "pattern": "needle",
+                "path": file.to_string_lossy(),
+                "context": 1,
+            }),
+            &context,
+        )
+        .await;
+    assert!(!result.is_error, "grep failed: {}", result.content);
+
+    assert_eq!(
+        result.content,
+        concat!(
+            "lone-cr.txt-1- beforeprogress\n",
+            "lone-cr.txt:2: needle\n",
+            "lone-cr.txt-3- after",
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

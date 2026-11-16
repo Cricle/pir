@@ -622,10 +622,32 @@ async fn generate_uses_the_context_window_budget_and_the_response_cap() {
 
 type FakeRespond = Arc<dyn Fn(usize, &Context) -> AssistantMessage + Send + Sync>;
 
+type SeenReasoning = Arc<std::sync::Mutex<Vec<Option<ThinkingLevel>>>>;
+
 fn fake_registry_for(respond: FakeRespond) -> Arc<ProviderRegistry> {
+    fake_registry(fake_model(4096, 256), respond, None)
+}
+
+/// A registry that also records the `StreamOptions.reasoning` of every request
+/// it serves, so a test can assert what the summarizer call carried.
+fn fake_registry_recording_reasoning(
+    model: Model,
+    respond: FakeRespond,
+    seen: SeenReasoning,
+) -> Arc<ProviderRegistry> {
+    fake_registry(model, respond, Some(seen))
+}
+
+fn fake_registry(
+    model: Model,
+    respond: FakeRespond,
+    seen: Option<SeenReasoning>,
+) -> Arc<ProviderRegistry> {
     struct FakeProvider {
+        model: Model,
         calls: AtomicUsize,
         respond: FakeRespond,
+        seen: Option<SeenReasoning>,
     }
     impl Provider for FakeProvider {
         fn id(&self) -> &str {
@@ -638,7 +660,7 @@ fn fake_registry_for(respond: FakeRespond) -> Arc<ProviderRegistry> {
             "Fake provider"
         }
         fn get_models(&self) -> Vec<Model> {
-            vec![fake_model(4096, 256)]
+            vec![self.model.clone()]
         }
         fn api_key_auth(&self) -> Vec<ApiKeyAuth> {
             vec![ApiKeyAuth::new("fake key", vec!["FAKE_TEST_KEY".into()])]
@@ -647,8 +669,13 @@ fn fake_registry_for(respond: FakeRespond) -> Arc<ProviderRegistry> {
             &self,
             _model: &Model,
             context: Context,
-            _options: StreamOptions,
+            options: StreamOptions,
         ) -> AssistantMessageEventStream {
+            if let Some(seen) = &self.seen {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(options.reasoning);
+            }
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
             let message = (self.respond)(index, &context);
             let stream = AssistantMessageEventStream::new();
@@ -661,8 +688,10 @@ fn fake_registry_for(respond: FakeRespond) -> Arc<ProviderRegistry> {
     }
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(FakeProvider {
+        model,
         calls: AtomicUsize::new(0),
         respond,
+        seen,
     }));
     Arc::new(registry)
 }
@@ -696,12 +725,28 @@ fn agent_with_session(
     registry: Arc<ProviderRegistry>,
     dir: &std::path::Path,
 ) -> Arc<AgentSession> {
+    agent_with_session_model(
+        session,
+        registry,
+        dir,
+        fake_model(4096, 256),
+        ThinkingLevel::Off,
+    )
+}
+
+fn agent_with_session_model(
+    session: SessionManager,
+    registry: Arc<ProviderRegistry>,
+    dir: &std::path::Path,
+    model: Model,
+    thinking: ThinkingLevel,
+) -> Arc<AgentSession> {
     Arc::new(AgentSession::new(AgentSessionConfig {
         performance: Default::default(),
         provider_registry: registry,
-        model: fake_model(4096, 256),
+        model,
         api_key: None,
-        thinking: ThinkingLevel::Off,
+        thinking,
         tools: ToolRegistry::new(),
         session: Some(session),
         compaction: None,
@@ -797,6 +842,209 @@ async fn navigate_tree_generates_and_persists_the_branch_summary() {
         leaf.as_deref(),
         navigation.summary_entry_id.as_deref(),
         "the attached summary entry is the new leaf"
+    );
+}
+
+#[tokio::test]
+async fn navigate_summary_request_carries_the_session_thinking_level() {
+    // Upstream #11482: the branch-summarization call used to run with
+    // `options` stripped (`{ maxTokens }` only), so a session at `high`/`xhigh`
+    // summarized at the provider default and the result looked unrelated to
+    // the conversation. The summarization model is the session's model, so the
+    // request must carry the live level.
+    let temp = TempDir::new("navigate-summary-thinking");
+    let mut model = fake_model(4096, 256);
+    model.reasoning = true;
+
+    for level in [ThinkingLevel::High, ThinkingLevel::Off] {
+        let (session, ids) = branched_session();
+        let seen: SeenReasoning = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = agent_with_session_model(
+            session,
+            fake_registry_recording_reasoning(
+                model.clone(),
+                Arc::new(|_index, _context| {
+                    assistant_text("## Goal\nbranch work", StopReason::Stop)
+                }),
+                Arc::clone(&seen),
+            ),
+            &temp.0,
+            model.clone(),
+            level,
+        );
+
+        agent
+            .navigate_tree(&ids[0], true, None, false, 16_384)
+            .await
+            .expect("storage configured")
+            .expect("navigation");
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // `Off` is pir's representation of "no effort" and every adapter
+        // treats it as unset, exactly like the upstream `undefined`.
+        assert!(!seen.is_empty(), "the navigation must call the summarizer");
+        assert!(
+            seen.iter().all(|reasoning| *reasoning == Some(level)),
+            "every summary request must carry the session's live level ({level:?}), saw {seen:?}"
+        );
+    }
+}
+
+/// A linear `u1 -> a1` session whose branch ends with a recorded
+/// `thinking_level_change`.
+fn session_with_recorded_level(level: &str) -> (SessionManager, String) {
+    let mut session = SessionManager::in_memory(".", None).expect("in-memory session");
+    session
+        .append_message(user_msg("first"))
+        .expect("append u1");
+    session
+        .append_message(Message::Assistant(assistant_text(
+            "answer",
+            StopReason::Stop,
+        )))
+        .expect("append a1");
+    let change = session
+        .append_thinking_level_change(level)
+        .expect("append thinking change");
+    (session, change)
+}
+
+#[tokio::test]
+async fn prompt_records_the_live_thinking_level_on_the_current_branch() {
+    // Upstream #11888 / #11451: tree navigation can leave the latest
+    // `thinking_level_change` on an abandoned branch, so a resume restored a
+    // stale level. The live level is recorded on the branch the next prompt
+    // continues, before the user message.
+    let temp = TempDir::new("record-thinking");
+    let mut model = fake_model(4096, 256);
+    model.reasoning = true;
+
+    // The branch last recorded `high`, but the live level is `low` (what a
+    // `/tree` back past the `/thinking` change plus a new `/thinking` leaves).
+    let (session, recorded) = session_with_recorded_level("high");
+    let agent = agent_with_session_model(
+        session,
+        fake_registry_for(Arc::new(|_index, _context| {
+            assistant_text("ok", StopReason::Stop)
+        })),
+        &temp.0,
+        model.clone(),
+        ThinkingLevel::Low,
+    );
+    agent
+        .prompt("next", Arc::new(|_event| {}))
+        .await
+        .expect("prompt");
+
+    let entries = agent
+        .with_session_manager(|manager| manager.entries())
+        .await
+        .expect("session manager");
+    let recorded_index = entries
+        .iter()
+        .position(|entry| entry.id() == Some(recorded.as_str()))
+        .expect("recorded change is on the branch");
+    let levels = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::ThinkingLevelChange(change) => Some(change.thinking_level.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        levels,
+        vec!["high".to_owned(), "low".to_owned()],
+        "the live level must be appended after the stale one"
+    );
+    let live_change_index = entries
+        .iter()
+        .position(|entry| {
+            matches!(entry, FileEntry::ThinkingLevelChange(change) if change.thinking_level == "low")
+        })
+        .expect("live change entry");
+    assert_eq!(
+        live_change_index,
+        recorded_index + 1,
+        "the live level is recorded BEFORE the prompt's user message"
+    );
+    assert!(matches!(
+        entries.get(live_change_index + 1),
+        Some(FileEntry::Message(MessageEntry { message, .. })) if message.role() == "user"
+    ));
+
+    // A level that only differs after clamping is not recorded over the
+    // requested one: `xhigh` on this model runs as `high`, so a live `high`
+    // matches and appends nothing.
+    let (session, _recorded) = session_with_recorded_level("xhigh");
+    let agent = agent_with_session_model(
+        session,
+        fake_registry_for(Arc::new(|_index, _context| {
+            assistant_text("ok", StopReason::Stop)
+        })),
+        &temp.0,
+        model.clone(),
+        ThinkingLevel::High,
+    );
+    agent
+        .prompt("next", Arc::new(|_event| {}))
+        .await
+        .expect("prompt");
+    let levels = agent
+        .with_session_manager(|manager| {
+            manager
+                .entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    FileEntry::ThinkingLevelChange(change) => Some(change.thinking_level),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .expect("session manager");
+    assert_eq!(
+        levels,
+        vec!["xhigh".to_owned()],
+        "a level that only differs by clamping must not be recorded"
+    );
+
+    // A branch with no recorded level keeps its absence.
+    let mut session = SessionManager::in_memory(".", None).expect("in-memory session");
+    session
+        .append_message(user_msg("first"))
+        .expect("append u1");
+    let agent = agent_with_session_model(
+        session,
+        fake_registry_for(Arc::new(|_index, _context| {
+            assistant_text("ok", StopReason::Stop)
+        })),
+        &temp.0,
+        model,
+        ThinkingLevel::High,
+    );
+    agent
+        .prompt("next", Arc::new(|_event| {}))
+        .await
+        .expect("prompt");
+    let levels = agent
+        .with_session_manager(|manager| {
+            manager
+                .entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    FileEntry::ThinkingLevelChange(change) => Some(change.thinking_level),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .expect("session manager");
+    assert!(
+        levels.is_empty(),
+        "no recorded level means nothing to record"
     );
 }
 
