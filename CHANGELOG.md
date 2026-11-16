@@ -119,6 +119,9 @@ v1.5.2, and the generated test harnesses were rebuilt.
   authorization endpoint and device verification URI, and the CLI/TUI replace
   control characters in server-supplied sign-in, device-code, and info text
   before displaying it (`#11849`).
+- Disposing an SDK session runtime aborts an in-flight run and waits for it to
+  settle, so the interrupted tool result and final assistant message are
+  persisted before extensions shut down (`#9124`/`#9126`).
 
 ### correctness
 

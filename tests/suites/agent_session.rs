@@ -23,6 +23,7 @@ use pir::ai::types::*;
 use pir::coding_agent::rpc::{RpcServer, SessionFactory};
 use pir::extensions::{ExtensionConfig, ExtensionHandle, Notification};
 use pir::plugins::{AgentPlugin, PluginEvent, PluginEventOutcome, PluginFuture, PluginInfo};
+use pir::sdk::AgentSessionRuntime;
 use pir::session_manager::SessionManager;
 
 // ---------------------------------------------------------------------------
@@ -695,6 +696,78 @@ async fn abort_mid_run_stops_the_loop() {
         .expect("agent_end event");
     assert_eq!(agent_end["aborted"], serde_json::json!(true));
     assert!(!agent.is_streaming());
+}
+
+#[tokio::test]
+async fn runtime_dispose_settles_an_interrupted_tool_result() {
+    let temp = TempDir::new("dispose-settle");
+    // The gate never opens; only the dispose abort can end the tool.
+    let (_gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![tool_call("call-1", "gate")], StopReason::ToolUse)
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let agent = Arc::new(AgentSession::new(AgentSessionConfig {
+        performance: Default::default(),
+        provider_registry: registry,
+        model: fake_model(),
+        api_key: None,
+        thinking: ThinkingLevel::Off,
+        tools: tool_registry_with(Some((gate_rx, entered.clone()))),
+        session: Some(session),
+        compaction: None,
+        max_turns: 4,
+        system_prompt: None,
+        cwd: Some(temp.0.clone()),
+        event_stream: None,
+        extensions: None,
+        tool_selection: None,
+    }));
+    let runtime =
+        AgentSessionRuntime::new(Arc::clone(&agent), temp.0.clone(), temp.0.clone(), None);
+
+    let events: EventLog = Arc::new(Mutex::new(Vec::new()));
+    let prompt_task = tokio::spawn({
+        let agent = Arc::clone(&agent);
+        async move { agent.prompt("start", event_handler(events)).await }
+    });
+    wait_for_tool_entry(&entered).await;
+
+    // Upstream #9126/#9124: dispose aborts and waits for the run to settle,
+    // so the transcript has the interrupted tool result when it returns.
+    runtime.dispose().await.expect("dispose");
+    assert!(
+        !agent.is_streaming(),
+        "dispose waited for the run claim to release"
+    );
+    let prompt_result = prompt_task
+        .await
+        .expect("prompt task")
+        .expect("prompt result");
+    assert_eq!(prompt_result.stop_reason, StopReason::ToolUse);
+
+    let entries = agent
+        .with_session_manager(|manager| manager.entries())
+        .await
+        .expect("session manager");
+    let aborted_result = entries.iter().any(|entry| {
+        match entry {
+        pir::session_manager::FileEntry::Message(message) => match &message.message {
+            pir::session_manager::types::StoredMessage::ToolResult(result) => {
+                result.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(text) if text.text.contains("aborted"))
+                })
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+    });
+    assert!(
+        aborted_result,
+        "the interrupted tool result is stored before disposal: {entries:?}"
+    );
 }
 
 #[tokio::test]

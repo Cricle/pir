@@ -455,8 +455,14 @@ impl AgentSessionRuntime {
         })
     }
 
-    /// Tear down the extension runtime (upstream `dispose`).
+    /// Tear down the extension runtime (upstream `dispose`). An in-flight run
+    /// is aborted and allowed to settle first, so the interrupted tool result
+    /// and final assistant message are persisted before extensions shut down
+    /// (upstream #9124: disposing during tool execution used to leave a stored
+    /// tool call without its result).
     pub async fn dispose(&self) -> Result<(), SdkError> {
+        self.session.abort();
+        self.session.wait_until_idle().await;
         if let Some(handle) = self.session.extensions_handle() {
             handle
                 .shutdown()
