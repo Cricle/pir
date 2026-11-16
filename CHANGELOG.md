@@ -94,6 +94,9 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - A custom find backend is asked for `limit + 1` results; the tool shows at
   most `limit` and only prints the limit notice when the extra result exists
   (`#11747`).
+- Windows resource dedupe and package source matching fold path casing, so a
+  project directory reached through a differently-cased path is not loaded
+  twice or treated as another package (`#11588`).
 
 ### correctness
 

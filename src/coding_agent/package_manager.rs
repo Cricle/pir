@@ -971,7 +971,12 @@ fn source_identity_with(source: &str, local: impl FnOnce(&str) -> PathBuf) -> St
     match parse_source(source) {
         ParsedSource::Npm(npm) => format!("npm:{}", npm.name),
         ParsedSource::Git { host, path, .. } => format!("git:{host}/{path}"),
-        ParsedSource::Local { path } => format!("local:{}", local(&path).display()),
+        // Matching only: package identity folds Windows path casing so
+        // `remove c:\pkg` matches a configured `C:\pkg` (#11588).
+        ParsedSource::Local { path } => format!(
+            "local:{}",
+            crate::config::trust::path_comparison_key(&local(&path)).display()
+        ),
     }
 }
 

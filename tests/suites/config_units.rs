@@ -533,8 +533,8 @@ fn max_turns_defaults_to_1000_and_accepts_positive_env_overrides() {
 // ---------------------------------------------------------------------------
 
 use pir::config::trust::{
-    has_trust_requiring_project_resources, normalize_cwd, read_trust_file, resolve_project_trusted,
-    ProjectTrustResolution, ProjectTrustStore,
+    has_trust_requiring_project_resources, normalize_cwd, path_comparison_key_for, read_trust_file,
+    resolve_project_trusted, ProjectTrustResolution, ProjectTrustStore,
 };
 
 /// Strip the Windows `\\?\` prefix the way `normalize_cwd` does.
@@ -881,4 +881,28 @@ fn saved_do_not_trust_wins_without_trust_requiring_resources() {
 
     let _ = fs::remove_dir_all(&agent);
     let _ = fs::remove_dir_all(&project);
+}
+
+/// Upstream #11588: comparison keys fold Windows path casing, while POSIX
+/// paths stay case-sensitive. Stored/displayed paths are untouched.
+#[test]
+fn path_comparison_key_folds_case_on_windows_only() {
+    let upper = std::path::Path::new(r"C:\Users\Me\Project");
+    let lower = std::path::Path::new(r"c:\users\me\project");
+    assert_eq!(
+        path_comparison_key_for(upper, true),
+        path_comparison_key_for(lower, true)
+    );
+    assert_ne!(
+        path_comparison_key_for(upper, false),
+        path_comparison_key_for(lower, false)
+    );
+    assert_eq!(
+        path_comparison_key_for(std::path::Path::new("/home/Me"), false),
+        std::path::PathBuf::from("/home/Me")
+    );
+    assert_eq!(
+        path_comparison_key_for(std::path::Path::new("/home/Me"), true),
+        std::path::PathBuf::from("/home/me")
+    );
 }

@@ -50,6 +50,27 @@ pub fn normalize_cwd(cwd: &Path) -> PathBuf {
     }
 }
 
+/// A comparison-only identity for a filesystem path (upstream
+/// `getPathComparisonKey`, #11588): [`normalize_cwd`], lowercased on Windows
+/// because drive-letter/directory casing is not significant there. It never
+/// changes a stored or displayed path; callers use it for dedupe and
+/// matching only.
+pub fn path_comparison_key(path: &Path) -> PathBuf {
+    path_comparison_key_for(path, cfg!(windows))
+}
+
+/// [`path_comparison_key`] with the platform switch injectable for tests on a
+/// case-sensitive host.
+#[doc(hidden)]
+pub fn path_comparison_key_for(path: &Path, windows: bool) -> PathBuf {
+    let normalized = normalize_cwd(path);
+    if windows {
+        PathBuf::from(normalized.to_string_lossy().to_lowercase())
+    } else {
+        normalized
+    }
+}
+
 /// The trust options offered by the interactive selector (upstream
 /// `getProjectTrustOptions`).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 
 use crate::coding_agent::package_manager::TopLevelResourceFilter;
 use crate::coding_agent::prompt_templates::{load_templates_from_dir, PromptTemplate};
-use crate::config::trust::normalize_cwd;
 use crate::skills::{
     discover_skills_with_diagnostics, load_skill_from_file, SkillDiagnostic, SkillInfo,
 };
@@ -212,8 +211,10 @@ impl AgentsSkillDirs {
             collect_ancestor_agents_skill_dirs(cwd)
                 .into_iter()
                 .filter(|dir| {
-                    user.as_ref()
-                        .is_none_or(|user| normalize_cwd(dir) != normalize_cwd(user))
+                    user.as_ref().is_none_or(|user| {
+                        crate::config::trust::path_comparison_key(dir)
+                            != crate::config::trust::path_comparison_key(user)
+                    })
                 })
                 .collect()
         } else {
