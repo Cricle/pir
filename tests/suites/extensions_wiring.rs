@@ -963,7 +963,10 @@ mod shim_deflate {
             // `event.contentIndex` (packages/ai/src/types.ts:823-831).
             // #11546: `pi.exec` forwards `options.maxBuffer` and turns the
             // host's RangeError carrier into a JS error.
-            "93fa8a2969da7ab50b88b8d6e3ea8c62a62ba15a3fb2f5d510532f38892db26e",
+            // #11630: host-resolved `keyText`/`keyHint` are injected into
+            // `ToolRenderContext`, `MessageRenderOptions`, and
+            // `EntryRenderOptions`.
+            "45a68a8e771059aa331794fed6c539c088a1337b78ad1023dd0b95f36e8168a8",
         ),
         (
             "process_global_stub.js.txt",
