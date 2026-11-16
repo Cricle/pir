@@ -86,10 +86,14 @@
 //! by `declared_tools`; the only remaining delay is the one-request window
 //! above.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::BoxFuture;
@@ -121,22 +125,42 @@ const STOP_WORDS: [&str; 21] = [
 ];
 
 /// Lowercase, split camelCase and non-alphanumeric runs, drop stop words,
-/// naive-stem plurals (upstream `tokenize` / `stem`, tool.ts:64-80).
+/// naive-stem plurals (upstream `tokenize` / `stem`, tool.ts:73-96). Text in
+/// any script is NFC-normalized and segmented with UAX #29 word boundaries,
+/// so Chinese/Japanese/Thai queries and canonically equivalent accents match
+/// (#11037).
 pub fn tokenize(text: &str) -> Vec<String> {
+    let normalized = if text.is_ascii() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.nfc().collect())
+    };
     let mut tokens = Vec::new();
-    for raw in split_identifier_words(text) {
+    for raw in split_identifier_words(&normalized) {
         let lowered = raw.to_lowercase();
         if lowered.is_empty() || STOP_WORDS.contains(&lowered.as_str()) {
             continue;
         }
-        tokens.push(stem(&lowered));
+        // Upstream stems only ASCII words (`/^[a-z0-9]+$/`); stemming a
+        // Unicode plural such as `cafés` would corrupt it.
+        tokens.push(
+            if lowered
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+            {
+                stem(&lowered)
+            } else {
+                lowered
+            },
+        );
     }
     tokens
 }
 
 /// camelCase / snake_case / kebab-case aware word split (upstream
 /// `tokenize`'s pipeline: `([a-z0-9])([A-Z])` -> `$1 $2`,
-/// `([A-Z]+)([A-Z][a-z])` -> `$1 $2`, lowercase, then `split(/[^a-z0-9]+/)`).
+/// `([A-Z]+)([A-Z][a-z])` -> `$1 $2`, lowercase, then
+/// `split(/[^\p{L}\p{M}\p{N}]+/)`).
 fn split_identifier_words(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     // Pass 1: a lowercase letter or digit immediately followed by an
@@ -167,12 +191,24 @@ fn split_identifier_words(text: &str) -> Vec<String> {
         }
         second.push(*character);
     }
-    second
-        .to_lowercase()
-        .split(|character: char| !character.is_ascii_lowercase() && !character.is_ascii_digit())
-        .filter(|word| !word.is_empty())
-        .map(str::to_owned)
-        .collect()
+    // Lowercase and replace non-letter/mark/digit runs with spaces. Scripts
+    // without spaces are then split at word boundaries; pure-ASCII text
+    // splits at its spaces, like upstream's fast path.
+    let mut cleaned = String::with_capacity(second.len());
+    for character in second.chars() {
+        for lower in character.to_lowercase() {
+            if lower.is_alphanumeric() || is_combining_mark(lower) {
+                cleaned.push(lower);
+            } else {
+                cleaned.push(' ');
+            }
+        }
+    }
+    if cleaned.is_ascii() {
+        cleaned.split_whitespace().map(str::to_owned).collect()
+    } else {
+        cleaned.unicode_words().map(str::to_owned).collect()
+    }
 }
 
 /// Naive plural stem (upstream `stem`, tool.ts:64-69).

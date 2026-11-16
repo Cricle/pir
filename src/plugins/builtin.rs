@@ -334,10 +334,13 @@ pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 pub(crate) mod tool_search;
 
 /// Public re-export of the `tool-search` builtin (tests and embedders).
-/// [`Bm25Ranker`](tool_search::Bm25Ranker) rides along for the
+/// [`Bm25Ranker`](tool_search::Bm25Ranker) and
+/// [`tokenize`](tool_search::tokenize) ride along for the text-pipeline and
 /// ordering-determinism tests (the documented score-desc/name-asc key).
 #[cfg(feature = "tool-search")]
-pub use tool_search::{tool_search_document_text, Bm25Document, Bm25Ranker, ToolSearchPlugin};
+pub use tool_search::{
+    tokenize, tool_search_document_text, Bm25Document, Bm25Ranker, ToolSearchPlugin,
+};
 
 #[cfg(feature = "tool-search")]
 fn new_tool_search_plugin() -> Arc<dyn AgentPlugin> {

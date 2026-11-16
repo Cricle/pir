@@ -9,6 +9,10 @@
 
 use std::borrow::Cow;
 
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
+
 /// One searchable document.
 #[derive(Clone, Copy, Debug)]
 pub struct SearchDocument<'a> {
@@ -51,14 +55,20 @@ fn stem(term: &str) -> Cow<'_, str> {
 
 /// Visit the terms of `text` in order, reusing one token buffer.
 ///
-/// This is the single-pass form of the old
-/// `split_camel_case(text).to_lowercase().split(...)` pipeline: it inserts the
-/// same camelCase boundaries (judged on the original characters), lowercases
-/// each character exactly like `str::to_lowercase` (including expansions such
-/// as `İ` → `i̇`), splits on lowercased non-ASCII-alphanumerics, drops stop
-/// words and applies [`stem`]. It never allocates a whole-text copy; the
-/// per-token buffer is reused across terms.
+/// ASCII text keeps the single-pass form of the old
+/// `split_camel_case(text).to_lowercase().split(...)` pipeline (no whole-text
+/// copies). Text in any other script is NFC-normalized and split at UAX #29
+/// word boundaries, so Chinese/Japanese/Thai terms and canonically
+/// equivalent accents match (upstream `tokenize`, #11037).
 fn for_each_token(text: &str, mut visit: impl FnMut(&str)) {
+    if text.is_ascii() {
+        for_each_ascii_token(text, &mut visit);
+    } else {
+        for_each_unicode_token(text, &mut visit);
+    }
+}
+
+fn for_each_ascii_token(text: &str, visit: &mut impl FnMut(&str)) {
     let mut current = String::new();
     let mut previous: Option<char> = None;
     let mut chars = text.chars().peekable();
@@ -72,30 +82,78 @@ fn for_each_token(text: &str, mut visit: impl FnMut(&str)) {
                 && character.is_ascii_uppercase()
                 && chars.peek().is_some_and(|next| next.is_ascii_lowercase());
             if lower_then_upper || acronym_then_word {
-                flush_token(&mut current, &mut visit);
+                flush_token(&mut current, visit);
             }
         }
         for lower in character.to_lowercase() {
             if lower.is_ascii_alphanumeric() {
                 current.push(lower);
             } else {
-                flush_token(&mut current, &mut visit);
+                flush_token(&mut current, visit);
             }
         }
         previous = Some(character);
     }
-    flush_token(&mut current, &mut visit);
+    flush_token(&mut current, visit);
+}
+
+fn for_each_unicode_token(text: &str, visit: &mut impl FnMut(&str)) {
+    let normalized: String = text.nfc().collect();
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut cleaned = String::with_capacity(normalized.len() + 8);
+    for (index, character) in chars.iter().enumerate() {
+        if index > 0 {
+            let previous = chars[index - 1];
+            let lower_then_upper = (previous.is_ascii_lowercase() || previous.is_ascii_digit())
+                && character.is_ascii_uppercase();
+            let acronym_then_word = previous.is_ascii_uppercase()
+                && character.is_ascii_uppercase()
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_lowercase());
+            if lower_then_upper || acronym_then_word {
+                cleaned.push(' ');
+            }
+        }
+        for lower in character.to_lowercase() {
+            if lower.is_alphanumeric() || is_combining_mark(lower) {
+                cleaned.push(lower);
+            } else {
+                cleaned.push(' ');
+            }
+        }
+    }
+    if cleaned.is_ascii() {
+        for word in cleaned.split_whitespace() {
+            visit_word(word, visit);
+        }
+    } else {
+        for word in cleaned.unicode_words() {
+            visit_word(word, visit);
+        }
+    }
 }
 
 fn flush_token(current: &mut String, visit: &mut impl FnMut(&str)) {
     if current.is_empty() {
         return;
     }
-    if !is_stop_word(current) {
-        let stemmed = stem(current);
-        visit(stemmed.as_ref());
-    }
+    visit_word(current, visit);
     current.clear();
+}
+
+fn visit_word(word: &str, visit: &mut impl FnMut(&str)) {
+    if word.is_empty() || is_stop_word(word) {
+        return;
+    }
+    // Upstream stems only ASCII words; stemming a Unicode plural such as
+    // `cafés` would corrupt it.
+    if word.is_ascii() {
+        let stemmed = stem(word);
+        visit(stemmed.as_ref());
+    } else {
+        visit(word);
+    }
 }
 
 /// Lowercase terms, split at camelCase boundaries and non-alphanumerics,

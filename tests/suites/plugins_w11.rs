@@ -471,6 +471,53 @@ fn bm25_keeps_score_descending_as_the_primary_key() {
     );
 }
 
+/// #11037: tokenization keeps non-ASCII words (it used to keep only ASCII
+/// letters and digits), NFC-normalizes canonically equivalent text, and a
+/// query in another script finds its document.
+#[cfg(feature = "tool-search")]
+#[test]
+fn bm25_matches_unicode_terms_in_any_script() {
+    use pir::plugins::builtin::{tokenize, Bm25Ranker};
+
+    let russian = tokenize("Поиск документов");
+    assert!(
+        russian.contains(&"поиск".to_owned()) && russian.contains(&"документов".to_owned()),
+        "Cyrillic words survive: {russian:?}"
+    );
+    let chinese = tokenize("搜索仓库问题");
+    assert!(
+        !chinese.is_empty(),
+        "text without spaces must not tokenize to nothing"
+    );
+    assert_eq!(
+        tokenize("café"),
+        tokenize("cafe\u{301}"),
+        "NFC makes canonically equivalent text identical"
+    );
+    assert_eq!(
+        tokenize("cafés"),
+        vec!["cafés"],
+        "only ASCII words get the naive plural stem"
+    );
+
+    for (query, text) in [
+        ("Поиск документов", "поиск документов сервера"),
+        ("搜索仓库问题", "搜索仓库问题"),
+        ("café", "cafe\u{301} au lait"),
+    ] {
+        let ranker = Bm25Ranker::new(vec![
+            ("target".to_owned(), text.to_owned()),
+            ("other".to_owned(), "unrelated words here".to_owned()),
+        ]);
+        let ranked = ranker.rank(query, 8);
+        assert_eq!(
+            ranked.first().map(|(name, _)| name.as_str()),
+            Some("target"),
+            "query {query:?} finds its document: {ranked:?}"
+        );
+    }
+}
+
 /// `ae823bc0b` #11331: a query that names a tool ranks it first (upstream
 /// `tool.ts`, `isExactNameQuery`); after #11625 the name field also outweighs
 /// description mentions, so a name term keeps the tool first for a partial

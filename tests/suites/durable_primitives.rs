@@ -41,6 +41,51 @@ fn tokenize_lowercases_splits_camel_case_and_drops_stop_words() {
 }
 
 #[test]
+fn tokenize_supports_unicode_text_and_scripts_without_spaces() {
+    // #11037: the old tokenizer kept only ASCII letters and digits, so these
+    // terms were dropped and search found nothing.
+    let russian = tokenize("Поиск документов");
+    assert!(
+        russian.contains(&"поиск".to_owned()) && russian.contains(&"документов".to_owned()),
+        "Cyrillic words survive: {russian:?}"
+    );
+    assert!(
+        !tokenize("搜索仓库问题").is_empty(),
+        "text without spaces must not tokenize to nothing"
+    );
+    assert_eq!(
+        tokenize("café"),
+        tokenize("cafe\u{301}"),
+        "NFC makes canonically equivalent text identical"
+    );
+    assert_eq!(
+        tokenize("cafés"),
+        vec!["cafés"],
+        "only ASCII words get the naive plural stem"
+    );
+
+    for (query, text) in [
+        ("Поиск документов", "поиск документов сервера"),
+        ("搜索仓库问题", "搜索仓库问题"),
+        ("café", "cafe\u{301} au lait"),
+    ] {
+        let names = rank_documents(
+            query,
+            &[
+                document("target", text),
+                document("other", "unrelated words here"),
+            ],
+            8,
+        );
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("target"),
+            "query {query:?} finds its document: {names:?}"
+        );
+    }
+}
+
+#[test]
 fn tokenize_applies_the_naive_singular_form() {
     // The implementation ports upstream's plural stripping, not a Porter
     // stemmer: "issues" matches "issue", and every `s`-suffix rule maps the

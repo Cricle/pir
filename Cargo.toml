@@ -314,10 +314,11 @@ ciborium = "0.2.2"
 crossterm = { version = "0.29.0", optional = true }
 unicode-width = "0.2.2"
 # Grapheme-cluster segmentation for the TUI width/cursor layer (UAX #29
-# extended clusters: ZWJ emoji, flags, skin tones, keycaps, combining marks).
-# Rust's `Intl.Segmenter` equivalent, already in the lock as a transitive dep
-# (MIT/Apache-2.0) — this promotes it to a direct dependency edge only.
-unicode-segmentation = { version = "1.13", optional = true }
+# extended clusters: ZWJ emoji, flags, skin tones, keycaps, combining marks)
+# and word segmentation for tool search in any script. Rust's `Intl.Segmenter`
+# equivalent, already in the lock as a transitive dep (MIT/Apache-2.0) — this
+# promotes it to a direct dependency edge only.
+unicode-segmentation = "1.13"
 # Mermaid code-block rendering (src/tui/mermaid.rs): the ecosystem Unicode
 # box-drawing renderer that replaced the hand-written grok-mermaid port.
 # Clean tree: MIT, MSRV 1.92, three deps (ascii-dag, chrono, unicode-width).
@@ -598,7 +599,6 @@ tui = [
     "dep:crossterm_winapi",
     "dep:arboard",
     "dep:notify",
-    "dep:unicode-segmentation",
     "dep:mermaid-text",
     # The TUI `/export` command renders a session through
     # `coding_agent::export_html`; the feature (and its module) follows.
