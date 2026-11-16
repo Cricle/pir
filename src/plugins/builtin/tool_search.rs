@@ -86,7 +86,7 @@
 //! by `declared_tools`; the only remaining delay is the one-request window
 //! above.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -465,7 +465,8 @@ fn tool_document(
 ) -> (String, String) {
     let mut text = description.to_owned();
     if let Some(schema) = parameters {
-        append_schema_text(schema, &mut text);
+        let mut seen = HashSet::from([schema as *const Value as usize]);
+        append_schema_text(schema, schema, &mut text, &mut seen);
     }
     let mut namespace_text = String::new();
     if let Some(namespace) = namespace {
@@ -493,10 +494,29 @@ fn tool_document(
 /// object-valued `items`, and the `anyOf`/`oneOf`/`allOf` variant arrays.
 /// Array-valued `items` and non-object variants contribute nothing, exactly
 /// like upstream's `isObject` guard.
-fn append_schema_text(schema: &Value, document: &mut String) {
+///
+/// Local `$ref`s are followed (upstream #11850): MCP/Pydantic tools put
+/// nested models in `$defs`, and without this their descriptions are not
+/// searchable. Each referenced subschema is read once, so recursive and
+/// shared definitions neither loop nor inflate the BM25 term counts;
+/// unreferenced `$defs` and remote refs stay out.
+fn append_schema_text(
+    schema: &Value,
+    root: &Value,
+    document: &mut String,
+    seen: &mut HashSet<usize>,
+) {
     let Value::Object(map) = schema else {
         return;
     };
+    if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+        if let Some(target) = resolve_local_schema_ref(root, reference) {
+            let key = target as *const Value as usize;
+            if seen.insert(key) {
+                append_schema_text(target, root, document, seen);
+            }
+        }
+    }
     if let Some(description) = map.get("description").and_then(Value::as_str) {
         document.push(' ');
         document.push_str(description);
@@ -505,19 +525,71 @@ fn append_schema_text(schema: &Value, document: &mut String) {
         for (name, property) in properties {
             document.push(' ');
             document.push_str(name);
-            append_schema_text(property, document);
+            append_schema_text(property, root, document, seen);
         }
     }
     if let Some(items) = map.get("items") {
-        append_schema_text(items, document);
+        append_schema_text(items, root, document, seen);
     }
     for key in ["anyOf", "oneOf", "allOf"] {
         if let Some(variants) = map.get(key).and_then(Value::as_array) {
             for variant in variants {
-                append_schema_text(variant, document);
+                append_schema_text(variant, root, document, seen);
             }
         }
     }
+}
+
+/// Resolve one local JSON Pointer (`#/$defs/x`) against `root` (upstream
+/// `resolveSchemaRef`): `~1`/`~0` escapes, array indices, and percent
+/// decoding; a remote ref, a missing target, or a malformed escape resolves
+/// to nothing.
+fn resolve_local_schema_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#')?;
+    if pointer.is_empty() {
+        return Some(root);
+    }
+    let pointer = pointer.strip_prefix('/')?;
+    let mut current = root;
+    for segment in pointer.split('/') {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        let segment = percent_decode(&segment)?;
+        current = match current {
+            Value::Object(map) => map.get(&segment)?,
+            Value::Array(array) => array.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+/// Decode `%xx` escapes in a JSON Pointer segment; invalid UTF-8 or an
+/// incomplete escape resolves to nothing instead of throwing.
+fn percent_decode(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = segment.get(index + 1..index + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The searchable text for one tool schema (`#[doc(hidden)]` seam for the
+/// `$ref` regression tests).
+#[doc(hidden)]
+pub fn tool_search_document_text(description: &str, parameters: &Value) -> String {
+    let mut text = description.to_owned();
+    let mut seen = HashSet::from([parameters as *const Value as usize]);
+    append_schema_text(parameters, parameters, &mut text, &mut seen);
+    text
 }
 
 // ---------------------------------------------------------------------------

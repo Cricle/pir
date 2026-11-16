@@ -255,8 +255,9 @@ provider-login redirect for `auth.provider` servers (#11791);
 (#11891); the Windows PowerShell 5.1 native exit-code suffix (#11964);
 transport errors that retain the deepest cause (#11783); shared
 indentation preserved in single-line edit diffs (#9274); the custom find
-backend's `limit + 1` proof (#11747); and case-folded Windows resource and
-package path keys (#11588).
+backend's `limit + 1` proof (#11747); case-folded Windows resource and
+package path keys (#11588); and local `$ref` following in tool search
+(#11850).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP

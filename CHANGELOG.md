@@ -97,6 +97,10 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - Windows resource dedupe and package source matching fold path casing, so a
   project directory reached through a differently-cased path is not loaded
   twice or treated as another package (`#11588`).
+- Tool search follows local `$ref`s into `$defs` (escaped/percent segments
+  included) once per definition, so MCP/Pydantic nested-model descriptions
+  are searchable without recursive or shared definitions inflating BM25
+  counts (`#11850`).
 
 ### correctness
 

@@ -602,6 +602,45 @@ fn bm25_ranks_more_query_term_coverage_first() {
     );
 }
 
+/// `6d3e342b` #11850: MCP/Pydantic schemas keep nested models in `$defs`;
+/// the search text follows local `$ref`s (including escaped and percent
+/// segments) once, ignores remote refs and unreferenced definitions, and
+/// terminates on recursion.
+#[cfg(feature = "tool-search")]
+#[test]
+fn tool_search_text_follows_local_schema_refs() {
+    let parameters = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "options": { "$ref": "#/$defs/options" },
+            "tree": { "$ref": "#/$defs/node" },
+            "escaped": { "$ref": "#/$defs/a~1b" },
+            "encoded": { "$ref": "#/$defs/space%20name" },
+            "remote": { "$ref": "https://example.invalid/schema" }
+        },
+        "$defs": {
+            "options": {
+                "properties": { "mode": { "description": "reconciliation" } }
+            },
+            "node": {
+                "properties": { "child": { "$ref": "#/$defs/node" } }
+            },
+            "a/b": { "description": "slash definition" },
+            "space name": { "description": "percent definition" },
+            "unused": { "description": "unreferenced-token" }
+        }
+    });
+    let text = pir::plugins::builtin::tool_search_document_text("Inspect records", &parameters);
+    assert!(text.contains("reconciliation"), "{text}");
+    assert!(text.contains("slash definition"), "{text}");
+    assert!(text.contains("percent definition"), "{text}");
+    assert!(!text.contains("unreferenced-token"), "{text}");
+    assert!(
+        !text.contains("example.invalid"),
+        "remote refs stay out: {text}"
+    );
+}
+
 /// `cc44fa216` #11625: a query term in the tool's name outweighs any number
 /// of mentions in the description.
 #[cfg(feature = "tool-search")]
