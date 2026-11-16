@@ -41,6 +41,7 @@ diagnostics; upstream-relative pages with no counterpart are in [MAPPING.md](../
 | Page | Contents |
 |---|---|
 | [upstream-drift-status.md](upstream-drift-status.md) | Verified upstream drift through v1.5.2: 641 commits, 130 touching ported source, per-commit Landed/Partial/Open/N-A evidence |
+| [upstream-next-plan.md](upstream-next-plan.md) | Remaining v1.5.2 follow-ups: A/B blocker, Wave A/B/C plan with upstream citations |
 | [system-prompt-audit.md](system-prompt-audit.md) | System prompt audit vs upstream: aligned sections, open deviations, host matrix, fix priorities |
 | [memory-builtin-ab-2026-11-10.md](memory-builtin-ab-2026-11-10.md) | Post-0.3.1 real-agent A/B: Q&A tokens, short-edit routing gate, cache-accounting caveats |
 | [performance-profiles.md](performance-profiles.md) | `performance.profile` presets, loadout deltas, measurement method |

@@ -261,8 +261,12 @@ package path keys (#11588); and local `$ref` following in tool search
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP
-refresh-only guard; `pi auth login/logout` flags; case-insensitive Windows
-resource keys; and the remaining queue/window edge items.
+refresh-only/redirect/cancel guards; `pi auth login/logout` flags;
+trust-store path casing; untrusted URL/terminal-text hardening; and the
+remaining queue/window/DX items (keybinding hints, page keys, Unicode
+segmentation, SDK dispose, Anthropic root `$defs`, package-update summary).
+The prioritized Wave A/B/C breakdown with `file:line` evidence is
+[`upstream-next-plan.md`](upstream-next-plan.md).
 
 **Deferred / large (not a parity bug)**: Anthropic message threads,
 Bedrock strict-tool fallback, the pi-schema coercion superset, extension
