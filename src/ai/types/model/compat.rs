@@ -197,6 +197,16 @@ pub struct OpenAiCompat {
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_non_null_assistant_content: Option<bool>,
+    /// Whether a request without tools must still send `"tools": []` when the
+    /// transcript has tool calls/results (upstream
+    /// `requiresToolsWithToolHistory`; needed by older LiteLLM proxies in
+    /// front of Anthropic).
+    #[serde(
+        default,
+        rename = "requiresToolsWithToolHistory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_tools_with_tool_history: Option<bool>,
     /// Whether thinking blocks must be replayed as plain text (upstream
     /// `requiresThinkingAsText`).
     #[serde(
@@ -420,6 +430,7 @@ impl Default for OpenAiCompat {
             requires_tool_result_name: None,
             requires_assistant_after_tool_result: None,
             requires_non_null_assistant_content: None,
+            requires_tools_with_tool_history: None,
             requires_thinking_as_text: None,
             requires_reasoning_content_on_assistant_messages: None,
             zai_tool_stream: None,
@@ -532,6 +543,9 @@ impl OpenAiCompat {
         }
         if over.requires_non_null_assistant_content.is_some() {
             merged.requires_non_null_assistant_content = over.requires_non_null_assistant_content;
+        }
+        if over.requires_tools_with_tool_history.is_some() {
+            merged.requires_tools_with_tool_history = over.requires_tools_with_tool_history;
         }
         if over.requires_thinking_as_text.is_some() {
             merged.requires_thinking_as_text = over.requires_thinking_as_text;

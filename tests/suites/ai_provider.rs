@@ -930,7 +930,8 @@ fn openai_prompt_cache_key_and_retention_gating() {
 }
 
 /// No tools + no tool history -> `tools` omitted; tool history without
-/// declared tools -> `"tools": []` (upstream openai-completions.ts:855-863).
+/// declared tools omits it too unless `requiresToolsWithToolHistory` asks
+/// for `"tools": []` (upstream #11891, openai-completions.ts:849-854).
 #[test]
 fn openai_tools_two_branch_behavior() {
     let model = parity_model("openai", "https://example.invalid/v1");
@@ -949,7 +950,8 @@ fn openai_tools_two_branch_behavior() {
     .expect("body");
     assert!(body.get("tools").is_none());
 
-    // Tool history (assistant tool call) without declared tools: [].
+    // Tool history (assistant tool call) without declared tools: omitted by
+    // default (vLLM 0.20+ rejects `tools: []`), `[]` only on the opt-in.
     let call = ContentBlock::ToolCall(ToolCall {
         id: "call_1".into(),
         name: "search".into(),
@@ -958,7 +960,7 @@ fn openai_tools_two_branch_behavior() {
         namespace: None,
         arguments_error: None,
     });
-    let context = Context {
+    let tool_history_context = Context {
         messages: vec![
             Message::Assistant(AssistantMessage {
                 api: "openai-completions".into(),
@@ -974,9 +976,22 @@ fn openai_tools_two_branch_behavior() {
     };
     let body = build_openai_body(
         &model,
-        &context,
+        &tool_history_context,
         &StreamOptions::default(),
         &OpenAiCompat::default(),
+    )
+    .expect("body");
+    assert!(body.get("tools").is_none());
+
+    let legacy_proxy = OpenAiCompat {
+        requires_tools_with_tool_history: Some(true),
+        ..OpenAiCompat::default()
+    };
+    let body = build_openai_body(
+        &model,
+        &tool_history_context,
+        &StreamOptions::default(),
+        &legacy_proxy,
     )
     .expect("body");
     assert_eq!(body["tools"], json!([]));
@@ -2700,4 +2715,73 @@ fn simple_max_tokens_clamp_leaves_openrouter_input_overcount_room() {
         ..Context::default()
     };
     assert_eq!(clamp_max_tokens_to_context(&model, &context, 1_000), 1_000);
+}
+
+/// Upstream #11783: a generic "Connection error." keeps the deepest cause
+/// (`fetch failed` → `connect ECONNREFUSED`), including its OS code.
+#[test]
+fn transport_error_keeps_the_deepest_cause() {
+    #[derive(Debug)]
+    struct Layer {
+        message: &'static str,
+        cause: Option<Box<dyn std::error::Error + 'static>>,
+    }
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause.as_deref()
+        }
+    }
+
+    let generic = Layer {
+        message: "Connection error.",
+        cause: Some(Box::new(Layer {
+            message: "fetch failed",
+            cause: Some(Box::new(Layer {
+                message: "connect ECONNREFUSED 127.0.0.1:8080",
+                cause: None,
+            })),
+        })),
+    };
+    assert_eq!(
+        pir::ai::util::error_with_cause_detail(&generic),
+        "Connection error.: connect ECONNREFUSED 127.0.0.1:8080"
+    );
+
+    // The deepest io::Error's OS code is appended when its own message does
+    // not already carry it (localized texts are not assumed).
+    let code = if cfg!(windows) { 10061 } else { 111 };
+    let with_code = Layer {
+        message: "Connection error.",
+        cause: Some(Box::new(std::io::Error::from_raw_os_error(code))),
+    };
+    let detail = pir::ai::util::error_with_cause_detail(&with_code);
+    assert!(detail.starts_with("Connection error.: "), "{detail}");
+    assert!(detail.contains(&code.to_string()), "{detail}");
+
+    let no_cause = Layer {
+        message: "Connection error.",
+        cause: None,
+    };
+    assert_eq!(
+        pir::ai::util::error_with_cause_detail(&no_cause),
+        "Connection error."
+    );
+
+    // An already-included detail does not repeat.
+    let included = Layer {
+        message: "Connection error: connect ECONNREFUSED",
+        cause: Some(Box::new(Layer {
+            message: "connect ECONNREFUSED",
+            cause: None,
+        })),
+    };
+    assert_eq!(
+        pir::ai::util::error_with_cause_detail(&included),
+        "Connection error: connect ECONNREFUSED"
+    );
 }

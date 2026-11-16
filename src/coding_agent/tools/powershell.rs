@@ -53,6 +53,29 @@ pub(crate) const POWERSHELL_ARGS: [&str; 5] = [
 const UTF8_OUTPUT_PREFIX: &str =
     "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 
+/// Upstream #11964: Windows PowerShell 5.1 turns redirected native stderr
+/// into error records and clears `$?`, so `git push 2>&1 | ...` exits 1 even
+/// when git exited 0. The leading lone `;` keeps an unfinished last statement
+/// (`Get-ChildItem |`) a parse error rather than continuing into the suffix.
+/// PowerShell 7 is unaffected and gets no suffix.
+const WINDOWS_POWERSHELL_EXIT_SUFFIX: &str = "\n;\nif ($?) { exit 0 }\nif (($LASTEXITCODE -eq 0) -and (\"$($Error[0].FullyQualifiedErrorId)\" -like \"NativeCommandError*\")) { exit 0 }\nexit 1";
+
+/// The suffix appended for `powershell.exe` only, and never after a trailing
+/// backtick (it would continue the user's line into the suffix).
+#[doc(hidden)]
+pub fn windows_powershell_exit_suffix(shell: &str, command: &str) -> &'static str {
+    let name = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name == "powershell.exe" && !command.ends_with('`') {
+        WINDOWS_POWERSHELL_EXIT_SUFFIX
+    } else {
+        ""
+    }
+}
+
 /// Resolve the PowerShell executable (upstream `getPowerShellConfig`):
 /// prefer PowerShell 7 (`pwsh.exe`), fall back to Windows PowerShell
 /// (`powershell.exe`). PATH first, then the standard installation directories
@@ -276,7 +299,10 @@ impl AgentTool for PowerShellTool {
             let mut spawn = tokio::process::Command::new(&shell);
             spawn
                 .args(POWERSHELL_ARGS)
-                .arg(format!("{UTF8_OUTPUT_PREFIX}{command}"))
+                .arg(format!(
+                    "{UTF8_OUTPUT_PREFIX}{command}{}",
+                    windows_powershell_exit_suffix(&shell, &command)
+                ))
                 .current_dir(&cwd)
                 // Upstream `stdio: ["ignore", "pipe", "pipe"]` (the powershell
                 // tool has no stdin command transport, so the first slot is

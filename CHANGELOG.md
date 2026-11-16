@@ -65,6 +65,35 @@ v1.5.2, and the generated test harnesses were rebuilt.
   and exit failures are reported instead of discarded (`#11627`); starting in
   a deleted working directory prints one actionable error and exits 1
   (`#11511`).
+- OpenAI Responses sends the session-affinity header as `session-id` rather
+  than `session_id`, which nginx/Envoy configurations can drop or reject
+  (`#11793`); the completions API keeps the underscore spelling.
+- The `auth.json` lock resolves the file path first, so every alias (a
+  symlinked agent dir, `.`/`..` spellings) shares one lock and two processes
+  cannot refresh the same OAuth token concurrently (`#11787`).
+- `.dart`, `.nix`, `.groovy`, and `.gradle` files highlight in read/write views
+  and code fences instead of rendering as plain text (`#11790`).
+- `pir mcp list` reports `authProvider` for `auth.provider` servers and points
+  their sign-in hint at `/login <provider>`; `pir mcp login`/`logout` refuse
+  those servers with the same redirect, since the token belongs to the
+  provider store (`#11791`).
+- OpenAI-completions requests omit `tools` when no tool is declared, even
+  with tool calls/results in the transcript, so vLLM 0.20+ no longer rejects
+  `"tools": []`; the new `requiresToolsWithToolHistory` compat flag restores
+  the empty array for older LiteLLM proxies in front of Anthropic (`#11891`).
+- Windows PowerShell 5.1 commands gain upstream's exit-code suffix: a native
+  command that wrote to redirected stderr but exited 0 no longer reports
+  failure, while real errors and unfinished statements keep their behavior;
+  `pwsh.exe` is untouched (`#11964`).
+- Transport failures keep the deepest `source()` cause in the error text, so
+  a generic "Connection error." also names the refused/reset connection and
+  its OS code (`#11783`).
+- Single-line edit diffs split the shared indentation before word-diffing, so
+  an insertion at the start of an indented line no longer drops that
+  indentation from the removed row (`#9274`).
+- A custom find backend is asked for `limit + 1` results; the tool shows at
+  most `limit` and only prints the limit notice when the extra result exists
+  (`#11747`).
 
 ### correctness
 

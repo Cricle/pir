@@ -1661,3 +1661,28 @@ fn channel_registry_sweep_reaps_owned_expired_files_and_spares_live_pids() {
     let _ = std::fs::remove_dir(&own_dir);
     let _ = std::fs::remove_dir(&foreign_dir);
 }
+
+/// Upstream #11964: only Windows PowerShell 5.1 gets the exit-code suffix,
+/// and never after a trailing backtick (which would continue the user's line
+/// into the appended script).
+#[test]
+fn powershell_windows_exit_suffix_is_guarded() {
+    let suffix = pir::coding_agent::tools::windows_powershell_exit_suffix;
+    let applied = suffix(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "Get-Item .",
+    );
+    assert!(applied.starts_with("\n;\nif ($?) { exit 0 }"));
+    assert!(applied.contains("NativeCommandError*"));
+    assert!(applied.ends_with("exit 1"));
+
+    assert_eq!(suffix("pwsh.exe", "Get-Item ."), "");
+    assert_eq!(
+        suffix(r"C:\Program Files\PowerShell\7\pwsh.exe", "Get-Item ."),
+        ""
+    );
+    // A trailing backtick would splice the suffix onto the user's line.
+    assert_eq!(suffix("powershell.exe", "Write-Output hi `"), "");
+    // The caller's case does not matter; the executable name is lowercased.
+    assert_eq!(suffix("POWERSHELL.EXE", "Get-Item ."), applied);
+}

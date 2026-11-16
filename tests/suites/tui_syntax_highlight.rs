@@ -105,6 +105,11 @@ fn language_table_matches_upstream_extension_map() {
         ("a.proto", "protobuf"),
         ("a.tf", "hcl"),
         ("a.hcl", "hcl"),
+        // Upstream #11790: grammars existed, the lookup table did not.
+        ("a.dart", "dart"),
+        ("a.nix", "nix"),
+        ("a.groovy", "groovy"),
+        ("build.gradle", "groovy"),
     ];
     for (path, expected) in table {
         assert_eq!(
@@ -138,12 +143,38 @@ fn language_table_handles_bare_dockerfile_makefile_and_aliases() {
     assert_eq!(normalize_language("golang"), Some("go"));
     assert_eq!(normalize_language("yml"), Some("yaml"));
     assert_eq!(normalize_language("terraform"), Some("hcl"));
+    assert_eq!(normalize_language("dart"), Some("dart"));
+    assert_eq!(normalize_language("nix"), Some("nix"));
+    assert_eq!(normalize_language("groovy"), Some("groovy"));
     // Fence info strings may carry extra tokens; the first token wins.
     assert_eq!(normalize_language("rust title=main.rs"), Some("rust"));
     assert_eq!(normalize_language(""), None);
     assert_eq!(normalize_language("brainfuck"), None);
     assert!(supports_language("typescript"));
     assert!(!supports_language("brainfuck"));
+}
+
+#[test]
+fn dart_nix_and_groovy_highlight_their_keywords() {
+    let _guard = super::tui_system_theme::lock();
+    set_theme("dark");
+    let keyword = ansi(ThemeColor::SyntaxKeyword);
+    let comment = ansi(ThemeColor::SyntaxComment);
+
+    for (language, code, marker) in [
+        ("dart", "class Widget { final int n = 1; }", "class"),
+        ("nix", "{ pkgs }: let x = 1; in x", "let"),
+        ("groovy", "def run() { return 1 }", "def"),
+    ] {
+        let line = &highlight_code(code, Some(language))[0];
+        assert!(
+            line.contains(&keyword),
+            "{language} keyword {marker} is styled: {line:?}"
+        );
+    }
+    assert!(highlight_code("class A {}", Some("dart"))[0].contains(&keyword));
+    assert!(highlight_code("# comment", Some("nix"))[0].contains(&comment));
+    assert!(highlight_code("// comment", Some("groovy"))[0].contains(&comment));
 }
 
 // ---------------------------------------------------------------------------

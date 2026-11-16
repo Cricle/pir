@@ -108,6 +108,9 @@ fn language_from_extension(extension: &str) -> Option<&'static str> {
         "graphql" => "graphql",
         "proto" => "protobuf",
         "tf" | "hcl" => "hcl",
+        "dart" => "dart",
+        "nix" => "nix",
+        "groovy" | "gradle" => "groovy",
         _ => return None,
     })
 }
@@ -168,6 +171,9 @@ pub fn normalize_language(language: &str) -> Option<&'static str> {
         "graphql" | "gql" => "graphql",
         "protobuf" | "proto" => "protobuf",
         "hcl" | "tf" | "terraform" => "hcl",
+        "dart" => "dart",
+        "nix" => "nix",
+        "groovy" => "groovy",
         _ => return None,
     })
 }
@@ -601,6 +607,9 @@ enum Language {
     GraphQL,
     Protobuf,
     Hcl,
+    Dart,
+    Nix,
+    Groovy,
 }
 
 impl Language {
@@ -649,6 +658,9 @@ impl Language {
             "graphql" => Language::GraphQL,
             "protobuf" => Language::Protobuf,
             "hcl" => Language::Hcl,
+            "dart" => Language::Dart,
+            "nix" => Language::Nix,
+            "groovy" => Language::Groovy,
             _ => return None,
         })
     }
@@ -670,7 +682,8 @@ impl Language {
             | Language::R
             | Language::Elixir
             | Language::Hcl
-            | Language::GraphQL => &["#"],
+            | Language::GraphQL
+            | Language::Nix => &["#"],
             Language::Sql | Language::Lua | Language::Haskell => &["--"],
             Language::Clojure => &[";"],
             Language::Erlang => &["%"],
@@ -715,6 +728,9 @@ impl Language {
             Language::Rust => &['"'],
             Language::Vim => &['\''],
             Language::Markdown => &['`'],
+            // Nix uses `''` only for indented strings, which the line
+            // scanner cannot pair reliably; a bare `'` is part of identifiers.
+            Language::Nix => &['"'],
             _ => &['\'', '"'],
         }
     }
@@ -787,6 +803,9 @@ impl Language {
             Language::GraphQL => GRAPHQL_KEYWORDS,
             Language::Protobuf => PROTOBUF_KEYWORDS,
             Language::Hcl => HCL_KEYWORDS,
+            Language::Dart => DART_KEYWORDS,
+            Language::Nix => NIX_KEYWORDS,
+            Language::Groovy => GROOVY_KEYWORDS,
         }
     }
 
@@ -809,6 +828,8 @@ impl Language {
             Language::Sql => SQL_TYPES,
             Language::Protobuf => PROTOBUF_TYPES,
             Language::Hcl => HCL_TYPES,
+            Language::Dart => DART_TYPES,
+            Language::Groovy => GROOVY_TYPES,
             _ => &[],
         }
     }
@@ -1925,6 +1946,153 @@ const HCL_KEYWORDS: &[&str] = &[
 ];
 const HCL_TYPES: &[&str] = &[
     "bool", "list", "map", "number", "object", "set", "string", "tuple",
+];
+
+// Added upstream in #11790 (highlight.js grammars already shipped; the path
+// table was the missing piece).
+const DART_KEYWORDS: &[&str] = &[
+    "abstract",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "covariant",
+    "default",
+    "deferred",
+    "do",
+    "dynamic",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "extension",
+    "external",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for",
+    "get",
+    "hide",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "interface",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "set",
+    "show",
+    "static",
+    "super",
+    "switch",
+    "sync",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
+const DART_TYPES: &[&str] = &[
+    "bool", "double", "int", "num", "String", "List", "Map", "Set", "Future", "Stream", "Iterable",
+    "Object", "dynamic", "void",
+];
+
+const NIX_KEYWORDS: &[&str] = &[
+    "assert", "else", "if", "in", "inherit", "let", "or", "rec", "then", "with",
+];
+
+const GROOVY_KEYWORDS: &[&str] = &[
+    "as",
+    "assert",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "def",
+    "default",
+    "do",
+    "else",
+    "enum",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "goto",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "native",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "static",
+    "strictfp",
+    "super",
+    "switch",
+    "synchronized",
+    "this",
+    "throw",
+    "throws",
+    "trait",
+    "transient",
+    "true",
+    "try",
+    "var",
+    "void",
+    "volatile",
+    "while",
+];
+
+const GROOVY_TYPES: &[&str] = &[
+    "BigDecimal",
+    "BigInteger",
+    "Boolean",
+    "Byte",
+    "Character",
+    "Class",
+    "Date",
+    "Double",
+    "Float",
+    "Integer",
+    "List",
+    "Long",
+    "Map",
+    "Object",
+    "Set",
+    "Short",
+    "String",
 ];
 
 /// Literals styled like upstream's `literal` scope (`syntaxNumber`).

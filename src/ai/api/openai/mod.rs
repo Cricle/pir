@@ -556,11 +556,11 @@ fn build_openai_body_parts(
             }
         }
         None => {
-            // Anthropic (via LiteLLM/proxy) requires the tools param when the
-            // conversation has tool_calls/tool_results even though no tool is
-            // declared now; with no tool history at all the field is omitted
-            // entirely (several gateways reject an empty `tools: []`).
-            if has_tool_history {
+            // Older LiteLLM proxies in front of Anthropic require the tools
+            // param when the conversation has tool_calls/tool_results even
+            // though no tool is declared now; everything else omits the
+            // field (vLLM 0.20+ rejects an empty `tools: []`, #11891).
+            if compat.requires_tools_with_tool_history.unwrap_or(false) && has_tool_history {
                 converted_tools = Some(Vec::new());
             }
         }

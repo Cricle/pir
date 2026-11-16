@@ -479,6 +479,89 @@ fn mcp_login_logout_local_scope_and_name_suggestion() {
     }
 }
 
+/// Upstream #11791: `auth.provider` servers report the provider, point the
+/// sign-in hint at `/login <provider>`, and refuse `mcp login/logout`
+/// because the token belongs to the pi provider store.
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_auth_provider_listing_and_login_hint() {
+    let _env = ENV_LOCK.lock().unwrap();
+    let previous_agent_dir = std::env::var("PIR_AGENT_DIR").ok();
+    let agent_dir = temp_agent_dir("mcp-auth-provider");
+    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
+    let global = pir::config::mcp::global_mcp_path(&agent_dir);
+    pir::coding_agent::cli::mcp_config_upsert(
+        &global,
+        "radius-probe",
+        &serde_json::json!({
+            "url": "https://mcp.example.invalid/mcp",
+            "auth": { "provider": "radius" },
+            "enabled": false
+        }),
+    )
+    .expect("seed auth.provider entry");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pir"))
+        .args(["mcp", "list", "--json"])
+        .env("PIR_AGENT_DIR", &agent_dir)
+        .output()
+        .expect("run pir mcp list");
+    assert!(
+        output.status.success(),
+        "mcp list succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("mcp list --json is JSON");
+    let server = document["servers"]
+        .as_array()
+        .expect("servers array")
+        .iter()
+        .find(|server| server["name"] == "radius-probe")
+        .expect("radius-probe is reported");
+    assert_eq!(server["authProvider"], "radius");
+    assert_eq!(server["state"], "disabled");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    for (command, expected) in [
+        (
+            McpCommand::Login {
+                server: "radius-probe".to_string(),
+                local: false,
+                timeout_seconds: 300,
+            },
+            "Run /login radius in pir.",
+        ),
+        (
+            McpCommand::Logout {
+                server: "radius-probe".to_string(),
+                local: false,
+            },
+            "Run /logout radius in pir.",
+        ),
+    ] {
+        let error = runtime
+            .block_on(pir::coding_agent::cli::run_mcp_command(command))
+            .expect_err("provider-backed servers are signed in through /login");
+        let message = error.to_string();
+        assert!(
+            message.contains("uses the credentials of provider \"radius\"")
+                && message.contains(expected),
+            "the error points at the provider login: {message}"
+        );
+    }
+
+    let _ = pir::coding_agent::cli::mcp_config_remove(&global, "radius-probe");
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    match previous_agent_dir {
+        Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
+        None => std::env::remove_var("PIR_AGENT_DIR"),
+    }
+}
+
 #[test]
 fn mcp_config_upsert_remove_round_trip() {
     let dir = temp_agent_dir("mcp-roundtrip");

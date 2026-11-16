@@ -2734,6 +2734,11 @@ async fn run_mcp_login(
             mcp_source_label(&entry.source)
         ));
     }
+    if let Some(provider) = crate::mcp::oauth::auth_provider(&entry.config) {
+        return Err(anyhow::anyhow!(
+            "MCP server \"{server}\" uses the credentials of provider \"{provider}\". Run /login {provider} in pir."
+        ));
+    }
     let Some(url) = crate::mcp::oauth::oauth_server_url(&entry.config) else {
         return Err(anyhow::anyhow!(
             "MCP server \"{server}\" does not use OAuth. Only HTTP servers without an Authorization header do."
@@ -2843,6 +2848,11 @@ async fn run_mcp_logout(server: &str, local: bool, project_trusted: bool) -> cra
         return Err(anyhow::anyhow!(
             "MCP server \"{server}\" is defined in {}, not in the project; omit --local.",
             mcp_source_label(&entry.source)
+        ));
+    }
+    if let Some(provider) = crate::mcp::oauth::auth_provider(&entry.config) {
+        return Err(anyhow::anyhow!(
+            "MCP server \"{server}\" uses the credentials of provider \"{provider}\". Run /logout {provider} in pir."
         ));
     }
     let Some(url) = crate::mcp::oauth::oauth_server_url(&entry.config) else {
@@ -3013,6 +3023,10 @@ struct McpListEntry {
     exposure: String,
     /// `command args` for stdio, the URL for HTTP.
     transport: String,
+    /// The pi provider whose token the server receives, from `auth.provider`
+    /// (upstream `ServerReport.authProvider`, #11791).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_provider: Option<String>,
     /// `disabled`, `connected`, `needs-auth`, `disconnected`, `closed`, or
     /// `failed` (upstream `ServerState`).
     state: String,
@@ -3171,6 +3185,7 @@ async fn run_mcp_list(json: bool, project_trusted: bool) -> crate::Result<bool> 
             enabled,
             exposure: crate::mcp::manager::exposure_label(base_exposure).to_owned(),
             transport,
+            auth_provider: crate::mcp::oauth::auth_provider(&entry.config).map(str::to_owned),
             state,
             tools,
             tool_exposure,
@@ -3220,7 +3235,10 @@ async fn run_mcp_list(json: bool, project_trusted: bool) -> crate::Result<bool> 
             println!("  project override: {override_path}");
         }
         if report.state == "needs-auth" {
-            println!("  sign in with: pir mcp login {}", report.name);
+            match &report.auth_provider {
+                Some(provider) => println!("  sign in with: /login {provider} in pir"),
+                None => println!("  sign in with: pir mcp login {}", report.name),
+            }
         }
         if !report.tools.is_empty() {
             let tools = report

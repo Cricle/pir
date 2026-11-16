@@ -30,7 +30,8 @@ pub enum PromptCacheKeyMode {
 /// `OpenAICompletionsCompat.sessionAffinityFormat`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionAffinityFormat {
-    /// `session_id` + `x-client-request-id` + `x-session-affinity`.
+    /// `session_id` (completions) or `session-id` (Responses) plus
+    /// `x-client-request-id` and `x-session-affinity` on completions.
     #[default]
     #[serde(rename = "openai")]
     Openai,

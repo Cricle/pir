@@ -246,8 +246,16 @@ suggestion (upstream `be15fe3c1`); `requiresNonNullAssistantContent`
 (#8118); `promptCacheKeyMode` (#9442); grep context/limit semantics from the
 engine (#11705); branch-summary context edits (#11680); tool-search field
 weighting and coverage ranking (#11625/#11632); WSL helper cwd and
-external-editor failure reporting (#11627); and the deleted-cwd startup
-diagnostic (#11511).
+external-editor failure reporting (#11627); the deleted-cwd startup
+diagnostic (#11511); OpenAI Responses' `session-id` header (#11793); the
+canonical `auth.json` lock across path aliases (#11787); Dart/Nix/Groovy
+syntax highlighting (#11790); MCP `authProvider` reporting plus the
+provider-login redirect for `auth.provider` servers (#11791);
+`requiresToolsWithToolHistory` and the omitted empty `tools` array
+(#11891); the Windows PowerShell 5.1 native exit-code suffix (#11964);
+transport errors that retain the deepest cause (#11783); shared
+indentation preserved in single-line edit diffs (#9274); and the custom find
+backend's `limit + 1` proof (#11747).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP

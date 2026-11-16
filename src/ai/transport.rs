@@ -518,11 +518,10 @@ impl ReqwestTransport {
         request: reqwest::Request,
     ) -> crate::agent::tool_execution::BoxFuture<'_, AiResult<HttpResponse>> {
         Box::pin(async move {
-            let response = self
-                .client
-                .execute(request)
-                .await
-                .map_err(|error| AiError::Http(error.to_string()))?;
+            let response =
+                self.client.execute(request).await.map_err(|error| {
+                    AiError::Http(crate::ai::util::error_with_cause_detail(&error))
+                })?;
             Ok(into_http_response(response))
         })
     }
@@ -547,7 +546,7 @@ impl HttpTransport for ReqwestTransport {
                 .body(body)
                 .send()
                 .await
-                .map_err(|error| AiError::Http(error.to_string()))?;
+                .map_err(|error| AiError::Http(crate::ai::util::error_with_cause_detail(&error)))?;
             Ok(into_http_response(response))
         })
     }
@@ -558,7 +557,7 @@ fn into_http_response(response: reqwest::Response) -> HttpResponse {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let body = response.bytes_stream().map(|item| {
-        item.map_err(|error| AiError::Http(error.to_string()))
+        item.map_err(|error| AiError::Http(crate::ai::util::error_with_cause_detail(&error)))
             .map(HttpBodyChunk::new)
     });
     HttpResponse {

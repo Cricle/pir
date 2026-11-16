@@ -228,6 +228,8 @@ pub use grep::{GrepOperations, GrepTool};
 #[cfg(feature = "tool-ls")]
 pub use ls::{LsOperations, LsTool};
 #[cfg(feature = "tool-powershell")]
+pub use powershell::windows_powershell_exit_suffix;
+#[cfg(feature = "tool-powershell")]
 pub use powershell::{PowerShellOperations, PowerShellTool};
 #[cfg(feature = "tool-read")]
 pub use read::{ReadOperations, ReadTool};

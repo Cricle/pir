@@ -390,14 +390,17 @@ fn session_headers_follow_the_affinity_format() {
         "sk-test",
         ProviderHeaders::new(),
     );
+    // Upstream #11793: the OpenAI format sends `session-id` (not the
+    // underscore spelling completions keeps).
     assert_eq!(
-        headers.get("session_id").map(String::as_str),
+        headers.get("session-id").map(String::as_str),
         Some("sess-1")
     );
     assert_eq!(
         headers.get("x-client-request-id").map(String::as_str),
         Some("sess-1")
     );
+    assert!(!headers.contains_key("session_id"));
     assert!(!headers.contains_key("x-session-id"));
 
     let openrouter = sample_model("openrouter", "x", "https://openrouter.ai/api/v1");
@@ -415,11 +418,12 @@ fn session_headers_follow_the_affinity_format() {
         Some("sess-1")
     );
     assert!(!headers.contains_key("session_id"));
+    assert!(!headers.contains_key("session-id"));
     assert!(!headers.contains_key("x-client-request-id"));
 
     // Nosession format: upstream only reaches it with an explicit
     // `sessionAffinityFormat: "openai-nosession"` compat (a bare custom
-    // model detects the OpenAI format and DOES send session_id).
+    // model detects the OpenAI format and DOES send session-id).
     let nosession = Model {
         compat: Some(OpenAiCompat {
             session_affinity_format: Some(SessionAffinityFormat::OpenaiNosession),
@@ -437,6 +441,7 @@ fn session_headers_follow_the_affinity_format() {
         ProviderHeaders::new(),
     );
     assert!(!headers.contains_key("session_id"));
+    assert!(!headers.contains_key("session-id"));
     assert!(!headers.contains_key("x-session-id"));
     assert_eq!(
         headers.get("x-client-request-id").map(String::as_str),
@@ -464,6 +469,8 @@ fn cache_retention_none_drops_the_session_headers() {
         ProviderHeaders::new(),
     );
     assert!(!headers.contains_key("session_id"));
+    assert!(!headers.contains_key("session-id"));
+    assert!(!headers.contains_key("x-session-id"));
     assert!(!headers.contains_key("x-client-request-id"));
 }
 

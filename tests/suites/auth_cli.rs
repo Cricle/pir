@@ -382,3 +382,44 @@ fn models_json_api_key_is_a_printable_credential() {
     );
     drop(guard);
 }
+
+/// Upstream #11787: the auth lock resolves the path, so every alias of
+/// auth.json (`.`/`..` spellings, symlinked agent dirs) shares one lock.
+#[test]
+fn auth_storage_lock_path_is_canonical_across_path_aliases() {
+    use pir::ai::auth::storage::FileAuthStorage;
+
+    let root = std::env::temp_dir().join(format!(
+        "pir-auth-lock-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let dir = root.join("agent");
+    std::fs::create_dir_all(dir.join("nested")).expect("create agent dir");
+    std::fs::write(dir.join("auth.json"), "{}").expect("seed auth.json");
+
+    let plain = FileAuthStorage::new(dir.join("auth.json"));
+    let dot = FileAuthStorage::new(dir.join(".").join("auth.json"));
+    let parent = FileAuthStorage::new(dir.join("nested").join("..").join("auth.json"));
+    let lock = plain.lock_file_path();
+    assert_eq!(dot.lock_file_path(), lock);
+    assert_eq!(parent.lock_file_path(), lock);
+    assert_eq!(
+        lock,
+        std::path::PathBuf::from(format!(
+            "{}.lock",
+            std::fs::canonicalize(dir.join("auth.json"))
+                .expect("canonical auth path")
+                .display()
+        ))
+    );
+
+    #[cfg(unix)]
+    {
+        let alias = root.join("alias.json");
+        std::os::unix::fs::symlink(dir.join("auth.json"), &alias).expect("create symlink");
+        assert_eq!(FileAuthStorage::new(alias).lock_file_path(), lock);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}

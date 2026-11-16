@@ -2641,15 +2641,26 @@ fn render_intra_line_diff(old_content: &str, new_content: &str) -> (String, Stri
     if old_content == new_content {
         return (old_content.into_owned(), new_content.into_owned());
     }
-    let n = token_count(&old_content);
-    let m = token_count(&new_content);
+    // Upstream #9274: pull the shared leading whitespace out before diffing,
+    // so a leading insertion cannot swallow the indentation into the added
+    // segment and drop it from the removed line.
+    let common_indent_len: usize = old_content
+        .chars()
+        .zip(new_content.chars())
+        .take_while(|(old, new)| old == new && old.is_whitespace())
+        .map(|(ch, _)| ch.len_utf8())
+        .sum();
+    let old_body = &old_content[common_indent_len..];
+    let new_body = &new_content[common_indent_len..];
+    let n = token_count(old_body);
+    let m = token_count(new_body);
     if n.saturating_mul(m) > INTRA_LINE_DIFF_MAX_CELLS
         || n.saturating_add(m) > INTRA_LINE_DIFF_MAX_TOKENS
     {
         return (old_content.into_owned(), new_content.into_owned());
     }
-    let old_tokens = tokens(&old_content, n);
-    let new_tokens = tokens(&new_content, m);
+    let old_tokens = tokens(old_body, n);
+    let new_tokens = tokens(new_body, m);
     // One flat `u32` table instead of `n + 1` `usize` rows: an LCS length is
     // bounded by `min(n, m) <= INTRA_LINE_DIFF_MAX_TOKENS` and the cell budget
     // above keeps this allocation at ~1.3 MB.
@@ -2666,8 +2677,9 @@ fn render_intra_line_diff(old_content: &str, new_content: &str) -> (String, Stri
             };
         }
     }
-    let mut removed_line = String::new();
-    let mut added_line = String::new();
+    let common_indent = &old_content[..common_indent_len];
+    let mut removed_line = common_indent.to_string();
+    let mut added_line = removed_line.clone();
     let mut first_removed = true;
     let mut first_added = true;
     let (mut i, mut j) = (0usize, 0usize);

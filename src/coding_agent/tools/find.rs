@@ -334,7 +334,9 @@ async fn find_with_operations(
             search_path,
             FindGlobOptions {
                 ignore: vec!["**/node_modules/**".to_owned(), "**/.git/**".to_owned()],
-                limit: effective_limit,
+                // One result past the limit tells "exactly N matches" apart
+                // from "more than N" (upstream #11747).
+                limit: effective_limit.saturating_add(1),
             },
         )
         .await
@@ -348,11 +350,12 @@ async fn find_with_operations(
     if results.is_empty() {
         return ToolResult::ok("No files found matching pattern");
     }
+    let limit_reached = results.len() > effective_limit;
     let relativized: Vec<String> = results
         .iter()
+        .take(effective_limit)
         .map(|result| relativize_custom_find_result(result, search_path))
         .collect();
-    let limit_reached = relativized.len() >= effective_limit;
     let raw_output = relativized.join("\n");
     let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
     // `details.truncation` embeds its own copy of the retained paths (upstream

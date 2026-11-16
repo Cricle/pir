@@ -237,6 +237,9 @@ impl FileAuthStorage {
     /// callers). Bounded acquire with stale-lock takeover after
     /// [`LOCK_STALE_AFTER`].
     fn acquire_file_lock_sync(&self) -> AiResult<LockGuard> {
+        // Upstream ensures the file exists before locking so realpath can
+        // resolve it (#11787).
+        self.ensure_file()?;
         let lock_path = self.lock_path();
         let deadline = std::time::Instant::now() + LOCK_ACQUIRE_TIMEOUT;
         let mut transient_retries = 0u32;
@@ -272,6 +275,7 @@ impl FileAuthStorage {
     /// [`Self::acquire_file_lock_sync`] for async contexts: the retry delay
     /// sleeps on the runtime instead of blocking the worker thread.
     async fn acquire_file_lock_async(&self) -> AiResult<LockGuard> {
+        self.ensure_file()?;
         let lock_path = self.lock_path();
         let deadline = std::time::Instant::now() + LOCK_ACQUIRE_TIMEOUT;
         let mut transient_retries = 0u32;
@@ -305,7 +309,20 @@ impl FileAuthStorage {
     }
 
     fn lock_path(&self) -> PathBuf {
-        PathBuf::from(format!("{}.lock", self.auth_path.display()))
+        // Upstream #11787 drops `realpath: false`: every alias of auth.json
+        // (symlinked agent dirs, `.`/`..` spellings) must share one lock, or
+        // two processes can refresh the same OAuth token concurrently.
+        // `ensure_file` runs before every lock acquisition, so the file
+        // exists and canonicalize resolves it.
+        let resolved =
+            std::fs::canonicalize(&self.auth_path).unwrap_or_else(|_| self.auth_path.clone());
+        PathBuf::from(format!("{}.lock", resolved.display()))
+    }
+
+    /// The canonicalized lock path (upstream `realpath` resolution, #11787).
+    #[doc(hidden)]
+    pub fn lock_file_path(&self) -> PathBuf {
+        self.lock_path()
     }
 
     fn read_data(&self) -> AiResult<AuthStorageData> {

@@ -351,6 +351,7 @@ const UPSTREAM_PROVIDER_COMPAT: &[&str] = &[
     "requiresToolResultName",
     "requiresAssistantAfterToolResult",
     "requiresNonNullAssistantContent",
+    "requiresToolsWithToolHistory",
     "requiresThinkingAsText",
     "requiresReasoningContentOnAssistantMessages",
     "thinkingFormat",
@@ -418,7 +419,7 @@ fn models_schema_compat_matches_openai_compat() {
     let properties = keys_of(&compat["properties"]);
     let rust = openai_compat_keys();
 
-    assert_eq!(rust.len(), 47, "OpenAiCompat carries 47 compat fields");
+    assert_eq!(rust.len(), 48, "OpenAiCompat carries 48 compat fields");
     for key in &rust {
         assert!(
             properties.contains(key),
@@ -446,7 +447,7 @@ fn models_schema_compat_matches_openai_compat() {
     }
     assert_eq!(
         UPSTREAM_PROVIDER_COMPAT.len(),
-        42,
+        43,
         "upstream ProviderCompat field count"
     );
     // Upstream-only knobs pir's runtime has no field for stay undocumented

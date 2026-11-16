@@ -236,6 +236,7 @@ const KNOWN_COMPAT_KEYS = new Set([
   "requiresToolResultName",
   "requiresAssistantAfterToolResult",
   "requiresNonNullAssistantContent",
+  "requiresToolsWithToolHistory",
   "requiresThinkingAsText",
   "requiresReasoningContentOnAssistantMessages",
   "zaiToolStream",

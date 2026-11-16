@@ -72,6 +72,28 @@ fn render_diff_text_keeps_unparseable_lines_verbatim() {
     assert_eq!(lines[1], "+5 tail");
 }
 
+/// Upstream #9274: a leading insertion must not consume the indentation the
+/// two lines share; it stays outside the inverse-video run.
+#[test]
+fn render_diff_text_preserves_shared_indentation() {
+    let rendered = render_diff_text(
+        "-83   await commitRecordingChunk({\n+83   const result = await commitRecordingChunk({",
+    );
+    let stripped = strip_ansi(&rendered);
+    let lines: Vec<&str> = stripped.split('\n').collect();
+    assert_eq!(lines[0], "-83   await commitRecordingChunk({");
+    assert_eq!(
+        lines[1],
+        "+83   const result = await commitRecordingChunk({"
+    );
+    let added_start = rendered.find("+83   ").expect("added row");
+    let inverse_start = rendered.find("\x1b[7m").expect("inverse run");
+    assert!(
+        added_start < inverse_start,
+        "the shared indent precedes the inverse run: {rendered:?}"
+    );
+}
+
 // --- edit_preview_input (renderers/edit.ts:64-85) ---------------------------
 
 #[test]

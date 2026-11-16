@@ -527,8 +527,11 @@ pub fn assemble_request_headers(
                         .or_insert_with(|| session_id.clone());
                 }
                 SessionAffinityFormat::Openai => {
+                    // Upstream #11793: Responses sends `session-id`; proxies
+                    // configured with `underscores_in_headers off` drop the
+                    // underscore spelling the completions API still uses.
                     headers
-                        .entry("session_id".into())
+                        .entry("session-id".into())
                         .or_insert_with(|| session_id.clone());
                     headers
                         .entry("x-client-request-id".into())

@@ -39,6 +39,48 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Append the deepest cause of a transport error to its message (upstream
+/// `withCauseDetail`, #11783). SDK/HTTP clients replace connection-level
+/// failures with a generic sentence; the real reason (`Connection refused`,
+/// DNS, TLS) sits in the `source()` chain. At most five levels are walked,
+/// mirroring upstream; an unchanged message is returned when there is no
+/// deeper cause or the detail is already included.
+pub fn error_with_cause_detail(error: &(dyn std::error::Error + 'static)) -> String {
+    const MAX_CAUSE_DEPTH: usize = 5;
+    let mut deepest: Option<&(dyn std::error::Error + 'static)> = None;
+    let mut current = error.source();
+    for _ in 0..MAX_CAUSE_DEPTH {
+        let Some(source) = current else { break };
+        deepest = Some(source);
+        current = source.source();
+    }
+    let message = error.to_string();
+    let Some(deepest) = deepest else {
+        return message;
+    };
+    let mut detail = deepest.to_string().trim().to_string();
+    if let Some(io) = deepest.downcast_ref::<std::io::Error>() {
+        if let Some(code) = io.raw_os_error() {
+            let code = code.to_string();
+            if !detail.contains(&code) {
+                detail = if detail.is_empty() {
+                    code
+                } else {
+                    format!("{detail} ({code})")
+                };
+            }
+        }
+    }
+    if detail.is_empty() || message.contains(&detail) {
+        return message;
+    }
+    if message.is_empty() {
+        detail
+    } else {
+        format!("{message}: {detail}")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Context overflow classification (upstream packages/ai/src/utils/overflow.ts)
 // ---------------------------------------------------------------------------

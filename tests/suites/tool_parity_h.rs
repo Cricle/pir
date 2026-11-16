@@ -998,6 +998,74 @@ async fn find_with_operations_uses_the_injected_backend() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Upstream #11747: the custom backend gets `limit + 1`, the tool shows at
+/// most `limit`, and exactly N results does not print the limit notice.
+struct CountingFind {
+    results: Vec<String>,
+    limits: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl FindOperations for CountingFind {
+    fn exists<'a>(&'a self, _absolute_path: &'a Path) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+    fn glob<'a>(
+        &'a self,
+        _pattern: &'a str,
+        _cwd: &'a Path,
+        options: FindGlobOptions,
+    ) -> BoxFuture<'a, Result<Vec<String>, String>> {
+        self.limits.lock().expect("limits").push(options.limit);
+        let results = self.results.clone();
+        Box::pin(async move { Ok(results) })
+    }
+}
+
+#[tokio::test]
+async fn find_with_operations_proves_the_limit_with_one_extra_result() {
+    let root = temp_workspace("ops-find-limit");
+    let limits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let results: Vec<String> = (1..=3).map(|index| format!("f{index}.rs")).collect();
+    let tool = FindTool::with_operations(Arc::new(CountingFind {
+        results,
+        limits: Arc::clone(&limits),
+    }));
+    let exact = tool
+        .run(
+            &serde_json::json!({"pattern": "*.rs", "limit": 3}),
+            &ToolContext::new(&root),
+        )
+        .await;
+    assert_eq!(exact.content, "f1.rs\nf2.rs\nf3.rs");
+    assert!(
+        !exact.content.contains("limit reached"),
+        "exactly N results is not a truncation: {}",
+        exact.content
+    );
+
+    let results: Vec<String> = (1..=4).map(|index| format!("f{index}.rs")).collect();
+    let tool = FindTool::with_operations(Arc::new(CountingFind {
+        results,
+        limits: Arc::clone(&limits),
+    }));
+    let over = tool
+        .run(
+            &serde_json::json!({"pattern": "*.rs", "limit": 3}),
+            &ToolContext::new(&root),
+        )
+        .await;
+    assert_eq!(
+        over.content,
+        "f1.rs\nf2.rs\nf3.rs\n\n[3 results limit reached. Use limit=6 for more, or refine pattern]"
+    );
+    assert_eq!(
+        *limits.lock().expect("limits"),
+        vec![4, 4],
+        "the backend is asked for one result past the limit"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 struct FakeGrep;
 
 impl GrepOperations for FakeGrep {
