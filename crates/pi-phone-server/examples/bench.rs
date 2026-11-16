@@ -240,6 +240,9 @@ async fn bench_store_catalog(iterations: usize) -> anyhow::Result<Stats> {
     let descriptors: Vec<SessionDescriptor> = (0..10_000)
         .map(|index| SessionDescriptor {
             id: format!("session-{index}"),
+            session_id: None,
+            has_pending_ui_request: None,
+            last_activity_at: None,
             label: Some(format!("Session {index}")),
             kind: Some("parent".into()),
             cwd: Some(format!("/bench/{index}")),

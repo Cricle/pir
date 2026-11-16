@@ -86,6 +86,9 @@ impl Env {
                 let descriptors: Vec<SessionDescriptor> = (start..end)
                     .map(|index| SessionDescriptor {
                         id: format!("session-{index}"),
+                        session_id: None,
+                        has_pending_ui_request: Some(false),
+                        last_activity_at: None,
                         label: Some(format!("Load session {index}")),
                         kind: Some("parent".into()),
                         cwd: Some(format!("/load/{index}")),

@@ -16,6 +16,9 @@ fn tenant_isolation_and_session_pagination() -> anyhow::Result<()> {
             &alice_device.id,
             &SessionDescriptor {
                 id: format!("session-{index}"),
+                session_id: None,
+                has_pending_ui_request: None,
+                last_activity_at: None,
                 label: Some(format!("Alice session {index}")),
                 kind: Some("parent".into()),
                 cwd: Some("/alice".into()),
@@ -34,6 +37,9 @@ fn tenant_isolation_and_session_pagination() -> anyhow::Result<()> {
         &bob_device.id,
         &SessionDescriptor {
             id: "session-0".into(),
+            session_id: None,
+            has_pending_ui_request: None,
+            last_activity_at: None,
             label: Some("Bob session".into()),
             kind: Some("parent".into()),
             cwd: Some("/bob".into()),
