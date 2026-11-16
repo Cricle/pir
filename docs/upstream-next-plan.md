@@ -28,8 +28,9 @@ resource/package/project-trust keys, the refresh-only MCP refresh guard and
 sign-in's stored-client refresh, root `$defs` in non-strict Anthropic
 schemas, Unicode tool-search segmentation in both tokenizers, web-URL-only
 OAuth opening with control-character stripping in sign-in displays, SDK
-runtime disposal that settles an aborted run, and autocomplete/`/settings`
-PageUp/PageDown.
+runtime disposal that settles an aborted run, autocomplete/`/settings`
+PageUp/PageDown, and host-resolved `keyText`/`keyHint` hints in extension
+render contexts.
 
 Gate evidence for the latest commits: full nextest **7570 passed / 0 failed /
 46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, 43 catalog
@@ -51,14 +52,16 @@ and rewrites both arms' `models.json` without storing the key. A second-model
 leg remains possible if another provider is restored; record the single-model
 limitation until then.
 
-## Wave A — small, ready to implement
+## Wave A — complete
 
-Each item is independent and should stay a separate commit with a regression
-test that cites the upstream commit.
-
-1. **Extension keybinding hints (#11630).** The JS render/message context
-   lacks `keyHint`/`keyText`; inject the host's resolved bindings instead of
-   the static shim table.
+1. **Extension keybinding hints (#11630).** Landed: the TUI resolves the
+   settings/keybindings-file text through
+   `Keybindings::keybinding_hints_json` and pushes it with
+   `ExtensionHandle::update_keybinding_hints`; the prelude injects
+   `keyText`/`keyHint` into `ToolRenderContext`, `MessageRenderOptions`, and
+   `EntryRenderOptions`, and re-pushes after `/reload`. Headless hosts never
+   push, so their renderers format empty hints like upstream RPC/print. Test:
+   `tests/renderer_parity.rs::renderers_receive_host_resolved_keybinding_hints`.
 
 ## Wave B — medium, needs a small design pass
 

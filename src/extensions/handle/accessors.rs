@@ -731,6 +731,16 @@ impl ExtensionHandle {
         crate::extensions::runtime::lock_state(&self.state).theme_registry = registry;
     }
 
+    /// Push the host-resolved keybinding text map (`{id: "ctrl+o", ...}`)
+    /// backing the `keyText`/`keyHint` functions injected into extension
+    /// render contexts (upstream #11630 `KeybindingHints`). The TUI pushes
+    /// the map resolved from `settings.json`/`keybindings.json`; headless
+    /// hosts never push, so the contexts' functions answer with the empty
+    /// text (upstream RPC/print never install app keybindings either).
+    pub fn update_keybinding_hints(&self, hints: JsonValue) {
+        crate::extensions::runtime::lock_state(&self.state).keybinding_hints = hints;
+    }
+
     /// Whether any `ui.addAutocompleteProvider` suggester is registered
     /// (fast-path read before paying the async completion round-trip).
     pub fn has_autocomplete_suggesters(&self) -> bool {

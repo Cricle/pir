@@ -537,6 +537,13 @@ pub(crate) struct RuntimeState {
     /// `ui.setTheme`: `{themes: [{name, path}], current: name,
     /// snapshots: {name: snapshot}}`. Host-pushed state, survives reloads.
     pub(crate) theme_registry: JsonValue,
+    /// Host-pushed resolved keybinding text (`{id: "ctrl+o", ...}`) backing
+    /// the `keyText`/`keyHint` functions injected into extension render
+    /// contexts (upstream #11630). The TUI pushes its settings-resolved map;
+    /// headless hosts never push, so unbound ids render as empty — upstream
+    /// RPC/print never install app keybindings either. Host-pushed state,
+    /// survives reloads.
+    pub(crate) keybinding_hints: JsonValue,
     /// Whether any `ui.addAutocompleteProvider` suggester is registered
     /// (fast-path check before paying the async completion round-trip).
     pub(crate) has_autocomplete_suggesters: bool,

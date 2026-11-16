@@ -367,3 +367,131 @@ fn markdown_transformer_failure_keeps_current_markdown_and_continues() {
         "a throwing transformer must not abort the chain"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Host keybinding hints (#11630)
+//
+// Upstream passes the host's resolved `keyText`/`keyHint` into
+// `ToolRenderContext`, `MessageRenderOptions` and `EntryRenderOptions`
+// (fixes #4748: an extension's own package copy cannot see the host's
+// settings overrides). The TUI resolves the map through
+// `Keybindings::keybinding_hints_json` and pushes it with
+// `ExtensionHandle::update_keybinding_hints`; the renderer sees the injected
+// functions, never the shim's static table.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renderers_receive_host_resolved_keybinding_hints() {
+    use pir::tui::ansi::strip_ansi;
+    use pir::tui::keybindings::Keybindings;
+
+    let temp = TempDir::new("keybinding-hints");
+    let handle = start_handle(&temp.0);
+    load_extension(
+        &handle,
+        &temp.0,
+        "hints.ts",
+        r#"
+        import { Type } from "typebox";
+        export default function (pi) {
+          pi.registerTool({
+            name: "hint-tool",
+            description: "hint tool",
+            parameters: Type.Object({}),
+            async execute() {
+              return { content: [{ type: "text", text: "ok" }] };
+            },
+            renderCall(_args, _theme, context) {
+              return [`call:${context.keyText("app.tools.expand")}|${context.keyHint("app.tools.expand", "to expand")}`];
+            },
+          });
+          pi.registerMessageRenderer("hint-msg", (_message, options) => {
+            return [`msg:${options.keyText("app.tools.expand")}|${options.keyHint("app.tools.expand", "to expand")}`];
+          });
+          pi.registerEntryRenderer("hint-entry", (_entry, options) => {
+            return [`entry:${options.keyText("app.tools.expand")}|${options.keyHint("app.tools.expand", "to expand")}`];
+          });
+        }
+        "#,
+    );
+    let handle = Arc::new(handle);
+    let invoker = ExtensionRendererInvoker::new(Arc::clone(&handle));
+
+    let plain = |lines: Option<Vec<String>>| -> Vec<String> {
+        lines
+            .expect("renderer lines")
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect()
+    };
+
+    // No host push yet (the headless/RPC shape): the injected functions exist,
+    // but every id answers the empty text — same as upstream RPC/print, where
+    // app keybindings are never installed.
+    let tool_call = handle
+        .call_tool_renderer_sync(
+            "hint-tool",
+            "call",
+            &json!({ "args": {}, "toolCallId": "h1", "cwd": "/w" }),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("tool renderer call");
+    assert_eq!(plain(tool_call.lines), vec!["call:| to expand".to_string()]);
+
+    // The TUI seam: resolve a user override, then push the map into the
+    // extension runtime (startup and `/reload` do exactly this).
+    let keybindings = Keybindings::from_settings(Some(&json!({
+        "app.tools.expand": "ctrl+e"
+    })))
+    .expect("keybindings settings");
+    let hints = keybindings.keybinding_hints_json();
+    assert_eq!(hints["app.tools.expand"], json!("ctrl+e"));
+    // Both namespaces are covered: `tui.*` ids resolve through the TUI
+    // registry, `app.*` through the app/hint tables.
+    assert_eq!(hints["tui.select.confirm"], json!("enter"));
+    assert_eq!(hints["app.interrupt"], json!("esc"));
+    handle.update_keybinding_hints(hints);
+
+    // Tool renderCall: the overridden chord reaches ToolRenderContext.
+    let tool_call = handle
+        .call_tool_renderer_sync(
+            "hint-tool",
+            "call",
+            &json!({ "args": {}, "toolCallId": "h2", "cwd": "/w" }),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("tool renderer call");
+    assert_eq!(
+        plain(tool_call.lines),
+        vec!["call:ctrl+e|ctrl+e to expand".to_string()],
+        "tool renderers must format hints from the host's configured binding"
+    );
+
+    // Message renderer: the overridden chord reaches MessageRenderOptions.
+    let message = invoke(
+        &invoker,
+        RendererKind::Message,
+        "hint-msg",
+        json!({ "customType": "hint-msg" }),
+    )
+    .expect("message renderer invoke");
+    assert_eq!(
+        plain(message.lines),
+        vec!["msg:ctrl+e|ctrl+e to expand".to_string()],
+        "message renderers must receive keyText/keyHint in their options"
+    );
+
+    // Entry renderer: the overridden chord reaches EntryRenderOptions.
+    let entry = invoke(
+        &invoker,
+        RendererKind::Entry,
+        "hint-entry",
+        json!({ "customType": "hint-entry" }),
+    )
+    .expect("entry renderer invoke");
+    assert_eq!(
+        plain(entry.lines),
+        vec!["entry:ctrl+e|ctrl+e to expand".to_string()],
+        "entry renderers must receive keyText/keyHint in their options"
+    );
+}

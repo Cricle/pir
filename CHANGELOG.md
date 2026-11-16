@@ -125,6 +125,10 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - PageUp/PageDown move the editor autocomplete menu and the `/settings` list by
   one visible page, clamped at the list ends and honoring remapped
   `tui.select.pageUp`/`tui.select.pageDown` bindings (`#7629`).
+- Extension tool, message, and entry renderers receive the host's resolved
+  `keyText`/`keyHint` in `ToolRenderContext` / `MessageRenderOptions` /
+  `EntryRenderOptions`, so a user's `app.tools.expand` or `tui.select.*` override
+  renders instead of an extension-local static table (`#11630`).
 
 ### correctness
 

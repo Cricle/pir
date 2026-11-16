@@ -263,12 +263,14 @@ refresh (#11743); root `$defs`/`definitions` in non-strict Anthropic schemas
 and web-URL-only OAuth opening plus control-character stripping in the
 CLI/TUI sign-in displays and Radius endpoints (#11849); SDK runtime disposal
 that aborts and settles an in-flight run before extension shutdown (#9126);
-and PageUp/PageDown in autocomplete and `/settings` (#7629).
+and PageUp/PageDown in autocomplete and `/settings` (#7629); and host-resolved
+`keyText`/`keyHint` hints injected into extension tool/message/entry render
+contexts (#11630).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
 audit tables): the fork choice for a missing session cwd (4ea88379); MCP
 refresh redirect/cancel guards; `pi auth login/logout` flags; and the
-remaining queue/window/DX items (keybinding hints, package-update summary).
+remaining queue/window/DX items (package-update summary).
 The prioritized Wave A/B/C breakdown with `file:line` evidence is
 [`upstream-next-plan.md`](upstream-next-plan.md).
 

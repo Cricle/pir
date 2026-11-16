@@ -9756,6 +9756,11 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
         // Push the theme registry backing `ui.getThemes/getTheme/setTheme`
         // (built-ins + custom themes from <agent_dir>/themes).
         extensions.update_theme_registry(theme_registry_json());
+        // Push the settings/keybindings-file-resolved key text backing the
+        // `keyText`/`keyHint` functions injected into extension render
+        // contexts (upstream #11630). Headless modes never push this, so a
+        // renderer there formats empty hints exactly like upstream RPC/print.
+        extensions.update_keybinding_hints(keybindings.keybinding_hints_json());
     }
 
     // D8: keep the session root's SOURCE, not only the resolved string. The
@@ -23517,6 +23522,16 @@ fn apply_reload_outcome(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 app.keybindings.hint_key_text("app.message.dequeue");
+            // The extension render contexts read the HOST's resolved key text
+            // (upstream #11630): re-push after a keybinding swap, and drop the
+            // cached renderer output so already-drawn tool blocks rebuild their
+            // hint text on the next frame.
+            if let Some(extensions) = app.ext.as_ref() {
+                extensions.update_keybinding_hints(app.keybindings.keybinding_hints_json());
+            }
+            *app.raw_render_epoch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
         Err(error) => entries.push(ChatEntry::Notice {
             kind: super::app::NoticeKind::Warning,

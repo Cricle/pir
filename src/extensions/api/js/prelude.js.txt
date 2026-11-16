@@ -3178,6 +3178,7 @@ globalThis.__pir_callToolRenderer = async (toolName, kind, requestJson) => {
   const theme = request.theme ?? rendererTheme();
   const args = request.args ?? request.arguments ?? {};
   const stateForTool = request.state ?? {};
+  const keyHints = rendererKeyHints();
   const context = {
     args,
     toolCallId: String(request.toolCallId ?? ""),
@@ -3200,6 +3201,10 @@ globalThis.__pir_callToolRenderer = async (toolName, kind, requestJson) => {
     isError: request.isError === true,
     durationMs: typeof request.durationMs === "number" ? request.durationMs : undefined,
     outputPad: typeof request.outputPad === "number" ? request.outputPad : 0,
+    // Upstream `ToolRenderContext extends KeybindingHints`: the HOST's
+    // resolved bindings, never the renderer module's own static table.
+    keyText: keyHints.keyText,
+    keyHint: keyHints.keyHint,
   };
   try {
     let result;
@@ -4750,6 +4755,44 @@ function rendererTheme() {
   return parseHostJson(__pir_host.getThemeJson()) ?? {};
 }
 
+// The host's resolved keybinding text for the renderer hint API (upstream
+// #11630): `ToolRenderContext`, `MessageRenderOptions` and `EntryRenderOptions`
+// carry `keyText`/`keyHint` so an extension's own copy of the package — which
+// never sees the host's settings overrides — cannot render empty hints. The
+// map is host-pushed (`update_keybinding_hints`); a headless host never pushes,
+// so every id answers "" (upstream RPC/print install no app keybindings).
+function rendererKeyHints() {
+  let hints = {};
+  try {
+    if (typeof __pir_host !== "undefined" && typeof __pir_host.getKeybindingHintsJson === "function") {
+      const parsed = parseHostJson(__pir_host.getKeybindingHintsJson());
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) hints = parsed;
+    }
+  } catch { /* a host-less prelude keeps empty hints */ }
+  const isDarwin = typeof process !== "undefined" && process && process.platform === "darwin";
+  // Same display normalization as upstream `formatKeyText`: chords join with
+  // "/", parts with "+", and `alt` reads `option` on macOS.
+  const formatKeys = (keys) =>
+    String(keys ?? "")
+      .split("/")
+      .map((chord) =>
+        chord
+          .split("+")
+          .map((part) => (isDarwin && part.toLowerCase() === "alt" ? "option" : part))
+          .join("+"))
+      .join("/");
+  const keyText = (keybinding) => {
+    const name = String(keybinding ?? "");
+    return Object.prototype.hasOwnProperty.call(hints, name) ? formatKeys(hints[name]) : "";
+  };
+  const theme = pirWidgetTheme();
+  return {
+    keyText,
+    keyHint: (keybinding, description) =>
+      theme.fg("dim", keyText(keybinding)) + theme.fg("muted", ` ${description}`),
+  };
+}
+
 // Upstream `ReadonlyFooterDataProvider` (footer-data-provider.ts:385-387):
 // the data not otherwise accessible to extensions — `getGitBranch`,
 // `getExtensionStatuses`, `getAvailableProviderCount`, `onBranchChange`.
@@ -5134,8 +5177,12 @@ globalThis.__pir_callRenderer = async (requestJson) => {
     if (!entry) return JSON.stringify({ ok: true, lines: null, text: null });
     const fn = rendererFn(entry);
     if (!fn) return JSON.stringify({ ok: true, lines: null, text: null });
+    // Upstream `MessageRenderOptions` / `EntryRenderOptions` extend
+    // `KeybindingHints` (#11630): hand the renderer the HOST's resolved
+    // keybinding text, not its own package copy's static table.
+    const entryOptions = Object.assign({}, renderOptions, rendererKeyHints());
     const lines = await rendererLines(
-      await fn(request.payload, renderOptions, theme),
+      await fn(request.payload, entryOptions, theme),
       renderOptions,
     );
     return JSON.stringify({ ok: true, lines, text: null });

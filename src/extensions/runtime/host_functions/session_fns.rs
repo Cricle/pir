@@ -303,6 +303,19 @@ pub(super) fn register_session_host_fns(
     // (`extensions::runtime::message_update_snapshot_json`) is kept as the wire
     // tests' reference.
 
+    // -- Renderer keybinding hints (host-pushed; upstream #11630) --
+
+    {
+        let st = state.clone();
+        sync_fn!("getKeybindingHintsJson", move || -> String {
+            // Host-pushed resolved keybinding text: render contexts format
+            // `keyText`/`keyHint` from THIS map so a user's settings override
+            // is honored. Null until the TUI pushes (RPC/print never do),
+            // which the prelude reads as "no keybindings".
+            lock_state(&st).keybinding_hints.to_string()
+        });
+    }
+
     // -- ctx.ui theme API (host-pushed registry; TUI applies setTheme live) --
 
     {

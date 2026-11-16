@@ -302,6 +302,7 @@ impl RuntimeState {
             host_completion: None,
             editor_text: String::new(),
             theme_registry: JsonValue::Null,
+            keybinding_hints: JsonValue::Null,
             has_autocomplete_suggesters: false,
             stream_hook_bridges: HashMap::new(),
             fd_table: FdTable::new(),

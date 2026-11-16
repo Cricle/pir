@@ -997,6 +997,51 @@ impl Keybindings {
             .collect::<Vec<_>>()
             .join("/")
     }
+
+    /// The resolved display text for ONE keybinding id, in either namespace:
+    /// registered `tui.*` ids resolve through [`Self::keys_for_id`], `app.*`
+    /// ids (and the `tui.altScreen.*` family) through
+    /// [`Self::keys_for_app_id`]. Multiple chords join with `/`; an unbound or
+    /// unknown id yields the empty string. This is the single lookup behind
+    /// the extension-facing `keyText`/`keyHint` injected into render contexts
+    /// (upstream #11630 `KeybindingHints`).
+    pub fn key_text_for(&self, id: &str) -> String {
+        self.keys_for_id(id)
+            .or_else(|| self.keys_for_app_id(id))
+            .map(|combos| {
+                combos
+                    .iter()
+                    .map(super::terminal::combo_text)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default()
+    }
+
+    /// The resolved key text for every id the host knows, keyed by binding id
+    /// (`{ "app.tools.expand": "ctrl+o", "tui.select.confirm": "enter", ... }`).
+    ///
+    /// The TUI pushes this map into the extension runtime
+    /// (`ExtensionHandle::update_keybinding_hints`) so renderers can format
+    /// hints from the HOST's settings overrides instead of a static table —
+    /// matching upstream #11630, where `keyText`/`keyHint` are passed into
+    /// `ToolRenderContext` / `MessageRenderOptions` / `EntryRenderOptions`.
+    pub fn keybinding_hints_json(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for id in default_app_ids() {
+            map.insert(
+                (*id).to_string(),
+                serde_json::Value::String(self.key_text_for(id)),
+            );
+        }
+        for definition in TUI_KEYBINDING_DEFINITIONS {
+            map.insert(
+                definition.id.to_string(),
+                serde_json::Value::String(self.key_text_for(definition.id)),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
 }
 
 /// Default chords for the startup-header hint ids and the `app.*` ids that
