@@ -216,6 +216,9 @@ fn execute(mut options: Options) -> RunOutcome {
             // GNU grep searches ignored/hidden files too.
             respect_ignore: false,
             limit: usize::MAX,
+            // GNU grep context flags are not ported here; the native path
+            // falls back for them.
+            context: 0,
             abort: &abort,
         }) {
             Ok(result) => result,

@@ -241,15 +241,16 @@ branch-summary thinking level and live thinking-level recording
 `qwen-token-plan-individual-cn` provider; npm `--no-audit --no-fund` and the
 unchanged-version warning (#11469/#11571); prompt-template apostrophes and
 escaped quotes (#11873); tool-search name-first ranking (#11331); `pi.exec`
-`maxBuffer`/`truncated` (#11546); and MCP `login`/`logout` `-l` with a name
-suggestion (upstream `be15fe3c1`).
+`maxBuffer`/`truncated` (#11546); MCP `login`/`logout` `-l` with a name
+suggestion (upstream `be15fe3c1`); `requiresNonNullAssistantContent`
+(#8118); `promptCacheKeyMode` (#9442); and grep context/limit semantics from
+the engine (#11705).
 
 **Open items worth a follow-up lane** (all small, upstream citations in the
-audit tables): grep limit-notice edge (engine-supplied context, #11705);
-branch-summary context edits (#11680); tool-search coverage ranking;
-helper spawn cwd; MCP refresh-only guard; `requiresNonNullAssistantContent`;
-`promptCacheKeyMode`; `pi auth login/logout` flags; case-insensitive Windows
-resource keys; and the remaining queue/window edge items.
+audit tables): branch-summary context edits (#11680); tool-search coverage
+ranking; helper spawn cwd; MCP refresh-only guard; `pi auth login/logout`
+flags; case-insensitive Windows resource keys; and the remaining queue/window
+edge items.
 
 **Deferred / large (not a parity bug)**: Anthropic message threads,
 Bedrock strict-tool fallback, the pi-schema coercion superset, extension

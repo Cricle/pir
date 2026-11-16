@@ -1097,6 +1097,10 @@ pub struct ResponsesWireOptions<'a> {
     /// `getConfigurationUpdateEffort`); `None` when the adapter has no
     /// configuration-update items.
     pub configuration_update_effort: Option<&'a str>,
+    /// Azure sends `prompt_cache_key` regardless of cache retention
+    /// (upstream `azure-openai-responses.ts:205-210`); the OpenAI variant
+    /// drops it with retention `none`.
+    pub prompt_cache_key_ignores_retention: bool,
 }
 
 impl<'a> ResponsesWireOptions<'a> {
@@ -1108,6 +1112,7 @@ impl<'a> ResponsesWireOptions<'a> {
             allowed_tool_call_providers: OPENAI_TOOL_CALL_PROVIDERS,
             omit_unsupported_fields: false,
             configuration_update_effort: None,
+            prompt_cache_key_ignores_retention: false,
         }
     }
 
@@ -1126,6 +1131,12 @@ impl<'a> ResponsesWireOptions<'a> {
     /// Carry the cache-preserving configuration-update effort.
     pub fn with_configuration_update_effort(mut self, effort: Option<&'a str>) -> Self {
         self.configuration_update_effort = effort;
+        self
+    }
+
+    /// Send `prompt_cache_key` regardless of cache retention (Azure).
+    pub fn with_prompt_cache_key_ignores_retention(mut self, ignores: bool) -> Self {
+        self.prompt_cache_key_ignores_retention = ignores;
         self
     }
 }
@@ -1155,6 +1166,7 @@ pub fn build_responses_params(
         allowed_tool_call_providers,
         omit_unsupported_fields,
         configuration_update_effort,
+        ..
     } = *wire;
     let message_options = ConvertResponsesMessagesOptions {
         include_system_prompt: true,
@@ -1183,7 +1195,12 @@ pub fn build_responses_params(
     // (`resolveCacheRetention`, openai-responses.ts:72-76): explicit request
     // value first, then `PI_CACHE_RETENTION=long`, then `short`.
     let cache_retention = crate::ai::api::resolve_cache_retention(options);
-    if cache_retention != CacheRetention::None {
+    // `promptCacheKeyMode: "disabled"` never sends the field, for compatible
+    // proxies that reject it (upstream openai-responses.ts:361-374).
+    let send_prompt_cache_key = compat.prompt_cache_key_mode
+        != crate::ai::types::PromptCacheKeyMode::Disabled
+        && (wire.prompt_cache_key_ignores_retention || cache_retention != CacheRetention::None);
+    if send_prompt_cache_key {
         if let Some(key) = clamp_openai_prompt_cache_key(options.session_id.as_deref()) {
             params["prompt_cache_key"] = json!(key);
         }

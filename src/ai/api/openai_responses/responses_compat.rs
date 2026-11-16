@@ -3,7 +3,7 @@
 //! `OpenAiCompat` are read from there, everything else keeps the upstream
 //! default).
 
-use crate::ai::types::{Model, OpenAiCompat, SessionAffinityFormat};
+use crate::ai::types::{Model, OpenAiCompat, PromptCacheKeyMode, SessionAffinityFormat};
 
 /// Resolved Responses compatibility flags for one model (upstream
 /// `getCompat`'s `Required<OpenAIResponsesCompat>`).
@@ -19,6 +19,10 @@ pub struct ResponsesCompat {
     /// `OpenAIResponsesCompat.sessionAffinityFormat`; auto-detected from the
     /// provider/base URL when the model compat leaves it unset).
     pub session_affinity_format: SessionAffinityFormat,
+    /// `prompt_cache_key` emission mode (upstream
+    /// `OpenAIResponsesCompat.promptCacheKeyMode`); `auto` and `enabled` send
+    /// it whenever caching is active, `disabled` never sends it.
+    pub prompt_cache_key_mode: PromptCacheKeyMode,
     pub supports_long_cache_retention: bool,
     pub supports_strict_mode: bool,
     pub supports_openai_grammar_tools: bool,
@@ -40,6 +44,7 @@ impl Default for ResponsesCompat {
             supports_mid_convo_system_messages: false,
             supports_mid_convo_effort: false,
             session_affinity_format: SessionAffinityFormat::Openai,
+            prompt_cache_key_mode: PromptCacheKeyMode::Auto,
             supports_long_cache_retention: true,
             supports_strict_mode: false,
             supports_openai_grammar_tools: false,
@@ -79,6 +84,7 @@ impl ResponsesCompat {
             session_affinity_format: compat
                 .session_affinity_format
                 .unwrap_or_else(|| detect_session_affinity_format(model)),
+            prompt_cache_key_mode: compat.prompt_cache_key_mode.unwrap_or_default(),
             supports_long_cache_retention: compat.supports_long_cache_retention.unwrap_or(true),
             supports_strict_mode: compat.supports_strict_mode.unwrap_or(false),
             supports_openai_grammar_tools: compat.supports_openai_grammar_tools.unwrap_or(false),

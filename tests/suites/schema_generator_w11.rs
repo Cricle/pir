@@ -11,7 +11,7 @@
 //!
 //! - every rendered schema equals the committed `Value` (the gate itself),
 //! - `models`: the root/`$defs`/`patternProperties` shape mirrors upstream,
-//!   the `ProviderCompat` `$defs` entry carries the same 45 properties and the
+//!   the `ProviderCompat` `$defs` entry carries the same 47 properties and the
 //!   four enum knobs, `compat` is a `$ref` in all three places,
 //!   `models[].required` is `["id"]` while `modelOverrides` entries stay
 //!   unconstrained,
@@ -96,7 +96,7 @@ fn w11_generator_renders_exactly_the_committed_artifacts() {
 // ---------------------------------------------------------------------------
 
 /// `ProviderCompat` is a `$defs` entry with the upstream property set. The
-/// committed file carries 45 knobs; a missing one silently widens
+/// committed file carries 47 knobs; a missing one silently widens
 /// `additionalProperties` validation for that key.
 #[test]
 fn w11_models_compat_defs_carry_the_full_provider_compat_surface() {
@@ -108,7 +108,7 @@ fn w11_models_compat_defs_carry_the_full_provider_compat_surface() {
     let properties = compat["properties"]
         .as_object()
         .expect("ProviderCompat.properties");
-    assert_eq!(properties.len(), 45, "ProviderCompat property count");
+    assert_eq!(properties.len(), 47, "ProviderCompat property count");
     for field in [
         "supportsStore",
         "maxTokensField",

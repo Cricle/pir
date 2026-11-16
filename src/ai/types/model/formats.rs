@@ -9,6 +9,23 @@ pub enum CacheControlFormat {
     Anthropic,
 }
 
+/// How `prompt_cache_key` is emitted (upstream `promptCacheKeyMode`):
+/// `auto` keeps each API's default, `enabled` sends it whenever caching is
+/// active (compatible proxies), `disabled` never sends it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PromptCacheKeyMode {
+    /// Each API's default gating.
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    /// Send whenever caching is active.
+    #[serde(rename = "enabled")]
+    Enabled,
+    /// Never send the field.
+    #[serde(rename = "disabled")]
+    Disabled,
+}
+
 /// Session-affinity header format (upstream
 /// `OpenAICompletionsCompat.sessionAffinityFormat`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

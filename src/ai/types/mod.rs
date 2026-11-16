@@ -48,8 +48,8 @@ pub use messages::{
 pub use model::{
     calculate_cost, calculate_cost_with, clamp_thinking_level, get_supported_thinking_levels,
     thinking_level_supported, CacheControlFormat, Model, ModelCost, ModelCostRates, ModelCostTier,
-    OpenAiCompat, SessionAffinityFormat, ThinkingFormat, ThinkingLevel, ThinkingTokenBudgetField,
-    EXTENDED_THINKING_LEVELS,
+    OpenAiCompat, PromptCacheKeyMode, SessionAffinityFormat, ThinkingFormat, ThinkingLevel,
+    ThinkingTokenBudgetField, EXTENDED_THINKING_LEVELS,
 };
 pub use stream::{
     finalize_headers, has_header, has_non_empty_header, header_value, insert_header, merge_headers,

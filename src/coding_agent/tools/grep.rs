@@ -13,7 +13,7 @@ use crate::ai::types::AbortSignal;
 use crate::coding_agent::truncate::{format_size, truncate_head, DEFAULT_MAX_BYTES};
 
 use super::grep_engine::{search_matches, SearchRequest};
-use super::util::{max_source_bytes, path_error_message, source_limit_error, workspace_path};
+use super::util::{path_error_message, workspace_path};
 
 // ---------------------------------------------------------------------------
 // Abort watcher
@@ -133,13 +133,15 @@ fn clamp_notice(name: &str, cap: usize, requested: Option<&serde_json::Value>) -
     (value > cap as f64).then(|| format!("{name} clamped to {cap}; requested {requested}"))
 }
 
-/// One ripgrep match (upstream `matches[]` entries).
+/// One ripgrep match or context line (upstream `matches[]` entries).
 struct GrepMatch {
     file_path: String,
     line_number: u64,
-    /// The matched line text from the ripgrep event (absent for custom
-    /// backends; pir's local ripgrep always provides it).
+    /// The line text from the ripgrep event (absent for custom backends;
+    /// pir's local engine always provides it).
     line_text: Option<String>,
+    /// True for a surrounding context line (`-` separator instead of `:`).
+    is_context: bool,
 }
 
 /// Upstream `truncateLine`: cut a match line to max chars with a marker.
@@ -192,15 +194,14 @@ fn format_grep_path(file_path: &str, search_path: &Path, is_directory: bool) -> 
 }
 
 /// Pluggable filesystem operations for the grep tool (upstream
-/// `GrepOperations`, grep.ts:53-68). The in-process search engine stays local
-/// (upstream always spawns ripgrep); these cover the directory check and the
-/// context-line reads.
+/// `GrepOperations`, grep.ts:48-58). The in-process search engine stays local
+/// (upstream always spawns ripgrep); only the directory check remains — the
+/// search and its context lines come from the engine, so no matched file is
+/// re-read (upstream removed `readFile` in #11705).
 pub trait GrepOperations: Send + Sync {
     /// Whether the search path is a directory; an error means it cannot be
     /// inspected (upstream reports "Path not found").
     fn is_directory<'a>(&'a self, absolute_path: &'a Path) -> BoxFuture<'a, std::io::Result<bool>>;
-    /// Read a file for context lines.
-    fn read_file<'a>(&'a self, absolute_path: &'a Path) -> BoxFuture<'a, std::io::Result<String>>;
 }
 
 pub struct GrepTool {
@@ -360,6 +361,7 @@ impl AgentTool for GrepTool {
                         excludes: &[],
                         respect_ignore: true,
                         limit: search_limit,
+                        context,
                         abort: &search_flag,
                     },
                     GREP_MAX_COLLECTED_MATCH_BYTES,
@@ -393,6 +395,7 @@ impl AgentTool for GrepTool {
                     file_path: found.path.to_string_lossy().into_owned(),
                     line_number: found.line_number,
                     line_text: Some(found.line_text),
+                    is_context: found.is_context,
                 });
             }
             let match_limit_reached = raw_limit_reached;
@@ -420,12 +423,11 @@ impl AgentTool for GrepTool {
                 return ToolResult::ok(output);
             }
 
-            // Format the matches: context == 0 uses the ripgrep match line
-            // directly; context > 0 (or a missing line text) re-reads each
-            // file for the surrounding block (upstream `formatBlock`). Only
-            // the current file is cached: matches arrive grouped by file, and
-            // a one-entry cache bounds memory to one source file.
-            let mut file_cache: Option<(String, Arc<Vec<String>>)> = None;
+            // Format the engine's match and context lines directly: context
+            // lines arrive as `context` events, grouped and deduplicated by the
+            // engine, so no matched file is re-read (upstream #11705). The
+            // engine already stripped the line terminator; a lone CR inside a
+            // line stays content.
             let mut output_lines: Vec<String> = Vec::new();
             let mut output_bytes = 0usize;
             let mut lines_truncated = false;
@@ -434,55 +436,16 @@ impl AgentTool for GrepTool {
             // over-limit input and reports the normal truncation details.
             'matches: for entry in &matches {
                 let relative = format_grep_path(&entry.file_path, &search_path, is_directory);
-                let direct = context == 0;
-                let direct = direct.then(|| {
-                    entry.line_text.as_ref().map(|line_text| {
-                        let sanitized = line_text
-                            .replace("\r\n", "\n")
-                            .replace('\r', "")
-                            .trim_end_matches('\n')
-                            .to_owned();
-                        let (truncated, was_truncated) = truncate_line(&sanitized);
-                        lines_truncated |= was_truncated;
-                        format!("{}:{}: {}", relative, entry.line_number, truncated)
-                    })
-                });
-                if let Some(line) = direct.flatten() {
-                    if push_output_line(&mut output_lines, &mut output_bytes, line) {
-                        break 'matches;
-                    }
-                    continue;
-                }
-                let file_lines =
-                    match read_file_lines(&entry.file_path, &mut file_cache, operations.as_ref())
-                        .await
-                    {
-                        Ok(lines) => lines,
-                        Err(error) => {
-                            let line = format!("{relative}:{}: ({error})", entry.line_number);
-                            if push_output_line(&mut output_lines, &mut output_bytes, line) {
-                                break 'matches;
-                            }
-                            continue;
-                        }
-                    };
-                let start = entry.line_number.saturating_sub(context as u64).max(1);
-                let end = entry
-                    .line_number
-                    .saturating_add(context as u64)
-                    .min(file_lines.len() as u64);
-                for current in start..=end {
-                    let raw = file_lines[(current - 1) as usize].replace('\r', "");
-                    let (truncated, was_truncated) = truncate_line(&raw);
-                    lines_truncated |= was_truncated;
-                    let line = if current == entry.line_number {
-                        format!("{relative}:{current}: {truncated}")
-                    } else {
-                        format!("{relative}-{current}- {truncated}")
-                    };
-                    if push_output_line(&mut output_lines, &mut output_bytes, line) {
-                        break 'matches;
-                    }
+                let raw = entry.line_text.as_deref().unwrap_or("");
+                let (truncated, was_truncated) = truncate_line(raw);
+                lines_truncated |= was_truncated;
+                let line = if entry.is_context {
+                    format!("{relative}-{}- {truncated}", entry.line_number)
+                } else {
+                    format!("{relative}:{}: {truncated}", entry.line_number)
+                };
+                if push_output_line(&mut output_lines, &mut output_bytes, line) {
+                    break 'matches;
                 }
             }
 
@@ -544,93 +507,4 @@ impl AgentTool for GrepTool {
             result
         })
     }
-}
-
-/// Read a file into lines (CRLF normalized), caching only the current file
-/// (upstream `getFileLines`). A failed or oversized read yields a clear error
-/// that is rendered in place of the context block.
-///
-/// Only CRLF is normalized: a lone CR is NOT a line break to ripgrep (it
-/// counts lines at LF only), so turning it into one shifted every later
-/// context line by one (upstream grep.ts, issue #11398). The lone CR stays in
-/// the line and is stripped at display time by the context formatter.
-///
-/// The file is read as bytes and decoded with `String::from_utf8_lossy`, not
-/// `read_to_string`: ripgrep matches files that are not valid UTF-8, so a
-/// lossily-grepped file must still render its context instead of degrading to
-/// "(unable to read file)" (upstream grep.ts reads bytes and decodes the same
-/// way).
-///
-/// A one-entry cache is sufficient because ripgrep reports matches grouped by
-/// file; it bounds retained line allocations to one source file instead of an
-/// unbounded per-run map.
-async fn read_file_lines(
-    file_path: &str,
-    cache: &mut Option<(String, Arc<Vec<String>>)>,
-    operations: Option<&Arc<dyn GrepOperations>>,
-) -> Result<Arc<Vec<String>>, String> {
-    use tokio::io::AsyncReadExt;
-
-    if let Some((cached_path, lines)) = cache.as_ref() {
-        if cached_path == file_path {
-            return Ok(Arc::clone(lines));
-        }
-    }
-    if let Some(operations) = operations {
-        let content = operations
-            .read_file(Path::new(file_path))
-            .await
-            .map_err(|error| format!("cannot read context file '{file_path}': {error}"))?;
-        let limit = max_source_bytes();
-        if content.len() as u64 > limit {
-            return Err(format!(
-                "context unavailable for '{file_path}': {}",
-                source_limit_error(content.len() as u64)
-            ));
-        }
-        let lines = Arc::new(
-            content
-                .replace("\r\n", "\n")
-                .split('\n')
-                .map(str::to_owned)
-                .collect::<Vec<String>>(),
-        );
-        *cache = Some((file_path.to_owned(), Arc::clone(&lines)));
-        return Ok(lines);
-    }
-    let file = tokio::fs::File::open(file_path)
-        .await
-        .map_err(|error| format!("cannot read context file '{file_path}': {error}"))?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|error| format!("cannot read context file '{file_path}': {error}"))?;
-    let limit = max_source_bytes();
-    if metadata.len() > limit {
-        return Err(format!(
-            "context unavailable for '{file_path}': {}",
-            source_limit_error(metadata.len())
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len().min(limit) as usize);
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| format!("cannot read context file '{file_path}': {error}"))?;
-    if bytes.len() as u64 > limit {
-        return Err(format!(
-            "context unavailable for '{file_path}': {}",
-            source_limit_error(bytes.len() as u64)
-        ));
-    }
-    let content = String::from_utf8_lossy(&bytes);
-    let lines = Arc::new(
-        content
-            .replace("\r\n", "\n")
-            .split('\n')
-            .map(str::to_owned)
-            .collect::<Vec<String>>(),
-    );
-    *cache = Some((file_path.to_owned(), Arc::clone(&lines)));
-    Ok(lines)
 }

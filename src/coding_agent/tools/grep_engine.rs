@@ -13,32 +13,96 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One raw match from the in-process searcher.
+/// One raw match or surrounding context line from the in-process searcher.
 pub(crate) struct RawMatch {
     pub(crate) path: PathBuf,
     pub(crate) line_number: u64,
     pub(crate) line_text: String,
+    /// True for a surrounding context line (upstream rg `context` event).
+    pub(crate) is_context: bool,
 }
 
-/// Collecting sink over one file's matches: enforces the global match limit,
-/// the optional retained-text byte budget and the abort flag by returning
-/// `false` (stop this file) and recording the reason.
-///
-/// The byte budget is SHARED across the whole walk: `retained_bytes` points at
-/// the run-wide counter, never at a per-file one (a per-file reset would turn
-/// one total budget into `budget × files`). `max_bytes: None` is the CLI's
-/// unbounded-text path.
+/// Run-wide collection state shared by every per-file sink: the match limit
+/// and its trailing context span files, and the byte budget is a total, not a
+/// per-file allowance (upstream grep.ts:184-230 `matchCount`/`limitHit`/
+/// `trailingContextEnd`/`lastFile`).
+struct CollectState {
+    matches: Vec<RawMatch>,
+    match_count: usize,
+    /// Set at the last allowed match. The searcher still delivers that
+    /// match's trailing context, kept up to `trailing_context_end`, and the
+    /// limit notice waits for proof of one more match (#11705).
+    limit_hit: bool,
+    trailing_context_end: u64,
+    last_file: Option<PathBuf>,
+    /// Retained match/context text bytes the WHOLE search may keep.
+    retained_bytes: usize,
+    limit_reached: bool,
+    byte_limit_reached: bool,
+    aborted: bool,
+}
+
+/// Collecting sink over one file's matches: enforces the run-wide match
+/// limit, the optional retained-text byte budget and the abort flag by
+/// returning `false` (stop the search) and recording the reason.
 struct CollectSink<'a> {
     path: &'a Path,
-    matches: &'a mut Vec<RawMatch>,
+    context: usize,
     limit: usize,
-    limit_reached: bool,
-    /// Match-text bytes the WHOLE search may retain (see [`CollectSink`]).
     max_bytes: Option<usize>,
-    retained_bytes: &'a mut usize,
-    byte_limit_reached: bool,
     abort: &'a AtomicBool,
-    aborted: bool,
+    state: &'a mut CollectState,
+}
+
+impl CollectSink<'_> {
+    /// Trim the line terminator at the BYTE level: CR/LF are ASCII (never part
+    /// of a multi-byte sequence), so a lone CR inside the line stays content
+    /// (upstream `replace(/\r?\n?$/, "")`).
+    fn trimmed(raw: &[u8]) -> &[u8] {
+        let mut trimmed_len = raw.len();
+        while trimmed_len > 0 && matches!(raw[trimmed_len - 1], b'\n' | b'\r') {
+            trimmed_len -= 1;
+        }
+        &raw[..trimmed_len]
+    }
+
+    /// Push one line into the retained set, enforcing the byte budget. A line
+    /// whose raw bytes already exceed the remaining budget is rejected before
+    /// allocating; lossy decoding can only make it larger, so the second check
+    /// still enforces the hard budget.
+    fn push(&mut self, line_number: u64, raw: &[u8], is_context: bool) -> bool {
+        let trimmed = Self::trimmed(raw);
+        if let Some(max_bytes) = self.max_bytes {
+            let remaining = max_bytes.saturating_sub(self.state.retained_bytes);
+            if trimmed.len() > remaining {
+                self.state.byte_limit_reached = true;
+                return false;
+            }
+        }
+        let line_text = String::from_utf8_lossy(trimmed).into_owned();
+        if let Some(max_bytes) = self.max_bytes {
+            let next = self.state.retained_bytes.saturating_add(line_text.len());
+            if next > max_bytes {
+                self.state.byte_limit_reached = true;
+                return false;
+            }
+            self.state.retained_bytes = next;
+        }
+        self.state.last_file = Some(self.path.to_path_buf());
+        self.state.matches.push(RawMatch {
+            path: self.path.to_path_buf(),
+            line_number,
+            line_text,
+            is_context,
+        });
+        true
+    }
+
+    fn in_trailing_window(&self, line_number: u64) -> bool {
+        self.state.limit_hit
+            && self.state.last_file.as_deref() == Some(self.path)
+            && line_number <= self.state.trailing_context_end
+    }
 }
 
 impl grep_searcher::Sink for CollectSink<'_> {
@@ -50,52 +114,58 @@ impl grep_searcher::Sink for CollectSink<'_> {
         mat: &grep_searcher::SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         if self.abort.load(Ordering::SeqCst) {
-            self.aborted = true;
+            self.state.aborted = true;
             return Ok(false);
         }
         let line_number = mat.line_number().unwrap_or(0);
-        // Trim trailing CR/LF at the BYTE level first: they are ASCII (never
-        // part of a multi-byte sequence), so this matches
-        // `trim_end_matches(['\n', '\r'])` on the decoded text without
-        // materializing it. A line whose raw bytes already exceed the
-        // remaining budget is rejected here; lossy decoding can only make it
-        // larger (an invalid byte becomes a 3-byte U+FFFD), so the second
-        // check below still enforces the hard budget.
         let raw = mat.bytes();
-        let mut trimmed_len = raw.len();
-        while trimmed_len > 0 && matches!(raw[trimmed_len - 1], b'\n' | b'\r') {
-            trimmed_len -= 1;
-        }
-        let trimmed = &raw[..trimmed_len];
-        if let Some(max_bytes) = self.max_bytes {
-            let remaining = max_bytes.saturating_sub(*self.retained_bytes);
-            if trimmed.len() > remaining {
-                // Stop BEFORE allocating the line: the budget is a hard
-                // retained-memory bound, and the caller reports the cap.
-                self.byte_limit_reached = true;
+        if self.state.limit_hit {
+            let in_window = self.in_trailing_window(line_number);
+            // A match inside the last allowed match's trailing context is
+            // shown as a context line.
+            if in_window && !self.push(line_number, raw, true) {
                 return Ok(false);
             }
+            // Only another match proves that the limit cut results off.
+            self.state.limit_reached = true;
+            // Keep draining the trailing window; stop once it ends.
+            return Ok(in_window && line_number < self.state.trailing_context_end);
         }
-        let line_text = String::from_utf8_lossy(trimmed).into_owned();
-        if let Some(max_bytes) = self.max_bytes {
-            let next = self.retained_bytes.saturating_add(line_text.len());
-            if next > max_bytes {
-                // Lossy decoding expanded invalid bytes past the budget.
-                self.byte_limit_reached = true;
-                return Ok(false);
-            }
-            *self.retained_bytes = next;
-        }
-        self.matches.push(RawMatch {
-            path: self.path.to_path_buf(),
-            line_number,
-            line_text,
-        });
-        if self.matches.len() >= self.limit {
-            self.limit_reached = true;
+        if !self.push(line_number, raw, false) {
             return Ok(false);
         }
+        self.state.match_count += 1;
+        if self.state.match_count >= self.limit {
+            self.state.limit_hit = true;
+            self.state.trailing_context_end = line_number.saturating_add(self.context as u64);
+        }
+        // Do not stop at the limit: the trailing context of the last allowed
+        // match and the proof of one more match are still to come.
         Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        context: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self.abort.load(Ordering::SeqCst) {
+            self.state.aborted = true;
+            return Ok(false);
+        }
+        let line_number = context.line_number().unwrap_or(0);
+        let raw = context.bytes();
+        if !self.state.limit_hit {
+            return Ok(self.push(line_number, raw, true));
+        }
+        let in_window = self.in_trailing_window(line_number);
+        if in_window && !self.push(line_number, raw, true) {
+            return Ok(false);
+        }
+        // Once an extra match proved the limit, keep the window up to its end
+        // and stop on the first line at/after it.
+        Ok(!self.state.limit_reached
+            || (in_window && line_number < self.state.trailing_context_end))
     }
 }
 
@@ -116,6 +186,9 @@ pub(crate) struct SearchRequest<'a> {
     /// them; `pir grep` mirrors GNU grep and searches ignored files too.
     pub(crate) respect_ignore: bool,
     pub(crate) limit: usize,
+    /// Lines of surrounding context per match (`rg --context N`), emitted as
+    /// context lines around the matches.
+    pub(crate) context: usize,
     pub(crate) abort: &'a AtomicBool,
 }
 
@@ -172,6 +245,7 @@ pub fn search_budget_for_tests(
         excludes: &[],
         respect_ignore: false,
         limit: 100_000,
+        context: 0,
         abort: &abort,
     };
     let (matches, _limit_reached, byte_limit_reached) = search_matches(request, max_match_bytes)?;
@@ -195,6 +269,7 @@ fn search_sync_impl(
         excludes,
         respect_ignore,
         limit,
+        context,
         abort,
     } = request;
     // Existence/permission guard: a missing or unreadable root must be a real
@@ -218,19 +293,33 @@ fn search_sync_impl(
         .word(word)
         .build(pattern)
         .map_err(|error| format!("Invalid search pattern: {error}"))?;
-    let mut searcher = grep_searcher::SearcherBuilder::new()
+    let mut searcher_builder = grep_searcher::SearcherBuilder::new();
+    searcher_builder
         .line_number(true)
-        .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
-        .build();
+        .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'));
+    if context > 0 {
+        // `rg --context N`: the surrounding lines arrive as context events,
+        // so no matched file is ever re-read (upstream #11705).
+        searcher_builder
+            .before_context(context)
+            .after_context(context);
+    }
+    let mut searcher = searcher_builder.build();
 
-    let mut matches: Vec<RawMatch> = Vec::new();
-    let mut limit_reached = false;
-    let mut byte_limit_reached = false;
-    // RUN-WIDE retained match text: the sink below points every file's search
-    // at this one counter, so `max_match_bytes` is a total budget rather than a
-    // per-file allowance (the per-file reset this replaced allowed
-    // `budget × files` retained bytes).
-    let mut retained_bytes = 0usize;
+    // RUN-WIDE state: the sink below points every file's search at this one
+    // state, so the limit, its trailing context and the retained-text budget
+    // are totals rather than per-file allowances.
+    let mut state = CollectState {
+        matches: Vec::new(),
+        match_count: 0,
+        limit_hit: false,
+        trailing_context_end: 0,
+        last_file: None,
+        retained_bytes: 0,
+        limit_reached: false,
+        byte_limit_reached: false,
+        aborted: false,
+    };
     let mut searched_files: Vec<PathBuf> = Vec::new();
     let mut first_walk_error: Option<String> = None;
     let mut first_search_error: Option<String> = None;
@@ -242,14 +331,11 @@ fn search_sync_impl(
         }
         let mut sink = CollectSink {
             path,
-            matches: &mut matches,
+            context,
             limit,
-            limit_reached: false,
             max_bytes: max_match_bytes,
-            retained_bytes: &mut retained_bytes,
-            byte_limit_reached: false,
             abort,
-            aborted: false,
+            state: &mut state,
         };
         // Read errors on a single file are recorded and skipped while other
         // files remain searchable (rg reports and moves on). If no file could
@@ -265,13 +351,7 @@ fn search_sync_impl(
                 }
             }
         }
-        if sink.limit_reached {
-            limit_reached = true;
-        }
-        if sink.byte_limit_reached {
-            byte_limit_reached = true;
-        }
-        !limit_reached && !sink.aborted && !sink.byte_limit_reached
+        !sink.state.limit_reached && !sink.state.aborted && !sink.state.byte_limit_reached
     };
 
     if is_directory {
@@ -360,5 +440,10 @@ fn search_sync_impl(
             ));
         }
     }
-    Ok((matches, limit_reached, searched_files, byte_limit_reached))
+    Ok((
+        state.matches,
+        state.limit_reached,
+        searched_files,
+        state.byte_limit_reached,
+    ))
 }

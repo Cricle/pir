@@ -213,8 +213,10 @@ pub fn build_azure_params(
     compat.supports_prompt_cache_retention = false;
     let deployment =
         resolve_deployment_name_with_options(model, options.env.as_ref(), options.azure.as_ref());
-    let wire =
-        ResponsesWireOptions::new(&deployment).with_tool_call_providers(AZURE_TOOL_CALL_PROVIDERS);
+    let wire = ResponsesWireOptions::new(&deployment)
+        .with_tool_call_providers(AZURE_TOOL_CALL_PROVIDERS)
+        // Azure's buildParams sends the cache key regardless of retention.
+        .with_prompt_cache_key_ignores_retention(true);
     crate::ai::api::openai_responses::shared::build_responses_params(
         model, context, options, &compat, &wire,
     )

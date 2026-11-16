@@ -953,6 +953,52 @@ fn openai_empty_text_parts_omitted() {
     assert_eq!(converted[0]["content"], json!("(no tool output)"));
 }
 
+/// `14b804d8` #8118: an empty replayed assistant message (tool-call-only)
+/// sends `content: null` by default, but `requiresNonNullAssistantContent`
+/// (or `requiresAssistantAfterToolResult`) switches it to `""` (upstream
+/// `openai-completions.ts:1281-1285`).
+#[test]
+fn openai_empty_assistant_content_null_is_configurable() {
+    let assistant = Message::Assistant(AssistantMessage {
+        api: "openai-completions".into(),
+        provider: "test".into(),
+        model: "gpt-test".into(),
+        content: vec![ContentBlock::ToolCall(ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: BTreeMap::new(),
+            thought_signature: None,
+            namespace: None,
+            arguments_error: None,
+        })],
+        stop_reason: StopReason::ToolUse,
+        ..AssistantMessage::default()
+    });
+    let messages = || vec![user_message("hi"), assistant.clone()];
+
+    let converted = convert_messages(
+        &openai_model(),
+        &context_with(messages()),
+        &OpenAiCompat::default(),
+    );
+    assert_eq!(converted[1]["content"], Value::Null, "default stays null");
+
+    let compat = OpenAiCompat {
+        requires_non_null_assistant_content: Some(true),
+        ..OpenAiCompat::default()
+    };
+    let converted = convert_messages(&openai_model(), &context_with(messages()), &compat);
+    assert_eq!(converted[1]["content"], json!(""));
+
+    // `requiresAssistantAfterToolResult` sends the empty string here too.
+    let compat = OpenAiCompat {
+        requires_assistant_after_tool_result: Some(true),
+        ..OpenAiCompat::default()
+    };
+    let converted = convert_messages(&openai_model(), &context_with(messages()), &compat);
+    assert_eq!(converted[1]["content"], json!(""));
+}
+
 #[test]
 fn openai_sampling_params_merge_chain() {
     // Upstream resolveSamplingParams: model.samplingParams ->

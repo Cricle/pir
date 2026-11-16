@@ -1007,15 +1007,14 @@ impl GrepOperations for FakeGrep {
     ) -> BoxFuture<'a, std::io::Result<bool>> {
         Box::pin(async { Ok(false) })
     }
-    fn read_file<'a>(&'a self, _absolute_path: &'a Path) -> BoxFuture<'a, std::io::Result<String>> {
-        Box::pin(async { Ok("custom-context\nneedle\n".to_owned()) })
-    }
 }
 
+/// `8da141c2a` #11705 removed `GrepOperations.readFile`: the engine supplies
+/// context lines, so no matched file is re-read through the backend.
 #[tokio::test]
-async fn grep_with_operations_reads_context_through_the_backend() {
+async fn grep_context_lines_come_from_the_engine_not_the_backend() {
     let root = temp_workspace("ops-grep");
-    std::fs::write(root.join("m.txt"), "needle\n").expect("fixture");
+    std::fs::write(root.join("m.txt"), "before\nneedle\nafter\n").expect("fixture");
     let tool = GrepTool::with_operations(Arc::new(FakeGrep));
     let result = tool
         .run(
@@ -1024,10 +1023,9 @@ async fn grep_with_operations_reads_context_through_the_backend() {
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
-    assert!(
-        result.content.contains("custom-context"),
-        "context must come from the backend: {}",
-        result.content
+    assert_eq!(
+        result.content, "m.txt-1- before\nm.txt:2: needle\nm.txt-3- after",
+        "context must come from the engine"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

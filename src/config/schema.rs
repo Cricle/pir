@@ -261,7 +261,7 @@ enum CompatNested {
 }
 
 /// `(name, description, field)` for every upstream `ProviderCompat` knob,
-/// in upstream declaration order (45 entries). Deliberately unknown keys are
+/// in upstream declaration order (47 entries). Deliberately unknown keys are
 /// preserved by `additionalProperties: true`.
 const COMPAT_FIELDS: &[(&str, Option<&str>, CompatField)] = &[
     ("supportsStore", Some("Whether the provider supports the store field. Default: auto-detected from URL."), CompatField::Bool(None)),
@@ -272,6 +272,7 @@ const COMPAT_FIELDS: &[(&str, Option<&str>, CompatField)] = &[
     ("maxTokensField", Some("Which field to use for max tokens. Default: auto-detected from URL."), CompatField::Enum(&["max_completion_tokens", "max_tokens"])),
     ("requiresToolResultName", Some("Whether tool results require the name field. Default: auto-detected from URL."), CompatField::Bool(None)),
     ("requiresAssistantAfterToolResult", Some("Whether a user message after tool results requires an assistant message in between. Default: auto-detected from URL."), CompatField::Bool(None)),
+    ("requiresNonNullAssistantContent", Some("Whether replayed assistant messages with no text (e.g. tool-call-only messages) must send \"\" instead of null content. Default: false."), CompatField::Bool(None)),
     ("requiresThinkingAsText", Some("Whether thinking blocks must be converted to text blocks with <thinking> delimiters. Default: auto-detected from URL."), CompatField::Bool(None)),
     ("requiresReasoningContentOnAssistantMessages", Some("Whether all replayed assistant messages must include an empty reasoning_content field when reasoning is enabled. Default: auto-detected from URL."), CompatField::Bool(None)),
     ("thinkingFormat", Some("Format for reasoning or thinking parameters. When omitted, Pi auto-detects the format from the provider URL. \"openai\" uses reasoning_effort, \"openrouter\" uses reasoning.effort, \"deepseek\" uses thinking.type plus reasoning_effort when supported, \"together\" uses reasoning.enabled plus reasoning_effort when supported, \"baseten\" uses configurable chat_template_args plus reasoning_effort when supported, \"zai\" uses thinking.type, \"qwen\" uses top-level enable_thinking, \"qwen-chat-template\" uses chat_template_kwargs.enable_thinking and preserve_thinking, \"chat-template\" uses configurable chat_template_kwargs, \"string-thinking\" uses top-level thinking, and \"ant-ling\" uses reasoning.effort only when the mapped effort is non-null."), CompatField::Enum(&["openai", "openrouter", "deepseek", "together", "baseten", "zai", "qwen", "chat-template", "qwen-chat-template", "string-thinking", "ant-ling"])),
@@ -289,6 +290,7 @@ const COMPAT_FIELDS: &[(&str, Option<&str>, CompatField)] = &[
     ("cacheControlFormat", Some("Cache control convention for prompt caching. Anthropic applies cache_control markers to the system prompt, last tool definition, and last user, assistant, or tool-result text content."), CompatField::Const("anthropic")),
     ("sendSessionAffinityHeaders", Some("Whether to send session-affinity data from options.sessionId. Defaults are API-specific."), CompatField::Bool(None)),
     ("sessionAffinityFormat", Some("Session-affinity header format. Defaults are API-specific or auto-detected."), CompatField::Enum(&["openai", "openai-nosession", "openrouter"])),
+    ("promptCacheKeyMode", Some("Controls the prompt_cache_key request field for openai-completions and openai-responses: auto keeps each API's default, enabled sends it whenever caching is active, disabled never sends it. Default: auto."), CompatField::Enum(&["auto", "enabled", "disabled"])),
     ("supportsLongCacheRetention", Some("Whether the provider supports long prompt cache retention. Defaults are API-specific or auto-detected."), CompatField::Bool(None)),
     ("vllmPriority", Some("vLLM scheduler priority sent as the top-level priority request field. Lower values are handled earlier and the server default is 0. Only meaningful with --scheduling-policy priority. Off by default and not set on the generated catalog."), CompatField::Number),
     ("supportsAdditionalTools", Some("Whether the model supports message-anchored additional_tools input items."), CompatField::Bool(Some(false))),

@@ -45,6 +45,14 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - `pir mcp login`/`logout` accept `-l`/`--local`, reject a server that is not
   defined in the project config, and suggest a configured name within edit
   distance 2 (upstream `be15fe3c1`).
+- The provider compat block gains `requiresNonNullAssistantContent` (send `""`
+  for a text-less replayed assistant message; `#8118`) and
+  `promptCacheKeyMode` (`auto`/`enabled`/`disabled` for OpenRouter-style
+  proxies; `#9442`), including Azure's retention-independent key.
+- grep takes its context lines from the search engine instead of re-reading
+  matched files, merges overlapping windows, keeps a lone CR as content, and
+  reports the match limit only after proof of one more match; the public
+  `GrepOperations` loses `read_file` as upstream did (`#11705`).
 
 ### correctness
 

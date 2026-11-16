@@ -1,11 +1,10 @@
-//! M7: `grep` with context materializes a file's line vector once per run.
+//! `grep` context lines come from the engine, not from re-reading matched
+//! files (`8da141c2a`, #11705; upstream stopped reading matched files and
+//! passes `--context N` to ripgrep instead).
 //!
-//! The context form re-reads each matching file through a per-run cache
-//! (`read_file_lines`). The cache used to store `Vec<String>` and deep-copy
-//! the whole line vector on every hit (and once more on insert); it now
-//! stores `Arc<Vec<String>>`, so a file with several matches clones the `Arc`.
-//! The output contract is unchanged: the two matches below must render the
-//! same context blocks, byte for byte.
+//! The in-process engine configures ripgrep's own `before_context` /
+//! `after_context`, so overlapping context around nearby matches is merged:
+//! shared lines appear once, the one intended output change of #11705.
 
 #![cfg(feature = "grep-find")]
 
@@ -29,7 +28,7 @@ fn fixture_file() -> (PathBuf, PathBuf) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn context_output_is_unchanged_for_a_multi_match_file() {
+async fn context_output_merges_overlapping_windows() {
     let (dir, _file) = fixture_file();
 
     let mut registry = ToolRegistry::new();
@@ -48,13 +47,11 @@ async fn context_output_is_unchanged_for_a_multi_match_file() {
         .await;
     assert!(!result.is_error, "grep failed: {}", result.content);
 
-    // Two matches in one file, each with one line of context: the second
-    // match's context re-uses the cached line vector, and line 3 appears in
-    // both blocks (exactly the pre-fix output).
+    // Two matches in one file with one line of context each: the engine
+    // merges the overlapping windows, so `between` appears once (#11705).
     let expected = concat!(
         "sample.txt-1- zero\n",
         "sample.txt:2: match one\n",
-        "sample.txt-3- between\n",
         "sample.txt-3- between\n",
         "sample.txt:4: match two\n",
         "sample.txt-5- tail",
@@ -64,11 +61,8 @@ async fn context_output_is_unchanged_for_a_multi_match_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A lone CR is not a line break to ripgrep, which numbers lines at LF only
-/// (upstream issue #11398). Context reads must split the same way: splitting
-/// on a bare CR too put the following lines one number too high, so the
-/// context block showed `progress` as the match and dropped `after`. The CR
-/// is stripped for display, joining the two halves of the line.
+/// A lone CR is content, not a line break (upstream #11398/#11705): the
+/// engine strips only the line terminator, so `before\rprogress` keeps its CR.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_line_numbers_align_with_ripgrep_for_a_lone_cr() {
     let (dir, _file) = fixture_file();
@@ -94,10 +88,94 @@ async fn context_line_numbers_align_with_ripgrep_for_a_lone_cr() {
     assert_eq!(
         result.content,
         concat!(
-            "lone-cr.txt-1- beforeprogress\n",
+            "lone-cr.txt-1- before\rprogress\n",
             "lone-cr.txt:2: needle\n",
             "lone-cr.txt-3- after",
         )
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #11705: exactly `limit` matches no longer claim the limit cut results off;
+/// the notice needs one more match. The trailing context of the last allowed
+/// match is still kept, and an extra match inside that window is rendered as
+/// a context line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_limit_and_trailing_context_follow_upstream() {
+    let (dir, _file) = fixture_file();
+    let file = dir.join("limit.txt");
+
+    let mut registry = ToolRegistry::new();
+    pir::coding_agent::tools::register_core_tools(&mut registry);
+    let tool = registry.get("grep").expect("the grep tool is registered");
+    let context = ToolContext::new(dir.to_string_lossy().into_owned());
+
+    // Exactly two matches for limit=2: no notice and no matchLimitReached.
+    std::fs::write(&file, "match one\nmatch two\n").expect("write exact fixture");
+    let result = tool
+        .run(
+            &json!({
+                "pattern": "match",
+                "path": file.to_string_lossy(),
+                "limit": 2,
+            }),
+            &context,
+        )
+        .await;
+    assert!(!result.is_error, "grep failed: {}", result.content);
+    assert!(
+        !result.content.contains("limit reached"),
+        "exactly `limit` matches must not claim truncation: {}",
+        result.content
+    );
+    assert_eq!(
+        result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("matchLimitReached")),
+        None
+    );
+
+    // Limit=2 with a third match inside the last match's two-line trailing
+    // window: the third match is shown as context, the window end is kept,
+    // and the line beyond it is dropped.
+    std::fs::write(
+        &file,
+        "match one\nmatch two\nmatch three\nwindow end\nbeyond\n",
+    )
+    .expect("write window fixture");
+    let result = tool
+        .run(
+            &json!({
+                "pattern": "match",
+                "path": file.to_string_lossy(),
+                "limit": 2,
+                "context": 2,
+            }),
+            &context,
+        )
+        .await;
+    assert!(!result.is_error, "grep failed: {}", result.content);
+    assert_eq!(
+        result.content,
+        concat!(
+            "limit.txt:1: match one\n",
+            "limit.txt:2: match two\n",
+            "limit.txt-3- match three\n",
+            "limit.txt-4- window end\n",
+            "\n[2 matches limit reached. Use limit=4 for more, or refine pattern]",
+        )
+    );
+    assert!(
+        result.content.contains("2 matches limit reached"),
+        "the third match proves the limit: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("beyond"),
+        "lines past the trailing window are not kept: {}",
+        result.content
     );
 
     let _ = std::fs::remove_dir_all(&dir);

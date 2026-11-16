@@ -188,6 +188,15 @@ pub struct OpenAiCompat {
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_assistant_after_tool_result: Option<bool>,
+    /// Whether replayed assistant messages with no text (e.g. tool-call-only
+    /// messages) must send `""` instead of null content (upstream
+    /// `requiresNonNullAssistantContent`).
+    #[serde(
+        default,
+        rename = "requiresNonNullAssistantContent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub requires_non_null_assistant_content: Option<bool>,
     /// Whether thinking blocks must be replayed as plain text (upstream
     /// `requiresThinkingAsText`).
     #[serde(
@@ -271,6 +280,16 @@ pub struct OpenAiCompat {
         skip_serializing_if = "Option::is_none"
     )]
     pub session_affinity_format: Option<SessionAffinityFormat>,
+    /// Controls the `prompt_cache_key` request field (upstream
+    /// `promptCacheKeyMode`): `auto` sends it to api.openai.com, or with long
+    /// cache retention when supported; `enabled` sends it whenever caching is
+    /// active, for compatible proxies; `disabled` never sends it.
+    #[serde(
+        default,
+        rename = "promptCacheKeyMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompt_cache_key_mode: Option<PromptCacheKeyMode>,
     /// Whether the provider supports long prompt cache retention
     /// (`prompt_cache_retention: "24h"` / `cache_control.ttl: "1h"`;
     /// upstream `supportsLongCacheRetention`).
@@ -400,6 +419,7 @@ impl Default for OpenAiCompat {
             supports_developer_role: None,
             requires_tool_result_name: None,
             requires_assistant_after_tool_result: None,
+            requires_non_null_assistant_content: None,
             requires_thinking_as_text: None,
             requires_reasoning_content_on_assistant_messages: None,
             zai_tool_stream: None,
@@ -410,6 +430,7 @@ impl Default for OpenAiCompat {
             supports_max_output_tokens: None,
             cache_control_format: None,
             session_affinity_format: None,
+            prompt_cache_key_mode: None,
             supports_long_cache_retention: None,
             open_router_routing: None,
             vercel_gateway_routing: None,
@@ -509,6 +530,9 @@ impl OpenAiCompat {
         if over.requires_assistant_after_tool_result.is_some() {
             merged.requires_assistant_after_tool_result = over.requires_assistant_after_tool_result;
         }
+        if over.requires_non_null_assistant_content.is_some() {
+            merged.requires_non_null_assistant_content = over.requires_non_null_assistant_content;
+        }
         if over.requires_thinking_as_text.is_some() {
             merged.requires_thinking_as_text = over.requires_thinking_as_text;
         }
@@ -542,6 +566,9 @@ impl OpenAiCompat {
         }
         if over.session_affinity_format.is_some() {
             merged.session_affinity_format = over.session_affinity_format;
+        }
+        if over.prompt_cache_key_mode.is_some() {
+            merged.prompt_cache_key_mode = over.prompt_cache_key_mode;
         }
         if over.supports_long_cache_retention.is_some() {
             merged.supports_long_cache_retention = over.supports_long_cache_retention;

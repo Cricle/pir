@@ -485,13 +485,21 @@ fn build_openai_body_parts(
     let cache_retention = resolve_cache_retention(options);
     let cache_control = compat_cache_control(compat, cache_retention);
     let mut body = json!({"model": model.id, "messages": Value::Null, "stream": true});
-    // Prompt-cache session key (upstream buildParams:826-831): standard
+    // Prompt-cache session key (upstream buildParams:808-829): standard
     // OpenAI keys every cacheable request on the session; other providers
-    // only with explicit long retention.
-    let use_prompt_cache_key = (model.base_url.contains("api.openai.com")
-        && cache_retention != CacheRetention::None)
-        || (cache_retention == CacheRetention::Long
-            && compat.supports_long_cache_retention.unwrap_or(true));
+    // only with explicit long retention. `promptCacheKeyMode` overrides the
+    // auto-detection: `enabled` sends it to any compatible proxy, `disabled`
+    // never sends it.
+    let supports_prompt_cache_key = match compat.prompt_cache_key_mode.unwrap_or_default() {
+        PromptCacheKeyMode::Enabled => true,
+        PromptCacheKeyMode::Disabled => false,
+        PromptCacheKeyMode::Auto => {
+            model.base_url.contains("api.openai.com")
+                || (cache_retention == CacheRetention::Long
+                    && compat.supports_long_cache_retention.unwrap_or(true))
+        }
+    };
+    let use_prompt_cache_key = cache_retention != CacheRetention::None && supports_prompt_cache_key;
     if use_prompt_cache_key {
         if let Some(key) = options
             .session_id
@@ -1183,6 +1191,10 @@ struct ConverterPlan<'a> {
     supports_images: bool,
     requires_tool_result_name: bool,
     requires_assistant_after_tool_result: bool,
+    /// Whether an empty replayed assistant message sends `""` instead of
+    /// null content (upstream `requiresAssistantAfterToolResult ||
+    /// requiresNonNullAssistantContent`).
+    non_null_assistant_content: bool,
     requires_thinking_as_text: bool,
     requires_reasoning_content: bool,
     /// Whether later system messages carry their own `toolsAdded` as in-place
@@ -1307,6 +1319,10 @@ impl<'a> ConverterPlan<'a> {
             requires_assistant_after_tool_result: compat
                 .requires_assistant_after_tool_result
                 .unwrap_or(false),
+            non_null_assistant_content: compat
+                .requires_assistant_after_tool_result
+                .unwrap_or(false)
+                || compat.requires_non_null_assistant_content.unwrap_or(false),
             requires_thinking_as_text: compat.requires_thinking_as_text.unwrap_or(false),
             requires_reasoning_content: compat
                 .requires_reasoning_content_on_assistant_messages
@@ -1574,6 +1590,7 @@ struct OpenAiMessageConverter<'a> {
     supports_images: bool,
     requires_tool_result_name: bool,
     requires_assistant_after_tool_result: bool,
+    non_null_assistant_content: bool,
     requires_thinking_as_text: bool,
     requires_reasoning_content: bool,
     /// The model reasons (DeepSeek's `reasoning_content` gate).
@@ -1603,6 +1620,7 @@ impl<'a> OpenAiMessageConverter<'a> {
             supports_images: plan.supports_images,
             requires_tool_result_name: plan.requires_tool_result_name,
             requires_assistant_after_tool_result: plan.requires_assistant_after_tool_result,
+            non_null_assistant_content: plan.non_null_assistant_content,
             requires_thinking_as_text: plan.requires_thinking_as_text,
             requires_reasoning_content: plan.requires_reasoning_content,
             model_reasoning: model.reasoning,
@@ -1850,7 +1868,14 @@ impl<'a> OpenAiMessageConverter<'a> {
                 } else if text.is_empty() {
                     // Some providers don't accept null content; but with tool
                     // calls present null content is the standard shape.
-                    item["content"] = Value::Null;
+                    // `requiresAssistantAfterToolResult` and
+                    // `requiresNonNullAssistantContent` both switch it to ""
+                    // (upstream openai-completions.ts:1281-1285).
+                    item["content"] = if self.non_null_assistant_content {
+                        json!("")
+                    } else {
+                        Value::Null
+                    };
                 } else {
                     item["content"] = json!(text);
                 }

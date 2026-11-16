@@ -880,6 +880,53 @@ fn openai_prompt_cache_key_and_retention_gating() {
     let body = build_openai_body(&model, &Context::default(), &options, &Default::default())
         .expect("body");
     assert_eq!(body["prompt_cache_key"].as_str().unwrap().len(), 64);
+
+    // `promptCacheKeyMode: "enabled"` sends the key to a compatible proxy
+    // with short retention (upstream #9442); "disabled" drops it even on
+    // standard OpenAI.
+    use pir::ai::types::PromptCacheKeyMode;
+    let model = parity_model("acme", "https://acme.example/v1");
+    let options = StreamOptions {
+        session_id: Some("sess-1".into()),
+        ..StreamOptions::default()
+    };
+    let compat = OpenAiCompat {
+        prompt_cache_key_mode: Some(PromptCacheKeyMode::Enabled),
+        ..OpenAiCompat::default()
+    };
+    let body = build_openai_body(&model, &Context::default(), &options, &compat).expect("body");
+    assert_eq!(body["prompt_cache_key"], json!("sess-1"));
+    assert!(
+        body.get("prompt_cache_retention").is_none(),
+        "short retention sends no retention marker"
+    );
+
+    let model = parity_model("openai", "https://api.openai.com/v1");
+    let compat = OpenAiCompat {
+        prompt_cache_key_mode: Some(PromptCacheKeyMode::Disabled),
+        ..OpenAiCompat::default()
+    };
+    let body = build_openai_body(&model, &Context::default(), &options, &compat).expect("body");
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "disabled never sends the key"
+    );
+
+    // "enabled" also overrides a provider without long-retention support.
+    let model = parity_model("acme", "https://acme.example/v1");
+    let options = StreamOptions {
+        session_id: Some("sess-1".into()),
+        cache_retention: Some(CacheRetention::Long),
+        ..StreamOptions::default()
+    };
+    let compat = OpenAiCompat {
+        prompt_cache_key_mode: Some(PromptCacheKeyMode::Enabled),
+        supports_long_cache_retention: Some(false),
+        ..OpenAiCompat::default()
+    };
+    let body = build_openai_body(&model, &Context::default(), &options, &compat).expect("body");
+    assert_eq!(body["prompt_cache_key"], json!("sess-1"));
+    assert!(body.get("prompt_cache_retention").is_none());
 }
 
 /// No tools + no tool history -> `tools` omitted; tool history without
@@ -1500,6 +1547,68 @@ fn openai_responses_service_tier_passthrough() {
     )
     .expect("body");
     assert!(body.get("service_tier").is_none());
+}
+
+/// `promptCacheKeyMode` gates the Responses `prompt_cache_key`: `disabled`
+/// never sends it, and Azure sends it even with retention `none`
+/// (upstream openai-responses.ts:361-374, azure-openai-responses.ts:205-210).
+#[test]
+fn openai_responses_prompt_cache_key_mode() {
+    use pir::ai::api::openai_responses::shared::build_responses_params;
+    use pir::ai::api::openai_responses::{ResponsesCompat, ResponsesWireOptions};
+    use pir::ai::types::PromptCacheKeyMode;
+
+    let mut model = parity_model("openai", "https://api.openai.com/v1");
+    model.reasoning = false;
+    let options = StreamOptions {
+        session_id: Some("sess-1".into()),
+        ..StreamOptions::default()
+    };
+    let body = build_responses_params(
+        &model,
+        &Context::default(),
+        &options,
+        &ResponsesCompat::default(),
+        &ResponsesWireOptions::new(&model.id),
+    )
+    .expect("body");
+    assert_eq!(body["prompt_cache_key"], json!("sess-1"));
+
+    let compat = ResponsesCompat {
+        prompt_cache_key_mode: PromptCacheKeyMode::Disabled,
+        ..ResponsesCompat::default()
+    };
+    let body = build_responses_params(
+        &model,
+        &Context::default(),
+        &options,
+        &compat,
+        &ResponsesWireOptions::new(&model.id),
+    )
+    .expect("body");
+    assert!(body.get("prompt_cache_key").is_none());
+
+    // Azure's variant always takes the key; the OpenAI variant drops it when
+    // caching is disabled.
+    let options = StreamOptions {
+        session_id: Some("sess-1".into()),
+        cache_retention: Some(CacheRetention::None),
+        ..StreamOptions::default()
+    };
+    let compat = ResponsesCompat::default();
+    let body = build_responses_params(
+        &model,
+        &Context::default(),
+        &options,
+        &compat,
+        &ResponsesWireOptions::new(&model.id),
+    )
+    .expect("body");
+    assert!(body.get("prompt_cache_key").is_none());
+    let wire = ResponsesWireOptions::new(&model.id).with_prompt_cache_key_ignores_retention(true);
+    let body = build_responses_params(&model, &Context::default(), &options, &compat, &wire)
+        .expect("body");
+    assert_eq!(body["prompt_cache_key"], json!("sess-1"));
 }
 
 /// `error.metadata.raw` is appended to provider error messages when present in

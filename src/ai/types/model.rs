@@ -11,7 +11,7 @@ mod formats;
 
 pub use compat::OpenAiCompat;
 pub use cost::{calculate_cost, calculate_cost_with, ModelCost, ModelCostRates, ModelCostTier};
-pub use formats::{CacheControlFormat, SessionAffinityFormat, ThinkingFormat};
+pub use formats::{CacheControlFormat, PromptCacheKeyMode, SessionAffinityFormat, ThinkingFormat};
 /// A model definition.
 ///
 /// Wire shape is upstream camelCase (`baseUrl`, `contextWindow`, `maxTokens`,
