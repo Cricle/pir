@@ -250,9 +250,10 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 30] = [
     // the PIR-TUI-027/030 edits above it in the same function, then
     // 8458 -> 8509 by the PIR-TUI-034/035/036/039 window and dock edits, then
     // 8509 -> 8507 by the abort-retry/streaming edits, then 8507 -> 8530 by
-    // the background-completion notice helper above it (same site, same
-    // invariant).
-    ("tui/terminal.rs", 8530),
+    // the background-completion notice helper above it, then 8530 -> 8545 by
+    // the native-shortcut snapshot and live-overlay edits above it (same
+    // site, same invariant).
+    ("tui/terminal.rs", 8545),
     // `guard.sender.is_none()` returns above, so the `as_ref()` in the same
     // locked scope is `Some`: the sender is read and used under one sink lock
     // with no intervening mutation. (This site surfaced when the file's

@@ -1793,6 +1793,14 @@ impl PluginHost {
             .clone()
     }
 
+    /// Rust-backed shortcuts for the UI key router: `(normalized key,
+    /// description)`, last registration wins. A match dispatches through
+    /// [`Self::invoke_shortcut`]; JS-backed keys are excluded because the
+    /// UI's extension dispatcher already handles them.
+    pub fn rust_shortcuts(&self) -> Vec<(String, Option<String>)> {
+        self.registry().rust_shortcuts()
+    }
+
     /// The registry-definition generation: `0` after [`PluginHost::build`],
     /// incremented once for every successful rebuild
     /// ([`PluginHost::rebuild_registry`] / the change-gated

@@ -2005,10 +2005,15 @@ fn subagent_builtin_is_registered_and_replaceable() {
         .commands
         .iter()
         .any(|(def, _)| def.name == "subagents"));
-    assert!(registrations
+    let shortcut = registrations
         .shortcuts
         .iter()
-        .any(|(def, _)| def.key == "ctrl+shift+a"));
+        .find(|(def, _)| def.key == "ctrl+shift+a")
+        .expect("subagent shortcut");
+    assert!(
+        matches!(shortcut.1, Some(pir::plugins::ShortcutBackend::Rust(_))),
+        "the TUI key router only forwards Rust-backed shortcuts"
+    );
     let schema = registrations.tools[0].0.parameters.clone();
     assert!(!schema.is_null(), "parameters schema present");
     assert_eq!(schema["properties"]["agent"]["type"], "string");
@@ -3112,8 +3117,12 @@ fn subagent_activity_notifies_through_the_ui_service() {
         .messages
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(messages.len(), 1);
-    assert!(messages[0].contains("Subagent scout done"), "{messages:?}");
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages[0].contains("Subagent scout started"),
+        "{messages:?}"
+    );
+    assert!(messages[1].contains("Subagent scout done"), "{messages:?}");
 }
 
 #[test]

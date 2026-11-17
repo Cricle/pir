@@ -1223,6 +1223,14 @@ pub trait OverlayComponent: Send + Sync {
     /// focused component receives through `handleInput(data)`).
     fn handle_input(&self, _data: &str) {}
 
+    /// Whether the TUI should refresh this component on its own cadence while
+    /// it stays open (live counters, elapsed timers). The host asks once per
+    /// tick; a component that returns `true` is repainted even without a key
+    /// or a host event. Default `false` keeps static overlays cached.
+    fn live_refresh(&self) -> bool {
+        false
+    }
+
     /// Release resources when the overlay closes. Called exactly once, by
     /// whichever path removes the registration.
     fn dispose(&self) {}

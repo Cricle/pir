@@ -150,7 +150,6 @@ pub struct SubagentActivity {
     data: Arc<ActivityData>,
     next_id: AtomicU64,
     ui: RwLock<Option<Arc<dyn UiService>>>,
-    widget_registered: AtomicBool,
 }
 
 impl Default for SubagentActivity {
@@ -167,7 +166,6 @@ impl SubagentActivity {
             }),
             next_id: AtomicU64::new(1),
             ui: RwLock::new(None),
-            widget_registered: AtomicBool::new(false),
         }
     }
 
@@ -177,7 +175,6 @@ impl SubagentActivity {
             .ui
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ui;
-        self.widget_registered.store(false, Ordering::Relaxed);
         self.repaint();
     }
 
@@ -198,6 +195,8 @@ impl SubagentActivity {
     ) -> RunHandle {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let signal = AbortSignal::new();
+        let agent = agent.into();
+        let task = task.into();
         let mut runs = self
             .data
             .runs
@@ -212,8 +211,8 @@ impl SubagentActivity {
         }
         runs.push(RunEntry {
             id,
-            agent: agent.into(),
-            task: task.into(),
+            agent: agent.clone(),
+            task,
             mode,
             step,
             state: RunState::Running,
@@ -228,6 +227,11 @@ impl SubagentActivity {
         });
         drop(runs);
         self.repaint();
+        let step_text = step.map(|step| format!(" step {step}")).unwrap_or_default();
+        self.notify(
+            NotifyLevel::Info,
+            format!("Subagent {agent} started ({mode}{step_text})"),
+        );
         RunHandle { id, signal }
     }
 
@@ -367,7 +371,6 @@ impl SubagentActivity {
         if let Some(ui) = self.ui() {
             ui.clear_widget(WIDGET_KEY);
         }
-        self.widget_registered.store(false, Ordering::Relaxed);
     }
 
     fn notify(&self, level: NotifyLevel, message: String) {
@@ -376,22 +379,21 @@ impl SubagentActivity {
         }
     }
 
-    /// Register the compact status widget once per bound UI service. The
-    /// widget renders empty once no run is running and the last finish is
-    /// older than [`RECENT_WINDOW`].
+    /// Re-register the compact status widget: the registration is also the
+    /// TUI's dirty signal, so every board mutation re-renders the live
+    /// running/done summary. The widget paints empty once no run is running
+    /// and the last finish is older than [`RECENT_WINDOW`].
     fn repaint(&self) {
         let Some(ui) = self.ui() else {
             return;
         };
-        if !self.widget_registered.swap(true, Ordering::Relaxed) {
-            ui.set_widget(
-                WIDGET_KEY,
-                Arc::new(SubagentWidget {
-                    data: Arc::clone(&self.data),
-                }),
-                WidgetPlacement::BelowEditor,
-            );
-        }
+        ui.set_widget(
+            WIDGET_KEY,
+            Arc::new(SubagentWidget {
+                data: Arc::clone(&self.data),
+            }),
+            WidgetPlacement::BelowEditor,
+        );
     }
 
     /// Open the keyboard-selectable overlay. Returns `false` when the session
@@ -563,6 +565,7 @@ pub fn overlay_component_for_tests(
         activity,
         selected: AtomicUsize::new(0),
         expanded: AtomicBool::new(false),
+        last_live_refresh: Mutex::new(None),
         done,
     })
 }
@@ -577,6 +580,7 @@ impl OverlayComponentFactory for SubagentOverlayFactory {
             activity: Arc::clone(&self.activity),
             selected: AtomicUsize::new(0),
             expanded: AtomicBool::new(false),
+            last_live_refresh: Mutex::new(None),
             done,
         }))
     }
@@ -586,6 +590,10 @@ struct SubagentOverlay {
     activity: Arc<SubagentActivity>,
     selected: AtomicUsize,
     expanded: AtomicBool,
+    /// Throttles the live repaint to a few frames per second: the TUI asks
+    /// `live_refresh()` every tick, but an elapsed-time list does not need a
+    /// new frame per tick.
+    last_live_refresh: Mutex<Option<Instant>>,
     done: OverlayDone,
 }
 
@@ -712,6 +720,24 @@ impl OverlayComponent for SubagentOverlay {
             }
             "\u{1b}" | "q" | "Q" => self.close(),
             _ => {}
+        }
+    }
+
+    /// Live elapsed/turn counters change without a keypress. The TUI asks on
+    /// every tick; throttle to ~4 Hz so the shared frame cache is not rebuilt
+    /// for a timer that only needs second-level precision.
+    fn live_refresh(&self) -> bool {
+        let now = Instant::now();
+        let mut last = self
+            .last_live_refresh
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_millis(250))
+        {
+            *last = Some(now);
+            true
+        } else {
+            false
         }
     }
 }

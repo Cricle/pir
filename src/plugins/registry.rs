@@ -244,6 +244,25 @@ impl PluginRegistry {
         found
     }
 
+    /// Rust-backed shortcuts with last-registration-wins semantics, keyed
+    /// by the same normalized comparison [`Self::shortcut`] uses. The TUI
+    /// keeps this list to route a keypress to
+    /// [`crate::plugins::PluginHost::invoke_shortcut`]; JS-backed bindings
+    /// are excluded because the TUI's extension dispatcher already owns
+    /// those.
+    pub fn rust_shortcuts(&self) -> Vec<(String, Option<String>)> {
+        let mut resolved: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        for plugin in &self.plugins {
+            for (def, backend) in &plugin.registrations.shortcuts {
+                if matches!(backend, Some(ShortcutBackend::Rust(_))) {
+                    resolved.insert(def.key.to_lowercase(), def.description.clone());
+                }
+            }
+        }
+        resolved.into_iter().collect()
+    }
+
     /// Shortcut conflict resolution (upstream `getShortcuts`): reserved
     /// builtin keybindings block extension shortcuts; other conflicts warn
     /// and last-wins. Returns the resolved shortcuts plus per-conflict

@@ -1094,12 +1094,22 @@ impl AgentSession {
         // nothing. A run (or compaction) in flight keeps the existing path:
         // the action stays queued and the settle drain applies it, because
         // swapping storage or reloading plugins under a live run is unsafe.
+        self.apply_idle_plugin_actions(&mut outcome).await;
+        Ok(outcome)
+    }
+
+    /// Apply the session-control actions a plugin command/shortcut handler
+    /// recorded (`ctx.newSession/fork/switchSession/navigateTree/reload`)
+    /// immediately when the session is idle. A run/compaction in flight keeps
+    /// the existing settle drain: swapping storage or reloading plugins under
+    /// a live run is unsafe.
+    async fn apply_idle_plugin_actions(&self, outcome: &mut crate::extensions::CommandOutcome) {
         if self.extensions.is_some() && !self.is_streaming() && !self.is_compacting() {
             for (action, result) in self.apply_session_command_actions().await {
                 let Err(error) = result else {
                     continue;
                 };
-                crate::ext_diag!("[ext] command action {action:?} failed: {error}");
+                crate::ext_diag!("[ext] plugin action {action:?} failed: {error}");
                 outcome.ok = false;
                 outcome.error = Some(match outcome.error.take() {
                     Some(text) if !text.is_empty() => format!("{text} {error}"),
@@ -1107,6 +1117,25 @@ impl AgentSession {
                 });
             }
         }
+    }
+
+    /// Invoke one plugin keyboard shortcut through the session's
+    /// [`PluginHost`](crate::plugins::PluginHost). This is the worker seam
+    /// behind the TUI's native shortcut router; Rust-backed handlers run
+    /// here, JS-backed keys fall back to the runtime exactly like
+    /// [`Self::dispatch_plugin_command`].
+    ///
+    /// Recorded session-control actions are applied under the same idle rule
+    /// as commands (see [`Self::apply_idle_plugin_actions`]).
+    pub async fn invoke_plugin_shortcut(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<crate::extensions::CommandOutcome> {
+        let Some(plugins) = &self.plugins else {
+            anyhow::bail!("shortcut `{key}` is not registered by any plugin");
+        };
+        let mut outcome = plugins.invoke_shortcut(key).await?;
+        self.apply_idle_plugin_actions(&mut outcome).await;
         Ok(outcome)
     }
 

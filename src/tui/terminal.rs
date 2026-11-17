@@ -160,6 +160,14 @@ pub const CUSTOM_OVERLAY_EVENT_KEY: &str =
 /// notice), never a retry loop.
 pub const CUSTOM_OVERLAY_CALL_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// One Rust-backed plugin shortcut shown by the TUI's key router and help
+/// overlay. The key is normalized to lower case by the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeShortcut {
+    pub(crate) key: String,
+    pub(crate) description: Option<String>,
+}
+
 /// One externally supplied overlay component living in the [`Overlay`] slot —
 /// the TUI half of `ctx.ui.custom` (upstream `showExtensionCustom`,
 /// interactive-mode.ts:2966-3026).
@@ -2240,6 +2248,12 @@ pub(crate) struct App {
     /// their native handler through [`WorkerCommand::DispatchPluginCommand`]
     /// instead of being submitted to the model as a prompt.
     native_commands: Arc<Mutex<Vec<String>>>,
+    /// Rust-backed plugin shortcuts reported once with the native command
+    /// snapshot ([`WorkerEvent::NativeShortcuts`]). JS shortcuts stay in
+    /// `extension_shortcuts`; these route through the worker's
+    /// [`WorkerCommand::InvokePluginShortcut`] so `ctrl+shift+a` / `t` reach
+    /// their native handlers.
+    native_shortcuts: Arc<Mutex<Vec<NativeShortcut>>>,
     /// The worker's one live `AgentSession`, published once after construction
     /// ([`WorkerEvent::AgentSessionReady`]). Session-scoped `/login`, provider
     /// model refresh and Radius token auth resolve through this session's
@@ -3146,6 +3160,7 @@ impl App {
             ext,
             ext_dispatcher,
             native_commands: Arc::new(Mutex::new(Vec::new())),
+            native_shortcuts: Arc::new(Mutex::new(Vec::new())),
             session: None,
             extension_shortcuts: Arc::new(Mutex::new(Vec::new())),
             session_dir,
@@ -11936,6 +11951,16 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // commands appear now instead of on the next keystroke.
                     update_autocomplete(&app);
                 }
+                WorkerEvent::NativeShortcuts(shortcuts) => {
+                    // Rust-backed plugin shortcuts are static for the session
+                    // (builtins register during host build). Keeping the
+                    // snapshot lets the key path decide synchronously and
+                    // dispatch through the worker without a UI-thread round
+                    // trip to the host.
+                    *app.native_shortcuts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = shortcuts;
+                }
                 WorkerEvent::BranchSummaryAbortHandle(abort) => {
                     // Session latch handoff (see the worker's send site): Esc
                     // fires it directly while the command loop is blocked.
@@ -14122,9 +14147,10 @@ fn handle_key(
 
     // 1.5 Extension-registered shortcuts (upstream `registerShortcut`):
     // extension bindings take precedence over built-in actions. Matched keys
-    // are dispatched asynchronously on the extension dispatcher thread; the
-    // UI loop never blocks on a JS handler.
-    if try_extension_shortcut(key, app) {
+    // are dispatched asynchronously on the extension dispatcher thread (JS) or
+    // the worker (Rust-backed builtin bindings); the UI loop never blocks on
+    // a handler.
+    if try_extension_shortcut(key, app, worker) {
         return false;
     }
 
@@ -18210,6 +18236,15 @@ fn refresh_external_overlay(app: &App) -> bool {
         }
         (overlay, app.core.columns(), app.core.rows())
     };
+    // A live component (elapsed/turn counters) asks for frames even when no
+    // key or host event arrived. It throttles its own cadence; static
+    // overlays keep the cached frame.
+    if overlay
+        .component()
+        .is_some_and(|component| component.live_refresh())
+    {
+        overlay.mark_dirty();
+    }
     let theme = native_factory_theme();
     overlay.refresh_for_terminal(term_width, term_height, theme.as_ref())
 }
@@ -21068,22 +21103,42 @@ fn handle_command(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                if !shortcuts.is_empty() {
-                    sections.push((
-                        "Extensions",
-                        shortcuts
-                            .iter()
-                            .map(|shortcut| {
-                                (
-                                    shortcut.key.clone(),
-                                    shortcut
-                                        .description
-                                        .clone()
-                                        .unwrap_or_else(|| shortcut.source_info.path.clone()),
-                                )
-                            })
-                            .collect::<Vec<(String, String)>>(),
-                    ));
+                let mut rows: Vec<(String, String)> = shortcuts
+                    .iter()
+                    .map(|shortcut| {
+                        (
+                            shortcut.key.clone(),
+                            shortcut
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| shortcut.source_info.path.clone()),
+                        )
+                    })
+                    .collect();
+                // Rust-backed builtin bindings (`ctrl+shift+a` subagents,
+                // `ctrl+shift+t` todo dock) are not JS registrations, but they
+                // are user-facing shortcuts and belong in the same list.
+                for shortcut in app
+                    .native_shortcuts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                {
+                    if !rows
+                        .iter()
+                        .any(|(key, _)| key.eq_ignore_ascii_case(&shortcut.key))
+                    {
+                        rows.push((
+                            shortcut.key.clone(),
+                            shortcut
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| "Plugin shortcut".to_owned()),
+                        ));
+                    }
+                }
+                if !rows.is_empty() {
+                    sections.push(("Extensions", rows));
                 }
             }
             entries.push(ChatEntry::Notice {
@@ -22802,24 +22857,40 @@ fn key_combo_string(key: &KeyEvent) -> String {
     parts.join("+")
 }
 
-/// Match `key` against the cached extension shortcut registry and dispatch a
-/// hit. Returns `true` when the key was consumed by an extension binding.
-fn try_extension_shortcut(key: &KeyEvent, app: &App) -> bool {
-    let Some(dispatcher) = &app.ext_dispatcher else {
-        return false;
-    };
+/// Match `key` against the cached JS extension shortcuts and the Rust-backed
+/// native plugin shortcuts, dispatching the hit on the owning thread. Returns
+/// `true` when the key was consumed by a plugin binding.
+fn try_extension_shortcut(key: &KeyEvent, app: &App, worker: &WorkerHandle) -> bool {
     let combo = key_combo_string(key);
-    let matches_shortcut = {
+    if let Some(dispatcher) = &app.ext_dispatcher {
+        let matches_js = {
+            let shortcuts = app
+                .extension_shortcuts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            shortcuts
+                .iter()
+                .any(|shortcut| shortcut.key.eq_ignore_ascii_case(&combo))
+        };
+        if matches_js {
+            dispatcher.invoke_shortcut(combo);
+            return true;
+        }
+    }
+    let matches_native = {
         let shortcuts = app
-            .extension_shortcuts
+            .native_shortcuts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         shortcuts
             .iter()
             .any(|shortcut| shortcut.key.eq_ignore_ascii_case(&combo))
     };
-    if matches_shortcut {
-        dispatcher.invoke_shortcut(combo);
+    if matches_native {
+        // The handler runs on the worker (it may await a modal overlay); the
+        // key is consumed even when the worker is gone so it never leaks into
+        // the editor as literal text.
+        let _ = worker.invoke_plugin_shortcut(combo);
         true
     } else {
         false
@@ -23955,6 +24026,12 @@ enum WorkerEvent {
     /// stores this snapshot so `/todos`, `/phone-start`, ... dispatch
     /// natively instead of falling through to the prompt.
     NativeCommands(Vec<SlashCommand>),
+    /// Rust-backed plugin shortcuts (`PluginHost::rust_shortcuts`), sent with
+    /// the native command snapshot. The TUI key path matches a keypress
+    /// against this list and dispatches it through
+    /// [`WorkerCommand::InvokePluginShortcut`]; JS shortcuts keep their own
+    /// dispatcher.
+    NativeShortcuts(Vec<NativeShortcut>),
     /// The session's live native renderer/completion services and native
     /// dialog reply cell (`PluginHost::context()` / `PluginHost::native_dialogs`),
     /// sent once after the session is built. The UI stores the renderer and
@@ -24374,6 +24451,13 @@ enum WorkerCommand {
     DispatchPluginCommand {
         name: String,
         args: String,
+    },
+    /// A Rust-backed plugin shortcut (`ctrl+shift+a`, `ctrl+shift+t`, ...):
+    /// run the registered handler through the session's `PluginHost`
+    /// ([`crate::agent_session::AgentSession::invoke_plugin_shortcut`]) on the
+    /// worker, never on the UI thread.
+    InvokePluginShortcut {
+        key: String,
     },
 }
 
@@ -24858,6 +24942,15 @@ impl WorkerHandle {
             Some(tx) => tx
                 .send(WorkerCommand::DispatchPluginCommand { name, args })
                 .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Send a Rust-backed plugin shortcut to the worker. `false` when the
+    /// worker thread is gone.
+    fn invoke_plugin_shortcut(&self, key: String) -> bool {
+        match &self.submit_tx {
+            Some(tx) => tx.send(WorkerCommand::InvokePluginShortcut { key }).is_ok(),
             None => false,
         }
     }
@@ -28993,6 +29086,20 @@ async fn worker_loop(
         })
         .collect();
     let _ = events.send(WorkerEvent::NativeCommands(native_commands));
+    // Rust-backed plugin shortcuts are static too (`ctrl+shift+a` opens the
+    // subagent overlay, `ctrl+shift+t` collapses the todo dock). One snapshot
+    // lets the UI key path match synchronously and hand the dispatch to the
+    // worker.
+    let native_shortcuts = session
+        .plugin_host()
+        .map(|host| {
+            host.rust_shortcuts()
+                .into_iter()
+                .map(|(key, description)| NativeShortcut { key, description })
+                .collect()
+        })
+        .unwrap_or_default();
+    let _ = events.send(WorkerEvent::NativeShortcuts(native_shortcuts));
     // Native plugin renderer/completion services bound to this session's
     // `PluginHost`; the UI consumes them at the existing renderer/completion
     // seams. `None` when the session has no plugin host or a host whose
@@ -30084,6 +30191,28 @@ async fn handle_session_command(
                 }
                 Err(error) => {
                     let _ = events.send(WorkerEvent::Error(format!("/{name}: {error}")));
+                }
+            }
+        }
+        // Rust-backed plugin shortcut (`ctrl+shift+a`, `ctrl+shift+t`, ...):
+        // same handler contract and error surface as a native slash command,
+        // but dispatched by key. The handler itself may await a modal overlay;
+        // it runs on the worker, never the UI thread.
+        WorkerCommand::InvokePluginShortcut { key } => {
+            match session.invoke_plugin_shortcut(&key).await {
+                Ok(outcome) => {
+                    if let Some(text) = outcome.error {
+                        let _ = events.send(if outcome.ok {
+                            WorkerEvent::Status(text)
+                        } else {
+                            WorkerEvent::Error(text)
+                        });
+                    } else if !outcome.ok {
+                        let _ = events.send(WorkerEvent::Error(format!("shortcut {key} failed")));
+                    }
+                }
+                Err(error) => {
+                    let _ = events.send(WorkerEvent::Error(format!("shortcut {key}: {error}")));
                 }
             }
         }
