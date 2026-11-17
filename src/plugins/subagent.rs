@@ -116,7 +116,7 @@ use crate::coding_agent::ToolSelection;
 use crate::extensions::{CommandOutcome, ExtensionHandle};
 
 use super::plugin::{
-    AgentPlugin, CommandBackend, PluginContext, RegistrationContext, ShortcutBackend,
+    AgentPlugin, CommandBackend, PluginContext, PluginFuture, RegistrationContext, ShortcutBackend,
 };
 use super::source::PluginInfo;
 use activity::{COMMAND_NAME, SHORTCUT};
@@ -625,6 +625,13 @@ impl AgentPlugin for SubagentPlugin {
 
     fn on_context(&self, ctx: &PluginContext) {
         self.activity.bind_ui(ctx.ui_arc());
+    }
+
+    fn on_shutdown(&self) -> PluginFuture<'_, anyhow::Result<()>> {
+        Box::pin(async {
+            self.activity.clear();
+            Ok(())
+        })
     }
 
     /// Downcast support: the plugin host reaches this concrete builtin to

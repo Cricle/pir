@@ -3081,6 +3081,8 @@ fn subagent_activity_tracks_lifecycle_and_abort_signal() {
     );
     assert_eq!(activity.snapshots()[0].state, RunState::Aborted);
     assert_eq!(activity.running_count(), 0);
+    activity.clear();
+    assert!(activity.snapshots().is_empty());
 }
 
 #[test]

@@ -351,6 +351,25 @@ impl SubagentActivity {
             .count()
     }
 
+    /// Session teardown: abort live runs, drop the board and retire the
+    /// widget. A reused plugin instance starts clean.
+    pub fn clear(&self) {
+        let mut runs = self
+            .data
+            .runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for run in runs.iter().filter(|run| run.state == RunState::Running) {
+            run.signal.abort();
+        }
+        runs.clear();
+        drop(runs);
+        if let Some(ui) = self.ui() {
+            ui.clear_widget(WIDGET_KEY);
+        }
+        self.widget_registered.store(false, Ordering::Relaxed);
+    }
+
     fn notify(&self, level: NotifyLevel, message: String) {
         if let Some(ui) = self.ui() {
             ui.notify(level, &message);
