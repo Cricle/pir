@@ -1076,6 +1076,30 @@ fn background_status_marker_rides_the_working_slot() {
     );
 }
 
+/// Background completions append one short notice; the full result still
+/// replaces the tool block.
+#[test]
+fn background_completion_notice_is_compact_and_distinguishes_failure() {
+    use pir::tui::terminal::background_finished_text;
+
+    assert_eq!(
+        background_finished_text("bash", false, Some(1_250)),
+        "background bash finished in 1.2s"
+    );
+    assert_eq!(
+        background_finished_text("grep", false, Some(250)),
+        "background grep finished in 250ms"
+    );
+    assert_eq!(
+        background_finished_text("bash", true, Some(2_000)),
+        "background bash failed after 2.0s"
+    );
+    assert_eq!(
+        background_finished_text("bash", false, None),
+        "background bash finished"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // terminal.rs — extension-status and dialog-admission helpers
 // ---------------------------------------------------------------------------

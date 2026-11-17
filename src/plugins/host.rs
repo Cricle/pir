@@ -7,7 +7,7 @@
 //! shortcuts/providers/renderers), and merge semantics are identical for
 //! both runtimes because both implement [`AgentPlugin`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -613,6 +613,11 @@ pub struct PluginHost {
     js_event_dispatch: AtomicBool,
     /// The native dialog request/reply cell shared with the TUI responder.
     native_dialogs: Arc<NativeDialogCell>,
+    /// Presentation notifications queued by native plugins when the session
+    /// has no JS runtime. With a JS runtime the same [`Notification`] values
+    /// ride its bounded queue instead, so the TUI/headless drains see one
+    /// ordered stream.
+    native_notifications: Mutex<VecDeque<crate::extensions::Notification>>,
     /// Outermost-UI-prompt nesting state shared by every native dialog on
     /// this host (upstream `withUIPrompt`'s `uiPromptDepth` +
     /// `activeUIPrompt`, runner.ts:589-621): concurrent dialogs emit ONE
@@ -1403,6 +1408,7 @@ impl PluginHost {
             js_owned: AtomicBool::new(true),
             js_event_dispatch: AtomicBool::new(true),
             native_dialogs: Arc::new(NativeDialogCell::default()),
+            native_notifications: Mutex::new(VecDeque::new()),
             ui_prompt: Mutex::new((0, None)),
             terminal_input: Arc::new(TerminalInputRegistry::default()),
             native_terminal_input,
@@ -3341,23 +3347,65 @@ impl PluginHost {
         }
     }
 
+    /// Push one presentation notification from a native plugin. With a JS
+    /// runtime attached the notification joins its bounded queue (the same
+    /// stream `ctx.ui.notify` uses); without one it waits in the native
+    /// queue until the host drains it.
+    #[doc(hidden)]
+    pub fn push_native_notification(&self, notification: crate::extensions::Notification) {
+        if let Some(js) = &self.js {
+            js.push_notification(notification);
+            return;
+        }
+        const CAP: usize = 1024;
+        let mut queue = self
+            .native_notifications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= CAP {
+            queue.pop_front();
+        }
+        queue.push_back(notification);
+    }
+
     /// Drain notifications matching `predicate`, keeping the rest queued.
     pub fn take_notifications(
         &self,
         predicate: impl Fn(&crate::extensions::Notification) -> bool,
     ) -> Vec<crate::extensions::Notification> {
-        match &self.js {
-            Some(js) => js.take_notifications(predicate),
+        let mut taken = match &self.js {
+            Some(js) => js.take_notifications(|notification| predicate(notification)),
             None => Vec::new(),
+        };
+        let mut queue = self
+            .native_notifications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut kept = VecDeque::with_capacity(queue.len());
+        while let Some(notification) = queue.pop_front() {
+            if predicate(&notification) {
+                taken.push(notification);
+            } else {
+                kept.push_back(notification);
+            }
         }
+        *queue = kept;
+        taken
     }
 
-    /// How many notifications are currently queued in the JS runtime.
+    /// How many presentation notifications are currently queued.
     pub fn pending_notification_count(&self) -> usize {
-        self.js
+        let js = self
+            .js
             .as_ref()
-            .map(|js| js.pending_notification_count())
-            .unwrap_or(0)
+            .map(ExtensionHandle::pending_notification_count)
+            .unwrap_or(0);
+        let native = self
+            .native_notifications
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        js + native
     }
 
     /// Push the live session/model snapshot backing the `ctx` facade.

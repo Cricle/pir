@@ -43,6 +43,7 @@ use pir::plugins::plugin::services::{
     OverlayComponentFactory, OverlayDone,
 };
 use pir::plugins::plugin::{AgentPlugin, PluginContext};
+use pir::plugins::PluginHost;
 use pir::plugins::PluginInfo;
 use pir::session_manager::SessionManager;
 
@@ -1151,4 +1152,32 @@ fn plugin_service_trust_reads_the_extension_decision_and_pinned_denial() {
             .is_project_trusted(),
         "a pinned denial must be visible to the plugin service"
     );
+}
+
+/// Native plugins (`todo`, `subagent`) queue presentation notifications even
+/// when the session has no JS runtime. The TUI/headless drain sees them; the
+/// old JS-only path dropped them silently.
+#[test]
+fn native_presentation_notifications_drain_without_js() {
+    let host = PluginHost::build(None, Vec::new());
+    assert_eq!(host.pending_notification_count(), 0);
+    host.push_native_notification(Notification::Notify {
+        message: "native notice".to_owned(),
+        level: "info".to_owned(),
+    });
+    host.push_native_notification(Notification::Status {
+        key: "status".to_owned(),
+        text: Some("working".to_owned()),
+    });
+    assert_eq!(host.pending_notification_count(), 2);
+
+    let notices =
+        host.take_notifications(|notification| matches!(notification, Notification::Notify { .. }));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(host.pending_notification_count(), 1);
+
+    let statuses =
+        host.take_notifications(|notification| matches!(notification, Notification::Status { .. }));
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(host.pending_notification_count(), 0);
 }

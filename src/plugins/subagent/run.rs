@@ -1,6 +1,16 @@
 use super::child::ChildRunInputs;
 use super::*;
 
+/// Abort the child when either the parent signal or the selected-run signal
+/// fires. `AbortSignal::any` owns the watcher tasks; callers are already on
+/// the async runtime.
+fn combined_signal(parent: Option<&AbortSignal>, task: &AbortSignal) -> Option<AbortSignal> {
+    match parent {
+        Some(parent) => Some(AbortSignal::any([parent.clone(), task.clone()])),
+        None => Some(task.clone()),
+    }
+}
+
 /// Tool execution entry point: mode validation, the project-agent trust
 /// gate, then the single/parallel/chain dispatch (upstream `execute`).
 /// Pre-abort handling is per-mode (below) so the parent-aborted case yields
@@ -10,6 +20,7 @@ pub(super) async fn execute(
     ctx: &ToolContext,
     extensions: Option<ExtensionHandle>,
     budget: SubagentBudget,
+    activity: Arc<super::activity::SubagentActivity>,
 ) -> ToolResult {
     let Some(env) = ctx.session_env.clone() else {
         return ToolResult::error(
@@ -142,6 +153,7 @@ pub(super) async fn execute(
                 emit,
                 ctx,
                 budget,
+                Arc::clone(&activity),
             )
             .await
         }
@@ -155,10 +167,16 @@ pub(super) async fn execute(
                 emit,
                 ctx,
                 budget,
+                Arc::clone(&activity),
             )
             .await
         }
-        _ => run_single(params, env, extensions, agents, builder, emit, ctx, budget).await,
+        _ => {
+            run_single(
+                params, env, extensions, agents, builder, emit, ctx, budget, activity,
+            )
+            .await
+        }
     }
 }
 
@@ -173,6 +191,7 @@ async fn run_single(
     emit: EmitUpdate,
     ctx: &ToolContext,
     budget: SubagentBudget,
+    activity: Arc<super::activity::SubagentActivity>,
 ) -> ToolResult {
     let agent_name = params.agent.unwrap_or_default();
     let task = params.task.unwrap_or_default();
@@ -183,10 +202,15 @@ async fn run_single(
     if ctx.is_aborted() {
         return ToolResult::error("Subagent was aborted");
     }
+    let run = activity.begin(agent_name.clone(), task.clone(), "single", None);
+    let task_signal = combined_signal(ctx.signal.as_ref(), &run.signal);
     let on_task_update: OnTaskUpdate = {
         let emit = emit.clone();
         let builder = builder.clone();
+        let activity = Arc::clone(&activity);
+        let run_id = run.id;
         Arc::new(move |result| {
+            activity.update(run_id, result);
             emit_partial(
                 &emit,
                 &builder,
@@ -206,11 +230,12 @@ async fn run_single(
         task,
         cwd,
         step: None,
-        parent_signal: ctx.signal.clone(),
+        parent_signal: task_signal,
         on_task_update: Some(on_task_update),
         budget,
     })
     .await;
+    activity.finish(run.id, &result);
     let details = builder.build(std::slice::from_ref(&result));
     if ctx
         .signal
@@ -247,6 +272,7 @@ async fn run_chain(
     emit: EmitUpdate,
     ctx: &ToolContext,
     budget: SubagentBudget,
+    activity: Arc<super::activity::SubagentActivity>,
 ) -> ToolResult {
     let completed: Arc<Mutex<Vec<SingleResult>>> = Arc::new(Mutex::new(Vec::new()));
     let mut previous_output = String::new();
@@ -280,11 +306,21 @@ async fn run_chain(
             ));
             emit_partial(&emit, &builder, &snapshot, Some("(running...)"));
         }
+        let run = activity.begin(
+            step.agent.clone(),
+            task_with_context.clone(),
+            "chain",
+            Some(index + 1),
+        );
+        let task_signal = combined_signal(ctx.signal.as_ref(), &run.signal);
         let on_task_update: OnTaskUpdate = {
             let emit = emit.clone();
             let builder = builder.clone();
             let completed = Arc::clone(&completed);
+            let activity = Arc::clone(&activity);
+            let run_id = run.id;
             Arc::new(move |result| {
+                activity.update(run_id, result);
                 // Upstream shows the completed steps plus exactly ONE entry
                 // for the running step: the latest snapshot REPLACES any
                 // earlier partial of the same step (rebuilt from the
@@ -315,11 +351,12 @@ async fn run_chain(
             task: task_with_context,
             cwd,
             step: Some(index + 1),
-            parent_signal: ctx.signal.clone(),
+            parent_signal: task_signal,
             on_task_update: Some(on_task_update),
             budget,
         })
         .await;
+        activity.finish(run.id, &result);
         let failed = is_failed(&result);
         completed
             .lock()
@@ -367,6 +404,7 @@ async fn run_parallel(
     emit: EmitUpdate,
     ctx: &ToolContext,
     budget: SubagentBudget,
+    activity: Arc<super::activity::SubagentActivity>,
 ) -> ToolResult {
     if tasks.len() > MAX_PARALLEL_TASKS {
         return ok_with_details(
@@ -427,6 +465,7 @@ async fn run_parallel(
     let mut children: tokio::task::JoinSet<(usize, SingleResult)> = tokio::task::JoinSet::new();
     let mut task_indices: std::collections::HashMap<tokio::task::Id, usize> =
         std::collections::HashMap::with_capacity(tasks.len());
+    let mut run_ids: Vec<u64> = Vec::with_capacity(tasks.len());
     for (index, task) in tasks.iter().enumerate() {
         let env = Arc::clone(&env);
         let extensions = extensions.clone();
@@ -439,13 +478,18 @@ async fn run_parallel(
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
-        let signal = ctx.signal.clone();
+        let run = activity.begin(task.agent.clone(), task.task.clone(), "parallel", None);
+        run_ids.push(run.id);
+        let signal = combined_signal(ctx.signal.as_ref(), &run.signal);
         let agent_name = task.agent.clone();
         let task_text = task.task.clone();
+        let activity_update = Arc::clone(&activity);
+        let run_id = run.id;
         let on_task_update: OnTaskUpdate = {
             let shared = Arc::clone(&shared);
             let emit_aggregate = Arc::clone(&emit_aggregate);
             Arc::new(move |result| {
+                activity_update.update(run_id, result);
                 {
                     let mut slots = shared
                         .lock()
@@ -457,6 +501,7 @@ async fn run_parallel(
                 emit_aggregate();
             })
         };
+        let activity_finish = Arc::clone(&activity);
         let handle = children.spawn(async move {
             let _permit = semaphore.acquire_owned().await;
             let result = run_child(ChildRunInputs {
@@ -472,6 +517,7 @@ async fn run_parallel(
                 budget,
             })
             .await;
+            activity_finish.finish(run_id, &result);
             {
                 let mut slots = shared
                     .lock()
@@ -507,6 +553,9 @@ async fn run_parallel(
                     None,
                 );
                 if let Some(index) = index {
+                    if let Some(run_id) = run_ids.get(index) {
+                        activity.finish(*run_id, &failed);
+                    }
                     if let Some(slot) = results.get_mut(index) {
                         *slot = Some(failed);
                     }

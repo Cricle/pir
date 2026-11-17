@@ -135,6 +135,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
@@ -146,7 +147,10 @@ use crate::plugins::plugin::{
     AgentPlugin, CommandBackend, EventInterest, PluginContext, PluginEvent, PluginEventOutcome,
     PluginFuture, RegistrationContext, ShortcutBackend,
 };
-use crate::plugins::services::{FactoryRenderContext, UiService, WidgetFactory, WidgetPlacement};
+use crate::plugins::services::{
+    DialogOptions, FactoryRenderContext, OverlayComponent, OverlayComponentFactory, OverlayDone,
+    UiService, WidgetFactory, WidgetPlacement,
+};
 use crate::plugins::source::PluginInfo;
 
 // ---------------------------------------------------------------------------
@@ -2058,6 +2062,324 @@ pub fn widget_lines_for_tests(store: &Arc<TodoStore>, collapsed: bool) -> Vec<St
     })
 }
 
+// ---------------------------------------------------------------------------
+// Interactive `/todos` overlay
+// ---------------------------------------------------------------------------
+
+/// Arrow keys move the selection; `space` advances the status machine, `d`
+/// tombstones the selected task, `enter` expands its details.
+struct TodoOverlayFactory {
+    store: Arc<TodoStore>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl OverlayComponentFactory for TodoOverlayFactory {
+    fn create(&self, done: OverlayDone) -> Option<Arc<dyn OverlayComponent>> {
+        Some(Arc::new(TodoOverlay {
+            store: Arc::clone(&self.store),
+            repaint: Arc::clone(&self.repaint),
+            selected: AtomicU64::new(0),
+            expanded: AtomicBool::new(false),
+            done,
+        }))
+    }
+}
+
+struct TodoOverlay {
+    store: Arc<TodoStore>,
+    repaint: Arc<dyn Fn() + Send + Sync>,
+    /// Selected task id (`0` = first visible task).
+    selected: AtomicU64,
+    expanded: AtomicBool,
+    done: OverlayDone,
+}
+
+impl TodoOverlay {
+    fn close(&self) {
+        (self.done)(JsonValue::Null);
+    }
+
+    fn selected_state(&self) -> (String, TodoState, Option<Task>) {
+        let session = self.store.active_session();
+        let state = self.store.state(&session);
+        let tasks = visible_tasks(&state);
+        let selected = self.selected.load(Ordering::Relaxed);
+        let task = tasks
+            .iter()
+            .find(|task| task.id == selected)
+            .or_else(|| tasks.first())
+            .map(|task| (*task).clone());
+        (session, state, task)
+    }
+
+    fn move_selection(&self, delta: isize) {
+        let (_, state, _) = self.selected_state();
+        let tasks = visible_tasks(&state);
+        if tasks.is_empty() {
+            return;
+        }
+        let current = self.selected.load(Ordering::Relaxed);
+        let index = tasks
+            .iter()
+            .position(|task| task.id == current)
+            .unwrap_or(0);
+        let next = if delta < 0 {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(tasks.len() - 1)
+        };
+        self.selected.store(tasks[next].id, Ordering::Relaxed);
+    }
+
+    fn mutate(&self, action: TaskAction, params: TodoParams) {
+        let (session, mut state, _) = self.selected_state();
+        let op = apply_mutation(&mut state, action, &params);
+        if !matches!(op, TodoOp::Error { .. }) {
+            self.store.replace_state(&session, state);
+            (self.repaint)();
+        }
+    }
+
+    fn advance_status(&self) {
+        let Some(task) = self.selected_state().2 else {
+            return;
+        };
+        let next = match task.status {
+            TaskStatus::Pending => TaskStatus::InProgress,
+            TaskStatus::InProgress => TaskStatus::Completed,
+            _ => return,
+        };
+        self.mutate(
+            TaskAction::Update,
+            TodoParams {
+                id: Some(task.id),
+                status: Some(next),
+                ..TodoParams::default()
+            },
+        );
+    }
+
+    fn delete_selected(&self) {
+        let Some(task) = self.selected_state().2 else {
+            return;
+        };
+        self.mutate(
+            TaskAction::Delete,
+            TodoParams {
+                id: Some(task.id),
+                ..TodoParams::default()
+            },
+        );
+    }
+}
+
+fn visible_tasks(state: &TodoState) -> Vec<&Task> {
+    state
+        .tasks
+        .iter()
+        .filter(|task| task.status != TaskStatus::Deleted)
+        .collect()
+}
+
+fn todo_glyph(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "○",
+        TaskStatus::InProgress => "◐",
+        TaskStatus::Completed => "✓",
+        TaskStatus::Deleted => "×",
+    }
+}
+
+fn clip_line(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(width.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
+fn wrap_line(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let mut current = String::new();
+        for word in raw.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = word.to_owned();
+            }
+            if lines.len() >= max_lines {
+                break;
+            }
+        }
+        if !current.is_empty() && lines.len() < max_lines {
+            lines.push(current);
+        }
+        if lines.len() >= max_lines {
+            break;
+        }
+    }
+    lines
+}
+
+/// Test seam: build the interactive list without a UI service.
+#[doc(hidden)]
+pub fn todo_overlay_component_for_tests(
+    store: Arc<TodoStore>,
+    done: OverlayDone,
+) -> Arc<dyn OverlayComponent> {
+    Arc::new(TodoOverlay {
+        store,
+        repaint: Arc::new(|| {}),
+        selected: AtomicU64::new(0),
+        expanded: AtomicBool::new(false),
+        done,
+    })
+}
+
+impl OverlayComponent for TodoOverlay {
+    fn render(&self, context: &FactoryRenderContext<'_>) -> Vec<String> {
+        let width = context.width.max(24);
+        let (_, state, _) = self.selected_state();
+        let tasks = visible_tasks(&state);
+        let header = format_todos_command(&state)
+            .and_then(|text| text.lines().next().map(str::to_owned))
+            .unwrap_or_else(|| MSG_NO_TODOS.to_owned());
+        let mut lines = vec![clip_line(&format!("Todos · {header} · ↑/↓ select"), width)];
+        if tasks.is_empty() {
+            lines.push(MSG_NO_TODOS.to_owned());
+            lines.push("Esc closes.".to_owned());
+            return lines;
+        }
+        let selected_id = tasks
+            .iter()
+            .find(|task| task.id == self.selected.load(Ordering::Relaxed))
+            .or_else(|| tasks.first())
+            .map(|task| task.id)
+            .unwrap_or(0);
+        self.selected.store(selected_id, Ordering::Relaxed);
+        for task in &tasks {
+            let marker = if task.id == selected_id { "▶" } else { " " };
+            let row = format_command_task_line(task, todo_glyph(task.status));
+            lines.push(clip_line(&format!("{marker} {}", row.trim_start()), width));
+        }
+        if self.expanded.load(Ordering::Relaxed) {
+            if let Some(task) = tasks.iter().find(|task| task.id == selected_id) {
+                lines.push(String::new());
+                lines.push(clip_line(
+                    &format!("#{} {}", task.id, sanitize_terminal_text(&task.subject)),
+                    width,
+                ));
+                lines.push(clip_line(
+                    &format!("status: {}", task.status.as_str()),
+                    width,
+                ));
+                if let Some(active_form) = task.active_form.as_deref() {
+                    for line in wrap_line(&format!("active: {active_form}"), width, 2) {
+                        lines.push(line);
+                    }
+                }
+                if let Some(owner) = task.owner.as_deref() {
+                    lines.push(clip_line(&format!("owner: {owner}"), width));
+                }
+                if let Some(description) = task.description.as_deref() {
+                    for line in wrap_line(&format!("description: {description}"), width, 6) {
+                        lines.push(line);
+                    }
+                }
+                if let Some(blocked_by) = task.blocked_by.as_ref().filter(|ids| !ids.is_empty()) {
+                    lines.push(clip_line(
+                        &format!(
+                            "blocked by: {}",
+                            blocked_by
+                                .iter()
+                                .map(|id| format!("#{id}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        width,
+                    ));
+                }
+                let blocks = derive_blocks(&state.tasks);
+                if let Some(ids) = blocks.get(&task.id).filter(|ids| !ids.is_empty()) {
+                    lines.push(clip_line(
+                        &format!(
+                            "blocks: {}",
+                            ids.iter()
+                                .map(|id| format!("#{id}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        width,
+                    ));
+                }
+            }
+        }
+        lines.push(String::new());
+        lines.push(
+            "↑/↓ move · enter details · space start/complete · d delete · esc close"
+                .chars()
+                .take(width)
+                .collect(),
+        );
+        lines
+    }
+
+    fn handle_input(&self, data: &str) {
+        match data {
+            "\u{1b}[A" | "\u{1b}OA" => self.move_selection(-1),
+            "\u{1b}[B" | "\u{1b}OB" => self.move_selection(1),
+            "\r" | "\n" => {
+                let expanded = self.expanded.load(Ordering::Relaxed);
+                self.expanded.store(!expanded, Ordering::Relaxed);
+            }
+            " " => self.advance_status(),
+            "d" | "D" => self.delete_selected(),
+            "\u{1b}" | "q" | "Q" => self.close(),
+            _ => {}
+        }
+    }
+}
+
+impl TodoUi {
+    /// Open the interactive list. Resolves when the user closes it.
+    async fn open_overlay(self: &Arc<Self>, store: &Arc<TodoStore>) -> bool {
+        let Some(service) = self
+            .service
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return false;
+        };
+        let repaint = {
+            let ui = Arc::clone(self);
+            let store = Arc::clone(store);
+            Arc::new(move || ui.repaint(&store)) as Arc<dyn Fn() + Send + Sync>
+        };
+        let factory = Arc::new(TodoOverlayFactory {
+            store: Arc::clone(store),
+            repaint,
+        });
+        service
+            .custom(
+                factory,
+                DialogOptions::with_timeout(Duration::from_secs(60 * 60)),
+            )
+            .await
+            .is_ok()
+    }
+}
+
 /// The `todo` builtin plugin.
 pub struct TodoPlugin {
     info: PluginInfo,
@@ -2182,7 +2504,20 @@ impl AgentPlugin for TodoPlugin {
             let has_ui = Arc::clone(&has_ui);
             let ui = Arc::clone(&ui);
             Box::pin(async move {
-                let outcome = todos_command_outcome(&store, has_ui.load(Ordering::Relaxed));
+                let has_ui = has_ui.load(Ordering::Relaxed);
+                let opened = if has_ui {
+                    ui.open_overlay(&store).await
+                } else {
+                    false
+                };
+                let outcome = if opened {
+                    CommandOutcome {
+                        ok: true,
+                        error: None,
+                    }
+                } else {
+                    todos_command_outcome(&store, has_ui)
+                };
                 ui.repaint(&store);
                 outcome
             })

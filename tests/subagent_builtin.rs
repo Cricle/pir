@@ -21,10 +21,14 @@ use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::*;
+use pir::plugins::services::{
+    FactoryRenderContext, NotifyLevel, OverlayComponent, OverlayDone, UiService,
+};
 use pir::plugins::subagent::{
     aggregate_parallel_text, apply_previous, discover_agents, get_final_output, is_failed,
-    load_agents_from_dir, parse_agent_markdown, result_output, truncate_parallel_output,
-    AgentScope, SubagentTool,
+    load_agents_from_dir, overlay_component_for_tests, parse_agent_markdown, result_output,
+    truncate_parallel_output, widget_lines_for_tests, AgentScope, RunState, SingleResult,
+    SubagentActivity, SubagentTool, UsageTotals,
 };
 use pir::plugins::{builtin_extension_def, instantiate_builtin};
 
@@ -1997,6 +2001,14 @@ fn subagent_builtin_is_registered_and_replaceable() {
     plugin.register(&mut ctx).expect("register");
     assert_eq!(registrations.tools.len(), 1);
     assert_eq!(registrations.tools[0].0.name, "subagent");
+    assert!(registrations
+        .commands
+        .iter()
+        .any(|(def, _)| def.name == "subagents"));
+    assert!(registrations
+        .shortcuts
+        .iter()
+        .any(|(def, _)| def.key == "ctrl+shift+a"));
     let schema = registrations.tools[0].0.parameters.clone();
     assert!(!schema.is_null(), "parameters schema present");
     assert_eq!(schema["properties"]["agent"]["type"], "string");
@@ -3015,4 +3027,134 @@ mod tool_search_isolation {
             "child prompts must not leak into the parent session JSONL: {parent_user_texts:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live activity board, status widget and keyboard overlay
+// ---------------------------------------------------------------------------
+
+fn activity_result(agent: &str, task: &str, pending: bool, stop: Option<&str>) -> SingleResult {
+    SingleResult {
+        agent: agent.to_owned(),
+        agent_source: "user",
+        task: task.to_owned(),
+        messages: Vec::new(),
+        usage: UsageTotals {
+            input: 100,
+            output: 50,
+            cache_read: 25,
+            turns: 3,
+            ..UsageTotals::default()
+        },
+        model: Some("test-model".to_owned()),
+        stop_reason: stop.map(str::to_owned),
+        error_message: None,
+        stderr: None,
+        step: None,
+        pending,
+    }
+}
+
+fn activity_context() -> FactoryRenderContext<'static> {
+    FactoryRenderContext {
+        width: 90,
+        theme: None,
+        footer_data: None,
+        request_render: None,
+    }
+}
+
+#[test]
+fn subagent_activity_tracks_lifecycle_and_abort_signal() {
+    let activity = SubagentActivity::new();
+    let handle = activity.begin("worker", "do work", "single", None);
+    assert_eq!(activity.running_count(), 1);
+    activity.update(handle.id, &activity_result("worker", "do work", true, None));
+    let snapshots = activity.snapshots();
+    assert_eq!(snapshots[0].state, RunState::Running);
+    assert_eq!(snapshots[0].turns, 3);
+    assert!(activity.abort(handle.id));
+    assert!(handle.signal.is_aborted());
+    activity.finish(
+        handle.id,
+        &activity_result("worker", "do work", false, Some("aborted")),
+    );
+    assert_eq!(activity.snapshots()[0].state, RunState::Aborted);
+    assert_eq!(activity.running_count(), 0);
+}
+
+#[test]
+fn subagent_activity_notifies_through_the_ui_service() {
+    #[derive(Default)]
+    struct Sink {
+        messages: Mutex<Vec<String>>,
+    }
+    impl UiService for Sink {
+        fn notify(&self, _level: NotifyLevel, message: &str) {
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.to_owned());
+        }
+    }
+
+    let activity = SubagentActivity::new();
+    let sink = Arc::new(Sink::default());
+    activity.bind_ui(Some(sink.clone()));
+    let handle = activity.begin("scout", "look", "single", None);
+    activity.finish(
+        handle.id,
+        &activity_result("scout", "look", false, Some("stop")),
+    );
+    let messages = sink
+        .messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("Subagent scout done"), "{messages:?}");
+}
+
+#[test]
+fn subagent_overlay_selects_and_aborts_one_run() {
+    let activity = Arc::new(SubagentActivity::new());
+    let first = activity.begin("worker", "first task", "single", None);
+    let second = activity.begin("scout", "second task", "parallel", None);
+    let done: OverlayDone = Arc::new(|_| {});
+    let overlay = overlay_component_for_tests(Arc::clone(&activity), done);
+    let lines = overlay.render(&activity_context());
+    assert!(
+        lines.iter().any(|line| line.contains("#1 worker")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("#2 scout")),
+        "{lines:?}"
+    );
+
+    overlay.handle_input("\u{1b}[B");
+    assert!(overlay
+        .render(&activity_context())
+        .iter()
+        .any(|line| line.contains("▶ ◐ #2 scout")));
+    overlay.handle_input("x");
+    assert!(second.signal.is_aborted());
+    assert!(!first.signal.is_aborted());
+}
+
+#[test]
+fn subagent_widget_summarizes_running_then_recent_runs() {
+    let activity = SubagentActivity::new();
+    assert!(widget_lines_for_tests(&activity, 90).is_empty());
+    let handle = activity.begin("worker", "task", "single", None);
+    let lines = widget_lines_for_tests(&activity, 90);
+    assert!(lines[0].contains("1 running"), "{lines:?}");
+    activity.finish(
+        handle.id,
+        &activity_result("worker", "task", false, Some("stop")),
+    );
+    let lines = widget_lines_for_tests(&activity, 90);
+    assert!(
+        lines[0].contains("worker") && lines[0].contains("done"),
+        "{lines:?}"
+    );
 }

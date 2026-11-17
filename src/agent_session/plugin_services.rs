@@ -1613,6 +1613,8 @@ impl LiveUiService {
     fn push(&self, notification: Notification) {
         if let Some(js) = self.js() {
             js.push_notification(notification);
+        } else if let Some(host) = self.state.host() {
+            host.push_native_notification(notification);
         }
     }
 

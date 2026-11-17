@@ -119,6 +119,23 @@ suppressed (`has_ui=false`): `ctx.ui.select/confirm/input/editor` resolve `undef
 queueing a dialog whose only drainer is the blocked renderer thread. Synchronous UI (`notify`, `setStatus`,
 `setTitle`, editor text) keeps working.
 
+## Activity overlays
+
+Builtin activity surfaces use the same native `ctx.ui.custom` overlay slot as extensions, so they are modal only
+while open and never take a permanent frame row beyond their compact dock widget.
+
+- **`/todos`** opens the task list. `↑`/`↓` select, `enter` expands description/owner/dependencies, `space`
+  advances `pending → in_progress → completed`, `d` tombstones the task, `esc` closes. The always-visible
+  `todos` widget stays capped at 12 rows; `ctrl+shift+t` toggles its one-line summary.
+- **`/subagents`** (or `ctrl+shift+a`) opens the live/recent subagent list. Rows show agent, mode step, state,
+  elapsed time, turns and tokens. `↑`/`↓` select, `enter` expands the task/model/usage/output, `x` aborts the
+  selected running child (a per-run `AbortSignal` combined with the parent's), `esc` closes. A compact
+  `subagents` widget appears only while work is running or for 12s after a finish.
+- **Notifications.** Subagent start/finish/abort and background tool completion append one-line transcript
+  notices. Native plugins queue presentation notifications even when the session has no JS runtime; with a JS
+  runtime the same values ride its bounded notification queue. The full subagent/background result still lands
+  in its normal transcript block.
+
 ## Modes
 
 - Steering: send messages while a run executes (queued, applied between tool batches).

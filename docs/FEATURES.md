@@ -62,10 +62,10 @@ provider) and every OAuth flow drives the shared auth HTTP client, so every feat
 | `session` | JSONL persistence, tail-page reader (pulls the optional `memmap2`), discovery |
 | `skills` | skill discovery/loading |
 | `sdk` | `pir::sdk` facade |
-| `subagent` | native `subagent` builtin |
+| `subagent` | native `subagent` builtin + `/subagents` activity overlay (`ctrl+shift+a`) |
 | `tool-repair` | tool-repair pipeline |
 | `tool-search` | BM25 `tool_search` |
-| `todo` | `todo` builtin + `/todos` |
+| `todo` | `todo` builtin + `/todos` (interactive overlay in UI sessions) |
 | `memory` | embedded cm-memory engine: `memory` tool, `/memory`, input auto-recall |
 | `phone` | phone UI; compiled, default **off** |
 | `brush` | embedded bash behind `pir __brush` |

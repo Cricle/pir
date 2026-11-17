@@ -113,10 +113,16 @@ use crate::agent::tool_execution::{
 use crate::agent_session::{AgentSession, AgentSessionConfig, ModelCatalog};
 use crate::ai::types::{AbortSignal, Message, Model, StopReason};
 use crate::coding_agent::ToolSelection;
-use crate::extensions::ExtensionHandle;
+use crate::extensions::{CommandOutcome, ExtensionHandle};
 
-use super::plugin::{AgentPlugin, RegistrationContext};
+use super::plugin::{
+    AgentPlugin, CommandBackend, PluginContext, RegistrationContext, ShortcutBackend,
+};
 use super::source::PluginInfo;
+use activity::{COMMAND_NAME, SHORTCUT};
+
+/// `/subagents` without a UI (same contract as `/todos`).
+pub const ERR_REQUIRES_INTERACTIVE: &str = "/subagents requires interactive mode";
 
 /// Upstream `MAX_PARALLEL_TASKS`.
 const MAX_PARALLEL_TASKS: usize = 8;
@@ -262,12 +268,17 @@ const CONFIG_DIR_NAME: &str = ".pi";
 // Agent discovery (upstream `agents.ts`)
 // ---------------------------------------------------------------------------
 
+mod activity;
 mod child;
 mod discovery;
 mod dispatch;
 mod results;
 mod run;
 
+#[doc(hidden)]
+pub use activity::{
+    overlay_component_for_tests, widget_lines_for_tests, RunSnapshot, RunState, SubagentActivity,
+};
 pub use discovery::{
     discover_agents, find_nearest_project_agents_dir, load_agents_from_dir, parse_agent_markdown,
     parse_tool_list, split_frontmatter, AgentConfig, AgentFrontmatter, AgentScope, AgentSource,
@@ -398,6 +409,9 @@ pub struct SubagentTool {
     /// ([`ToolSessionEnv::user_agents_dir`]) still wins for discovery; this
     /// text names the default the tool itself resolves.
     description: String,
+    /// Live run board shared with the plugin's `/subagents` overlay and
+    /// status widget.
+    activity: Arc<SubagentActivity>,
 }
 
 impl SubagentTool {
@@ -417,7 +431,15 @@ impl SubagentTool {
             extensions,
             budget: SubagentBudget::from_env(),
             description: subagent_description(user_agents_dir),
+            activity: Arc::new(SubagentActivity::new()),
         }
+    }
+
+    /// Share the plugin-owned run board (the `/subagents` overlay and status
+    /// widget read the same entries).
+    pub fn with_activity(mut self, activity: Arc<SubagentActivity>) -> Self {
+        self.activity = activity;
+        self
     }
 
     /// Replace the environment-resolved child budget (tests/embedders).
@@ -458,7 +480,8 @@ impl AgentTool for SubagentTool {
         let ctx = ctx.clone();
         let extensions = self.extensions.clone();
         let budget = self.budget;
-        Box::pin(async move { execute(&args, &ctx, extensions, budget).await })
+        let activity = Arc::clone(&self.activity);
+        Box::pin(async move { execute(&args, &ctx, extensions, budget, activity).await })
     }
 }
 
@@ -488,6 +511,9 @@ pub struct SubagentPlugin {
     /// `agent_dir`). `None` keeps the tool's historical process-environment
     /// resolution ([`crate::coding_agent::context::agent_dir`]).
     user_agents_dir: Option<PathBuf>,
+    /// The live run board shared by the tool, `/subagents`, the shortcut and
+    /// the status widget.
+    activity: Arc<SubagentActivity>,
 }
 
 impl SubagentPlugin {
@@ -501,6 +527,7 @@ impl SubagentPlugin {
             info,
             js: RwLock::new(None),
             user_agents_dir: None,
+            activity: Arc::new(SubagentActivity::new()),
         }
     }
 
@@ -544,9 +571,60 @@ impl AgentPlugin for SubagentPlugin {
         let tool = match self.user_agents_dir.as_deref() {
             Some(dir) => SubagentTool::with_extensions_and_dir(extensions, dir),
             None => SubagentTool::with_extensions(extensions),
-        };
+        }
+        .with_activity(Arc::clone(&self.activity));
         ctx.register_tool(Arc::new(tool));
+
+        let activity = Arc::clone(&self.activity);
+        let handler: crate::plugins::CommandHandler = Arc::new(move |_args: &str| {
+            let activity = Arc::clone(&activity);
+            Box::pin(async move {
+                if activity.open_overlay().await {
+                    CommandOutcome {
+                        ok: true,
+                        error: None,
+                    }
+                } else {
+                    CommandOutcome {
+                        ok: false,
+                        error: Some(ERR_REQUIRES_INTERACTIVE.to_owned()),
+                    }
+                }
+            })
+        });
+        ctx.register_command(
+            COMMAND_NAME,
+            Some("Show live subagent runs; ↑/↓, enter, x abort, esc close"),
+            Some(CommandBackend::Rust(handler)),
+        );
+
+        let activity = Arc::clone(&self.activity);
+        let shortcut: crate::plugins::ShortcutHandler = Arc::new(move || {
+            let activity = Arc::clone(&activity);
+            Box::pin(async move {
+                if activity.open_overlay().await {
+                    CommandOutcome {
+                        ok: true,
+                        error: None,
+                    }
+                } else {
+                    CommandOutcome {
+                        ok: false,
+                        error: Some(ERR_REQUIRES_INTERACTIVE.to_owned()),
+                    }
+                }
+            })
+        });
+        ctx.register_shortcut(
+            SHORTCUT,
+            Some("Show live subagent runs"),
+            Some(ShortcutBackend::Rust(shortcut)),
+        );
         Ok(())
+    }
+
+    fn on_context(&self, ctx: &PluginContext) {
+        self.activity.bind_ui(ctx.ui_arc());
     }
 
     /// Downcast support: the plugin host reaches this concrete builtin to

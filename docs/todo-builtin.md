@@ -103,7 +103,8 @@ deserialization for a well-formed transcript).
 
 ## 3. `/todos`
 
-`/todos` prints the whole list grouped by status, independent of any row budget:
+In a no-UI/print session `/todos` prints the whole list grouped by status, independent of
+any row budget:
 
 ```
 2/7 completed · 1 in progress · 4 pending
@@ -119,14 +120,22 @@ deserialization for a well-formed transcript).
 Header counts omit zero values; sections appear only when non-empty; tombstones are never listed. Empty list: `No
 todos yet. Ask the agent to add some!`. No UI: `/todos requires interactive mode` (`ok = false`).
 
-**Overlay.** On a UI session the plugin registers a native widget factory (`ctx.ui.setWidget("todos", …)`,
-`WidgetPlacement::Overlay`) that renders the same grouped list in the dock. It repaints after every tool mutation,
+**Interactive list.** In a UI session `/todos` opens a focused `ctx.ui.custom` overlay. `↑`/`↓` move the
+selection, `enter` expands the selected task's description/owner/dependencies, `space` advances
+`pending → in_progress → completed`, `d` tombstones the selected task, and `esc` closes. The same
+`apply_mutation` reducer used by the tool performs the edits, so validation, dependency rules and the
+transcript snapshot stay consistent. The overlay renders every tick from the live `TodoStore`; no
+per-key repaint plumbing is needed.
+
+**Dock widget.** The plugin also registers a native widget factory (`ctx.ui.setWidget("todos", …)`,
+`WidgetPlacement::Overlay`) that renders the grouped list at a glance. It repaints after every tool mutation,
 `/todos`, transcript replay, `/reload` and session start. The list is clipped to the frame width and capped at 12
-rows; `ctrl+shift+t` toggles a one-line counts summary. The `/todos` command keeps its text channel for print mode.
+rows; `ctrl+shift+t` toggles a one-line counts summary, so the always-visible dock stays small while the focused
+overlay carries the full details.
 
 **Text channel.** A Rust command's only host-visible text output is `CommandOutcome.error` (the `mcp` builtin's
-precedent), so the grouped list rides that field with `ok = true`. Print mode prints it (`[ext] command:todos:
-…`); the TUI overlay above is the interactive surface.
+precedent), so the print-mode list rides that field with `ok = true`. Print mode prints it (`[ext] command:todos:
+…`); interactive sessions use the overlay above.
 
 ## 4. Feature control
 
@@ -172,7 +181,7 @@ Pinned by `tests/suites/todo_builtin.rs` and module unit tests.
 | 13 | i18n through `@juicesharp/rpiv-i18n` (9 locales) with English fallbacks | English literals only | No i18n layer; scoped out |
 | 14 | `~/.config/rpiv-todo/config.json` (`maxWidgetLines`, `collapseKey`, `guidance`) | Not read | The native overlay uses fixed 12-row/width clipping and the registered `ctrl+shift+t`; the config file is not a settings surface yet |
 | 15 | Overlay widget, collapse state, "completed rows fade after the turn", per-row glyphs/colors, `selectOverlayLayout`; only the foreground session's overlay repaints | Native widget factory + collapse state ported; no per-row colors/fade or `selectOverlayLayout`. `ctrl+shift+t` reaches the native handler through `PluginHost::invoke_shortcut`; the TUI's JS-only shortcut dispatcher still does not call that host path | One overlay mechanism (`ctx.ui.setWidget`, `WidgetPlacement::Overlay`); TUI-native shortcut routing is a separate host seam |
-| 16 | `/todos` through `ctx.ui.notify(..., "info")` | Native overlay widget plus `CommandOutcome.error` text (`ok: true`) for print mode | The overlay is the interactive surface; print keeps the mcp-style text channel |
+| 16 | `/todos` through `ctx.ui.notify(..., "info")` | UI sessions open a focused `ctx.ui.custom` list (select/expand/advance/delete); print mode keeps the `CommandOutcome.error` text channel | The interactive list is the primary surface; print cannot take keyboard input |
 
 Everything else — six actions, parameter names/semantics, status machine, tombstones, dependency validation and
 `blocks` edges, metadata null-deletion, the envelope shape, all contract error strings, `list`/`get` content lines

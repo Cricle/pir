@@ -12,7 +12,7 @@
 #![cfg(feature = "todo")]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -21,12 +21,13 @@ use pir::agent::tool_execution::ToolContext;
 use pir::extensions::SessionContextSnapshot;
 use pir::plugins::builtin::todo::{
     apply_mutation, build_tool_result, derive_blocks, detect_cycle, format_content,
-    is_transition_valid, replay_from_entries, sanitize_terminal_text, todos_command_outcome,
-    widget_lines_for_tests, Task, TaskAction, TaskStatus, TodoOp, TodoParams, TodoPlugin,
-    TodoState, TodoStore, COMMAND_NAME, ERR_REQUIRES_INTERACTIVE, MAX_METADATA_BYTES,
-    MAX_OWNER_CHARS, MAX_SESSION_SLOTS, MAX_SUBJECT_CHARS, MAX_TASKS_PER_SESSION, MSG_NO_TODOS,
-    TOOL_NAME,
+    is_transition_valid, replay_from_entries, sanitize_terminal_text,
+    todo_overlay_component_for_tests, todos_command_outcome, widget_lines_for_tests, Task,
+    TaskAction, TaskStatus, TodoOp, TodoParams, TodoPlugin, TodoState, TodoStore, COMMAND_NAME,
+    ERR_REQUIRES_INTERACTIVE, MAX_METADATA_BYTES, MAX_OWNER_CHARS, MAX_SESSION_SLOTS,
+    MAX_SUBJECT_CHARS, MAX_TASKS_PER_SESSION, MSG_NO_TODOS, TOOL_NAME,
 };
+use pir::plugins::services::{FactoryRenderContext, OverlayComponent, OverlayDone};
 use pir::plugins::{AgentPlugin, EventInterest, PluginHost, ToolBackend};
 
 fn plugin() -> Arc<TodoPlugin> {
@@ -1931,4 +1932,108 @@ fn existing_session_writes_do_not_evict_other_slots() {
             "replay into s0 evicted {session}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive `/todos` overlay
+// ---------------------------------------------------------------------------
+
+fn overlay_store() -> Arc<TodoStore> {
+    let store = Arc::new(TodoStore::new());
+    store.set_active_session("s");
+    let mut state = TodoState::empty();
+    apply_mutation(
+        &mut state,
+        TaskAction::Create,
+        &TodoParams {
+            subject: Some("one".to_owned()),
+            description: Some("first task".to_owned()),
+            ..TodoParams::default()
+        },
+    );
+    apply_mutation(
+        &mut state,
+        TaskAction::Create,
+        &TodoParams {
+            subject: Some("two".to_owned()),
+            ..TodoParams::default()
+        },
+    );
+    store.replace_state("s", state);
+    store
+}
+
+fn overlay_context() -> FactoryRenderContext<'static> {
+    FactoryRenderContext {
+        width: 80,
+        theme: None,
+        footer_data: None,
+        request_render: None,
+    }
+}
+
+#[test]
+fn todo_overlay_selects_and_advances_status() {
+    let store = overlay_store();
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let done_closed = Arc::clone(&closed);
+    let done: OverlayDone = Arc::new(move |value| {
+        done_closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    });
+    let overlay = todo_overlay_component_for_tests(Arc::clone(&store), done);
+    let lines = overlay.render(&overlay_context());
+    assert!(lines[0].contains("Todos · 2 pending"), "{lines:?}");
+    assert!(lines.iter().any(|line| line.contains("▶ ○ #1 one")));
+
+    overlay.handle_input("\u{1b}[B");
+    assert!(overlay
+        .render(&overlay_context())
+        .iter()
+        .any(|line| line.contains("▶ ○ #2 two")));
+
+    overlay.handle_input(" ");
+    assert_eq!(store.state("s").tasks[1].status, TaskStatus::InProgress);
+    overlay.handle_input(" ");
+    assert_eq!(store.state("s").tasks[1].status, TaskStatus::Completed);
+    overlay.handle_input("d");
+    assert_eq!(store.state("s").tasks[1].status, TaskStatus::Deleted);
+    assert!(overlay
+        .render(&overlay_context())
+        .iter()
+        .all(|line| !line.contains("#2 two")));
+    assert!(closed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty());
+}
+
+#[test]
+fn todo_overlay_shows_details_and_closes_on_escape() {
+    let store = overlay_store();
+    let closed = Arc::new(Mutex::new(Vec::new()));
+    let done_closed = Arc::clone(&closed);
+    let done: OverlayDone = Arc::new(move |value| {
+        done_closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    });
+    let overlay = todo_overlay_component_for_tests(store, done);
+    overlay.handle_input("\r");
+    let lines = overlay.render(&overlay_context());
+    assert!(
+        lines.iter().any(|line| line.contains("first task")),
+        "{lines:?}"
+    );
+    overlay.handle_input("\u{1b}");
+    assert_eq!(
+        closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
 }

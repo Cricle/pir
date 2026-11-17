@@ -4855,6 +4855,29 @@ pub fn background_status_message(
     }
 }
 
+/// One-line completion notice for a background tool call. Kept short: the
+/// full output already lands in the tool block, so this only tells the user
+/// that the detached call settled.
+pub fn background_finished_text(
+    tool_name: &str,
+    is_error: bool,
+    duration_ms: Option<u64>,
+) -> String {
+    let elapsed = duration_ms.map(|millis| {
+        if millis < 1_000 {
+            format!("{millis}ms")
+        } else {
+            format!("{:.1}s", millis as f64 / 1_000.0)
+        }
+    });
+    match (is_error, elapsed) {
+        (false, Some(elapsed)) => format!("background {tool_name} finished in {elapsed}"),
+        (false, None) => format!("background {tool_name} finished"),
+        (true, Some(elapsed)) => format!("background {tool_name} failed after {elapsed}"),
+        (true, None) => format!("background {tool_name} failed"),
+    }
+}
+
 /// Distinct provider ids in the configured catalog, for the footer's
 /// "available providers" count (upstream `updateAvailableProviderCount`).
 ///
@@ -10967,6 +10990,21 @@ pub fn run(options: TuiRunOptions<'_>) -> crate::Result<()> {
                     // §4): the session registry's in-flight count, reported by
                     // the worker after every tool lifecycle edge.
                     app.background_running.store(count, Ordering::Relaxed);
+                }
+                WorkerEvent::BackgroundFinished {
+                    tool_name,
+                    is_error,
+                    duration_ms,
+                } => {
+                    entries.push(ChatEntry::Notice {
+                        kind: if is_error {
+                            super::app::NoticeKind::Warning
+                        } else {
+                            super::app::NoticeKind::Status
+                        },
+                        text: background_finished_text(&tool_name, is_error, duration_ms),
+                    });
+                    dirty = true;
                 }
                 WorkerEvent::ToolCallsAborted { message } => {
                     // Error/aborted turn end: every still-pending tool block
@@ -21801,6 +21839,7 @@ fn session_switch_drops_event(event: &WorkerEvent) -> bool {
             | WorkerEvent::EntryAppended { .. }
             | WorkerEvent::Dequeued { .. }
             | WorkerEvent::BackgroundCalls(_)
+            | WorkerEvent::BackgroundFinished { .. }
             | WorkerEvent::CompactionStarted
             | WorkerEvent::CompactionEnded { .. }
             // A rename belongs to the session being replaced; the attach
@@ -23722,6 +23761,13 @@ enum WorkerEvent {
     /// after every tool lifecycle edge and after each `BackgroundToolEnd`.
     /// Feeds the compact `bg: N` status marker.
     BackgroundCalls(usize),
+    /// One background tool call settled out of band. Appended as a one-line
+    /// transcript notice (the full result still replaces its tool block).
+    BackgroundFinished {
+        tool_name: String,
+        is_error: bool,
+        duration_ms: Option<u64>,
+    },
     /// The run ended with tool calls still pending (error/abort): upstream
     /// fills their blocks with the error message (interactive-mode.ts:3575-3585).
     ToolCallsAborted {
@@ -28666,6 +28712,11 @@ fn session_event_bridge(
                 // showed. Only the running-count refresh below applies to
                 // them.
                 if parent_call_id.is_none() {
+                    let _ = events.send(WorkerEvent::BackgroundFinished {
+                        tool_name: tool_name.clone(),
+                        is_error,
+                        duration_ms,
+                    });
                     // `tool_execution_end` parity: record the real duration
                     // and flip the block's phase before the output lands.
                     let _ = events.send(WorkerEvent::ToolExecutionFinished {
