@@ -25,10 +25,10 @@ use pir::plugins::services::{
     FactoryRenderContext, NotifyLevel, OverlayComponent, OverlayDone, UiService,
 };
 use pir::plugins::subagent::{
-    aggregate_parallel_text, apply_previous, discover_agents, get_final_output, is_failed,
-    load_agents_from_dir, overlay_component_for_tests, parse_agent_markdown, result_output,
-    truncate_parallel_output, widget_lines_for_tests, AgentScope, RunState, SingleResult,
-    SubagentActivity, SubagentTool, UsageTotals,
+    aggregate_parallel_text, apply_previous, cap_text_for_tests, discover_agents, get_final_output,
+    is_failed, load_agents_from_dir, overlay_component_for_tests, parse_agent_markdown,
+    result_output, truncate_parallel_output, widget_lines_for_tests, AgentScope, RunState,
+    SingleResult, SubagentActivity, SubagentTool, UsageTotals,
 };
 use pir::plugins::{builtin_extension_def, instantiate_builtin};
 
@@ -3123,6 +3123,51 @@ fn subagent_activity_notifies_through_the_ui_service() {
         "{messages:?}"
     );
     assert!(messages[1].contains("Subagent scout done"), "{messages:?}");
+}
+
+#[test]
+fn subagent_activity_caps_retained_previews() {
+    assert_eq!(cap_text_for_tests("short", 20), "short");
+    let long = "x".repeat(200);
+    let capped = cap_text_for_tests(&long, 20);
+    assert!(capped.ends_with("… [truncated]"), "{capped:?}");
+    assert_eq!(capped.chars().count(), 20);
+}
+
+#[test]
+fn subagent_parallel_start_notice_is_aggregated() {
+    #[derive(Default)]
+    struct Sink {
+        messages: Mutex<Vec<String>>,
+    }
+    impl UiService for Sink {
+        fn notify(&self, _level: NotifyLevel, message: &str) {
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message.to_owned());
+        }
+    }
+
+    let activity = SubagentActivity::new();
+    let sink = Arc::new(Sink::default());
+    activity.bind_ui(Some(sink.clone()));
+    activity.begin("worker", "one", "parallel", None);
+    activity.begin("scout", "two", "parallel", None);
+    assert!(
+        sink.messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "per-run parallel starts must not notify"
+    );
+    activity.notify_parallel_started(2);
+    let messages = sink
+        .messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("2 started (parallel)"), "{messages:?}");
 }
 
 #[test]

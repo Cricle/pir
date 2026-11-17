@@ -277,7 +277,8 @@ mod run;
 
 #[doc(hidden)]
 pub use activity::{
-    overlay_component_for_tests, widget_lines_for_tests, RunSnapshot, RunState, SubagentActivity,
+    cap_text_for_tests, overlay_component_for_tests, widget_lines_for_tests, RunSnapshot, RunState,
+    SubagentActivity,
 };
 pub use discovery::{
     discover_agents, find_nearest_project_agents_dir, load_agents_from_dir, parse_agent_markdown,

@@ -132,9 +132,10 @@ while open and never take a permanent frame row beyond their compact dock widget
   selected running child (a per-run `AbortSignal` combined with the parent's), `esc` closes. A compact
   `subagents` widget appears only while work is running or for 12s after a finish.
 - **Notifications.** Subagent start/finish/abort and background tool completion append one-line transcript
-  notices. Native plugins queue presentation notifications even when the session has no JS runtime; with a JS
-  runtime the same values ride its bounded notification queue. The full subagent/background result still lands
-  in its normal transcript block.
+  notices. A parallel batch emits one aggregated start notice instead of one per child. Native plugins queue
+  presentation notifications even when the session has no JS runtime; with a JS runtime the same values ride
+  its bounded notification queue. The full subagent/background result still lands in its normal transcript
+  block.
 
 ## Modes
 

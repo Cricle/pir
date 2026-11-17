@@ -17,3 +17,10 @@ linker = "rust-lld"
 
 [target.x86_64-pc-windows-gnu]
 linker = "rust-lld"
+
+# The agent/session tests nest in-process and two of them exceed the default
+# 2 MiB test-thread stack. CI exports this already; Cargo's [env] table makes
+# a direct local `cargo nextest run` / `cargo test` inherit it too, instead of
+# reporting a stack overflow (0xc00000fd) caused only by the missing variable.
+[env]
+RUST_MIN_STACK = "8388608"

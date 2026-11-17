@@ -22,6 +22,16 @@ use crate::plugins::services::{
 
 /// How long a finished run stays visible in the compact widget.
 const RECENT_WINDOW: Duration = Duration::from_secs(12);
+/// Minimum spacing between throttled widget repaints. Forced state changes
+/// (start/finish/abort) bypass it.
+const WIDGET_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+/// Per-run retention caps. The tool block/transcript already carries the full
+/// result; the activity board only needs a readable preview, and 64 runs must
+/// not pin 64 full model outputs in memory.
+const MAX_TASK_CHARS: usize = 512;
+const MAX_OUTPUT_CHARS: usize = 8 * 1024;
+const MAX_ERROR_CHARS: usize = 4 * 1024;
+const MAX_LAST_CHARS: usize = 240;
 /// Widget key (the TUI factory registry slot).
 pub const WIDGET_KEY: &str = "subagents";
 /// Overlay command/shortcut.
@@ -150,6 +160,8 @@ pub struct SubagentActivity {
     data: Arc<ActivityData>,
     next_id: AtomicU64,
     ui: RwLock<Option<Arc<dyn UiService>>>,
+    /// Last widget registration instant, for the partial-update throttle.
+    last_widget_repaint: Mutex<Option<Instant>>,
 }
 
 impl Default for SubagentActivity {
@@ -166,6 +178,7 @@ impl SubagentActivity {
             }),
             next_id: AtomicU64::new(1),
             ui: RwLock::new(None),
+            last_widget_repaint: Mutex::new(None),
         }
     }
 
@@ -175,6 +188,10 @@ impl SubagentActivity {
             .ui
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ui;
+        *self
+            .last_widget_repaint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.repaint();
     }
 
@@ -196,7 +213,7 @@ impl SubagentActivity {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let signal = AbortSignal::new();
         let agent = agent.into();
-        let task = task.into();
+        let task = cap_text(task.into(), MAX_TASK_CHARS);
         let mut runs = self
             .data
             .runs
@@ -227,12 +244,27 @@ impl SubagentActivity {
         });
         drop(runs);
         self.repaint();
-        let step_text = step.map(|step| format!(" step {step}")).unwrap_or_default();
+        if mode != "parallel" {
+            let step_text = step.map(|step| format!(" step {step}")).unwrap_or_default();
+            self.notify(
+                NotifyLevel::Info,
+                format!("Subagent {agent} started ({mode}{step_text})"),
+            );
+        }
+        RunHandle { id, signal }
+    }
+
+    /// One start notice for a whole parallel batch. Per-run start notices are
+    /// suppressed for `"parallel"` runs so eight children do not flood the
+    /// transcript with eight near-identical lines.
+    pub fn notify_parallel_started(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
         self.notify(
             NotifyLevel::Info,
-            format!("Subagent {agent} started ({mode}{step_text})"),
+            format!("Subagents: {count} started (parallel)"),
         );
-        RunHandle { id, signal }
     }
 
     /// Apply one live partial. `result.pending` keeps the run running.
@@ -247,9 +279,12 @@ impl SubagentActivity {
         };
         run.usage = result.usage;
         run.model = result.model.clone();
-        let output = super::get_final_output(&result.messages).unwrap_or_default();
+        let output = cap_text(
+            super::get_final_output(&result.messages).unwrap_or_default(),
+            MAX_OUTPUT_CHARS,
+        );
         if !output.is_empty() {
-            run.last = first_line(&output).to_owned();
+            run.last = cap_text(first_line(&output).to_owned(), MAX_LAST_CHARS);
             run.output = output;
         } else if run.last.is_empty() {
             run.last = "(running…)".to_owned();
@@ -260,10 +295,11 @@ impl SubagentActivity {
             run.error = result
                 .error_message
                 .clone()
-                .or_else(|| result.stderr.clone());
+                .or_else(|| result.stderr.clone())
+                .map(|error| cap_text(error, MAX_ERROR_CHARS));
         }
         drop(runs);
-        self.repaint();
+        self.repaint_throttled();
     }
 
     /// Mark one run terminal and notify. Safe to call once per task.
@@ -280,16 +316,20 @@ impl SubagentActivity {
         run.model = result.model.clone();
         run.state = state_of(result);
         run.finished = Some(Instant::now());
-        run.output = super::get_final_output(&result.messages).unwrap_or_default();
+        run.output = cap_text(
+            super::get_final_output(&result.messages).unwrap_or_default(),
+            MAX_OUTPUT_CHARS,
+        );
         run.last = if run.output.is_empty() {
             run.state.label().to_owned()
         } else {
-            first_line(&run.output).to_owned()
+            cap_text(first_line(&run.output).to_owned(), MAX_LAST_CHARS)
         };
         run.error = result
             .error_message
             .clone()
-            .or_else(|| result.stderr.clone());
+            .or_else(|| result.stderr.clone())
+            .map(|error| cap_text(error, MAX_ERROR_CHARS));
         let elapsed = run
             .finished
             .unwrap_or_else(Instant::now)
@@ -387,6 +427,10 @@ impl SubagentActivity {
         let Some(ui) = self.ui() else {
             return;
         };
+        *self
+            .last_widget_repaint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         ui.set_widget(
             WIDGET_KEY,
             Arc::new(SubagentWidget {
@@ -394,6 +438,21 @@ impl SubagentActivity {
             }),
             WidgetPlacement::BelowEditor,
         );
+    }
+
+    /// Partial updates can arrive much faster than the widget needs to
+    /// change. Coalesce them; start/finish/abort still call [`Self::repaint`]
+    /// directly so state transitions are never delayed.
+    fn repaint_throttled(&self) {
+        let now = Instant::now();
+        let last = *self
+            .last_widget_repaint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|last| now.saturating_duration_since(last) < WIDGET_REPAINT_INTERVAL) {
+            return;
+        }
+        self.repaint();
     }
 
     /// Open the keyboard-selectable overlay. Returns `false` when the session
@@ -434,6 +493,19 @@ fn state_of(result: &SingleResult) -> RunState {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
+}
+
+/// Cap one retained string, preserving UTF-8 boundaries and making the
+/// truncation visible to the reader.
+fn cap_text(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    const SUFFIX: &str = "… [truncated]";
+    let keep = max_chars.saturating_sub(SUFFIX.chars().count());
+    let mut capped: String = text.chars().take(keep).collect();
+    capped.push_str(SUFFIX);
+    capped
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -539,6 +611,12 @@ impl WidgetFactory for SubagentWidget {
         };
         vec![clip(&line, context.width.max(12))]
     }
+}
+
+/// Test seam: the retention cap used for task/output/error previews.
+#[doc(hidden)]
+pub fn cap_text_for_tests(text: &str, max_chars: usize) -> String {
+    cap_text(text.to_owned(), max_chars)
 }
 
 /// Test seam: render the compact widget without binding a UI service.

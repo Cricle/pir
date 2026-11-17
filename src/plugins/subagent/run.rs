@@ -531,6 +531,7 @@ async fn run_parallel(
         });
         task_indices.insert(handle.id(), index);
     }
+    activity.notify_parallel_started(tasks.len());
 
     let mut results: Vec<Option<SingleResult>> = (0..tasks.len()).map(|_| None).collect();
     while let Some(joined) = children.join_next_with_id().await {
