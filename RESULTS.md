@@ -1,7 +1,8 @@
 # PIR 最终结果
 
-- 当前状态：2026-11-17，`master` 包含 #11630 与 TUI activity 改动。
-- 上一提交 `b480b5f` 的 CI：3/3 绿（Tests full suite / Linux lib + bins /
+- 当前状态：2026-11-17，`master` 包含 #11630、TUI activity 与 native shortcut
+  routing 改动。
+- 代码提交 `70ab9c1` 的 CI：3/3 绿（Tests full suite / Linux lib + bins /
   Lint + SDK matrix）。
 - 本文件是面向用户的结果文档；2026-11-15 之前的发版与旧 profiling 记录已移到
   [`docs/archive/results-history-2026-11.md`](docs/archive/results-history-2026-11.md)。
