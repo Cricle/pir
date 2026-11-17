@@ -146,6 +146,13 @@ jobs:
       - name: Tests (eight sequential groups; per-group binary cleanup)
         shell: bash
         run: |
+          # GitHub's `shell: bash` runs with `-e`; disable errexit or the first
+          # failing nextest group exits the whole step immediately. That skips
+          # both the per-group `::notice` and the failure annotations below,
+          # turning a normal test failure into a silent exit 100 with no clue
+          # in the checks API. The loop records failures and exits once at the
+          # end instead.
+          set +e
           set -uo pipefail
           status=0
           # `autotests = false` means tests/*.rs are modules inside the generated
