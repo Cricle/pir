@@ -41,9 +41,9 @@ diagnostics; upstream-relative pages with no counterpart are in [MAPPING.md](../
 | Page | Contents |
 |---|---|
 | [upstream-drift-status.md](upstream-drift-status.md) | Verified upstream drift through v1.5.2: 641 commits, 130 touching ported source, per-commit Landed/Partial/Open/N-A evidence |
-| [upstream-next-plan.md](upstream-next-plan.md) | Remaining v1.5.2 follow-ups: A/B blocker, Wave A/B/C plan with upstream citations |
+| [upstream-next-plan.md](upstream-next-plan.md) | Remaining v1.5.2 follow-ups: A/B status and Wave B/C plan with upstream citations |
 | [system-prompt-audit.md](system-prompt-audit.md) | System prompt audit vs upstream: aligned sections, open deviations, host matrix, fix priorities |
-| [memory-builtin-ab-2026-11-10.md](memory-builtin-ab-2026-11-10.md) | Post-0.3.1 real-agent A/B: Q&A tokens, short-edit routing gate, cache-accounting caveats |
 | [performance-profiles.md](performance-profiles.md) | `performance.profile` presets, loadout deltas, measurement method |
 | [phone-server-performance.md](phone-server-performance.md) | Repeatable release-profile load test: 10k catalog, fan-out, reconnect, RSS and CPU |
 | [test-harness-map.md](test-harness-map.md) | Generated map of every test file → merged harness/standalone target |
+| [archive/](archive/) | Historical release chronology and superseded A/B reports |

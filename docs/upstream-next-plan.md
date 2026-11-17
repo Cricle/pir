@@ -1,67 +1,44 @@
-# Upstream v1.5.2 follow-up plan (2026-11-16)
+# Upstream v1.5.2 follow-up plan (updated 2026-11-17)
 
 Scope: what remains from the 2026-11-15 v1.5.2 audit after the 2026-11-16
-batches. Evidence for the audit rows lives in `.play/evidence/upstream-v152/`
-(local only); landed items are recorded in
-[`upstream-drift-status.md`](upstream-drift-status.md) and `CHANGELOG.md`.
+batches and the 2026-11-17 TUI work. Per-commit evidence lives in
+[`upstream-drift-status.md`](upstream-drift-status.md) and `CHANGELOG.md`;
+this page is only the remaining plan.
 
-## Landed in the 2026-11-16 passes
+## Landed since the audit
 
-Compatibility/wire: LiteLLM/Zhipu overflow and cut-short retry patterns,
-project-trust precedence, OpenRouter token margin, `requiresNonNullAssistantContent`,
-`promptCacheKeyMode` (Azure retention-independent), `requiresToolsWithToolHistory`,
-OpenAI Responses `session-id`, provider ids with `/`, new default-model map,
-`CLAUDE_CODE_VERSION`, `qwen-token-plan-individual-cn`, OpenCode endpoints,
-Copilot classifier, Codex display name, cache-warming `idle`.
+The 2026-11-16 passes closed the compatibility/wire, tools/runtime, and TUI
+batches from the v1.5.2 audit; the per-item record is in `CHANGELOG.md` and
+[`upstream-drift-status.md`](upstream-drift-status.md). Two later landings are
+the current baseline:
 
-Tools/runtime: active-tool set order, branch-summary thinking level and context
-edits, live thinking record, grep lone CR plus engine-supplied context/limit
-semantics, hidden-thinking empty label, smaller PNG/JPEG, npm `--no-audit
---no-fund`/`realpath`/unchanged-version warning, prompt-template quote rules,
-tool-search name/exact/coverage/field ranking and local `$ref` following,
-`pi.exec` `maxBuffer`/`truncated`, MCP `login`/`logout -l` with a name
-suggestion and `authProvider` reporting, WSL helper cwd, external-editor
-failure text, deleted-cwd startup diagnostic, canonical `auth.json` lock,
-Dart/Nix/Groovy highlighting, Windows PowerShell 5.1 exit suffix, transport
-cause chains, diff indentation, custom find `limit + 1`, Windows case-folded
-resource/package/project-trust keys, the refresh-only MCP refresh guard and
-sign-in's stored-client refresh, root `$defs` in non-strict Anthropic
-schemas, Unicode tool-search segmentation in both tokenizers, web-URL-only
-OAuth opening with control-character stripping in sign-in displays, SDK
-runtime disposal that settles an aborted run, autocomplete/`/settings`
-PageUp/PageDown, and host-resolved `keyText`/`keyHint` hints in extension
-render contexts.
+- **#11630 host-resolved keybinding hints**: the TUI pushes `keyText`/
+  `keyHint` into tool/message/entry render contexts and re-pushes after
+  `/reload`; headless hosts keep the empty-hint upstream behavior.
+- **Activity TUI (2026-11-17)**: `/subagents` + `ctrl+shift+a` show live and
+  recent subagent runs with keyboard selection and per-run abort; `/todos`
+  opens a keyboard-selectable list (status advance, delete, details); native
+  builtins can queue presentation notifications without a JS runtime;
+  background tool completions append a compact transcript notice.
 
-Gate evidence for the latest commits: full nextest **7570 passed / 0 failed /
-46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, 43 catalog
-files canonical, CI green on `ab28770` and rerun for the newer commits.
+Gate evidence before this batch: full nextest **7570 passed / 0 failed /
+46 skipped**, doctests **33 passed / 7 ignored**, fmt/clippy clean, CI green
+on `b480b5f`. Re-run the full gate after the activity/TUI batch.
 
-## A/B extended validation
+## A/B status
 
-Status: **done for one model** (2026-11-16). The sequential N=5 campaign ran
-with `new-provider-3` (`tinygate`, Anthropic messages,
-`deepseek-v4.1-flash`): Q&A q1/q2/q3 and coding c1/c2/c3, both arms alternating
-per repetition, no concurrency. Raw data:
-`.play/ab/results/runs-ab-n5-{qa,coding}-final5.jsonl`; user-facing medians and
-caveats: [`RESULTS.md`](../RESULTS.md). Three Q&A cells hit provider transport
-failures in rep1 (recorded; retried up to three attempts); the other 27 cells
-completed, so the campaign is final evidence for this one model only.
+Old fixtures (q1–q3, c1–c3) were measured at N=5 and N=3; the 2026-11-17
+N=3 run had pir 18/18 with 150 turns / 206 tools / 2.20M tokens / 554.5s vs
+pi 18/18 with 176 / 266 / 2.54M / 642.3s.
 
-`run_ab_pi.py` takes `AB_PROVIDER_ID`/`AB_MODEL`/`AB_BASE_URL`/`AB_WIRE_API`
-and rewrites both arms' `models.json` without storing the key. A second-model
-leg remains possible if another provider is restored; record the single-model
-limitation until then.
-
-## Wave A — complete
-
-1. **Extension keybinding hints (#11630).** Landed: the TUI resolves the
-   settings/keybindings-file text through
-   `Keybindings::keybinding_hints_json` and pushes it with
-   `ExtensionHandle::update_keybinding_hints`; the prelude injects
-   `keyText`/`keyHint` into `ToolRenderContext`, `MessageRenderOptions`, and
-   `EntryRenderOptions`, and re-pushes after `/reload`. Headless hosts never
-   push, so their renderers format empty hints like upstream RPC/print. Test:
-   `tests/renderer_parity.rs::renderers_receive_host_resolved_keybinding_hints`.
+The 2026-11-17 four-category matrix (short, long, QA, real upstream release
+tooling) is the broader check: both arms 60/60; pi used fewer tokens, turns,
+tools, and time in aggregate, while pir had a slightly lower QA citation
+invalid rate. Results are task- and run-dependent (one long-task outlier and
+one transport retry move category totals), so the matrix does **not** support
+a general "pir is cheaper/faster" claim. Full numbers and caveats:
+[`RESULTS.md`](../RESULTS.md). Single-model/single-gateway remains the main
+limitation; a second model is still the cleanest next experiment.
 
 ## Wave B — medium, needs a small design pass
 
