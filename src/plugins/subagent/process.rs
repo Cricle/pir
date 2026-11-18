@@ -178,7 +178,8 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
     let stderr = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
             // Drain the pipe so a chatty child never blocks on a full stderr
-            // buffer, but retain only the diagnostic head.
+            // buffer. Retain the TAIL: a process's actual error is usually
+            // printed last, so keeping the head hid the useful diagnostic.
             let mut reader = BufReader::new(stderr);
             let cap = MAX_PROCESS_STDERR_BYTES as usize;
             let mut kept = Vec::new();
@@ -187,9 +188,12 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
                 match reader.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if kept.len() < cap {
-                            let take = count.min(cap - kept.len());
-                            kept.extend_from_slice(&buf[..take]);
+                        kept.extend_from_slice(&buf[..count]);
+                        if kept.len() > cap {
+                            // Drop the oldest bytes, keeping the most recent
+                            // `cap` bytes. drain is amortized O(n) per overflow.
+                            let excess = kept.len() - cap;
+                            kept.drain(..excess);
                         }
                     }
                 }
