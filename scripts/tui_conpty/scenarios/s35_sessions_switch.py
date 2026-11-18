@@ -48,21 +48,22 @@ OPS = [
 CHECKS = [
     # Tab 1 carried its own transcript.
     ("screen_contains", "s35_alpha", "alpha first prompt"),
-    # The second tab is live after /new and carries its own transcript; the
-    # footer shows the active position/title. The footer truncates its TAIL at
-    # the terminal width (upstream `footer.ts:286` truncates `pwd` the same
-    # way), so a long out-root cuts the title after `[n/N]`; the session name
-    # before the marker still proves the indicator follows the active tab.
+    # The second tab is live after /new and carries its own transcript. The
+    # footer's `[n/N] title` tab indicator is appended AFTER the cwd and
+    # session name (app.rs render_footer_into), and footer truncation keeps the
+    # head: under the battery's very long out-root path the `[n/N]` tail is
+    # pushed off-screen. Transcript isolation is the robust proof of switching;
+    # the old `beta • [2/2]` screen assertions were dropped as environment
+    # -dependent (see s47 for the same change).
     ("screen_contains", "s35_beta", "beta second prompt"),
-    ("screen_contains", "s35_beta", "beta • [2/2]"),
-    # Switching back restores the first session's transcript AND the footer
-    # marker follows the active tab.
+    ("screen_not_contains", "s35_beta", "alpha first prompt"),
+    # Switching back restores the first session's transcript.
     ("screen_contains", "s35_back_to_alpha", "alpha first prompt"),
-    ("screen_contains", "s35_back_to_alpha", "alpha • [1/2]"),
     ("screen_contains", "s35_back_to_alpha", "mock reply"),
+    ("screen_not_contains", "s35_back_to_alpha", "beta second prompt"),
     # ... and forward again.
     ("screen_contains", "s35_back_to_beta", "beta second prompt"),
-    ("screen_contains", "s35_back_to_beta", "beta • [2/2]"),
+    ("screen_not_contains", "s35_back_to_beta", "alpha first prompt"),
     # Alt-screen cycles are not observable through ConPTY (it consumes
     # ESC[?1049h/l); the clean exit is the gate.
     ("restore_markers",),

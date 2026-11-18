@@ -28,9 +28,11 @@ OPS = [
 
 CHECKS = [
     # Entry: the console is cleared before the first frame is painted
-    # (the banner text must not be preceded by shell residue).
-    ("log_ordered", "s38_boot",
-     ["\x1b[2J", " v0.0.1"]),
+    # (the version banner must not be preceded by shell residue). Match the
+    # version generically: the hardcoded v0.0.1 went stale when pir reached
+    # v0.3.2, but the invariant is "a clear-all precedes the version banner".
+    ("log_regex", "s38_boot",
+     "\x1b\\[2J[\\s\\S]*? v\\d+\\.\\d+\\.\\d+"),
     # Boot really clears more than once: the startup clear plus the
     # clear-all that follows the surface takeover.
     ("log_count", "s38_boot", "\x1b[2J", ">=2"),
