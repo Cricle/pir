@@ -597,7 +597,9 @@ def sanitized_settings_config(provider=SANITIZED_PROVIDER,
         "theme": "dark",
         "defaultProvider": provider,
         "defaultModel": model,
-        "defaultThinkingLevel": "max",
+        # Match the product default (DEFAULT_THINKING_LEVEL = Medium). The old
+        # "max" here made every real-model probe run a non-default config.
+        "defaultThinkingLevel": "medium",
         "hideThinkingBlock": False,
         "showCacheMissNotices": True,
         "enableInstallTelemetry": False,
