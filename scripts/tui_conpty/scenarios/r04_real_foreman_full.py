@@ -17,7 +17,7 @@ OPS = [
     ("wait", 1.5),
     ("snap", "r04_on"),
     ("log", "real foreman task: delegate worker, then reviewer, then finish"),
-    ("send", b"Delegate ONE worker subagent (agent=worker) with this task: using its bash tool, create a file named r04_worker.txt in the current directory containing exactly WORKER_REAL_OK. Then immediately delegate ONE reviewer subagent (agent=reviewer) whose task is: run `cat r04_worker.txt`, and reply with PASS on the very first line if the file contains WORKER_REAL_OK, otherwise FAIL. Reply with only PASS or FAIL plus one short evidence line. Finally reply with exactly FOREMAN_DONE. Do not use any other tools and do not write files yourself.\r"),
+    ("send", b"Delegate ONE worker subagent (agent=worker) with this task: using its bash tool, create a file named r04_worker.txt in the current directory containing exactly WORKER_REAL_OK. Then immediately delegate ONE reviewer subagent (agent=reviewer) with this task: run `cat r04_worker.txt`, and reply with PASS on the very first line if the file contains WORKER_REAL_OK, otherwise FAIL, plus one short evidence line. As the foreman, reply with ONLY the exact token FOREMAN_DONE and nothing else. Do not use any other tools and do not write files yourself.\r"),
     ("wait", 180.0),
     ("wait_quiet", 15),
     ("snap", "r04_result"),
@@ -30,10 +30,11 @@ OPS = [
 CHECKS = [
     ("screen_contains", "r04_on", "MODE: FOREMAN"),
     # The result is proven deterministically by VERIFY:worker_file /
-    # worker_delegated / reviewer_delegated / reviewer_pass_in_transcript, not
-    # by on-screen text: the final viewport can be filled with live subagent
-    # activity rows, and the prompt tells the foreman to reply with only a
-    # completion marker. Asserting a literal payload on screen is brittle.
+    # worker_delegated / reviewer_delegated / reviewer_pass_in_transcript. The
+    # final answer and reviewer PASS are also on screen: the prompt tells the
+    # foreman to reply with ONLY FOREMAN_DONE (no hedging text), so these are
+    # stable signals that the run reached a clean, visible conclusion.
+    ("screen_contains", "r04_result", "FOREMAN_DONE"),
     ("screen_contains", "r04_result", "PASS"),
     ("screen_contains", "r04_result", "PHASE: VERIFIED"),
     ("screen_contains", "r04_normal", "Normal mode restored"),
