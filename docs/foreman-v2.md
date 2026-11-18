@@ -74,3 +74,38 @@ Implementation order:
 Acceptance covers the existing mode/subagent suites, new journal/approval/
 worktree/process/CLI tests, fmt/clippy, and the TUI scenarios
 `s57_mode_foreman.py`, `s58_foreman_v2.py` and `s59_mode_plan.py`.
+
+## Residual limitations and the durable engine
+
+Two remaining edge cases share one architectural root cause: a run that waits
+for an asynchronous external event has no explicit, resumable wait state.
+
+- **Headless background completion**: in `pir print`, a background tool call
+  that finishes after the terminal model turn is persisted as a
+  `backgroundToolResult` entry and reported through a `background_tool_end`
+  event, but the model is not given another turn to consume the result.
+- **Approval waiting**: the foreman/plan approval gate blocks with
+  `terminate:false` and asks the model (via prompt/notice text) to end its turn;
+  the approval decision then arrives as a follow-up. Making the block
+  `terminate:true` was tried and reverted — it breaks the approval follow-up
+  because tool-call termination is a batch hint, not a suspend/resume primitive.
+
+`src/durable/` is a mature, high-fidelity port of `pi-durable`: atomic committed
+state (`src/durable/session/`), a check-pointed task state machine with
+`Waiting{on}` / `Sleeping{until}` / `Wake` (`src/durable/harness/scheduler/`),
+a submission inbox (`src/durable/harness/inbox.rs`), and background tasks.
+Conceptually it is the right engine for "suspend on an event, wake, resume from
+checkpoint". In practice it is **not wired to any production path**: every
+`crate::durable` reference is inside `src/durable/`, and its consumers are tests,
+benches and examples only. The module describes itself as a second harness
+beside `agent_loop`/`agent_session`, not the engine beneath them
+(`src/durable/mod.rs:12-16`), and still has open seams (unwired `DeferredPoll`,
+`HarnessError::NotPorted`, an experimental events adapter).
+
+Migrating foreman/headless orchestration onto durable to fix these two narrow
+cases would be a rewrite of run orchestration (scheduler/wake/approval
+wiring), not an incremental fix. The chosen approach is therefore a local,
+bounded wait-and-resume in the print host for the headless case, and keeping
+the approval design constraint as documented behavior. Durable remains the
+right long-term target only if the product goal becomes a unified,
+crash-recoverable run/subagent/background/approval orchestrator.

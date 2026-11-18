@@ -73,7 +73,7 @@ fn fixture_dir(test_name: &str) -> std::path::PathBuf {
 /// adopted background call.
 fn placeholder_text(tool_name: &str, call_id: &str) -> String {
     format!(
-        "Tool '{tool_name}' is running in the background (callId: {call_id}). Its result will arrive as a separate message; do not wait for it."
+        "Tool '{tool_name}' is running in the background (callId: {call_id}). End your turn now; its result arrives as a separate notification message. Do NOT sleep, poll, or wait for it."
     )
 }
 

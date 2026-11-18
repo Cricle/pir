@@ -5067,6 +5067,42 @@ pub async fn run_print_with_environment(
             } else if continue_requested {
                 crate::ext_diag!("[ext] agent_before_settle continuation cap reached; settling");
             }
+            // Headless background completion: a `background: true` call that
+            // finished after the terminal model turn has no live loop to inject
+            // into. Before settling, wait for in-flight calls and, if a
+            // completion arrived, run one more turn so the model consumes it.
+            if should_replay_background(
+                result.aborted,
+                termination.requested(),
+                background.call_count(),
+                settle_iterations,
+            ) && background.wait_for_idle(DEFAULT_BACKGROUND_EXIT_WAIT).await
+                && background.has_pending_follow_up().await
+            {
+                settle_iterations += 1;
+                if paged_prompt_context_used || streamed_prompt_source.is_some() {
+                    let mut guard = session.lock().await;
+                    if let Some(manager) = guard.as_mut() {
+                        manager.widen_to_full()?;
+                    }
+                }
+                let projected_messages =
+                    match crate::agent_session::project_optional_session_messages_off_thread(
+                        &session,
+                    )
+                    .await
+                    {
+                        Ok(Some(messages)) => messages,
+                        Ok(None) => result.context.messages.clone(),
+                        Err(error) => return Err(error),
+                    };
+                run_context = Context {
+                    system_prompt: result.context.system_prompt.clone(),
+                    messages: projected_messages,
+                    tools: result.context.tools.clone(),
+                };
+                continue;
+            }
             break result;
         };
         // The run settled (the aborted tool call has already killed its process
@@ -5888,6 +5924,22 @@ pub async fn generate_navigation_summary_with_retry_events(
 // ---------------------------------------------------------------------------
 // Automatic compaction (upstream AgentSession threshold compaction)
 // ---------------------------------------------------------------------------
+
+/// Whether a settling print run should wait for in-flight background calls and
+/// give the model one more turn to consume a late completion. Extracted as a
+/// pure function so every guard is unit-testable without driving the run loop.
+#[doc(hidden)]
+pub fn should_replay_background(
+    aborted: bool,
+    termination_requested: bool,
+    in_flight: usize,
+    settle_iterations: usize,
+) -> bool {
+    !aborted
+        && !termination_requested
+        && in_flight > 0
+        && settle_iterations < AGENT_BEFORE_SETTLE_CONTINUATION_CAP
+}
 
 /// The model compaction thresholds are checked against (agent_session
 /// `threshold_model_for`): a virtual selection checks the ROUTED physical
