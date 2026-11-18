@@ -820,6 +820,14 @@ impl ModeState {
             self.set_phase(Phase::Delegating);
         }
         if has_reviewer {
+            // A fresh reviewer delegation supersedes any earlier PASS for the
+            // current generation: the new verdict (which may be FAIL/errored)
+            // must be authoritative at the settle gate. Without this, a second
+            // reviewer that fails is masked by the first one's PASS.
+            *self
+                .review_passed_generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             if let Some(call_id) = call_id.filter(|call_id| !call_id.is_empty()) {
                 *self
                     .last_reviewer_call_id
@@ -1742,14 +1750,24 @@ fn force_readonly_subagent_tools(input: &mut Value) {
             .map(|name| Value::String((*name).to_owned()))
             .collect(),
     );
+    let force_one = |object: &mut serde_json::Map<String, Value>| {
+        object.insert("tools".to_owned(), tools.clone());
+        // A worktree is created by `git worktree add` on the HOST before the
+        // child runs, and `worktreeMerge:auto` runs `git add/commit/merge` on
+        // the HOST after it — both mutate the real workspace regardless of the
+        // child's tool allowlist. Force them off so a plan-mode subagent can
+        // never write through the isolation/merge path.
+        object.insert("isolation".to_owned(), Value::String("none".to_owned()));
+        object.insert("worktreeMerge".to_owned(), Value::String("none".to_owned()));
+    };
     // Top-level override (single mode and a default for tasks/chain).
     if let Some(object) = input.as_object_mut() {
-        object.insert("tools".to_owned(), tools.clone());
+        force_one(object);
         for key in ["tasks", "chain"] {
             if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
                 for item in items {
                     if let Some(item) = item.as_object_mut() {
-                        item.insert("tools".to_owned(), tools.clone());
+                        force_one(item);
                     }
                 }
             }
@@ -1894,20 +1912,26 @@ fn verdict_is_pass(text: &str) -> bool {
     if upper.is_empty() {
         return false;
     }
-    // Negations ("not PASS", "would not pass", "PASS?") are never a verdict.
-    if upper.contains("NOT PASS") || upper.contains("NOT  PASS") || upper.contains("PASS?") {
-        return false;
-    }
     let first = upper.lines().next().unwrap_or_default();
     let first = first.trim_start_matches(|character: char| {
         character.is_whitespace() || matches!(character, '*' | '#' | '`' | '_' | '>' | '-')
     });
     // Only a leading PASS token counts. A whole-text "contains PASS" fallback
     // made "the review would not pass" read as a successful verification.
-    matches!(
+    if !matches!(
         first.split(|c: char| !c.is_ascii_alphanumeric()).next(),
         Some("PASS")
-    )
+    ) {
+        return false;
+    }
+    // The first line must be a CLEAN PASS verdict. Text like
+    // "PASS criteria not met, verdict FAIL" starts with PASS but is a failure —
+    // checking only whole-text "NOT PASS" missed it. Reject explicit verdict
+    // reversals on the same line. Keep the markers narrow: an evidence clause
+    // like "PASS {not valid json" or "evidence: no failure found" must still
+    // count as PASS, so generic words ("NOT", "BUT", "?") are NOT reversals.
+    const REVERSALS: &[&str] = &["NOT PASS", "PASS?", "FAIL", "VERDICT", "CRITERIA"];
+    !REVERSALS.iter().any(|marker| first.contains(marker))
 }
 
 /// Parse `{"verdict":"PASS"|"FAIL", ...}` (optionally inside a Markdown fence)

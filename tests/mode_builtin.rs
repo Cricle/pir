@@ -608,7 +608,13 @@ async fn plan_mode_hides_mutations_and_blocks_execution_subagents() {
         "type": "tool_call",
         "toolCallId": "call-scout-2",
         "toolName": "subagent",
-        "input": { "agent": "scout", "task": "inspect" },
+        "input": {
+            "agent": "scout", "task": "inspect",
+            "isolation": "worktree", "worktreeMerge": "auto",
+            "tasks": [
+                { "agent": "reviewer", "task": "look", "isolation": "worktree", "worktreeMerge": "auto" }
+            ]
+        },
     });
     let outcome = host
         .emit("tool_call", &mut scout_payload)
@@ -623,6 +629,18 @@ async fn plan_mode_hides_mutations_and_blocks_execution_subagents() {
     assert!(
         !tool_names.contains(&"bash"),
         "bash must be removed: {tool_names:?}"
+    );
+    // Worktree isolation/merge mutate the HOST (git worktree add / commit /
+    // merge) regardless of the child's tool list. The plan fence must strip
+    // them at the top level AND in every task, or a plan-mode subagent can
+    // write through the isolation path.
+    assert_eq!(scout_payload["input"]["isolation"], "none");
+    assert_eq!(scout_payload["input"]["worktreeMerge"], "none");
+    assert_eq!(scout_payload["input"]["tasks"][0]["isolation"], "none");
+    assert_eq!(scout_payload["input"]["tasks"][0]["worktreeMerge"], "none");
+    assert_eq!(
+        scout_payload["input"]["tasks"][0]["tools"][0], "read",
+        "each task's tools are overridden too"
     );
 
     host.dispatch_command("mode", "normal")
@@ -666,6 +684,14 @@ async fn reviewer_structured_verdicts_win_over_text() {
     assert!(
         gate_after_reviewer_text("not PASS").await,
         "leading negation must be rejected"
+    );
+    assert!(
+        gate_after_reviewer_text("PASS criteria not met, verdict FAIL").await,
+        "a leading PASS token with reversal markers on the same line is a FAIL"
+    );
+    assert!(
+        gate_after_reviewer_text("PASS verdict FAIL after recheck").await,
+        "a PASS followed by an explicit FAIL verdict must not be read as success"
     );
 }
 
@@ -1455,6 +1481,32 @@ async fn a_new_worker_invalidates_an_earlier_reviewer_pass() {
     emit_tool_input(&host, "subagent", "call-worker-2", worker_input()).await;
     let result = emit_settle(&host, passed).await;
     assert_eq!(result["continue"], true, "{result}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fresh_reviewer_in_the_same_generation_clears_an_earlier_pass() {
+    let session = FakeSession::new(true, &["subagent", "read"]);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("enable foreman");
+
+    emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
+    emit_tool_input(&host, "subagent", "call-review-1", reviewer_input()).await;
+    let passed = completed_turn(vec![reviewer_tool_result("call-review-1", "PASS")]);
+    let result = emit_settle(&host, passed.clone()).await;
+    assert_ne!(result["continue"], true, "the first PASS settles: {result}");
+
+    // A second reviewer in the SAME worker generation re-opens the verdict:
+    // its FAIL must not be masked by the persisted PASS above.
+    emit_tool_input(&host, "subagent", "call-review-2", reviewer_input()).await;
+    let failed = completed_turn(vec![reviewer_tool_result("call-review-2", "FAIL")]);
+    let result = emit_settle(&host, failed).await;
+    assert_eq!(
+        result["continue"], true,
+        "a fresh reviewer's FAIL must re-open the gate: {result}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
