@@ -29,7 +29,11 @@ OPS = [
 
 CHECKS = [
     ("screen_contains", "r04_on", "MODE: FOREMAN"),
-    ("screen_contains", "r04_result", "WORKER_REAL_OK"),
+    # The result is proven deterministically by VERIFY:worker_file /
+    # worker_delegated / reviewer_delegated / reviewer_pass_in_transcript, not
+    # by on-screen text: the final viewport can be filled with live subagent
+    # activity rows, and the prompt tells the foreman to reply with only a
+    # completion marker. Asserting a literal payload on screen is brittle.
     ("screen_contains", "r04_result", "PASS"),
     ("screen_contains", "r04_result", "PHASE: VERIFIED"),
     ("screen_contains", "r04_normal", "Normal mode restored"),
