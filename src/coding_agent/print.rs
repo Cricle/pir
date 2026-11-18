@@ -48,7 +48,8 @@ use crate::agent_session::background::{
     BackgroundRegistry, BACKGROUND_TOOL_RESULT_TYPE, DEFAULT_BACKGROUND_CALL_LIMIT,
 };
 use crate::agent_session::{
-    BackgroundCallStatus, SessionEvent, SessionEventHandler, SESSION_IDLE, SESSION_RUNNING,
+    BackgroundCallStatus, SessionEvent, SessionEventHandler, AGENT_BEFORE_SETTLE_CONTINUATION_CAP,
+    SESSION_IDLE, SESSION_RUNNING,
 };
 use crate::ai::provider::ProviderRegistry;
 use crate::ai::types::{
@@ -5018,7 +5019,10 @@ pub async fn run_print_with_environment(
             // continuation iteration would only spin to the cap. Extension
             // aborts settle here and the next positional prompt gets a fresh
             // signal.
-            if continue_requested && !result.aborted && settle_iterations < 8 {
+            if continue_requested
+                && !result.aborted
+                && settle_iterations < AGENT_BEFORE_SETTLE_CONTINUATION_CAP
+            {
                 settle_iterations += 1;
                 // A continuation MUST observe the transcript the boundary just
                 // wrote: `custom_message` drafts project as user messages,
