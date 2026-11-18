@@ -659,6 +659,14 @@ async fn reviewer_structured_verdicts_win_over_text() {
         !gate_after_reviewer_text("PASS {not valid json").await,
         "malformed JSON must fall back to the text verdict"
     );
+    assert!(
+        gate_after_reviewer_text("The review would not PASS; see issues").await,
+        "negated PASS must never be read as a successful verdict"
+    );
+    assert!(
+        gate_after_reviewer_text("not PASS").await,
+        "leading negation must be rejected"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -907,6 +915,168 @@ async fn denying_one_approval_clears_an_unused_approval_allowance() {
         outcome.result["block"], true,
         "a denied delegation must not inherit an unused approval: {:?}",
         outcome.result
+    );
+}
+
+/// A denied worker request must be re-requestable: the stable approval id is
+/// reopened instead of being deduped forever against a terminal record.
+#[tokio::test(flavor = "current_thread")]
+async fn denied_worker_can_be_requested_again_and_approved() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-reopen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let input = worker_input();
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-1", input.clone()).await["block"],
+        true,
+        "first request must block"
+    );
+    let journal_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".foreman.jsonl");
+        std::path::PathBuf::from(p)
+    };
+    let read_id = || -> String {
+        let journal = std::fs::read_to_string(&journal_path).expect("journal");
+        // Read the LAST pending approval from either an approval event or a
+        // compacted snapshot (decide_approval snapshots the journal).
+        journal
+            .lines()
+            .rev()
+            .find_map(|line| {
+                let v: Value = serde_json::from_str(line).ok()?;
+                let t = v.get("t")?.as_str()?;
+                if t == "approval" && v.get("state") == Some(&Value::String("requested".to_owned()))
+                {
+                    return v.get("id")?.as_str().map(str::to_owned);
+                }
+                if t == "snapshot" {
+                    if let Some(approvals) = v.get("approvals").and_then(Value::as_array) {
+                        for record in approvals.iter().rev() {
+                            if record.get("state") == Some(&Value::String("requested".to_owned())) {
+                                if let Some(id) = record.get("id")?.as_str() {
+                                    return Some(id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .expect("pending approval id")
+    };
+    let id = read_id();
+    pir::foreman::decide_approval(&path, Some(&id), false).expect("deny");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore after deny");
+
+    // Re-request the SAME task after the deny: it must become pending again.
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-2", input.clone()).await["block"],
+        true,
+        "reopened request must still block until approved"
+    );
+    let id2 = read_id();
+    assert_eq!(id2, id, "reopen reuses the stable approval id");
+    pir::foreman::decide_approval(&path, Some(&id2), true).expect("approve reopened");
+    let mut start2 = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start2)
+        .await
+        .expect("restore after approve");
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-3", input).await["block"],
+        true,
+        "approved reopened request must admit the worker"
+    );
+}
+
+/// Approving worker A must not authorize a different worker B.
+#[tokio::test(flavor = "current_thread")]
+async fn approving_worker_a_does_not_admit_worker_b() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-bound-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let a = worker_input();
+    let b = json!({ "agent": "worker", "task": "write the other file" });
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a", a.clone()).await["block"],
+        true
+    );
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-b", b.clone()).await["block"],
+        true
+    );
+
+    let journal_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".foreman.jsonl");
+        std::path::PathBuf::from(p)
+    };
+    let journal = std::fs::read_to_string(&journal_path).expect("journal");
+    let id_a = journal
+        .lines()
+        .find_map(|line| {
+            let v: Value = serde_json::from_str(line).ok()?;
+            let summary = v.get("summary")?.as_str()?;
+            (v.get("t") == Some(&Value::String("approval".to_owned()))
+                && v.get("state") == Some(&Value::String("requested".to_owned()))
+                && summary.contains("write the file"))
+            .then(|| v.get("id")?.as_str().map(str::to_owned))
+            .flatten()
+        })
+        .expect("id A");
+    pir::foreman::decide_approval(&path, Some(&id_a), true).expect("approve A");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore");
+
+    // A is approved -> allowed; B is a different task -> still blocked.
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-a2", a).await["block"],
+        true,
+        "A must pass"
+    );
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-b2", b).await["block"],
+        true,
+        "B must not pass on A's approval"
     );
 }
 

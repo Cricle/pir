@@ -1519,7 +1519,9 @@ async fn parallel_mode_reports_failures_in_the_aggregate() {
         &ctx,
     )
     .await;
-    assert!(!result.is_error);
+    // Any failed leg now makes the whole batch an error: a foreman must not
+    // treat a partially broken parallel batch as a successful result.
+    assert!(result.is_error);
     assert!(result.content.starts_with("Parallel: 1/2 succeeded\n\n"));
     assert!(result.content.contains("### [a] completed"));
     assert!(result

@@ -1,5 +1,12 @@
 //! `pir foreman` CLI surface and the public journal/sidecar bridge.
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,7 +84,7 @@ fn approval_decisions_update_the_journal_and_clear_pending() {
                 "call": "call-1",
                 "summary": "worker: write",
                 "state": "requested",
-                "createdAtMs": 0
+                "createdAtMs": now_ms()
             }],
             "allow_next_worker": false
         }))
@@ -119,7 +126,7 @@ fn approving_a_plan_switches_the_journal_to_normal() {
                 "state": "requested",
                 "plan": "1. do step one\n2. verify",
                 "kind": "plan",
-                "createdAtMs": 0
+                "createdAtMs": now_ms()
             }],
             "allow_next_worker": false,
             "submitted_plan": "1. do step one\n2. verify"

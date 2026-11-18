@@ -811,8 +811,15 @@ pub struct Cli {
     #[arg(long = "model", value_name = "PATTERN", global = true)]
     pub model: Option<String>,
 
-    /// API key for the selected provider (upstream `--api-key`)
-    #[arg(long = "api-key", value_name = "KEY", global = true)]
+    /// API key for the selected provider (upstream `--api-key`).
+    /// `PIR_SUBAGENT_API_KEY` lets a process-mode parent pass a provider-scoped
+    /// key without putting the secret in argv (visible in process listings).
+    #[arg(
+        long = "api-key",
+        value_name = "KEY",
+        global = true,
+        env = "PIR_SUBAGENT_API_KEY"
+    )]
     pub api_key: Option<String>,
 
     /// Replace the system prompt (upstream `--system-prompt`)

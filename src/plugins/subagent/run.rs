@@ -655,5 +655,12 @@ async fn run_parallel(
     {
         return error_with_details("Subagent was aborted".to_owned(), details);
     }
+    // Any failed parallel leg makes the whole batch an error. Previously a
+    // batch of all-failed workers still returned success, which let foreman
+    // treat a broken worker as verified input. Keep the aggregate text and
+    // details so callers can still see every leg's outcome.
+    if results.iter().any(is_failed) {
+        return error_with_details(aggregate_parallel_text(&results), details);
+    }
     ok_with_details(aggregate_parallel_text(&results), details)
 }

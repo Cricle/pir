@@ -16,15 +16,27 @@ subagent behavior:
 2. An approval queue. `approvals=manual` blocks worker delegations with a
    stable reason, records a pending request, and resumes the foreman after
    `/approvals` (TUI) or `pir foreman approve` (detached run). Denied calls do
-   not create a worker generation.
+   not create a worker generation. An approval authorizes exactly the task it
+   was granted for (bound by approval id): approving task A never admits a
+   different task B. A denied task can be requested again — its stable id is
+   reopened as a fresh pending request rather than being deduped away.
+   Reviewer PASS is persisted by worker generation, so a resumed session does
+   not re-gate an already verified worker. `/mode normal --force` is the
+   emergency exit while a run is busy.
 3. Optional git-worktree isolation per worker. Worktrees are created only for
-   clean repositories, merged back on success, and retained on conflict so the
-   foreman can inspect or clean them. Reviewer calls run against the merged
-   workspace; FAIL is fix-forward, not an automatic rollback.
+   clean repositories, merged back on success, and retained on conflict **or
+   on a failed run** so the foreman can inspect the worker's partial changes.
+   Reviewer calls run against the merged workspace; FAIL is fix-forward, not
+   an automatic rollback.
 4. An optional process executor (`executor=process`) for subagent tasks. It
    runs `pir --mode json --no-session` as a child process with the agent body,
    model and tool allowlist, parses the JSON event stream and enforces the same
-   turn/wall-clock/abort budgets.
+   turn/wall-clock/abort budgets. The parent's provider-scoped explicit
+   credential is inherited through `PIR_SUBAGENT_API_KEY` (an env var, never
+   an argv secret), and the subagent depth carries across the process boundary
+   via `PIR_SUBAGENT_DEPTH` so the global nesting cap stays effective.
+   A parallel batch returns an error if any leg fails — a broken worker is no
+   longer reported as a successful batch.
 5. A detached runner: `pir foreman run/status/logs/abort/approve/deny/resume/
    clean`. It reuses the existing detached jobs supervisor. There is no
    long-lived multi-client daemon and no live TUI attach; `logs --follow` plus

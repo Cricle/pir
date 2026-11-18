@@ -27,9 +27,14 @@ pub(crate) struct JournalState {
     pub(crate) generation: u32,
     pub(crate) reviewer: Option<String>,
     pub(crate) nudges: u32,
+    /// Worker generation with a persisted reviewer PASS.
+    pub(crate) review_passed_generation: Option<u32>,
     pub(crate) settings: ModeSettings,
     pub(crate) approvals: Vec<ApprovalRecord>,
+    /// Derived compatibility flag: true iff `allow_next_worker_id` is Some.
     pub(crate) allow_next_worker: bool,
+    /// The specific approval id authorized to pass once.
+    pub(crate) allow_next_worker_id: Option<String>,
     /// The most recently submitted plan text (plan mode).
     pub(crate) submitted_plan: Option<String>,
 }
@@ -42,9 +47,11 @@ impl Default for JournalState {
             generation: 0,
             reviewer: None,
             nudges: 0,
+            review_passed_generation: None,
             settings: ModeSettings::default(),
             approvals: Vec::new(),
             allow_next_worker: false,
+            allow_next_worker_id: None,
             submitted_plan: None,
         }
     }
@@ -59,9 +66,11 @@ impl JournalState {
                 generation,
                 reviewer,
                 nudges,
+                review_passed_generation,
                 settings,
                 approvals,
                 allow_next_worker,
+                allow_next_worker_id,
                 submitted_plan,
             } => {
                 self.mode = Mode::from_label(&mode).unwrap_or(Mode::Normal);
@@ -69,9 +78,12 @@ impl JournalState {
                 self.generation = generation;
                 self.reviewer = reviewer;
                 self.nudges = nudges;
+                self.review_passed_generation = review_passed_generation;
                 self.settings = settings;
                 self.approvals = approvals;
-                self.allow_next_worker = allow_next_worker;
+                self.allow_next_worker_id = allow_next_worker_id;
+                // Prefer the explicit id; fall back to the legacy bool.
+                self.allow_next_worker = self.allow_next_worker_id.is_some() || allow_next_worker;
                 self.submitted_plan = submitted_plan;
             }
             JournalEvent::Mode { mode, settings } => {
@@ -86,6 +98,11 @@ impl JournalState {
             }
             JournalEvent::Review { pass, .. } => {
                 self.phase = if pass { Phase::Verified } else { Phase::Review };
+                if pass {
+                    self.review_passed_generation = Some(self.generation);
+                } else {
+                    self.review_passed_generation = None;
+                }
             }
             JournalEvent::Gate {
                 generation,
@@ -110,6 +127,7 @@ impl JournalState {
                 let Some(state) = ApprovalState::parse(&state) else {
                     return;
                 };
+                let approval_id = id.clone();
                 if let Some(record) = self.approvals.iter_mut().find(|record| record.id == id) {
                     record.state = state;
                     if state == ApprovalState::Requested {
@@ -134,8 +152,10 @@ impl JournalState {
                 }
                 if kind == ApprovalKind::Worker {
                     if state == ApprovalState::Approved {
+                        self.allow_next_worker_id = Some(approval_id);
                         self.allow_next_worker = true;
                     } else if matches!(state, ApprovalState::Denied | ApprovalState::Expired) {
+                        self.allow_next_worker_id = None;
                         self.allow_next_worker = false;
                     }
                 }
@@ -164,11 +184,15 @@ pub(super) enum JournalEvent {
         generation: u32,
         reviewer: Option<String>,
         nudges: u32,
+        #[serde(default)]
+        review_passed_generation: Option<u32>,
         settings: ModeSettings,
         #[serde(default)]
         approvals: Vec<ApprovalRecord>,
         #[serde(default)]
         allow_next_worker: bool,
+        #[serde(default)]
+        allow_next_worker_id: Option<String>,
         #[serde(default)]
         submitted_plan: Option<String>,
     },
@@ -329,9 +353,11 @@ impl ForemanJournal {
                 generation: state.generation,
                 reviewer: state.reviewer.clone(),
                 nudges: state.nudges,
+                review_passed_generation: state.review_passed_generation,
                 settings: state.settings,
                 approvals: state.approvals.clone(),
                 allow_next_worker: state.allow_next_worker,
+                allow_next_worker_id: state.allow_next_worker_id.clone(),
                 submitted_plan: state.submitted_plan.clone(),
             },
         };
@@ -410,6 +436,14 @@ pub(crate) fn decide_approval_for_session(
         "this session has no foreman journal; start it with /mode foreman or pir foreman run"
             .to_owned()
     })?;
+    // Apply the same expiry rule as the live plugin before deciding: an
+    // approval that aged past the window is never decidable from the CLI.
+    let now = now_ms();
+    for record in state.approvals.iter_mut() {
+        if record.is_expired_at(now) {
+            record.state = ApprovalState::Expired;
+        }
+    }
     let mut decided = Vec::new();
     let state_name = if approved {
         ApprovalState::Approved
@@ -434,11 +468,17 @@ pub(crate) fn decide_approval_for_session(
     }
     // Only worker approvals gate the next worker; plan approvals are handled
     // by the live plugin's mode switch and must not leave a stale allowance.
-    if decided
-        .iter()
-        .any(|record| record.kind == ApprovalKind::Worker)
-    {
-        state.allow_next_worker = approved;
+    let approved_worker_id = if approved {
+        decided
+            .iter()
+            .find(|record| record.kind == ApprovalKind::Worker)
+            .map(|record| record.id.clone())
+    } else {
+        None
+    };
+    if approved_worker_id.is_some() || !approved {
+        state.allow_next_worker = approved_worker_id.is_some();
+        state.allow_next_worker_id = approved_worker_id;
     }
     // An approved plan transitions the session to normal mode in the journal
     // too, so a resumed/child process (which prefers the journal over the

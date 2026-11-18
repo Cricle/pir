@@ -39,7 +39,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Map, Value};
@@ -330,11 +330,15 @@ struct ModeState {
     last_reviewer_call_id: RwLock<Option<String>>,
     /// Settle-gate continuations already injected for this worker generation.
     gate_nudges: AtomicU32,
+    /// The worker generation whose reviewer already returned PASS. Persisted
+    /// so a resumed session does not re-gate an already verified worker.
+    review_passed_generation: RwLock<Option<u32>>,
     settings: RwLock<ModeSettings>,
     approvals: RwLock<Vec<ApprovalRecord>>,
-    /// One approved delegation may pass without prompting again. Persisted so
-    /// a detached approval round-trip survives a process restart.
-    allow_next_worker: AtomicBool,
+    /// The approval id whose worker delegation was approved and may pass once
+    /// without prompting again. Bound to a specific request so approving A can
+    /// never admit a different task B. Persisted for detached round-trips.
+    allow_next_worker_id: RwLock<Option<String>>,
     /// The plan text submitted by `submit_plan` in plan mode.
     submitted_plan: RwLock<Option<String>>,
     journal: RwLock<Option<journal::ForemanJournal>>,
@@ -351,9 +355,10 @@ impl ModeState {
             worker_generation: AtomicU32::new(0),
             last_reviewer_call_id: RwLock::new(None),
             gate_nudges: AtomicU32::new(0),
+            review_passed_generation: RwLock::new(None),
             settings: RwLock::new(ModeSettings::default()),
             approvals: RwLock::new(Vec::new()),
-            allow_next_worker: AtomicBool::new(false),
+            allow_next_worker_id: RwLock::new(None),
             submitted_plan: RwLock::new(None),
             journal: RwLock::new(None),
         }
@@ -411,7 +416,10 @@ impl ModeState {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.allow_next_worker.store(false, Ordering::SeqCst);
+        *self
+            .allow_next_worker_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.refresh_approval_status();
     }
 
@@ -423,10 +431,42 @@ impl ModeState {
             .approvals
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = approvals.iter().find(|record| record.id == id) {
-            return (existing.id.clone(), false);
-        }
         let summary = approval_summary(input);
+        if let Some(existing) = approvals.iter_mut().find(|record| record.id == id) {
+            if existing.is_pending() {
+                return (existing.id.clone(), false);
+            }
+            // A terminal (denied/approved/expired) request with the same stable
+            // id is REOPENED, not deduped: otherwise a denied worker could never
+            // be re-requested and the delegation was permanently blocked.
+            existing.state = ApprovalState::Requested;
+            existing.created_at_ms = now_ms();
+            existing.call = call.to_owned();
+            existing.summary = summary.clone();
+            existing.plan = None;
+            existing.kind = ApprovalKind::Worker;
+            drop(approvals);
+            // Reopening is a fresh authority: any allowance from the previous
+            // decision must not carry over.
+            *self
+                .allow_next_worker_id
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.journal_append(
+                JournalEvent::Approval {
+                    id: id.clone(),
+                    call: call.to_owned(),
+                    state: ApprovalState::Requested.label().to_owned(),
+                    summary,
+                    kind: ApprovalKind::Worker,
+                    plan: None,
+                },
+                true,
+            );
+            self.journal_snapshot(true);
+            self.refresh_approval_status();
+            return (id, true);
+        }
         approvals.push(ApprovalRecord::requested(
             id.clone(),
             call.to_owned(),
@@ -453,6 +493,9 @@ impl ModeState {
     }
 
     fn decide_approval(&self, id: &str, approved: bool) -> Option<ApprovalRecord> {
+        // A stale pending request is not decidable. Expire first so TUI and
+        // CLI decisions share the same authority check.
+        self.expire_stale_approvals();
         let mut approvals = self
             .approvals
             .write()
@@ -473,7 +516,11 @@ impl ModeState {
         // delegation cannot slip through on a stale flag. Plan approvals never
         // touch the worker allowance.
         if record.kind == ApprovalKind::Worker {
-            self.allow_next_worker.store(approved, Ordering::SeqCst);
+            *self
+                .allow_next_worker_id
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                approved.then(|| record.id.clone());
         }
         self.journal_append(
             JournalEvent::Approval {
@@ -558,7 +605,6 @@ impl ModeState {
     }
 
     fn expire_stale_approvals(&self) {
-        const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
         let now = now_ms();
         let mut expired = Vec::new();
         {
@@ -567,7 +613,7 @@ impl ModeState {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for record in approvals.iter_mut() {
-                if record.is_pending() && now.saturating_sub(record.created_at_ms) > MAX_AGE_MS {
+                if record.is_expired_at(now) {
                     record.state = ApprovalState::Expired;
                     expired.push(record.clone());
                 }
@@ -589,8 +635,25 @@ impl ModeState {
         self.refresh_approval_status();
     }
 
-    fn take_allow_next_worker(&self) -> bool {
-        self.allow_next_worker.swap(false, Ordering::SeqCst)
+    /// Consume the bound allowance only when the current delegation's approval
+    /// id matches the one that was approved. A mismatched task never consumes
+    /// another task's authorization.
+    fn take_allow_for(&self, id: &str) -> bool {
+        let allowance = self
+            .allow_next_worker_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match allowance {
+            Some(approved_id) if approved_id == id => {
+                *self
+                    .allow_next_worker_id
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn journal_state(&self) -> JournalState {
@@ -606,7 +669,20 @@ impl ModeState {
             nudges: self.gate_nudges.load(Ordering::SeqCst),
             settings: self.settings(),
             approvals: self.approvals(),
-            allow_next_worker: self.allow_next_worker.load(Ordering::SeqCst),
+            review_passed_generation: *self
+                .review_passed_generation
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            allow_next_worker: self
+                .allow_next_worker_id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            allow_next_worker_id: self
+                .allow_next_worker_id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             submitted_plan: self
                 .submitted_plan
                 .read()
@@ -663,11 +739,17 @@ impl ModeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.reviewer;
         self.gate_nudges.store(state.nudges, Ordering::SeqCst);
         *self
+            .review_passed_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.review_passed_generation;
+        *self
             .approvals
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.approvals;
-        self.allow_next_worker
-            .store(state.allow_next_worker, Ordering::SeqCst);
+        *self
+            .allow_next_worker_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.allow_next_worker_id;
         *self
             .submitted_plan
             .write()
@@ -710,6 +792,10 @@ impl ModeState {
         self.worker_generation.store(0, Ordering::SeqCst);
         self.gate_nudges.store(0, Ordering::SeqCst);
         *self
+            .review_passed_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
             .last_reviewer_call_id
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -723,6 +809,10 @@ impl ModeState {
         if has_worker {
             self.worker_generation.fetch_add(1, Ordering::SeqCst);
             self.gate_nudges.store(0, Ordering::SeqCst);
+            *self
+                .review_passed_generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             *self
                 .last_reviewer_call_id
                 .write()
@@ -760,6 +850,20 @@ impl ModeState {
         if self.worker_generation.load(Ordering::SeqCst) == 0 {
             return None;
         }
+        let generation = self.worker_generation.load(Ordering::SeqCst);
+        if self
+            .review_passed_generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(&generation)
+        {
+            // A persisted PASS for the current generation is authoritative:
+            // the reviewer tool result may have been compacted out of a
+            // resumed session's context payload.
+            self.set_phase(Phase::Verified);
+            return None;
+        }
         let reviewer_call_id = self
             .last_reviewer_call_id
             .read()
@@ -770,6 +874,10 @@ impl ModeState {
             .is_some_and(|call_id| reviewer_passed(payload, call_id))
         {
             self.set_phase(Phase::Verified);
+            *self
+                .review_passed_generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation);
             if let Some(call_id) = reviewer_call_id {
                 self.journal_append(
                     JournalEvent::Review {
@@ -1292,14 +1400,13 @@ impl AgentPlugin for ModePlugin {
                         let has_worker = agents.iter().any(|agent| agent != "reviewer");
                         let settings = self.state.settings();
                         let call_id = event.str_field("toolCallId").unwrap_or_default().to_owned();
+                        let worker_input = event.payload.get("input").unwrap_or(&Value::Null);
+                        let worker_approval_id = approval_id(worker_input);
                         if has_worker
                             && settings.approvals == ApprovalMode::Manual
-                            && !self.state.take_allow_next_worker()
+                            && !self.state.take_allow_for(&worker_approval_id)
                         {
-                            let (id, created) = self.state.request_approval(
-                                &call_id,
-                                event.payload.get("input").unwrap_or(&Value::Null),
-                            );
+                            let (id, created) = self.state.request_approval(&call_id, worker_input);
                             if created {
                                 self.state.notify_level(
                                     NotifyLevel::Warning,
@@ -1406,14 +1513,21 @@ pub fn new_mode_plugin() -> Arc<dyn AgentPlugin> {
 }
 
 fn handle_mode_command(state: &ModeState, args: &str) -> CommandOutcome {
-    match args.trim().to_ascii_lowercase().as_str() {
+    let trimmed = args.trim().to_ascii_lowercase();
+    let force = trimmed.ends_with(" --force");
+    let base = if force {
+        trimmed.trim_end_matches(" --force").trim()
+    } else {
+        trimmed.as_str()
+    };
+    match base {
         "" => CommandOutcome {
             ok: true,
             error: Some(format!("Current mode: {}.", state.mode().label())),
         },
-        "foreman" => switch_mode(state, Mode::Foreman),
-        "normal" => switch_mode(state, Mode::Normal),
-        "plan" => switch_mode(state, Mode::Plan),
+        "foreman" => switch_mode(state, Mode::Foreman, false),
+        "normal" => switch_mode(state, Mode::Normal, force),
+        "plan" => switch_mode(state, Mode::Plan, false),
         _ => CommandOutcome {
             ok: false,
             error: Some(USAGE_MESSAGE.to_owned()),
@@ -1421,7 +1535,7 @@ fn handle_mode_command(state: &ModeState, args: &str) -> CommandOutcome {
     }
 }
 
-fn switch_mode(state: &ModeState, target: Mode) -> CommandOutcome {
+fn switch_mode(state: &ModeState, target: Mode, force: bool) -> CommandOutcome {
     if state.mode() == target {
         return CommandOutcome {
             ok: true,
@@ -1437,7 +1551,7 @@ fn switch_mode(state: &ModeState, target: Mode) -> CommandOutcome {
             };
         }
         if let Some(session) = context.session() {
-            if !session.is_idle() {
+            if !session.is_idle() && !(force && target == Mode::Normal) {
                 return CommandOutcome {
                     ok: false,
                     error: Some(BUSY_MESSAGE.to_owned()),
@@ -1778,11 +1892,20 @@ fn verdict_is_pass(text: &str) -> bool {
     if upper.is_empty() {
         return false;
     }
+    // Negations ("not PASS", "would not pass", "PASS?") are never a verdict.
+    if upper.contains("NOT PASS") || upper.contains("NOT  PASS") || upper.contains("PASS?") {
+        return false;
+    }
     let first = upper.lines().next().unwrap_or_default();
     let first = first.trim_start_matches(|character: char| {
         character.is_whitespace() || matches!(character, '*' | '#' | '`' | '_' | '>' | '-')
     });
-    first.starts_with("PASS") || (upper.contains("PASS") && !upper.contains("FAIL"))
+    // Only a leading PASS token counts. A whole-text "contains PASS" fallback
+    // made "the review would not pass" read as a successful verification.
+    matches!(
+        first.split(|c: char| !c.is_ascii_alphanumeric()).next(),
+        Some("PASS")
+    )
 }
 
 /// Parse `{"verdict":"PASS"|"FAIL", ...}` (optionally inside a Markdown fence)

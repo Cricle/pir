@@ -333,7 +333,13 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         // Refuse BEFORE any agent/session/runtime work: the depth check is
         // pure registry metadata, so a refused depth never allocates a child
         // session, a child extension runtime slot, or an abort watcher.
-        let child_depth = session_depth(&env).saturating_add(1);
+        // A process-mode parent passes its computed depth via marker env;
+        // restore it so the per-process registry does not reset to 0.
+        let inherited_depth = std::env::var(super::process::SUBAGENT_DEPTH_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0);
+        let child_depth = inherited_depth.unwrap_or_else(|| session_depth(&env).saturating_add(1));
         if child_depth >= MAX_SUBAGENT_DEPTH {
             return SingleResult::failed(&agent_name, &task, depth_limit_message(), step);
         }
@@ -370,6 +376,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
                 budget,
                 isolation,
                 worktree_merge,
+                child_depth,
             })
             .await;
         }
@@ -749,7 +756,20 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         if let Some(lease) = worktree {
             let mut merge_result = super::worktree::WorktreeResult::default();
             if is_failed(&result) {
-                merge_result.cleaned = lease.cleanup().await.is_ok();
+                // Retain the worktree on failure: the worker's partial changes
+                // are the most useful evidence for a failed task. Previously
+                // this deleted them, contradicting the conflict path which
+                // keeps the worktree for inspection.
+                merge_result.cleaned = false;
+                let retained = format!(
+                    "Worktree retained after failed run at {} (branch {})",
+                    lease.path.display(),
+                    lease.branch
+                );
+                result.error_message = Some(match result.error_message.take() {
+                    Some(existing) => format!("{existing} — {retained}"),
+                    None => retained,
+                });
             } else if worktree_merge == WorktreeMerge::Auto {
                 merge_result = lease.merge().await;
                 if let Some(error) = &merge_result.error {

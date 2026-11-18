@@ -98,6 +98,16 @@ impl ApprovalRecord {
     pub(crate) fn is_pending(&self) -> bool {
         self.state == ApprovalState::Requested
     }
+
+    /// Approvals older than this are stale and must not be decidable. Shared by
+    /// the live plugin and the detached CLI so both compute expiry identically.
+    pub(crate) const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+
+    /// Whether this record is a pending request that has aged past the expiry
+    /// window at `now`. Never expires a non-pending (decided) record.
+    pub(crate) fn is_expired_at(&self, now: u64) -> bool {
+        self.is_pending() && now.saturating_sub(self.created_at_ms) > Self::MAX_AGE_MS
+    }
 }
 
 pub(crate) fn now_ms() -> u64 {
