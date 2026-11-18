@@ -1106,6 +1106,69 @@ async fn approving_worker_a_does_not_admit_worker_b() {
     );
 }
 
+/// approve-all (a single CLI decision over all pending) must grant EVERY
+/// pending worker, not just the last one. Previously `allow_next_worker_id`
+/// was a single slot, so the second approval overwrote the first and the
+/// first worker was needlessly re-prompted.
+#[tokio::test(flavor = "current_thread")]
+async fn approving_all_pending_workers_grants_each_independently() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-approveall-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let a = worker_input();
+    let b = json!({ "agent": "worker", "task": "write the other file" });
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a", a.clone()).await["block"],
+        true
+    );
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-b", b.clone()).await["block"],
+        true
+    );
+
+    // One decision over ALL pending approvals (None = every pending id).
+    pir::foreman::decide_approval(&path, None, true).expect("approve all");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore");
+
+    // Both distinct workers pass, each consuming its OWN one-shot allowance.
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-a2", a.clone()).await["block"],
+        true,
+        "worker A must be admitted by approve-all"
+    );
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-b2", b).await["block"],
+        true,
+        "worker B must also be admitted by approve-all"
+    );
+    // The allowance is one-shot: a second delegation of A needs a new approval.
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a3", a).await["block"],
+        true,
+        "a consumed allowance must not admit the worker twice"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn foreman_blocks_direct_mutation_and_allows_read_only_and_subagent() {
     let session = FakeSession::new(true, &["subagent", "read"]);

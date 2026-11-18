@@ -33,8 +33,13 @@ pub(crate) struct JournalState {
     pub(crate) approvals: Vec<ApprovalRecord>,
     /// Derived compatibility flag: true iff `allow_next_worker_id` is Some.
     pub(crate) allow_next_worker: bool,
-    /// The specific approval id authorized to pass once.
+    /// The specific approval id authorized to pass once. Bound to a specific
+    /// request so approving A can never admit a different task B. Kept as the
+    /// single "latest" mirror for older journal snapshots.
     pub(crate) allow_next_worker_id: Option<String>,
+    /// All approval ids authorized to pass once (approve-all can grant several
+    /// distinct workers in one decision). Each is consumed independently.
+    pub(crate) allow_next_worker_ids: Vec<String>,
     /// The most recently submitted plan text (plan mode).
     pub(crate) submitted_plan: Option<String>,
 }
@@ -52,6 +57,7 @@ impl Default for JournalState {
             approvals: Vec::new(),
             allow_next_worker: false,
             allow_next_worker_id: None,
+            allow_next_worker_ids: Vec::new(),
             submitted_plan: None,
         }
     }
@@ -71,6 +77,7 @@ impl JournalState {
                 approvals,
                 allow_next_worker,
                 allow_next_worker_id,
+                allow_next_worker_ids,
                 submitted_plan,
             } => {
                 self.mode = Mode::from_label(&mode).unwrap_or(Mode::Normal);
@@ -82,8 +89,15 @@ impl JournalState {
                 self.settings = settings;
                 self.approvals = approvals;
                 self.allow_next_worker_id = allow_next_worker_id;
-                // Prefer the explicit id; fall back to the legacy bool.
-                self.allow_next_worker = self.allow_next_worker_id.is_some() || allow_next_worker;
+                // Old snapshots only carry the single id; seed the set from it.
+                self.allow_next_worker_ids = if allow_next_worker_ids.is_empty() {
+                    self.allow_next_worker_id.clone().into_iter().collect()
+                } else {
+                    allow_next_worker_ids
+                };
+                // Prefer the explicit ids; fall back to the legacy bool.
+                self.allow_next_worker =
+                    !self.allow_next_worker_ids.is_empty() || allow_next_worker;
                 self.submitted_plan = submitted_plan;
             }
             JournalEvent::Mode { mode, settings } => {
@@ -152,11 +166,18 @@ impl JournalState {
                 }
                 if kind == ApprovalKind::Worker {
                     if state == ApprovalState::Approved {
+                        self.allow_next_worker_ids.retain(|id| id != &approval_id);
+                        self.allow_next_worker_ids.push(approval_id.clone());
                         self.allow_next_worker_id = Some(approval_id);
                         self.allow_next_worker = true;
                     } else if matches!(state, ApprovalState::Denied | ApprovalState::Expired) {
-                        self.allow_next_worker_id = None;
-                        self.allow_next_worker = false;
+                        self.allow_next_worker_ids.retain(|id| id != &approval_id);
+                        if self.allow_next_worker_ids.is_empty() {
+                            self.allow_next_worker_id = None;
+                            self.allow_next_worker = false;
+                        } else {
+                            self.allow_next_worker_id = self.allow_next_worker_ids.last().cloned();
+                        }
                     }
                 }
                 if self.approvals.len() > MAX_APPROVAL_HISTORY {
@@ -193,6 +214,8 @@ pub(super) enum JournalEvent {
         allow_next_worker: bool,
         #[serde(default)]
         allow_next_worker_id: Option<String>,
+        #[serde(default)]
+        allow_next_worker_ids: Vec<String>,
         #[serde(default)]
         submitted_plan: Option<String>,
     },
@@ -358,6 +381,7 @@ impl ForemanJournal {
                 approvals: state.approvals.clone(),
                 allow_next_worker: state.allow_next_worker,
                 allow_next_worker_id: state.allow_next_worker_id.clone(),
+                allow_next_worker_ids: state.allow_next_worker_ids.clone(),
                 submitted_plan: state.submitted_plan.clone(),
             },
         };
@@ -468,17 +492,32 @@ pub(crate) fn decide_approval_for_session(
     }
     // Only worker approvals gate the next worker; plan approvals are handled
     // by the live plugin's mode switch and must not leave a stale allowance.
-    let approved_worker_id = if approved {
+    // A single CLI decision can approve several pending workers at once, so
+    // grant every one of them (each is consumed independently by take_allow_for).
+    let approved_worker_ids: Vec<String> = if approved {
         decided
             .iter()
-            .find(|record| record.kind == ApprovalKind::Worker)
+            .filter(|record| record.kind == ApprovalKind::Worker)
             .map(|record| record.id.clone())
+            .collect()
     } else {
-        None
+        Vec::new()
     };
-    if approved_worker_id.is_some() || !approved {
-        state.allow_next_worker = approved_worker_id.is_some();
-        state.allow_next_worker_id = approved_worker_id;
+    if approved || !approved_worker_ids.is_empty() {
+        // A deny clears ALL outstanding allowances (a stale approval must not
+        // survive a later deny), matching the live plugin's decide_approval.
+        if !approved {
+            state.allow_next_worker_ids.clear();
+        } else {
+            for id in &approved_worker_ids {
+                state
+                    .allow_next_worker_ids
+                    .retain(|existing| existing != id);
+                state.allow_next_worker_ids.push(id.clone());
+            }
+        }
+        state.allow_next_worker = !state.allow_next_worker_ids.is_empty();
+        state.allow_next_worker_id = state.allow_next_worker_ids.last().cloned();
     }
     // An approved plan transitions the session to normal mode in the journal
     // too, so a resumed/child process (which prefers the journal over the

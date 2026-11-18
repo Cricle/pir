@@ -37,6 +37,7 @@
 //! the existing single/parallel/chain subagent execution.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -335,10 +336,11 @@ struct ModeState {
     review_passed_generation: RwLock<Option<u32>>,
     settings: RwLock<ModeSettings>,
     approvals: RwLock<Vec<ApprovalRecord>>,
-    /// The approval id whose worker delegation was approved and may pass once
-    /// without prompting again. Bound to a specific request so approving A can
-    /// never admit a different task B. Persisted for detached round-trips.
-    allow_next_worker_id: RwLock<Option<String>>,
+    /// Approval ids whose worker delegation was approved and may pass once
+    /// without prompting again. Bound to specific requests so approving A can
+    /// never admit a different task B; approve-all can grant several at once.
+    /// Persisted for detached round-trips.
+    allow_next_worker_ids: RwLock<HashSet<String>>,
     /// The plan text submitted by `submit_plan` in plan mode.
     submitted_plan: RwLock<Option<String>>,
     journal: RwLock<Option<journal::ForemanJournal>>,
@@ -358,7 +360,7 @@ impl ModeState {
             review_passed_generation: RwLock::new(None),
             settings: RwLock::new(ModeSettings::default()),
             approvals: RwLock::new(Vec::new()),
-            allow_next_worker_id: RwLock::new(None),
+            allow_next_worker_ids: RwLock::new(HashSet::new()),
             submitted_plan: RwLock::new(None),
             journal: RwLock::new(None),
         }
@@ -417,9 +419,9 @@ impl ModeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         *self
-            .allow_next_worker_id
+            .allow_next_worker_ids
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HashSet::new();
         self.refresh_approval_status();
     }
 
@@ -446,12 +448,12 @@ impl ModeState {
             existing.plan = None;
             existing.kind = ApprovalKind::Worker;
             drop(approvals);
-            // Reopening is a fresh authority: any allowance from the previous
-            // decision must not carry over.
-            *self
-                .allow_next_worker_id
+            // Reopening is a fresh authority: the allowance for THIS id must
+            // not carry over (other still-valid approvals are untouched).
+            self.allow_next_worker_ids
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
             self.journal_append(
                 JournalEvent::Approval {
                     id: id.clone(),
@@ -511,16 +513,19 @@ impl ModeState {
         record.state = state;
         let record = record.clone();
         drop(approvals);
-        // A decision is the latest authority: approve admits the next worker,
-        // deny must also clear an earlier unused approval so a different
-        // delegation cannot slip through on a stale flag. Plan approvals never
-        // touch the worker allowance.
+        // A decision is the latest authority for THIS id: approve admits that
+        // worker once, deny revokes any earlier allowance for it. Other ids
+        // already approved stay valid (approve-all can grant several). Plan
+        // approvals never touch the worker allowance.
         if record.kind == ApprovalKind::Worker {
-            *self
-                .allow_next_worker_id
+            let mut allowance = self
+                .allow_next_worker_ids
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                approved.then(|| record.id.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            allowance.remove(&record.id);
+            if approved {
+                allowance.insert(record.id.clone());
+            }
         }
         self.journal_append(
             JournalEvent::Approval {
@@ -636,24 +641,13 @@ impl ModeState {
     }
 
     /// Consume the bound allowance only when the current delegation's approval
-    /// id matches the one that was approved. A mismatched task never consumes
-    /// another task's authorization.
+    /// id is one that was approved. A mismatched task never consumes another
+    /// task's authorization; each approved id is consumed exactly once.
     fn take_allow_for(&self, id: &str) -> bool {
-        let allowance = self
-            .allow_next_worker_id
-            .read()
+        self.allow_next_worker_ids
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        match allowance {
-            Some(approved_id) if approved_id == id => {
-                *self
-                    .allow_next_worker_id
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                true
-            }
-            _ => false,
-        }
+            .remove(id)
     }
 
     fn journal_state(&self) -> JournalState {
@@ -673,16 +667,29 @@ impl ModeState {
                 .review_passed_generation
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            allow_next_worker: self
-                .allow_next_worker_id
+            allow_next_worker: !self
+                .allow_next_worker_ids
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some(),
+                .is_empty(),
             allow_next_worker_id: self
-                .allow_next_worker_id
+                .allow_next_worker_ids
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+                .iter()
+                .next()
+                .cloned(),
+            allow_next_worker_ids: {
+                let mut ids: Vec<String> = self
+                    .allow_next_worker_ids
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .cloned()
+                    .collect();
+                ids.sort();
+                ids
+            },
             submitted_plan: self
                 .submitted_plan
                 .read()
@@ -747,9 +754,10 @@ impl ModeState {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.approvals;
         *self
-            .allow_next_worker_id
+            .allow_next_worker_ids
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.allow_next_worker_id;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            state.allow_next_worker_ids.iter().cloned().collect();
         *self
             .submitted_plan
             .write()
