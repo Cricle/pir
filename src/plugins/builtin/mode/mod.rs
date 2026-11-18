@@ -672,13 +672,18 @@ impl ModeState {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty(),
-            allow_next_worker_id: self
-                .allow_next_worker_ids
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .next()
-                .cloned(),
+            // Both allowance fields must be deterministic: HashSet iteration
+            // order is random, so take the first of the SORTED ids for the
+            // legacy single-id mirror too.
+            allow_next_worker_id: {
+                let guard = self
+                    .allow_next_worker_ids
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut ids: Vec<&String> = guard.iter().collect();
+                ids.sort();
+                ids.first().map(|id| (*id).clone())
+            },
             allow_next_worker_ids: {
                 let mut ids: Vec<String> = self
                     .allow_next_worker_ids
