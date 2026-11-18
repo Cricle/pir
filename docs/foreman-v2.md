@@ -77,18 +77,22 @@ worktree/process/CLI tests, fmt/clippy, and the TUI scenarios
 
 ## Residual limitations and the durable engine
 
-Two remaining edge cases share one architectural root cause: a run that waits
-for an asynchronous external event has no explicit, resumable wait state.
+Two edge cases shared one architectural root cause: a run that waits for an
+asynchronous external event has no explicit, resumable wait state.
 
-- **Headless background completion**: in `pir print`, a background tool call
-  that finishes after the terminal model turn is persisted as a
+- **Headless background completion** — RESOLVED. A background tool call that
+  finishes after the terminal model turn used to be only persisted as a
   `backgroundToolResult` entry and reported through a `background_tool_end`
-  event, but the model is not given another turn to consume the result.
-- **Approval waiting**: the foreman/plan approval gate blocks with
-  `terminate:false` and asks the model (via prompt/notice text) to end its turn;
-  the approval decision then arrives as a follow-up. Making the block
-  `terminate:true` was tried and reverted — it breaks the approval follow-up
-  because tool-call termination is a batch hint, not a suspend/resume primitive.
+  event, with no extra model turn to consume it. The print host now does a
+  bounded `wait_for_idle` before settling and, when a completion arrived,
+  re-projects the session and runs one more turn (`should_replay_background`,
+  capped by `AGENT_BEFORE_SETTLE_CONTINUATION_CAP`).
+- **Approval waiting** — remaining design constraint. The foreman/plan approval
+  gate blocks with `terminate:false` and asks the model (via prompt/notice text)
+  to end its turn; the approval decision then arrives as a follow-up. Making the
+  block `terminate:true` was tried and reverted — it breaks the approval
+  follow-up because tool-call termination is a batch hint, not a suspend/resume
+  primitive.
 
 `src/durable/` is a mature, high-fidelity port of `pi-durable`: atomic committed
 state (`src/durable/session/`), a check-pointed task state machine with
@@ -104,8 +108,8 @@ beside `agent_loop`/`agent_session`, not the engine beneath them
 
 Migrating foreman/headless orchestration onto durable to fix these two narrow
 cases would be a rewrite of run orchestration (scheduler/wake/approval
-wiring), not an incremental fix. The chosen approach is therefore a local,
-bounded wait-and-resume in the print host for the headless case, and keeping
-the approval design constraint as documented behavior. Durable remains the
-right long-term target only if the product goal becomes a unified,
+wiring), not an incremental fix. The chosen approach was therefore the local,
+bounded wait-and-resume in the print host (now implemented for headless), while
+keeping the approval design constraint as documented behavior. Durable remains
+the right long-term target only if the product goal becomes a unified,
 crash-recoverable run/subagent/background/approval orchestrator.
