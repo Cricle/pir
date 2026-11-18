@@ -1156,7 +1156,9 @@ impl AgentPlugin for ModePlugin {
         });
         ctx.register_command(
             COMMAND_NAME,
-            Some("Switch session mode: /mode foreman | /mode normal | /mode plan"),
+            Some(
+                "Switch session mode: /mode foreman | /mode plan | /mode normal [--force].                  Foreman routes mutations to workers and requires a reviewer; plan is read-only                  until a submitted plan is approved. Run /approvals to decide pending approvals,                  /foreman to tune settings. Use --force to leave a busy session in an emergency.",
+            ),
             Some(CommandBackend::Rust(handler)),
         );
         let settings_state = Arc::clone(&self.state);
