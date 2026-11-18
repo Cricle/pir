@@ -330,6 +330,35 @@ fn pir_only_rules_are_gated_on_the_tools_that_trigger_them() {
     assert!(!read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[2]));
 }
 
+/// The no-blind-wait efficiency rule is global: it applies to every tool set,
+/// including read-only and empty ones, because sleeping never helps anywhere.
+#[test]
+fn no_blind_wait_rule_is_always_present_before_the_upstream_tail() {
+    const RULE: &str = "Never sleep, spin, or busy-wait to wait for unknown work or an external event; if a tool runs in the background, end your turn and wait for its result notification instead of wasting time, and otherwise use the available status tool or stop";
+    for tools in [
+        vec![],
+        vec![tool("read")],
+        vec![tool("bash"), tool("edit")],
+        vec![tool("background_status"), tool("subagent")],
+    ] {
+        let rules = rules_of(&tools);
+        assert!(
+            rules.iter().any(|r| r == RULE),
+            "missing rule for {tools:?}: {rules:#?}"
+        );
+        let pos = rules.iter().position(|r| r == RULE).unwrap();
+        assert_eq!(
+            rules[rules.len() - 2],
+            "Be concise in your responses",
+            "upstream tail must stay last: {rules:#?}"
+        );
+        assert!(
+            pos < rules.len() - 2,
+            "rule must precede the tail: {rules:#?}"
+        );
+    }
+}
+
 /// The `efficient` performance profile omits ONLY the advisory finish rule.
 ///
 /// The other three pir-only bullets mirror a hard tool/agent gate and must stay

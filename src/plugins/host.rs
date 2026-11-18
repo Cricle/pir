@@ -506,12 +506,13 @@ impl NativeEventIndex {
         index
     }
 
-    fn has_native_handlers(&self, event: &str) -> bool {
-        !self.all_native.is_empty()
-            || self
-                .by_event
-                .get(event)
-                .is_some_and(|positions| !positions.is_empty())
+    fn has_native_handlers(&self, plugins: &[Arc<dyn AgentPlugin>], event: &str) -> bool {
+        // Static interest only says who *subscribed*; a stateful plugin can
+        // currently be inert (see `AgentPlugin::handles_event_now`). Walking
+        // the (usually tiny) candidate list here lets such a plugin keep its
+        // declaration without forcing every caller to build the payload.
+        self.dispatch_indices(event, false)
+            .any(|index| plugins[index].handles_event_now(event))
     }
 
     /// Whether any native plugin that would RECEIVE `event` says its handler
@@ -528,8 +529,10 @@ impl NativeEventIndex {
         event: &str,
         model: Option<&str>,
     ) -> bool {
-        self.dispatch_indices(event, false)
-            .any(|index| plugins[index].handler_active_for_event(event, model))
+        self.dispatch_indices(event, false).any(|index| {
+            plugins[index].handles_event_now(event)
+                && plugins[index].handler_active_for_event(event, model)
+        })
     }
 
     /// Plugin indices to invoke for `event`, in dispatch order. `include_js`
@@ -1399,7 +1402,7 @@ impl PluginHost {
         let native_events = NativeEventIndex::build(&plugins);
         // Whether a non-JS plugin declared `terminal_input` interest at build
         // time — read from the same table the dispatch uses.
-        let native_terminal_input = native_events.has_native_handlers("terminal_input");
+        let native_terminal_input = native_events.has_native_handlers(&plugins, "terminal_input");
 
         let host = Self {
             plugins,
@@ -2055,10 +2058,24 @@ impl PluginHost {
     /// already delivered through the direct handle.
     pub fn has_native_handlers(&self, event: &str) -> bool {
         // The interest table was snapshotted at build (see
-        // [`NativeEventIndex`]); one map probe replaces the per-plugin
+        // [`NativeEventIndex`]), so this never re-runs the per-plugin
         // `events()` walk (which allocated a `Vec<String>` per `List`
-        // plugin on every call).
-        self.native_events.has_native_handlers(event)
+        // plugin). The per-candidate `handles_event_now` probe keeps a
+        // stateful plugin's idle declaration from forcing payload work.
+        self.native_events.has_native_handlers(&self.plugins, event)
+    }
+
+    /// Tool declarations native plugins currently require the host to omit
+    /// from the model-facing loadout
+    /// ([`AgentPlugin::hidden_tool_declarations`]), deduplicated in name
+    /// order.
+    pub fn hidden_tool_declarations(&self) -> Vec<String> {
+        self.plugins
+            .iter()
+            .flat_map(|plugin| plugin.hidden_tool_declarations())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Whether any native plugin that receives `message_update` opted into

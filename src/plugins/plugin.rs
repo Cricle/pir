@@ -660,6 +660,42 @@ pub trait AgentPlugin: Send + Sync {
         EventInterest::None
     }
 
+    /// Whether this plugin's handler for `event` is currently live.
+    ///
+    /// [`Self::events`] is a static declaration; this predicate is its
+    /// stateful twin for plugins whose handler becomes a no-op without
+    /// ceasing to subscribe. The host consults it when answering
+    /// [`PluginHost::has_handlers`](crate::plugins::PluginHost::has_handlers)
+    /// and `has_native_handlers`, so a plugin can avoid forcing expensive
+    /// payload construction (a boundary event serializes the whole
+    /// transcript) while its handler is provably a no-op.
+    ///
+    /// The default is conservative: `true` means "assume live", which keeps
+    /// the declared-interest behavior for every implementation that does not
+    /// override this. A plugin may answer `false` only when its handler would
+    /// return [`PluginEventOutcome::None`] and mutate nothing for EVERY
+    /// payload of that event in the current state.
+    fn handles_event_now(&self, event: &str) -> bool {
+        let _ = event;
+        true
+    }
+
+    /// Tool names whose declarations the host must omit from the model-facing
+    /// loadout while this plugin's current state requires a restricted tool
+    /// surface.
+    ///
+    /// Unlike [`AgentTool::prepare_loadout`](crate::agent::tool_execution::AgentTool::prepare_loadout)
+    /// (per tool, owned by the tool), this is a plugin-wide declaration
+    /// filter. The host applies it on every loadout rebuild; hidden tools stay
+    /// active and callable, so a plugin that needs execution safety must pair
+    /// it with a hard `tool_call` gate.
+    ///
+    /// The default returns no names, so existing plugins pay one cheap call
+    /// per loadout and observe unchanged behavior.
+    fn hidden_tool_declarations(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Whether this plugin's handler for `event` could change anything for a
     /// request running under `model` (the model id, when the caller knows it).
     ///

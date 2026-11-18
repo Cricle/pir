@@ -785,6 +785,9 @@ pub fn session_sidecar_paths(path: &Path) -> Vec<PathBuf> {
         parent.join(format!("{name}.checkpoints")),
         parent.join(format!("{name}.tmp")),
         parent.join(format!("{name}.bak")),
+        parent.join(format!("{name}.mode.json")),
+        parent.join(format!("{name}.foreman.jsonl")),
+        parent.join(format!("{name}.foreman.jsonl.1")),
     ];
     if let Some(lock) = session_lock_path(path) {
         paths.push(lock);

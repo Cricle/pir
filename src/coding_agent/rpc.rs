@@ -3022,7 +3022,7 @@ fn default_session_factory(
     // attach).
     let recorded_selection = session
         .as_ref()
-        .map(crate::sdk::agent::session_recorded_settings);
+        .map(crate::session_manager::recorded_settings::recorded_session_settings);
     let mut model_overrides = overrides.model.clone();
     if model_overrides.provider.is_none() && model_overrides.model.is_none() {
         if let Some((provider, model)) = recorded_selection

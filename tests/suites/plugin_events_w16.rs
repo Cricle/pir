@@ -38,6 +38,7 @@
 //! no JS runtime, no network, no model.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pir::agent::tool_batch::{FinalizedToolCall, ToolResult};
@@ -418,6 +419,18 @@ fn expected_builtin_events() -> Vec<(&'static str, EventInterest)> {
         // `EventInterest::None` (verified: no `on_event` override in each module).
         #[cfg(feature = "subagent")]
         ("subagent", EventInterest::None),
+        // User-triggered mode switching: prompt section, tool gate, session
+        // reset, and the foreman reviewer settle gate.
+        #[cfg(feature = "subagent")]
+        (
+            "mode",
+            EventInterest::List(vec![
+                "session_start".to_owned(),
+                "before_agent_start".to_owned(),
+                "tool_call".to_owned(),
+                "agent_before_settle".to_owned(),
+            ]),
+        ),
         #[cfg(feature = "extensions")]
         ("codemode", EventInterest::None),
         #[cfg(feature = "python")]
@@ -1251,4 +1264,139 @@ async fn gate_and_fan_out_agree_for_list_all_and_none_declarations() {
     // to assert that `All` had a hole in it, contradicting both the
     // declaration contract and the `has_native_handlers` agreement asserted
     // on the line above.
+}
+
+/// A stateful plugin can keep its declaration while telling the host that the
+/// handler is currently inert: `has_native_handlers` must follow
+/// `handles_event_now`, so a caller that gates expensive payload construction
+/// on it skips the event in the inert state.
+struct DynamicInterestPlugin {
+    info: PluginInfo,
+    live: Arc<AtomicBool>,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl AgentPlugin for DynamicInterestPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(vec!["agent_before_settle".to_owned()])
+    }
+
+    fn handles_event_now(&self, event: &str) -> bool {
+        event != "agent_before_settle" || self.live.load(Ordering::SeqCst)
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let name = event.name.to_string();
+        let seen = Arc::clone(&self.seen);
+        Box::pin(async move {
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(name);
+            PluginEventOutcome::None
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_interest_can_keep_the_declaration_while_inert() {
+    let live = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let host = PluginHost::build(
+        None,
+        vec![as_plugin(Arc::new(DynamicInterestPlugin {
+            info: PluginInfo::inline("w16-dynamic-interest"),
+            live: Arc::clone(&live),
+            seen: Arc::clone(&seen),
+        }))],
+    );
+
+    assert!(
+        !host.has_native_handlers("agent_before_settle"),
+        "an inert dynamic handler must not announce itself"
+    );
+    assert!(!host.has_handlers("agent_before_settle"));
+
+    live.store(true, Ordering::SeqCst);
+    assert!(host.has_native_handlers("agent_before_settle"));
+    assert!(host.has_handlers("agent_before_settle"));
+
+    let mut payload = json!({ "type": "agent_before_settle" });
+    host.emit("agent_before_settle", &mut payload)
+        .await
+        .expect("emit");
+    assert_eq!(drain_seen(&seen), vec!["agent_before_settle".to_owned()]);
+}
+
+/// A plugin that always returns one fixed boundary result.
+struct GenericResultPlugin {
+    info: PluginInfo,
+    events: Vec<&'static str>,
+    result: serde_json::Value,
+}
+
+impl AgentPlugin for GenericResultPlugin {
+    fn info(&self) -> &PluginInfo {
+        &self.info
+    }
+
+    fn events(&self) -> EventInterest {
+        EventInterest::List(
+            self.events
+                .iter()
+                .map(|event| (*event).to_owned())
+                .collect(),
+        )
+    }
+
+    fn on_event<'a>(&'a self, event: PluginEvent<'a>) -> PluginFuture<'a, PluginEventOutcome> {
+        let result = self.result.clone();
+        let matches = self.events.contains(&event.name.as_ref());
+        Box::pin(async move {
+            if matches {
+                PluginEventOutcome::Generic(result)
+            } else {
+                PluginEventOutcome::None
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn boundary_results_compose_continue_and_entries_across_plugins() {
+    for event in ["turn_end", "agent_before_settle"] {
+        let host = PluginHost::build(
+            None,
+            vec![
+                as_plugin(Arc::new(GenericResultPlugin {
+                    info: PluginInfo::inline("w16-boundary-continue"),
+                    events: vec!["turn_end", "agent_before_settle"],
+                    result: json!({ "continue": true }),
+                })),
+                as_plugin(Arc::new(GenericResultPlugin {
+                    info: PluginInfo::inline("w16-boundary-entries"),
+                    events: vec!["turn_end", "agent_before_settle"],
+                    result: json!({
+                        "continue": false,
+                        "entries": [{ "type": "custom", "customType": "probe" }],
+                    }),
+                })),
+            ],
+        );
+        let mut payload = json!({ "type": event });
+        let outcome = host.emit(event, &mut payload).await.expect("emit");
+        assert_eq!(
+            outcome.result["continue"], true,
+            "{event}: a later `continue: false` must not cancel an earlier request"
+        );
+        assert_eq!(
+            outcome.result["entries"].as_array().map(Vec::len),
+            Some(1),
+            "{event}: entries from both handlers must survive: {}",
+            outcome.result
+        );
+    }
 }

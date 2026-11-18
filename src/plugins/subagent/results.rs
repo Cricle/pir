@@ -15,6 +15,19 @@ pub struct UsageTotals {
     pub turns: u64,
 }
 
+/// Worktree metadata for one task. `merged` means the changes reached the
+/// main workspace (or there were none); `cleaned` means the lease was removed.
+#[derive(Debug, Clone)]
+pub struct WorktreeOutcome {
+    pub repo: String,
+    pub path: String,
+    pub branch: String,
+    pub base: String,
+    pub merged: bool,
+    pub cleaned: bool,
+    pub error: Option<String>,
+}
+
 /// One task's outcome (upstream `SingleResult`). Failure is
 /// `stop_reason` `error`/`aborted` or a child run error (`stderr`).
 #[derive(Debug, Clone)]
@@ -35,6 +48,10 @@ pub struct SingleResult {
     pub step: Option<usize>,
     /// Parallel placeholder still running (upstream `exitCode: -1`).
     pub pending: bool,
+    /// Worktree isolation metadata, when this task used one.
+    pub worktree: Option<WorktreeOutcome>,
+    /// `inline` or `process`.
+    pub executor: &'static str,
 }
 
 impl SingleResult {
@@ -53,6 +70,8 @@ impl SingleResult {
             stderr: Some(message),
             step,
             pending: false,
+            worktree: None,
+            executor: "inline",
         }
     }
 
@@ -80,6 +99,8 @@ impl SingleResult {
             stderr: None,
             step: None,
             pending: true,
+            worktree: None,
+            executor: "inline",
         }
     }
 
@@ -150,6 +171,26 @@ impl SingleResult {
         }
         if self.pending {
             value.insert("pending".to_owned(), JsonValue::Bool(true));
+        }
+        if self.executor != "inline" {
+            value.insert(
+                "executor".to_owned(),
+                JsonValue::String(self.executor.to_owned()),
+            );
+        }
+        if let Some(worktree) = &self.worktree {
+            value.insert(
+                "worktree".to_owned(),
+                serde_json::json!({
+                    "repo": worktree.repo,
+                    "path": worktree.path,
+                    "branch": worktree.branch,
+                    "base": worktree.base,
+                    "merged": worktree.merged,
+                    "cleaned": worktree.cleaned,
+                    "error": worktree.error,
+                }),
+            );
         }
         JsonValue::Object(value)
     }

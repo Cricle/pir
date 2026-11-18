@@ -743,8 +743,9 @@ async fn print_agent_before_settle_continues_and_commits_drafts() {
 
 /// `apply_extension_notifications`-style settlement: `custom_message` and
 /// `context_edit` drafts are persisted by the boundary AND visible in the
-/// session projection the next settle iteration consumes. This is exactly the
-/// data path `run_print`'s continuation uses after P2-PRINT1-01.
+/// session projection the next settle iteration consumes. A custom-message
+/// draft also makes an assistant-final context continuable. This is exactly
+/// the data path `run_print`'s continuation uses after P2-PRINT1-01.
 #[tokio::test(flavor = "current_thread")]
 async fn print_settle_drafts_project_into_the_next_context() {
     let session = in_memory_session("settle-projection");
@@ -771,10 +772,10 @@ async fn print_settle_drafts_project_into_the_next_context() {
             Arc::clone(&session),
             &context,
             &terminal,
-            // The test context ends on an assistant message; `pending_messages`
-            // is the upstream `canContinue` escape hatch for a handler that
-            // wants a continuation anyway.
-            true,
+            // The test context ends on an assistant message. The handler's
+            // `custom_message` draft creates the runnable user turn the
+            // continuation needs, so `pending_messages` stays false.
+            false,
             None,
         )
         .await

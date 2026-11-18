@@ -22,7 +22,9 @@ use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::*;
 use pir::coding_agent::rpc::{RpcServer, SessionFactory};
 use pir::extensions::{ExtensionConfig, ExtensionHandle, Notification};
-use pir::plugins::{AgentPlugin, PluginEvent, PluginEventOutcome, PluginFuture, PluginInfo};
+use pir::plugins::{
+    instantiate_builtin, AgentPlugin, PluginEvent, PluginEventOutcome, PluginFuture, PluginInfo,
+};
 use pir::sdk::AgentSessionRuntime;
 use pir::session_manager::SessionManager;
 
@@ -9281,5 +9283,184 @@ async fn ephemeral_extension_send_user_message_announces_a_user_entry_appended()
         texts.iter().any(|text| text == "X6STARTUP-TURN")
             && texts.iter().any(|text| text == "done"),
         "the in-memory transcript keeps the user message and the reply: {texts:?}"
+    );
+}
+
+/// A minimal named tool for loadout-surface tests.
+struct SurfaceTool(&'static str);
+
+impl AgentTool for SurfaceTool {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    fn description(&self) -> &'static str {
+        "test tool"
+    }
+    fn parameters(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "object"}))
+    }
+    fn run(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> BoxFuture<'static, ToolResult> {
+        Box::pin(async { ToolResult::ok("ok") })
+    }
+}
+
+/// Foreman mode must hide non-allowlisted tools from the MODEL-FACING
+/// declaration list (not merely block them after a call). `/mode normal`
+/// restores them. A worker child is out of scope here: its own plugin
+/// instance starts normal, pinned by the mode unit tests.
+#[tokio::test]
+async fn foreman_hides_mutating_tools_from_the_provider_request() {
+    let temp = TempDir::new("foreman-tool-surface");
+    let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_responder = Arc::clone(&seen);
+    let registry = fake_registry(Arc::new(move |_index, context| {
+        let names = context
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+            .unwrap_or_default();
+        seen_for_responder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(names);
+        assistant(vec![text("done")], StopReason::Stop)
+    }));
+
+    let mut tools = ToolRegistry::new();
+    for name in ["subagent", "read", "bash", "edit"] {
+        tools.register(Arc::new(SurfaceTool(name)));
+    }
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let mut config = race_agent_config(registry, session, &temp, None);
+    config.tools = tools;
+    config.compaction = None;
+    config.max_turns = 2;
+    let mode = instantiate_builtin("mode").expect("mode builtin");
+    let agent = AgentSession::new_with_plugins(config, vec![Arc::clone(&mode)]);
+
+    // The first prompt emits `session_start`, which intentionally resets the
+    // mode; warm up before switching (the TUI's startup emission makes its
+    // pre-prompt `/mode foreman` stick).
+    agent
+        .prompt("warm up", event_handler(EventLog::default()))
+        .await
+        .expect("warm-up prompt");
+
+    let enabled = agent
+        .dispatch_plugin_command("mode", "foreman")
+        .await
+        .expect("dispatch /mode foreman");
+    assert!(enabled.ok, "{enabled:?}");
+    agent
+        .prompt("do the task", event_handler(EventLog::default()))
+        .await
+        .expect("foreman prompt");
+
+    let normal = agent
+        .dispatch_plugin_command("mode", "normal")
+        .await
+        .expect("dispatch /mode normal");
+    assert!(normal.ok, "{normal:?}");
+    agent
+        .prompt("do the task again", event_handler(EventLog::default()))
+        .await
+        .expect("normal prompt");
+
+    let requests = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(
+        requests[1].iter().any(|name| name == "subagent")
+            && requests[1].iter().any(|name| name == "read"),
+        "foreman must keep the delegation/read tools: {:?}",
+        requests[1]
+    );
+    assert!(
+        !requests[1]
+            .iter()
+            .any(|name| name == "bash" || name == "edit"),
+        "foreman must not declare mutating tools: {:?}",
+        requests[1]
+    );
+    assert!(
+        requests[2].iter().any(|name| name == "bash")
+            && requests[2].iter().any(|name| name == "edit"),
+        "normal mode must restore the full declaration surface: {:?}",
+        requests[2]
+    );
+}
+
+/// A real Arc-backed session persists the selected mode next to its JSONL
+/// file; reopening that file restores foreman (and its restricted surface)
+/// before the first prompt.
+#[tokio::test]
+async fn reopened_arc_session_restores_the_persisted_mode() {
+    let temp = TempDir::new("mode-resume");
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("done")], StopReason::Stop)
+    }));
+    let session = SessionManager::create(".", &temp.0).expect("create session");
+    let path = session.path().to_path_buf();
+    let mut tools = ToolRegistry::new();
+    for name in ["subagent", "read", "bash"] {
+        tools.register(Arc::new(SurfaceTool(name)));
+    }
+    let mut config = race_agent_config(registry, session, &temp, None);
+    config.tools = tools;
+    config.compaction = None;
+    config.max_turns = 2;
+    let mode = instantiate_builtin("mode").expect("mode builtin");
+    let agent = AgentSession::new_arc_with_plugins(config, vec![Arc::clone(&mode)]);
+    agent
+        .prompt("warm up", event_handler(EventLog::default()))
+        .await
+        .expect("warm-up prompt");
+    let enabled = agent
+        .dispatch_plugin_command("mode", "foreman")
+        .await
+        .expect("dispatch /mode foreman");
+    assert!(enabled.ok, "{enabled:?}");
+    assert!(
+        agent
+            .plugin_statuses()
+            .iter()
+            .any(|(key, value)| key == "mode" && value == "MODE: FOREMAN"),
+        "the live session must publish the foreman badge: {:?}",
+        agent.plugin_statuses()
+    );
+    drop(agent);
+
+    let reopened = SessionManager::open(&path).expect("reopen session");
+    let registry = fake_registry(Arc::new(|_index, _context| {
+        assistant(vec![text("resumed")], StopReason::Stop)
+    }));
+    let mut tools = ToolRegistry::new();
+    for name in ["subagent", "read", "bash"] {
+        tools.register(Arc::new(SurfaceTool(name)));
+    }
+    let mut config = race_agent_config(registry, reopened, &temp, None);
+    config.tools = tools;
+    config.compaction = None;
+    config.max_turns = 2;
+    let mode = instantiate_builtin("mode").expect("mode builtin");
+    let resumed = AgentSession::new_arc_with_plugins(config, vec![Arc::clone(&mode)]);
+    assert!(
+        resumed
+            .plugin_statuses()
+            .iter()
+            .any(|(key, value)| key == "mode" && value == "MODE: FOREMAN"),
+        "reopening the session must restore the persisted mode: {:?}",
+        resumed.plugin_statuses()
+    );
+    assert!(
+        resumed
+            .plugin_host()
+            .expect("plugin host")
+            .hidden_tool_declarations()
+            .iter()
+            .any(|name| name == "bash"),
+        "the restored foreman surface must hide mutating tools"
     );
 }

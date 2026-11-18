@@ -55,6 +55,9 @@ pub mod projection;
 // `modes/interactive/components/session-selector-search.ts`): token/phrase/
 // regex parsing plus tiered exact/fuzzy scoring over id/name/cwd and every
 // user/assistant message.
+// Lightweight recorded model/thinking projection shared by the SDK, print
+// and rpc attach paths (the latter two compile without the `sdk` feature).
+pub(crate) mod recorded_settings;
 pub mod search;
 // Retention / garbage collection for persisted session files (P0-4).
 pub mod retention;

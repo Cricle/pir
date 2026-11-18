@@ -1,6 +1,41 @@
 use super::child::ChildRunInputs;
 use super::*;
 
+/// Apply the top-level isolation/executor/merge defaults to every task item
+/// and validate the resulting enum spellings before any child runs.
+fn resolve_task_defaults(params: &mut SubagentParams) -> Result<(), String> {
+    let default_isolation = params.isolation.clone();
+    let default_merge = params.worktree_merge.clone();
+    let default_executor = params.executor.clone();
+    let default_tools = params.tools.clone();
+    for item in params
+        .chain
+        .iter_mut()
+        .flatten()
+        .chain(params.tasks.iter_mut().flatten())
+    {
+        if item.isolation.is_none() {
+            item.isolation = default_isolation.clone();
+        }
+        if item.worktree_merge.is_none() {
+            item.worktree_merge = default_merge.clone();
+        }
+        if item.executor.is_none() {
+            item.executor = default_executor.clone();
+        }
+        if item.tools.is_none() {
+            item.tools = default_tools.clone();
+        }
+        Isolation::parse(item.isolation.as_deref())?;
+        WorktreeMerge::parse(item.worktree_merge.as_deref())?;
+        Executor::parse(item.executor.as_deref())?;
+    }
+    Isolation::parse(params.isolation.as_deref())?;
+    WorktreeMerge::parse(params.worktree_merge.as_deref())?;
+    Executor::parse(params.executor.as_deref())?;
+    Ok(())
+}
+
 /// Abort the child when either the parent signal or the selected-run signal
 /// fires. `AbortSignal::any` owns the watcher tasks; callers are already on
 /// the async runtime.
@@ -30,10 +65,14 @@ pub(super) async fn execute(
     // Borrowed-Value deserialization: `&Value` implements `serde::Deserializer`,
     // so the whole arguments object (agent / task / chain texts, the largest
     // strings this call carries) is no longer deep-cloned just to be parsed.
-    let params: SubagentParams = match <SubagentParams as serde::Deserialize>::deserialize(args) {
+    let mut params: SubagentParams = match <SubagentParams as serde::Deserialize>::deserialize(args)
+    {
         Ok(params) => params,
         Err(error) => return ToolResult::error(format!("Invalid subagent parameters: {error}")),
     };
+    if let Err(error) = resolve_task_defaults(&mut params) {
+        return ToolResult::error(error);
+    }
     let agent_scope = match &params.agent_scope {
         None => AgentScope::User,
         Some(value) => match AgentScope::parse(value) {
@@ -193,12 +232,17 @@ async fn run_single(
     budget: SubagentBudget,
     activity: Arc<super::activity::SubagentActivity>,
 ) -> ToolResult {
-    let agent_name = params.agent.unwrap_or_default();
-    let task = params.task.unwrap_or_default();
+    let agent_name = params.agent.clone().unwrap_or_default();
+    let task = params.task.clone().unwrap_or_default();
     let cwd = params
         .cwd
+        .clone()
         .map(PathBuf::from)
         .unwrap_or_else(|| ctx.cwd.clone());
+    let isolation = Isolation::parse(params.isolation.as_deref()).unwrap_or(Isolation::None);
+    let worktree_merge =
+        WorktreeMerge::parse(params.worktree_merge.as_deref()).unwrap_or(WorktreeMerge::Auto);
+    let executor = Executor::parse(params.executor.as_deref()).unwrap_or(Executor::Inline);
     if ctx.is_aborted() {
         return ToolResult::error("Subagent was aborted");
     }
@@ -233,6 +277,10 @@ async fn run_single(
         parent_signal: task_signal,
         on_task_update: Some(on_task_update),
         budget,
+        isolation,
+        worktree_merge,
+        executor,
+        tools: params.tools.clone(),
     })
     .await;
     activity.finish(run.id, &result);
@@ -291,6 +339,10 @@ async fn run_chain(
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
+        let isolation = Isolation::parse(step.isolation.as_deref()).unwrap_or(Isolation::None);
+        let worktree_merge =
+            WorktreeMerge::parse(step.worktree_merge.as_deref()).unwrap_or(WorktreeMerge::Auto);
+        let executor = Executor::parse(step.executor.as_deref()).unwrap_or(Executor::Inline);
         // Emit the running-step placeholder as soon as the step starts: the
         // completed steps plus exactly this step (upstream renders
         // `─── Step N: agent ⏳` immediately, PIR-TUI-005).
@@ -354,6 +406,10 @@ async fn run_chain(
             parent_signal: task_signal,
             on_task_update: Some(on_task_update),
             budget,
+            isolation,
+            worktree_merge,
+            executor,
+            tools: step.tools.clone(),
         })
         .await;
         activity.finish(run.id, &result);
@@ -478,6 +534,11 @@ async fn run_parallel(
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
+        let isolation = Isolation::parse(task.isolation.as_deref()).unwrap_or(Isolation::None);
+        let worktree_merge =
+            WorktreeMerge::parse(task.worktree_merge.as_deref()).unwrap_or(WorktreeMerge::Auto);
+        let executor = Executor::parse(task.executor.as_deref()).unwrap_or(Executor::Inline);
+        let task_tools = task.tools.clone();
         let run = activity.begin(task.agent.clone(), task.task.clone(), "parallel", None);
         run_ids.push(run.id);
         let signal = combined_signal(ctx.signal.as_ref(), &run.signal);
@@ -515,6 +576,10 @@ async fn run_parallel(
                 parent_signal: signal,
                 on_task_update: Some(on_task_update),
                 budget,
+                isolation,
+                worktree_merge,
+                executor,
+                tools: task_tools,
             })
             .await;
             activity_finish.finish(run_id, &result);

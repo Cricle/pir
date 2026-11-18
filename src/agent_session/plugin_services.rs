@@ -230,7 +230,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -390,9 +390,12 @@ pub(super) fn live_services(session: &AgentSession, host: &Arc<PluginHost>) -> L
         status: Arc::new(NativeStatusService::default()),
         events: Arc::new(NativeEventBus::default()),
         session: RwLock::new(None),
+        session_id: session.session_id(),
+        session_path: session.session_path(),
         auth: Arc::new(Mutex::new(AuthCache::default())),
         commands_cache: Mutex::new(None),
         tools_cache: Mutex::new(None),
+        static_widgets: Mutex::new(std::collections::HashSet::new()),
     });
     if perf_trace {
         eprintln!("[perf]     trust-resolve {:?}", perf_t0.elapsed());
@@ -494,6 +497,11 @@ struct LiveSessionState {
     /// Filled by [`LiveSessionServices::bind_session`] on the `Arc`
     /// construction path only.
     session: RwLock<Option<Weak<AgentSession>>>,
+    /// Construction-time identity fallback for by-value hosts (the TUI builds
+    /// an `AgentSession` without an `Arc`): a plugin that runs before the
+    /// first session-context push can still address the session file.
+    session_id: Option<String>,
+    session_path: Option<PathBuf>,
     /// Bounded-staleness credential-environment snapshot. Shared with the
     /// background refresh task, which is why the cell itself is an `Arc`.
     auth: Arc<Mutex<AuthCache>>,
@@ -503,6 +511,11 @@ struct LiveSessionState {
     /// `all_tools()` memo keyed on the host registry generation (`None` = no
     /// host). The core tool set is immutable for the session's lifetime.
     tools_cache: ToolsCache,
+    /// Static widget keys this service currently owns. Static widgets do not
+    /// register a native factory, so this is what lets `clear_widget` emit
+    /// the TUI removal payload without spamming a Null for every clear on a
+    /// session that never displayed the widget.
+    static_widgets: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Credential-environment snapshot plus the single-flight refresh flag.
@@ -694,6 +707,11 @@ impl SessionService for LiveSessionService {
             .session()
             .and_then(|session| session.session_id())
             .map(Arc::from)
+            .or_else(|| {
+                self.snapshot()
+                    .and_then(|snapshot| snapshot.session_id.as_deref().map(Arc::from))
+            })
+            .or_else(|| self.state.session_id.as_deref().map(Arc::from))
     }
 
     fn session_path(&self) -> Option<Arc<Path>> {
@@ -701,6 +719,15 @@ impl SessionService for LiveSessionService {
             .session()
             .and_then(|session| session.session_path())
             .map(|path| Arc::from(path.as_path()))
+            .or_else(|| {
+                self.snapshot().and_then(|snapshot| {
+                    snapshot
+                        .session_path
+                        .as_deref()
+                        .map(|path| Arc::from(Path::new(path)))
+                })
+            })
+            .or_else(|| self.state.session_path.as_deref().map(Arc::from))
     }
 
     fn cwd(&self) -> Option<Arc<Path>> {
@@ -2413,6 +2440,11 @@ impl UiService for LiveUiService {
         // key (upstream `setWidget` last-wins); retiring the native entry
         // first keeps the TUI's removal notification effective.
         self.state.factories.remove_widget(key);
+        self.state
+            .static_widgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.to_owned());
         // The prelude's static-widget wire shape (TUI host):
         // `{text, placement: "above_transcript" | "below_transcript"}`.
         let placement = widget_slot(placement);
@@ -2442,17 +2474,22 @@ impl UiService for LiveUiService {
     }
 
     fn clear_widget(&self, key: &str) {
-        // Face-scoped removal: only a native registration is retired. A
-        // clear for a slot the native face never owned must not touch the JS
-        // registration.
-        if !self.state.factories.remove_widget(key) {
-            return;
-        }
+        // Retire the native factory and/or static registration. A clear for a
+        // key this live service never displayed is a no-op: hosts share one
+        // notification queue, so an unconditional Null would leak a spurious
+        // `setWidget(null)` event into RPC/JSON clients.
+        let native_removed = self.state.factories.remove_widget(key);
+        let static_removed = self
+            .state
+            .static_widgets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
         if self.js_factory_registered(RendererKind::Widget, key) {
             // A JS factory still owns this key: keep the cache entry, just
             // re-render it through the JS face on the next tick.
             self.push_factory_repaint();
-        } else {
+        } else if native_removed || static_removed {
             // No JS factory: the same removal payload `setWidget(key,
             // undefined)` produces (the TUI drops the cache entry).
             self.push(Notification::Widget {

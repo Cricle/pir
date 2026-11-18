@@ -272,8 +272,10 @@ mod activity;
 mod child;
 mod discovery;
 mod dispatch;
+mod process;
 mod results;
 mod run;
+mod worktree;
 
 #[doc(hidden)]
 pub use activity::{
@@ -302,19 +304,35 @@ use dispatch::{
     child_tool_registry, emit_partial, error_with_details, ok_with_details, resolve_model,
     EmitUpdate, OnTaskUpdate,
 };
+#[doc(hidden)]
+pub use process::{dedupe_events_for_test, parse_event_for_test};
 use results::DetailsBuilder;
 use run::execute;
+#[doc(hidden)]
+pub use worktree::{prepare_in, WorktreeLease, WorktreeResult};
 
 // ---------------------------------------------------------------------------
 // Parameters
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TaskItem {
     agent: String,
     task: String,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    isolation: Option<String>,
+    #[serde(default)]
+    worktree_merge: Option<String>,
+    #[serde(default)]
+    executor: Option<String>,
+    /// Optional tool allowlist override for this task's child session. When
+    /// set, it narrows the agent's own frontmatter allowlist (e.g. plan mode
+    /// injects a read-only set so a `bash`-capable scout cannot mutate).
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -327,6 +345,92 @@ struct SubagentParams {
     agent_scope: Option<String>,
     confirm_project_agents: Option<bool>,
     cwd: Option<String>,
+    isolation: Option<String>,
+    worktree_merge: Option<String>,
+    executor: Option<String>,
+    /// Default tool allowlist override applied to every task (see TaskItem).
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+}
+
+#[doc(hidden)]
+pub struct TaskItemForTest {
+    pub agent: String,
+    pub task: String,
+    pub isolation: Option<String>,
+    pub worktree_merge: Option<String>,
+    pub executor: Option<String>,
+    pub tools: Option<Vec<String>>,
+}
+
+#[doc(hidden)]
+pub fn parse_task_item_for_test(value: serde_json::Value) -> Result<TaskItemForTest, String> {
+    let item: TaskItem = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    Ok(TaskItemForTest {
+        agent: item.agent,
+        task: item.task,
+        isolation: item.isolation,
+        worktree_merge: item.worktree_merge,
+        executor: item.executor,
+        tools: item.tools,
+    })
+}
+
+/// Per-task workspace isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Isolation {
+    None,
+    Worktree,
+}
+
+impl Isolation {
+    pub(super) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("") | Some("none") => Ok(Self::None),
+            Some("worktree") => Ok(Self::Worktree),
+            Some(other) => Err(format!(
+                "invalid isolation `{other}`; expected \"none\" or \"worktree\""
+            )),
+        }
+    }
+}
+
+/// How a worktree's changes return to the main workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorktreeMerge {
+    Auto,
+    None,
+}
+
+impl WorktreeMerge {
+    pub(super) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("") | Some("auto") => Ok(Self::Auto),
+            Some("none") => Ok(Self::None),
+            Some(other) => Err(format!(
+                "invalid worktreeMerge `{other}`; expected \"auto\" or \"none\""
+            )),
+        }
+    }
+}
+
+/// Per-task execution backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Executor {
+    Inline,
+    Process,
+}
+
+impl Executor {
+    pub(super) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("") | Some("inline") => Ok(Self::Inline),
+            Some("process") => Ok(Self::Process),
+            Some(other) => Err(format!(
+                "invalid executor `{other}`; expected \"inline\" or \"process\""
+            )),
+        }
+    }
 }
 
 fn task_item_json_schema(task_description: &str) -> JsonValue {
@@ -339,6 +443,26 @@ fn task_item_json_schema(task_description: &str) -> JsonValue {
             "agent": { "type": "string", "description": "Name of the agent to invoke" },
             "task": { "type": "string", "description": task_description },
             "cwd": { "type": "string", "description": "Working directory for the agent process" },
+            "isolation": {
+                "type": "string",
+                "enum": ["none", "worktree"],
+                "description": "Run this task in a git worktree (requires a clean repository)",
+            },
+            "worktreeMerge": {
+                "type": "string",
+                "enum": ["auto", "none"],
+                "description": "Merge the worktree back on success (default: auto)",
+            },
+            "executor": {
+                "type": "string",
+                "enum": ["inline", "process"],
+                "description": "Run the task in-process (default) or as a separate pir process",
+            },
+            "tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Tool allowlist override for this task's child (narrows the agent's own tools)",
+            },
         },
         "required": ["agent", "task"],
     })
@@ -382,6 +506,26 @@ fn parameters_schema() -> JsonValue {
             "cwd": {
                 "type": "string",
                 "description": "Working directory for the agent process (single mode)",
+            },
+            "isolation": {
+                "type": "string",
+                "enum": ["none", "worktree"],
+                "description": "Default isolation for every task (git worktree requires a clean repo)",
+            },
+            "worktreeMerge": {
+                "type": "string",
+                "enum": ["auto", "none"],
+                "description": "Default worktree merge behavior",
+            },
+            "executor": {
+                "type": "string",
+                "enum": ["inline", "process"],
+                "description": "Default execution backend for every task",
+            },
+            "tools": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Default tool allowlist override for every task",
             },
         },
     })

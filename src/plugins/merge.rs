@@ -20,6 +20,10 @@
 //! - `resources_discover`: path lists accumulate across handlers.
 //! - `tool_result`: field-wise overlay (`content`/`details`/`isError`/
 //!   `usage`).
+//! - `turn_end` / `agent_before_settle`: boundary results COMPOSE across
+//!   handlers — `continue` is OR'ed and `entries` concatenate — so one
+//!   plugin requesting the continuation cannot drop another plugin's drafts
+//!   (or vice versa). `Null` is no opinion.
 //! - everything else: results are informational (upstream's generic `emit`
 //!   ignores them); the last non-null result is surfaced for hosts that
 //!   read one (e.g. `project_trust`).
@@ -311,6 +315,55 @@ impl MergedEmit {
                 // preparation) merely because a later plugin answered
                 // `{cancel: false}`.
                 let cancellable = event.starts_with("session_before_");
+                let boundary = matches!(event, "turn_end" | "agent_before_settle");
+                if boundary {
+                    // Boundary handlers COMPOSE: one plugin may request the
+                    // continuation while another contributes entries (or both
+                    // do). Last-wins here would silently drop a request or a
+                    // draft whenever two plugins observe the same settle.
+                    if value.is_null() {
+                        return;
+                    }
+                    if self.result.is_object() && value.is_object() {
+                        let mut next = self.result.clone();
+                        let existing_continue = next
+                            .get("continue")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false);
+                        let new_continue = value
+                            .get("continue")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false);
+                        next["continue"] = JsonValue::Bool(existing_continue || new_continue);
+                        let mut entries = next
+                            .get("entries")
+                            .and_then(JsonValue::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(new_entries) =
+                            value.get("entries").and_then(JsonValue::as_array)
+                        {
+                            entries.extend(new_entries.iter().cloned());
+                        }
+                        if !entries.is_empty()
+                            || next.get("entries").is_some()
+                            || value.get("entries").is_some()
+                        {
+                            next["entries"] = JsonValue::Array(entries);
+                        }
+                        if let Some(value) = value.as_object() {
+                            for (key, field) in value {
+                                if key != "continue" && key != "entries" {
+                                    next[key.as_str()] = field.clone();
+                                }
+                            }
+                        }
+                        self.result = next;
+                    } else {
+                        self.result = value;
+                    }
+                    return;
+                }
                 if cancellable && self.result.is_object() && value.is_object() {
                     let mut next = self.result.clone();
                     if let (Some(next), Some(value)) = (next.as_object_mut(), value.as_object()) {

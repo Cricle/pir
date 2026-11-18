@@ -1162,6 +1162,9 @@ async fn ui_notify_reaches_the_native_sink_once_and_state_is_shared() {
     );
     ui.set_editor_text("draft");
     ui.paste_to_editor(" pasted");
+    // A STATIC widget has no native factory registration; clearing it must
+    // still emit the removal payload, or the TUI keeps the stale banner.
+    ui.clear_widget("todo");
 
     let notifications = handle.take_notifications(|notification| notification.is_presentation());
     assert!(notifications.iter().any(|notification| matches!(
@@ -1193,13 +1196,16 @@ async fn ui_notify_reaches_the_native_sink_once_and_state_is_shared() {
     )));
     assert!(notifications.iter().any(|notification| matches!(
         notification,
+        Notification::Widget { id, content } if id == "todo" && content.is_null()
+    )));
+    assert!(notifications.iter().any(|notification| matches!(
+        notification,
         Notification::EditorSetText(text) if text == "draft"
     )));
     assert!(notifications.iter().any(|notification| matches!(
         notification,
         Notification::EditorPaste(text) if text == " pasted"
     )));
-
     // Editor snapshot + theme registry reads are live.
     handle.update_editor_state("live text".to_owned());
     assert_eq!(&*ui.editor_text(), "live text");

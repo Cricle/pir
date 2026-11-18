@@ -306,6 +306,13 @@ fn render_rules_section(tools: &[ToolInfo], rule_options: PromptRuleOptions) -> 
             &mut rules,
         );
     }
+    // pir-specific efficiency rule: never burn wall-clock on a blind wait. A
+    // background tool's result arrives as a notification; otherwise end the
+    // turn (or use the status tool) instead of sleeping/polling.
+    add_rule(
+        "Never sleep, spin, or busy-wait to wait for unknown work or an external event; if a tool runs in the background, end your turn and wait for its result notification instead of wasting time, and otherwise use the available status tool or stop",
+        &mut rules,
+    );
     add_rule("Be concise in your responses", &mut rules);
     add_rule(
         "Show file paths clearly when working with files",

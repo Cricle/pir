@@ -2303,51 +2303,11 @@ fn accumulate_entry_totals(entry: &FileEntry, turns: &mut usize, tokens: &mut u6
     }
 }
 
-/// Model + thinking level recorded on the session's active branch.
-///
-/// Read from the leaf→root path only: the settings live in state entries and
-/// assistant messages on that path, so there is no need to materialize the
-/// compaction-aware projection (which clones every message of the
-/// conversation). Attach paths used to build the full projection only to
-/// read `projection.model`; this walks the same path with no transcript copy.
-///
-/// `get_session_context_settings` reports `"off"` as its thinking default for
-/// a branch with no entry; applying that default would silently disable
-/// thinking on every resumed session, so absence is reported as `None`.
-#[derive(Debug, Default)]
-pub(crate) struct RecordedSessionSettings {
-    /// `(provider, model_id)` of the last model-recorded entry, if any.
-    pub model: Option<(String, String)>,
-    /// Explicitly recorded thinking level, if the branch carries one.
-    pub thinking: Option<crate::ai::types::ThinkingLevel>,
-}
-
-pub(crate) fn session_recorded_settings(manager: &SessionManager) -> RecordedSessionSettings {
-    let path = manager.projected_branch_path(manager.leaf_id());
-    let mut settings = RecordedSessionSettings::default();
-    for entry in &path {
-        match entry {
-            FileEntry::ThinkingLevelChange(change) => {
-                // Last PARSEABLE level wins, matching the previous
-                // reverse `find_map` (a corrupt trailing value must not hide
-                // an earlier valid one).
-                if let Ok(level) = change.thinking_level.parse() {
-                    settings.thinking = Some(level);
-                }
-            }
-            FileEntry::ModelChange(change) => {
-                settings.model = Some((change.provider.clone(), change.model_id.clone()));
-            }
-            FileEntry::Message(message_entry) => {
-                if let StoredMessage::Assistant(assistant) = &message_entry.message {
-                    settings.model = Some((assistant.provider.clone(), assistant.model.clone()));
-                }
-            }
-            _ => {}
-        }
-    }
-    settings
-}
+/// Session-recorded settings live in
+/// [`crate::session_manager::recorded_settings`] so the headless hosts can
+/// read them without the `sdk` feature; the type and reader are re-exported
+/// here to keep the SDK-internal call sites and its single source of truth.
+pub(crate) use crate::session_manager::recorded_settings::recorded_session_settings as session_recorded_settings;
 
 /// Recompute a session's historical turn/token totals without materializing
 /// its transcript: a paged session streams its skipped prefix one entry at a

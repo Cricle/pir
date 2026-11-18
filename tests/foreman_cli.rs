@@ -1,0 +1,188 @@
+//! `pir foreman` CLI surface and the public journal/sidecar bridge.
+
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
+
+fn temp_dir(label: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "pir-foreman-cli-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("temp dir");
+    path
+}
+
+#[test]
+fn foreman_help_lists_the_v2_subcommands() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_pir"))
+        .args(["foreman", "--help"])
+        .output()
+        .expect("run pir foreman --help");
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    for command in [
+        "run", "status", "logs", "abort", "approve", "deny", "resume", "clean",
+    ] {
+        assert!(text.contains(command), "help missing {command}: {text}");
+    }
+}
+
+#[test]
+fn sidecar_is_written_in_v2_shape() {
+    let dir = temp_dir("sidecar");
+    let session = dir.join("session.jsonl");
+    pir::foreman::write_running_sidecar(
+        &session,
+        true,
+        pir::foreman::ForemanRouter::Process,
+        pir::foreman::ForemanApprovals::Manual,
+    )
+    .expect("write sidecar");
+    let text = std::fs::read_to_string(dir.join("session.jsonl.mode.json")).expect("sidecar");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["mode"], "foreman");
+    assert_eq!(value["settings"]["worktree"], true);
+    assert_eq!(value["settings"]["router"], "process");
+    assert_eq!(value["settings"]["approvals"], "manual");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn approval_decisions_update_the_journal_and_clear_pending() {
+    let dir = temp_dir("decision");
+    let session = dir.join("session.jsonl");
+    let mut journal = session.as_os_str().to_owned();
+    journal.push(".foreman.jsonl");
+    std::fs::write(
+        PathBuf::from(journal),
+        serde_json::to_string(&json!({
+            "v": 1,
+            "t": "snapshot",
+            "mode": "foreman",
+            "phase": "PLANNING",
+            "generation": 0,
+            "reviewer": null,
+            "nudges": 0,
+            "settings": {"approvals": "manual", "router": "inline", "worktree": false},
+            "approvals": [{
+                "id": "a1",
+                "call": "call-1",
+                "summary": "worker: write",
+                "state": "requested",
+                "createdAtMs": 0
+            }],
+            "allow_next_worker": false
+        }))
+        .expect("snapshot JSON"),
+    )
+    .expect("write journal");
+    let status = pir::foreman::read_status(&session).expect("status");
+    assert_eq!(status.pending.len(), 1);
+    let decided = pir::foreman::decide_approval(&session, Some("a1"), true).expect("approve");
+    assert_eq!(decided.len(), 1);
+    assert_eq!(decided[0].state, "approved");
+    let status = pir::foreman::read_status(&session).expect("status after");
+    assert!(status.pending.is_empty());
+    assert!(status.allow_next_worker);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn approving_a_plan_switches_the_journal_to_normal() {
+    let dir = temp_dir("plan-decision");
+    let session = dir.join("session.jsonl");
+    let mut journal_path = session.as_os_str().to_owned();
+    journal_path.push(".foreman.jsonl");
+    std::fs::write(
+        PathBuf::from(journal_path),
+        serde_json::to_string(&json!({
+            "v": 1,
+            "t": "snapshot",
+            "mode": "plan",
+            "phase": "PLANNING",
+            "generation": 0,
+            "reviewer": null,
+            "nudges": 0,
+            "settings": {"approvals": "auto", "router": "inline", "worktree": false},
+            "approvals": [{
+                "id": "p1",
+                "call": "call-plan",
+                "summary": "plan: step one",
+                "state": "requested",
+                "plan": "1. do step one\n2. verify",
+                "kind": "plan",
+                "createdAtMs": 0
+            }],
+            "allow_next_worker": false,
+            "submitted_plan": "1. do step one\n2. verify"
+        }))
+        .expect("snapshot JSON"),
+    )
+    .expect("write journal");
+
+    let decided = pir::foreman::decide_approval(&session, Some("p1"), true).expect("approve plan");
+    assert_eq!(decided.len(), 1);
+    assert_eq!(decided[0].kind, "plan");
+    assert_eq!(
+        decided[0].plan.as_deref(),
+        Some("1. do step one\n2. verify")
+    );
+
+    // The journal (authoritative on resume) must now say normal, with no
+    // pending approvals and no stale worker allowance.
+    let status = pir::foreman::read_status(&session).expect("status after");
+    assert_eq!(status.mode, "normal", "journal mode after plan approval");
+    assert!(status.pending.is_empty());
+    assert!(
+        !status.allow_next_worker,
+        "plan approval must not admit a worker"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn starting_a_foreman_run_overrides_an_existing_journal() {
+    let dir = temp_dir("restart");
+    let session = dir.join("session.jsonl");
+    let mut journal_path = session.as_os_str().to_owned();
+    journal_path.push(".foreman.jsonl");
+    std::fs::write(
+        PathBuf::from(journal_path),
+        serde_json::to_string(&json!({
+            "v": 1,
+            "t": "snapshot",
+            "mode": "plan",
+            "phase": "PLANNING",
+            "generation": 3,
+            "reviewer": "call-old",
+            "nudges": 2,
+            "settings": {"approvals": "auto", "router": "inline", "worktree": false},
+            "approvals": [],
+            "allow_next_worker": false
+        }))
+        .expect("snapshot JSON"),
+    )
+    .expect("write journal");
+
+    pir::foreman::write_running_sidecar(
+        &session,
+        true,
+        pir::foreman::ForemanRouter::Process,
+        pir::foreman::ForemanApprovals::Manual,
+    )
+    .expect("start foreman session");
+
+    // Journal is authoritative on restore: it must reflect the new CLI flags.
+    let status = pir::foreman::read_status(&session).expect("status");
+    assert_eq!(status.mode, "foreman");
+    assert_eq!(status.generation, 0, "fresh run resets stale gate state");
+    let _ = std::fs::remove_dir_all(&dir);
+}
