@@ -1331,16 +1331,31 @@ pub(crate) async fn dispatch_agent_before_settle_boundary_with_pending(
         .get("entries")
         .cloned()
         .unwrap_or(JsonValue::Null);
+    let drafts_create_context = session.is_some() && drafts_project_user_turn(&drafts);
     if let Some(session) = &session {
         session.commit_drafts(run_session_id, &drafts).await;
     }
-    if continue_requested && !can_continue {
+    if continue_requested && !(can_continue || drafts_create_context) {
         crate::ext_diag!(
             "[ext] agent_before_settle requested continuation without runnable model context"
         );
         return false;
     }
     continue_requested
+}
+
+/// Whether a boundary handler's entry drafts create a runnable next context on
+/// their own. A `custom_message` draft is persisted as a session entry and the
+/// settle loop re-projects the session, where it becomes a user turn; the
+/// pre-boundary `canContinue` cannot know about drafts, so a handler that
+/// returns both `continue: true` and a custom message must not be discarded
+/// merely because the settled context ended on an assistant message.
+fn drafts_project_user_turn(drafts: &JsonValue) -> bool {
+    drafts.as_array().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.get("type").and_then(JsonValue::as_str) == Some("custom_message"))
+    })
 }
 
 /// Emit the `session_compact` success event through the ordered plugin host

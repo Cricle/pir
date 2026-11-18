@@ -1392,6 +1392,8 @@ pub(super) async fn run() -> Result<()> {
             run_sessions_command(command, &config, &settings_manager)
         }
         Some(Command::Jobs { command }) => run_jobs_command(command),
+        #[cfg(feature = "subagent")]
+        Some(Command::Foreman { command }) => foreman_mode::run(command, &config).await,
         Some(Command::Checkpoint { command }) => run_checkpoint_command(command, &config),
         None => {
             // Upstream entry shapes (no subcommand given): print / json / rpc

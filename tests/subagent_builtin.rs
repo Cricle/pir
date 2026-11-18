@@ -27,8 +27,8 @@ use pir::plugins::services::{
 use pir::plugins::subagent::{
     aggregate_parallel_text, apply_previous, cap_text_for_tests, discover_agents, get_final_output,
     is_failed, load_agents_from_dir, overlay_component_for_tests, parse_agent_markdown,
-    result_output, truncate_parallel_output, widget_lines_for_tests, AgentScope, RunState,
-    SingleResult, SubagentActivity, SubagentTool, UsageTotals,
+    parse_task_item_for_test, result_output, truncate_parallel_output, widget_lines_for_tests,
+    AgentScope, RunState, SingleResult, SubagentActivity, SubagentTool, UsageTotals,
 };
 use pir::plugins::{builtin_extension_def, instantiate_builtin};
 
@@ -3057,6 +3057,8 @@ fn activity_result(agent: &str, task: &str, pending: bool, stop: Option<&str>) -
         stderr: None,
         step: None,
         pending,
+        worktree: None,
+        executor: "inline",
     }
 }
 
@@ -3213,4 +3215,19 @@ fn subagent_widget_summarizes_running_then_recent_runs() {
         lines[0].contains("worker") && lines[0].contains("done"),
         "{lines:?}"
     );
+}
+
+#[test]
+fn task_items_accept_camel_case_worktree_merge_and_executor_fields() {
+    let item = parse_task_item_for_test(serde_json::json!({
+        "agent": "worker",
+        "task": "do it",
+        "isolation": "worktree",
+        "worktreeMerge": "none",
+        "executor": "process",
+    }))
+    .expect("task item parses");
+    assert_eq!(item.isolation.as_deref(), Some("worktree"));
+    assert_eq!(item.worktree_merge.as_deref(), Some("none"));
+    assert_eq!(item.executor.as_deref(), Some("process"));
 }

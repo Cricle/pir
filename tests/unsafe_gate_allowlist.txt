@@ -41,6 +41,7 @@ extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + l
 jobs.rs 14 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes (all with SAFETY notes)
 mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
 plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
+plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
 session_manager/mod.rs 4 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION) + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle)
 session_manager/retention.rs 7 0 0  # Win32 OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes
 session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
@@ -50,4 +51,4 @@ tui/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
 tui/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
 tui/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
 
-# total: 23 file(s), 157 unsafe block(s), 5 unsafe fn, 1 unsafe impl/trait
+# total: 24 file(s), 158 unsafe block(s), 5 unsafe fn, 1 unsafe impl/trait

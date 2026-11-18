@@ -20,6 +20,9 @@ mod main_alloc;
 // `pir js` runs scripts on the embedded QuickJS runtime, so the whole module
 // (and its `include_str!` of the script boot overlay) is an `extensions`-only
 // surface. `run_mode` reports the missing feature at runtime instead.
+#[cfg(feature = "subagent")]
+#[path = "main_cli/foreman_mode.rs"]
+mod foreman_mode;
 #[cfg(feature = "extensions")]
 #[path = "main_cli/js_mode.rs"]
 mod js_mode;

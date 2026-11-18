@@ -98,6 +98,7 @@ fn default_plan_is_all_default_enabled_builtins_but_phone() {
         plugins,
         vec![
             "builtin:subagent",
+            "builtin:mode",
             "builtin:mcp",
             "builtin:codemode",
             "builtin:python",

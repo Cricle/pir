@@ -376,7 +376,7 @@ fn finalized_error(call: &PreparedToolCall, message: impl Into<String>) -> Final
 /// placeholder never requests termination.
 fn background_placeholder(call: &DetachedToolCall) -> FinalizedToolCall {
     let mut result = ToolResult::ok(format!(
-        "Tool '{}' is running in the background (callId: {}). Its result will arrive as a separate message; do not wait for it.",
+        "Tool '{}' is running in the background (callId: {}). End your turn now; its result arrives as a separate notification message. Do NOT sleep, poll, or wait for it.",
         call.tool_name, call.call_id
     ));
     result.details = Some(serde_json::json!({

@@ -1069,6 +1069,12 @@ pub enum Command {
         #[command(subcommand)]
         command: JobsCommand,
     },
+    /// Detached foreman runs and approvals
+    #[cfg(feature = "subagent")]
+    Foreman {
+        #[command(subcommand)]
+        command: ForemanCommand,
+    },
     /// File checkpoint inspection / restore
     Checkpoint {
         #[command(subcommand)]
@@ -1384,6 +1390,86 @@ pub enum CheckpointCommand {
 }
 
 /// `pir jobs` — persistent cross-process background jobs (pir extension).
+#[cfg(feature = "cli")]
+#[derive(Debug, Clone, Subcommand)]
+pub enum ForemanCommand {
+    /// Start a foreman run (detached by default)
+    Run {
+        /// Task text for the foreman
+        task: String,
+        /// Working directory (defaults to the current directory)
+        #[arg(long = "cwd", value_name = "DIR")]
+        cwd: Option<String>,
+        /// Existing session file/id to resume
+        #[arg(long = "session", value_name = "ID_OR_PATH")]
+        session: Option<String>,
+        /// Isolate each worker in a git worktree
+        #[arg(long = "worktree")]
+        worktree: bool,
+        /// Worker execution backend
+        #[arg(long = "router", value_parser = ["inline", "process"])]
+        router: Option<String>,
+        /// Approval policy; detached runs support auto or async manual
+        #[arg(long = "approvals", value_parser = ["auto", "manual"])]
+        approvals: Option<String>,
+        /// Run in this process instead of a detached job
+        #[arg(long = "foreground")]
+        foreground: bool,
+        /// Emit JSON
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Show a session/job foreman status
+    Status {
+        #[arg(value_name = "SESSION_OR_JOB")]
+        target: Option<String>,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Print a detached run's output log
+    Logs {
+        job: String,
+        /// Keep following the log
+        #[arg(long = "follow")]
+        follow: bool,
+    },
+    /// Abort a detached run
+    Abort { job: String },
+    /// Approve a pending worker delegation
+    Approve {
+        #[arg(value_name = "APPROVAL_OR_SESSION")]
+        id: Option<String>,
+        /// Approve every pending approval
+        #[arg(long = "all")]
+        all: bool,
+        /// Session file/id (required when the target is not a run id)
+        #[arg(long = "session", value_name = "ID_OR_PATH")]
+        session: Option<String>,
+    },
+    /// Deny a pending worker delegation
+    Deny {
+        #[arg(value_name = "APPROVAL_OR_SESSION")]
+        id: Option<String>,
+        /// Deny every pending approval
+        #[arg(long = "all")]
+        all: bool,
+        /// Session file/id (required when the target is not a run id)
+        #[arg(long = "session", value_name = "ID_OR_PATH")]
+        session: Option<String>,
+    },
+    /// Resume a finished foreman session in the interactive TUI
+    Resume {
+        #[arg(value_name = "SESSION")]
+        session: String,
+    },
+    /// Remove retained worktrees named by a session
+    Clean {
+        #[arg(value_name = "SESSION")]
+        session: String,
+    },
+}
+
+/// `pir jobs` — persistent cross-process background jobs.
 #[cfg(feature = "cli")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum JobsCommand {

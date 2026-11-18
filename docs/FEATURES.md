@@ -62,7 +62,7 @@ provider) and every OAuth flow drives the shared auth HTTP client, so every feat
 | `session` | JSONL persistence, tail-page reader (pulls the optional `memmap2`), discovery |
 | `skills` | skill discovery/loading |
 | `sdk` | `pir::sdk` facade |
-| `subagent` | native `subagent` builtin + `/subagents` activity overlay (`ctrl+shift+a`) |
+| `subagent` | native `subagent` builtin + `/subagents` activity overlay (`ctrl+shift+a`); the companion `mode` builtin adds user-triggered `/mode foreman` / `/mode plan` / `/mode normal`, durable foreman journal, `/approvals` (worker + plan approvals), plan submission/approval with execution handoff, optional git-worktree isolation, process-per-task router, and `pir foreman run/status/logs/abort/approve/deny/resume/clean` detached runs |
 | `tool-repair` | tool-repair pipeline |
 | `tool-search` | BM25 `tool_search` |
 | `todo` | `todo` builtin + `/todos` (interactive overlay in UI sessions) |

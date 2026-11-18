@@ -25037,7 +25037,7 @@ fn build_agent_session(
     resources: &crate::coding_agent::resources::DiscoveredResources,
     tool_selection: Option<crate::coding_agent::ToolSelection>,
     overrides: &WorkerOverrides,
-) -> crate::Result<crate::agent_session::AgentSession> {
+) -> crate::Result<std::sync::Arc<crate::agent_session::AgentSession>> {
     use crate::coding_agent::session_resolve::{open_session_manager, SessionPlan};
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // `Pick` never reaches the worker (main.rs resolves the picker before the
@@ -25111,8 +25111,8 @@ fn build_agent_session(
         &configured.settings,
         &crate::coding_agent::print::threshold_model_for(&provider_registry, &configured.model),
     );
-    let mut agent_session =
-        crate::agent_session::AgentSession::new(crate::agent_session::AgentSessionConfig {
+    let agent_session =
+        crate::agent_session::AgentSession::new_arc(crate::agent_session::AgentSessionConfig {
             provider_registry,
             // The worker's configured snapshot moves in: no second Model /
             // api-key clone for the session's own copy.
@@ -29037,15 +29037,10 @@ async fn worker_loop(
         tool_selection,
         &overrides,
     ) {
-        Ok(session) => {
-            // Bind the phone builtin's live adapter now that the session is
-            // reachable as an `Arc`; the adapter holds a `Weak`, so there is
-            // no reference cycle. No-op when the phone plugin is not in the
-            // plan (and idempotent otherwise).
-            let session = std::sync::Arc::new(session);
-            session.install_phone_host();
-            session
-        }
+        // `build_agent_session` uses `AgentSession::new_arc`, which already
+        // binds the phone builtin's live adapter (a `Weak`, so no cycle) and
+        // seeds its first publication.
+        Ok(session) => session,
         Err(error) => {
             // F2: same worker-level failure shape as the missing model above —
             // the error notice plus the run-end signal that stops the UI's
@@ -29344,9 +29339,30 @@ async fn worker_loop(
     .await;
     loop {
         let command = if queued_prompts.is_empty() {
-            match commands.recv().await {
-                Some(command) => command,
-                None => break,
+            // Idle commands can be queued by detached plugin tasks (the
+            // foreman approval task sends a trigger-turn custom message after
+            // the dialog resolves). A bounded idle wait lets the pump observe
+            // those runs without requiring the next user prompt.
+            match tokio::time::timeout(std::time::Duration::from_millis(250), commands.recv()).await
+            {
+                Ok(Some(command)) => command,
+                Ok(None) => break,
+                Err(_) => {
+                    pump_pending_custom_runs(
+                        RunServices {
+                            session: &session,
+                            events: &events,
+                            streaming: &streaming,
+                            session_dir: &session_dir,
+                            debug_mode: &debug_mode,
+                            pulse: &pulse,
+                        },
+                        &mut commands,
+                        &mut queued_prompts,
+                    )
+                    .await;
+                    continue;
+                }
             }
         } else {
             // F13: prompts queued during the last run still have to run, but

@@ -252,6 +252,15 @@ AGENT_DIR = os.path.join(OUT, "tui_agent")
 
 BASE_ENV = {
     "PIR_AGENT_DIR": AGENT_DIR,
+    # Real-provider credential passthrough: the battery never writes secrets to
+    # disk, and models.json uses `${ENV}` placeholders. Forward only explicitly
+    # named credential env vars when the operator actually set them; the
+    # hermetic mock path never needs these and they are absent by default.
+    **({
+        name: os.environ[name]
+        for name in ("ZCODE_LLM_KEY",)
+        if os.environ.get(name)
+    }),
     # Project-trust gate (upstream `resolveProjectTrusted`): every battery cwd
     # lives under the checkout, and an ancestor `.agents/skills` (or a
     # project-local `.pi` resource) makes the project trust-requiring. Without

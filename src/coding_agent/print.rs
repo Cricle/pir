@@ -3277,7 +3277,7 @@ pub async fn run_print_with_environment(
     // the defaults.
     let recorded_selection = session
         .as_ref()
-        .map(crate::sdk::agent::session_recorded_settings);
+        .map(crate::session_manager::recorded_settings::recorded_session_settings);
     let (effective_provider, effective_model) =
         if options.cli_provider.is_none() && options.cli_model.is_none() {
             match recorded_selection

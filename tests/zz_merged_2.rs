@@ -36,6 +36,8 @@ mod extension_fail_cache;
 mod feature_off_surface;
 #[path = "find_hidden_files.rs"]
 mod find_hidden_files;
+#[path = "foreman_cli.rs"]
+mod foreman_cli;
 #[path = "fs_numeric_open_flags.rs"]
 mod fs_numeric_open_flags;
 #[path = "fs_watch_real.rs"]
@@ -60,6 +62,8 @@ mod mcp_singleflight_locks;
 mod mcp_units;
 #[path = "memory_shared.rs"]
 mod memory_shared;
+#[path = "mode_builtin.rs"]
+mod mode_builtin;
 #[path = "node_shims.rs"]
 mod node_shims;
 #[path = "node_surface.rs"]
@@ -102,6 +106,10 @@ mod shell_command_timeout;
 mod sqlite_shims;
 #[path = "subagent_builtin.rs"]
 mod subagent_builtin;
+#[path = "subagent_process.rs"]
+mod subagent_process;
+#[path = "subagent_worktree.rs"]
+mod subagent_worktree;
 #[path = "subagents_parent_launch.rs"]
 mod subagents_parent_launch;
 #[path = "telemetry_ai_cost_w17.rs"]

@@ -151,6 +151,9 @@ pub mod mcp;
 pub mod minimal;
 // `pir grep` / `pir sed` / `pir python`: the standalone native command surface
 // (its clap subcommands live in `coding_agent::cli`, gated by `cli`).
+/// Detached foreman CLI bridge (journal/sidecar reads and approval writes).
+#[cfg(feature = "subagent")]
+pub mod foreman;
 #[cfg(feature = "cli")]
 pub mod native_cli;
 pub mod plugins;

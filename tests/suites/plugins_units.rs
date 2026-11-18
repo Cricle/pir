@@ -95,6 +95,7 @@ fn unknown_builtins_are_absent() {
         builtin_names(),
         vec![
             "subagent",
+            "mode",
             "mcp",
             "codemode",
             "python",
@@ -263,20 +264,21 @@ fn cli_paths_come_first_then_project_then_global() {
     // builtins in factory order; `phone` is compiled but default-disabled, so
     // it is not inserted.
 
-    assert_eq!(ordered.len(), 12);
+    assert_eq!(ordered.len(), 13);
     assert_eq!(ordered[0], PathBuf::from("cli.ts"));
     assert_eq!(ordered[1], builtin("subagent"));
     assert_eq!(ordered[2], PathBuf::from("D:/proj/.pi/extensions"));
     assert_eq!(ordered[3], PathBuf::from("C:/u/.pi/agent/extensions"));
 
-    assert_eq!(ordered[4], builtin("mcp"));
-    assert_eq!(ordered[5], builtin("codemode"));
-    assert_eq!(ordered[6], builtin("python"));
-    assert_eq!(ordered[7], builtin("context-mode"));
-    assert_eq!(ordered[8], builtin("tool-search"));
-    assert_eq!(ordered[9], builtin("tool-repair"));
-    assert_eq!(ordered[10], builtin("todo"));
-    assert_eq!(ordered[11], builtin("memory"));
+    assert_eq!(ordered[4], builtin("mode"));
+    assert_eq!(ordered[5], builtin("mcp"));
+    assert_eq!(ordered[6], builtin("codemode"));
+    assert_eq!(ordered[7], builtin("python"));
+    assert_eq!(ordered[8], builtin("context-mode"));
+    assert_eq!(ordered[9], builtin("tool-search"));
+    assert_eq!(ordered[10], builtin("tool-repair"));
+    assert_eq!(ordered[11], builtin("todo"));
+    assert_eq!(ordered[12], builtin("memory"));
 
     let cli_only = order_extension_paths(&cli, &defaults, true);
     assert_eq!(cli_only, cli);
@@ -303,6 +305,7 @@ fn compiled_out_builtins_name_their_cargo_feature() {
     // full build (the default feature set this suite runs under).
     for (name, feature) in [
         ("subagent", "subagent"),
+        ("mode", "subagent"),
         ("tool-repair", "tool-repair"),
         ("tool-search", "tool-search"),
         ("mcp", "mcp"),

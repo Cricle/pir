@@ -289,6 +289,12 @@ pub(super) struct ChildRunInputs {
     pub parent_signal: Option<AbortSignal>,
     pub on_task_update: Option<OnTaskUpdate>,
     pub budget: SubagentBudget,
+    pub isolation: Isolation,
+    pub worktree_merge: WorktreeMerge,
+    pub executor: Executor,
+    /// Optional tool allowlist override; replaces the agent's frontmatter
+    /// tools for this child (hard read-only enforcement in plan mode).
+    pub tools: Option<Vec<String>>,
 }
 
 /// Run one task in a fresh, isolated, in-process ephemeral child session
@@ -314,6 +320,10 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
         parent_signal,
         on_task_update,
         budget,
+        isolation,
+        worktree_merge,
+        executor,
+        tools,
     } = inputs;
     Box::pin(async move {
         // Wall-clock budget starts before any agent/runtime setup: a child
@@ -328,17 +338,55 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             return SingleResult::failed(&agent_name, &task, depth_limit_message(), step);
         }
 
-        let Some(agent) = agents.iter().find(|agent| agent.name == agent_name) else {
-            return SingleResult::failed(
-                &agent_name,
-                &task,
-                format!(
-                    "Unknown agent: \"{agent_name}\". Available agents: {}.",
-                    agent_names_quoted(&agents)
-                ),
-                step,
-            );
+        let mut agent = match agents.iter().find(|agent| agent.name == agent_name) {
+            Some(agent) => agent.clone(),
+            None => {
+                return SingleResult::failed(
+                    &agent_name,
+                    &task,
+                    format!(
+                        "Unknown agent: \"{agent_name}\". Available agents: {}.",
+                        agent_names_quoted(&agents)
+                    ),
+                    step,
+                );
+            }
         };
+        // A caller-supplied tool override (e.g. plan mode's read-only set)
+        // replaces the agent's own frontmatter allowlist. This is the hard
+        // fence that stops a `bash`-capable scout from mutating in plan mode.
+        if let Some(tools) = tools {
+            agent.tools = Some(tools);
+        }
+        if executor == Executor::Process {
+            return super::process::run_child_process(super::process::ProcessChildInputs {
+                env,
+                agent: agent.clone(),
+                task,
+                cwd,
+                step,
+                parent_signal,
+                on_task_update,
+                budget,
+                isolation,
+                worktree_merge,
+            })
+            .await;
+        }
+        let worktree = if isolation == Isolation::Worktree {
+            match super::worktree::prepare(&cwd, &agent_name).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    return SingleResult::failed(&agent_name, &task, error, step);
+                }
+            }
+        } else {
+            None
+        };
+        let cwd = worktree
+            .as_ref()
+            .map(|lease| lease.path.clone())
+            .unwrap_or(cwd);
 
         // Model: the agent's own override or the parent's (upstream dispatch
         // defaults). Thinking level is inherited from the parent only when the
@@ -377,7 +425,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             .agent_dir
             .clone()
             .unwrap_or_else(crate::coding_agent::context::agent_dir);
-        let mut child_tools = child_tool_registry(&env, agent);
+        let mut child_tools = child_tool_registry(&env, &agent);
         // Drop the dispatcher's inherited depth marker BEFORE deriving the
         // prompt's tool infos. The depth itself is registry metadata now, so
         // it can never appear as a tool — this only scrubs a stale
@@ -579,6 +627,8 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             stderr: None,
             step,
             pending: true,
+            worktree: None,
+            executor: "inline",
         }));
 
         let handler: EventHandler = {
@@ -694,6 +744,21 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             let limit = budget.wall_clock.unwrap_or_default();
             result.stop_reason = Some("error".to_owned());
             result.error_message = Some(wall_clock_error_message(limit));
+        }
+        result.executor = "inline";
+        if let Some(lease) = worktree {
+            let mut merge_result = super::worktree::WorktreeResult::default();
+            if is_failed(&result) {
+                merge_result.cleaned = lease.cleanup().await.is_ok();
+            } else if worktree_merge == WorktreeMerge::Auto {
+                merge_result = lease.merge().await;
+                if let Some(error) = &merge_result.error {
+                    result.stop_reason = Some("error".to_owned());
+                    result.error_message = Some(error.clone());
+                    result.stderr = Some(error.clone());
+                }
+            }
+            result.worktree = Some(lease.outcome(&merge_result));
         }
         result
     })

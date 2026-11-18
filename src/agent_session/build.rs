@@ -878,7 +878,7 @@ impl AgentSession {
     /// the facade itself never reads `~/.pi`; the host discovers the
     /// resources and installs them once at startup.
     pub fn set_prompt_resources(
-        &mut self,
+        &self,
         skills: Vec<crate::skills::SkillInfo>,
         prompt_templates: Vec<crate::coding_agent::prompt_templates::PromptTemplate>,
     ) {

@@ -24,13 +24,14 @@
 //!    into the shared [`PluginRegistry`], and dispatches its events on the
 //!    unified ordered list.
 //!
-//! Upstream keeps the list small; pir's builtins are `subagent`, `mcp`, and
-//! `codemode` — the same set upstream ships (minus its JS-only entries) —
-//! pir-only `python` (the embedded RustPython 3 interpreter), `tool-search`
-//! (upstream extensions/tool-search), `tool-repair` (the pi-tool-repair npm
-//! package ported natively), `todo` (the rpiv-todo port), and `memory` (the
-//! embedded cm-memory engine; always compiled with the `memory` feature and
-//! default-enabled).
+//! Upstream keeps the list small; pir's builtins are `subagent`, `mode` (the
+//! user-triggered `/mode foreman` / `/mode plan` session modes), `mcp`, and
+//! `codemode` — the same set upstream ships (minus its JS-only entries) plus
+//! the mode command — pir-only `python` (the embedded RustPython 3
+//! interpreter), `tool-search` (upstream extensions/tool-search),
+//! `tool-repair` (the pi-tool-repair npm package ported natively), `todo`
+//! (the rpiv-todo port), and `memory` (the embedded cm-memory engine; always
+//! compiled with the `memory` feature and default-enabled).
 
 use std::sync::Arc;
 
@@ -70,6 +71,17 @@ pub const BUILTIN_EXTENSION_FACTORIES: &[BuiltinExtensionDef] = &[
         name: "subagent",
         replaceable: true,
         factory: new_subagent_plugin,
+        default_enabled: true,
+    },
+    // User-triggered session modes. `foreman` makes the main session a
+    // read-only router that delegates mutations through the existing
+    // `subagent` tool; `plan` is read-only investigation/planning; `normal`
+    // restores the baseline.
+    #[cfg(feature = "subagent")]
+    BuiltinExtensionDef {
+        name: "mode",
+        replaceable: true,
+        factory: new_mode_plugin,
         default_enabled: true,
     },
     // The native MCP client integration (upstream
@@ -239,6 +251,7 @@ pub fn builtin_extension_def(name: &str) -> Option<&'static BuiltinExtensionDef>
 /// reachable only from a trimmed build.
 const BUILTIN_FEATURES: &[(&str, &str)] = &[
     ("subagent", "subagent"),
+    ("mode", "subagent"),
     ("tool-repair", "tool-repair"),
     ("tool-search", "tool-search"),
     ("mcp", "mcp"),
@@ -283,6 +296,14 @@ pub fn instantiate_builtin(name: &str) -> Option<Arc<dyn AgentPlugin>> {
 #[cfg(feature = "subagent")]
 fn new_subagent_plugin() -> Arc<dyn AgentPlugin> {
     super::subagent::new_subagent_plugin()
+}
+
+#[cfg(feature = "subagent")]
+pub(crate) mod mode;
+
+#[cfg(feature = "subagent")]
+fn new_mode_plugin() -> Arc<dyn AgentPlugin> {
+    mode::new_mode_plugin()
 }
 
 #[cfg(feature = "mcp")]

@@ -94,7 +94,7 @@ network ones.
 | `exclude_tools([...])` / `no_tools()` | Denylist on top of the default set (and any `tools` allowlist; unmatched ignored) / declare and execute no tools. |
 | `on_event(name, closure)` | One plugin per call: observe/transform a unified-dispatch event (`input`, `before_agent_start`, `tool_call`, `tool_result`, `session_start`, `model_select`, `thinking_level_select`, `turn_end`, `agent_before_settle`, `session_before_compact`/`fork`/`switch`, …). The closure receives `&mut serde_json::Value` and may return `()` or a `PluginEventOutcome`. Handlers run in registration order. |
 | `with_plugin(Arc<dyn AgentPlugin>)` | Attach a full Rust plugin (tools, commands, event handlers). |
-| `builtin(name)` / `builtins([...])` | Attach a compiled-in builtin (`"subagent"`, `"tool-repair"`, `"tool-search"`, `"todo"`, `"memory"`, `"mcp"`, `"python"`, `"codemode"`). `builtin:`-prefixed and bare names are equivalent. `tool-search` is model-only and its `tool_search` tool is default-inactive: also add `.tools(["+tool_search"])` (exposure is then the model's call surface); deferred tools load on demand. |
+| `builtin(name)` / `builtins([...])` | Attach a compiled-in builtin (`"subagent"`, `"mode"`, `"tool-repair"`, `"tool-search"`, `"todo"`, `"memory"`, `"mcp"`, `"python"`, `"codemode"`). `builtin:`-prefixed and bare names are equivalent. `tool-search` is model-only and its `tool_search` tool is default-inactive: also add `.tools(["+tool_search"])` (exposure is then the model's call surface); deferred tools load on demand. |
 | `extension_paths(paths)` / `only_builtin(bool)` | Load JS extensions from files or `builtin:<name>` pseudo-paths (requires `extensions`) / filter to `builtin:<name>` only: on-disk paths ignored with one diagnostic, no QuickJS actor (the CLI `--only-builtin` shape), no default-injection — attach builtins with `builtin()`/`builtins()`. |
 | `proxy(ProxyProvider, Model)` | Route requests through an application proxy server. Registers the provider in a private registry and pins the model exactly like `with_registry` (which it is mutually exclusive with, along with `endpoint`/`model*`). |
 | `session(SessionMode)` / `no_session()` | `DefaultDir` (default), `Dir(path)`, `Existing(path)`, or `None` (`SessionMode::None`, in-memory); durable modes write the upstream JSONL format (pi and pir share session files). |
@@ -534,6 +534,14 @@ Built-in extension `builtin:python` is not compiled into this build (the `python
 The agent directory's settings gates apply too: `pythonTool: false` or `disabledBuiltinExtensions` fails `build()`
 with a diagnostic naming the setting, so settings cannot be bypassed by attaching a builtin by name.
 `.builtin("builtin:subagent")` and `.builtin("subagent")` are equivalent.
+
+The `mode` builtin adds `/mode`, `/foreman`, and `/approvals` commands (never tools). Its foreman settings and
+durable journal are exposed to the binary through the public `pir::foreman` bridge:
+`write_running_sidecar`, `read_status`, and `decide_approval`. The `subagent` tool's JSON schema accepts optional
+`isolation` (`none`/`worktree`), `worktreeMerge` (`auto`/`none`), and `executor` (`inline`/`process`) fields;
+absent fields preserve the existing in-process behavior. Process workers are spawned from the current `pir`
+executable (`PIR_FOREMAN_PIR` overrides it for tests), receive the agent body through
+`--append-system-prompt`, and run with `--mode json --no-session`.
 
 ### Native providers
 

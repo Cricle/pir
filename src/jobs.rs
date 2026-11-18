@@ -403,6 +403,32 @@ impl JobStore {
         if spec.command.trim().is_empty() {
             return Err("job command must not be empty".to_owned());
         }
+        self.spawn_inner(spec)
+    }
+
+    /// Start a detached job from an argv vector (no shell, no command string).
+    /// The supervisor runs `program` with `args` directly.
+    pub fn spawn_argv(
+        &self,
+        program: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+    ) -> Result<JobMeta, String> {
+        if program.as_os_str().is_empty() {
+            return Err("job program must not be empty".to_owned());
+        }
+        let spec = JobSpec {
+            command: String::new(),
+            cwd: cwd.to_path_buf(),
+            program: program.to_string_lossy().into_owned(),
+            args: args.to_vec(),
+            env: env.to_vec(),
+        };
+        self.spawn_inner(&spec)
+    }
+
+    fn spawn_inner(&self, spec: &JobSpec) -> Result<JobMeta, String> {
         let id = format!(
             "job-{}-{}-{}",
             now_secs(),
@@ -1402,10 +1428,11 @@ pub fn run_supervisor(args: &[String]) -> i32 {
         }
         index += 1;
     }
-    let (Some(dir), Some(program), Some(command)) = (job_dir, program, command) else {
-        eprintln!("__jobs-supervise: --job-dir, --program and --command are required");
+    let (Some(dir), Some(program)) = (job_dir, program) else {
+        eprintln!("__jobs-supervise: --job-dir and --program are required");
         return 2;
     };
+    let command = command.unwrap_or_default();
     let Ok(mut meta) = read_meta(&dir).ok_or_else(|| "missing meta".to_owned()) else {
         eprintln!("__jobs-supervise: unreadable job meta in {}", dir.display());
         return 2;
@@ -1431,11 +1458,13 @@ pub fn run_supervisor(args: &[String]) -> i32 {
     let mut command_builder = std::process::Command::new(&program);
     command_builder
         .args(&program_args)
-        .arg(&command)
         .current_dir(&meta.spec.cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if !command.is_empty() {
+        command_builder.arg(&command);
+    }
     for (key, value) in &meta.spec.env {
         command_builder.env(key, value);
     }

@@ -1006,3 +1006,21 @@ fn clean_removes_terminal_jobs_only_when_allowed() {
     assert!(store.status(&meta.id).is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn spawn_argv_runs_without_a_shell_command_string() {
+    let root = temp_root("argv");
+    let store = job_store(&root);
+    let config = pir::coding_agent::tools::resolve_shell_config(None).expect("shell");
+    let mut args: Vec<String> = config.args().iter().map(|arg| (*arg).to_owned()).collect();
+    args.push("echo ARGV_OK".to_owned());
+    let cwd = std::env::current_dir().expect("cwd");
+    let meta = store
+        .spawn_argv(std::path::Path::new(config.program()), &args, &cwd, &[])
+        .expect("spawn argv");
+    let done = store.wait(&meta.id, Duration::from_secs(60)).expect("wait");
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    let log = store.read_log(&meta.id, 4096, 50).expect("log");
+    assert!(log.text.contains("ARGV_OK"), "{log:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

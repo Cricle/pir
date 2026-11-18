@@ -137,6 +137,66 @@ while open and never take a permanent frame row beyond their compact dock widget
   its bounded notification queue. The full subagent/background result still lands in its normal transcript
   block.
 
+## Session modes
+
+`/mode` switches the current session's working mode. It is user-triggered; the model cannot enter or leave a
+mode. The command is registered by the `mode` builtin (gated by the `subagent` feature).
+
+- **`/mode foreman`** — the main agent becomes a read-only foreman/router. It plans, delegates every workspace
+  mutation or command to the existing `subagent` tool, inspects results with read-only tools, and must get an
+  independent `reviewer` verdict before reporting completion. The host hides every non-allowlisted tool
+  declaration from the model-facing tool list (so `bash`, `edit`, `write`, `python`, `codemode`, `ctx_execute`,
+  `memory`, and MCP tools are not offered), and the `tool_call` seam still blocks them as an execution fence if a
+  hidden name is guessed. Worker children keep their normal tool surface; the mode does not change `subagent`
+  itself. The status line shows `MODE: FOREMAN`.
+- **`/mode plan`** — read-only investigation and planning mode. Mutating tools are hidden and blocked; only
+  `scout`, `planner`, and `reviewer` subagents may run. The model investigates, then calls the model-visible
+  `submit_plan` tool with a concrete plan (ordered steps, files to change, risks, verification). That tool is
+  blocked at the gate and creates a plan approval: `/approvals` shows the plan decision dialog. Approving
+  switches the session to normal mode and sends the approved plan back as a follow-up so it is executed with
+  the full tool surface; denying keeps plan mode and asks for a revision. The plan text and decision are
+  journalled and survive resume. The status line shows `MODE: PLAN` until approval or an explicit mode switch.
+- **Reviewer gate** — after any non-reviewer `subagent` call, the `agent_before_settle` boundary checks the latest
+  reviewer result. The preferred reviewer reply is a JSON object on its first line,
+  `{"verdict":"PASS"|"FAIL","evidence":"..."}`; a plain `PASS`/`FAIL` first line is accepted for compatibility.
+  `FAIL`, an errored child, or no reviewer result injects a visible `FOREMAN GATE` message and continues the run.
+  A new worker invalidates an earlier PASS. The gate nudges at most 3 times per worker generation; when the
+  budget is exhausted the run may settle but the footer becomes `PHASE: UNVERIFIED` and a warning is posted.
+- **Phases** — while a mode is active the footer carries `PHASE: PLANNING|DELEGATING|REVIEW|REWORK|VERIFIED|
+  UNVERIFIED`. This is advisory state, not a separate scheduler.
+- **Boundary composition** — `turn_end`/`agent_before_settle` results from multiple plugins compose (`continue`
+  is OR'ed, `entries` concatenate) instead of one plugin's result overwriting another's.
+- **`/mode normal`** — clears the mode, gate state, pending approvals, and phase, and restores the baseline
+  prompt, tools, and status line.
+- **`/mode`** — prints the current mode.
+- **`/foreman`** — foreman-only settings. `/foreman status` shows the phase and pending approvals;
+  `/foreman worktree on|off` requires a clean git repository, `/foreman router inline|process` selects the
+  execution backend, `/foreman approvals auto|manual` selects the approval policy, and `/foreman clean` removes
+  retained worktrees.
+- **`/approvals`** — lists pending worker delegations and opens the approve/deny dialogs when a UI is attached.
+  Manual approvals block the worker at `tool_call` with a stable approval id; approving sends a trigger-turn
+  custom message so the foreman retries the delegation. Denied calls do not create a worker generation.
+- **Durable journal** — `<session>.foreman.jsonl` stores the mode, phase, generation, reviewer call id, nudge
+  count, settings, and approvals. It is replayed on resume/reload and preferred over transcript scanning; a
+  missing journal falls back to `<session>.mode.json` plus transcript reconstruction.
+- **Worktrees** — with `worktree on`, each worker runs in a clean git worktree; successful changes are committed
+  and merged back, conflicts keep the worktree and fail the task. Reviewer calls run against the merged workspace;
+  FAIL is fix-forward, not an automatic rollback.
+- **Process router** — with `router process`, each subagent task runs as a separate `pir --mode json --no-session`
+  process with the agent body, model, and tool allowlist. The inline backend remains the default.
+- Switching is rejected while a run is in progress. New and forked/cloned sessions start normal; a resumed or
+  reloaded session restores its mode from the journal/sidecar. Ephemeral (`--no-session`) sessions keep the mode
+  in memory only. Normal and plan sessions skip the settle payload entirely (the mode's dynamic event predicate
+  only advertises `agent_before_settle` in foreman mode).
+
+### Detached foreman
+
+`pir foreman run "<task>"` starts a detached job (or `--foreground`) that restores foreman mode from the session
+sidecar and writes the normal session transcript/journal. `status`, `logs [--follow]`, `abort`, `approve`, `deny`,
+`resume`, and `clean` operate on that session. Background manual approvals are asynchronous: the first run may
+settle at the blocked delegation, and `approve`/`deny` appends the decision and starts a new run. There is no
+long-lived multi-client daemon or live TUI attach; use `logs --follow` while it runs and `resume` after it exits.
+
 ## Modes
 
 - Steering: send messages while a run executes (queued, applied between tool batches).

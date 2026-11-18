@@ -394,6 +394,13 @@ impl AgentSession {
                 }
             }
         }
+        // Plugin-wide declaration filters (a session mode restricting the
+        // model-facing surface). They compose with the per-tool
+        // `prepare_loadout` hides above; the tools stay active and callable,
+        // and the plugin's hard `tool_call` gate remains the execution fence.
+        if let Some(plugins) = plugins {
+            hidden_declarations.extend(plugins.hidden_tool_declarations());
+        }
 
         // D6: the system prompt follows the SAME declared/hidden set this
         // loadout just resolved. Upstream re-runs `_rebuildSystemPrompt` on
