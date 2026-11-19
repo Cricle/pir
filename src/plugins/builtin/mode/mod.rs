@@ -36,8 +36,7 @@
 //! starts at `Normal`; foreman/plan restrictions therefore never leak into
 //! the existing single/parallel/chain subagent execution.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -64,7 +63,7 @@ mod submit_plan;
 
 pub(crate) use approvals::ApprovalKind as ModeApprovalKind;
 use approvals::{now_ms, ApprovalKind, ApprovalRecord, ApprovalState};
-use journal::{ExecutionContract, JournalEvent, JournalState};
+use journal::{ExecutionContract, JournalEvent, JournalState, Verification};
 pub(crate) use settings::{ApprovalMode, ModeSettings, RouterMode};
 
 pub(crate) use journal::decide_approval_for_session;
@@ -153,6 +152,9 @@ pub const VERIFICATION_GATE_MESSAGE: &str = "EXECUTION CONTRACT: the approved pl
 /// Cap-warning for the contract verification gate.
 pub const VERIFICATION_UNVERIFIED_MESSAGE: &str = "EXECUTION CONTRACT UNVERIFIED: the verification gate reached its 3-nudge limit. The run may finish, but the approved plan's verification criteria were not confirmed by a tool result.";
 
+/// Model-facing nudge when the latest worker failed or was aborted.
+pub const WORKER_FAILURE_GATE_MESSAGE: &str = "FOREMAN GATE: the latest worker call failed or was aborted (error, non-zero exit, or stderr). A reviewer cannot pass failed work. Delegate a concrete fix to a worker, confirm it succeeds, then run the reviewer again before finishing.";
+
 /// Direct tools a foreman/plan session may call. Everything else is blocked at
 /// the `tool_call` seam and removed from the model-facing declarations.
 pub const MODE_ALLOWED_TOOLS: &[&str] = &[
@@ -184,9 +186,16 @@ Your job is to act as the foreman/router:
 - Delegate every workspace mutation and command execution to the existing
   `subagent` tool. Use single mode for one task, parallel mode for independent
   tasks, and chain mode for dependent steps.
+- Every worker task must state a concrete delivery contract: the deliverable
+  (files/output), the minimum viable result that can be verified, and how
+  success will be checked. A worker that only reports progress, or whose call
+  errors/aborts, has NOT delivered; do not treat it as done.
 - Use only read-only tools (`read`, `grep`, `find`, `ls`, `tool_search`) to
   inspect the workspace and worker results.
-- After ANY worker delegation, run an independent verification with a
+- A worker whose call is errored or aborted is a failure. Delegate a concrete
+  fix or report the blocker; never ask a reviewer to pass failed work. The
+  settle gate rejects a reviewer PASS that follows a failed/aborted worker.
+- After ANY successful worker delegation, run an independent verification with a
   `subagent` call whose agent is exactly `reviewer` before finishing.
 - The reviewer must reply with a JSON object on its first line:
   {"verdict":"PASS"|"FAIL","evidence":"..."}.
@@ -335,6 +344,9 @@ struct ModeState {
     /// Increments for every non-reviewer `subagent` call; a new worker makes
     /// any earlier reviewer verdict stale.
     worker_generation: AtomicU32,
+    /// The `toolCallId` of the latest worker (non-reviewer) `subagent` call,
+    /// used to detect a failed/aborted worker at the settle gate.
+    last_worker_call_id: RwLock<Option<String>>,
     /// The `toolCallId` of the latest reviewer `subagent` call.
     last_reviewer_call_id: RwLock<Option<String>>,
     /// Settle-gate continuations already injected for this worker generation.
@@ -367,6 +379,7 @@ impl ModeState {
             session_id: RwLock::new(None),
             session_path: RwLock::new(None),
             worker_generation: AtomicU32::new(0),
+            last_worker_call_id: RwLock::new(None),
             last_reviewer_call_id: RwLock::new(None),
             gate_nudges: AtomicU32::new(0),
             review_passed_generation: RwLock::new(None),
@@ -563,12 +576,13 @@ impl ModeState {
     /// Submit a plan for approval in plan mode. Returns the stable request id
     /// and whether this is a new request (a re-submission of the same text is
     /// deduped). The full plan is journaled so it survives resume.
-    fn submit_plan(&self, call: &str, plan: &str, verification: Option<&str>) -> (String, bool) {
-        let id = plan_approval_id(plan, verification);
-        let verification = verification
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned);
+    fn submit_plan(
+        &self,
+        call: &str,
+        plan: &str,
+        verification: Option<Verification>,
+    ) -> (String, bool) {
+        let id = plan_approval_id(plan, verification.as_ref());
         *self
             .submitted_plan
             .write()
@@ -716,6 +730,11 @@ impl ModeState {
             mode: self.mode(),
             phase: self.phase(),
             generation: self.worker_generation.load(Ordering::SeqCst),
+            last_worker_call: self
+                .last_worker_call_id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             reviewer: self
                 .last_reviewer_call_id
                 .read()
@@ -809,6 +828,10 @@ impl ModeState {
         self.worker_generation
             .store(state.generation, Ordering::SeqCst);
         *self
+            .last_worker_call_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.last_worker_call;
+        *self
             .last_reviewer_call_id
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.reviewer;
@@ -876,6 +899,10 @@ impl ModeState {
         self.worker_generation.store(0, Ordering::SeqCst);
         self.gate_nudges.store(0, Ordering::SeqCst);
         *self
+            .last_worker_call_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
             .review_passed_generation
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -899,6 +926,11 @@ impl ModeState {
         if has_worker {
             self.worker_generation.fetch_add(1, Ordering::SeqCst);
             self.gate_nudges.store(0, Ordering::SeqCst);
+            *self
+                .last_worker_call_id
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                call_id.filter(|id| !id.is_empty()).map(str::to_owned);
             *self
                 .review_passed_generation
                 .write()
@@ -967,6 +999,23 @@ impl ModeState {
         if self.worker_generation.load(Ordering::SeqCst) == 0 {
             return None;
         }
+        // A failed/aborted worker is never verifiable, even if a reviewer was
+        // (incorrectly) asked; delegate a fix instead of accepting the run.
+        let worker_call_id = self
+            .last_worker_call_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if worker_call_id
+            .as_deref()
+            .is_some_and(|call_id| worker_failed(payload, call_id))
+        {
+            return self.gate_nudge(
+                WORKER_FAILURE_GATE_MESSAGE,
+                GATE_CUSTOM_TYPE,
+                UNVERIFIED_MESSAGE,
+            );
+        }
         let generation = self.worker_generation.load(Ordering::SeqCst);
         if self
             .review_passed_generation
@@ -1019,11 +1068,12 @@ impl ModeState {
     /// keeps the previous "visible but ungated" behavior.
     fn contract_gate_continuation(&self, payload: &Value) -> Option<Value> {
         let contract = self.active_contract()?;
-        let requires_evidence = contract
-            .verification
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|text| !text.is_empty());
+        let declared_commands = contract.verification.as_ref().and_then(|v| v.commands());
+        let requires_evidence = match &contract.verification {
+            Some(Verification::Commands(items)) => !items.is_empty(),
+            Some(Verification::Text(text)) => !text.trim().is_empty(),
+            None => false,
+        };
         if !requires_evidence {
             return None;
         }
@@ -1035,7 +1085,7 @@ impl ModeState {
             self.set_phase(Phase::Verified);
             return None;
         }
-        if verification_evidence_passed(payload) {
+        if verification_evidence_passed(payload, declared_commands) {
             self.set_phase(Phase::Verified);
             *self
                 .verification_passed_id
@@ -1115,6 +1165,7 @@ impl ModeState {
         self.reset_gate();
         let mut generation = 0u32;
         let mut last_reviewer = None;
+        let mut last_worker = None;
         let Some(session) = context.session() else {
             return;
         };
@@ -1124,13 +1175,23 @@ impl ModeState {
                 for view in views {
                     if let Some(messages) = view.get("messages").and_then(Value::as_array) {
                         for message in messages {
-                            scan_subagent_calls(message, &mut generation, &mut last_reviewer);
+                            scan_subagent_calls(
+                                message,
+                                &mut generation,
+                                &mut last_reviewer,
+                                &mut last_worker,
+                            );
                             scanned = true;
                         }
                     } else if let Some(message) =
                         view.get("entry").and_then(|entry| entry.get("message"))
                     {
-                        scan_subagent_calls(message, &mut generation, &mut last_reviewer);
+                        scan_subagent_calls(
+                            message,
+                            &mut generation,
+                            &mut last_reviewer,
+                            &mut last_worker,
+                        );
                         scanned = true;
                     }
                 }
@@ -1151,13 +1212,22 @@ impl ModeState {
                             continue;
                         }
                         if let Some(message) = entry.get("message") {
-                            scan_subagent_calls(message, &mut generation, &mut last_reviewer);
+                            scan_subagent_calls(
+                                message,
+                                &mut generation,
+                                &mut last_reviewer,
+                                &mut last_worker,
+                            );
                         }
                     }
                 }
             }
         }
         self.worker_generation.store(generation, Ordering::SeqCst);
+        *self
+            .last_worker_call_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = last_worker;
         *self
             .last_reviewer_call_id
             .write()
@@ -1447,34 +1517,37 @@ impl AgentPlugin for ModePlugin {
                     self.state.refresh_status();
                     PluginEventOutcome::None
                 }
-                "before_agent_start" => match self.state.mode() {
-                    Mode::Foreman => {
-                        let prompt = format!(
-                            "{FOREMAN_PROMPT}{}",
-                            self.state.settings().prompt_addendum()
-                        );
-                        mode_prompt(event, FOREMAN_SECTION, &prompt)
-                    }
-                    Mode::Plan => mode_prompt(event, PLAN_SECTION, PLAN_PROMPT),
-                    Mode::Normal => match self.state.active_contract() {
-                        Some(contract) if !contract.plan.trim().is_empty() => {
-                            let mut prompt = String::from(EXECUTION_CONTRACT_PROMPT_HEAD);
-                            prompt.push_str(contract.plan.trim());
-                            if let Some(verification) = contract
-                                .verification
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|text| !text.is_empty())
-                            {
-                                prompt.push_str("\n\nVerification criteria: ");
-                                prompt.push_str(verification);
-                            }
-                            prompt.push_str(EXECUTION_CONTRACT_PROMPT_TAIL);
-                            mode_prompt(event, EXECUTION_CONTRACT_SECTION, &prompt)
+                "before_agent_start" => {
+                    match self.state.mode() {
+                        Mode::Foreman => {
+                            let prompt = format!(
+                                "{FOREMAN_PROMPT}{}",
+                                self.state.settings().prompt_addendum()
+                            );
+                            mode_prompt(event, FOREMAN_SECTION, &prompt)
                         }
-                        _ => PluginEventOutcome::None,
-                    },
-                },
+                        Mode::Plan => mode_prompt(event, PLAN_SECTION, PLAN_PROMPT),
+                        Mode::Normal => match self.state.active_contract() {
+                            Some(contract) if !contract.plan.trim().is_empty() => {
+                                let mut prompt = String::from(EXECUTION_CONTRACT_PROMPT_HEAD);
+                                prompt.push_str(contract.plan.trim());
+                                if let Some(verification) = contract.verification.as_ref() {
+                                    let text = verification.display();
+                                    if !text.trim().is_empty() {
+                                        prompt.push_str("\n\nVerification criteria: ");
+                                        if verification.commands().is_some() {
+                                            prompt.push_str("run one of these commands EXACTLY (no rewriting):\n");
+                                        }
+                                        prompt.push_str(text.trim());
+                                    }
+                                }
+                                prompt.push_str(EXECUTION_CONTRACT_PROMPT_TAIL);
+                                mode_prompt(event, EXECUTION_CONTRACT_SECTION, &prompt)
+                            }
+                            _ => PluginEventOutcome::None,
+                        },
+                    }
+                }
                 "tool_call" => {
                     let mode = self.state.mode();
                     let Some(tool_name) = event.tool_name().map(str::to_owned) else {
@@ -1541,12 +1614,12 @@ impl AgentPlugin for ModePlugin {
                                 terminate: false,
                             };
                         }
-                        let verification = event
-                            .payload
-                            .get("input")
-                            .and_then(|input| input.get("verification"))
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.trim().is_empty());
+                        let verification = parse_verification(
+                            event
+                                .payload
+                                .get("input")
+                                .and_then(|input| input.get("verification")),
+                        );
                         let (id, created) = self.state.submit_plan(&call_id, &plan, verification);
                         if created {
                             self.state.notify_level(
@@ -2007,7 +2080,12 @@ fn subagent_agents(input: &Value) -> Vec<&str> {
     agents
 }
 
-fn scan_subagent_calls(message: &Value, generation: &mut u32, last_reviewer: &mut Option<String>) {
+fn scan_subagent_calls(
+    message: &Value,
+    generation: &mut u32,
+    last_reviewer: &mut Option<String>,
+    last_worker: &mut Option<String>,
+) {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return;
     }
@@ -2025,6 +2103,11 @@ fn scan_subagent_calls(message: &Value, generation: &mut u32, last_reviewer: &mu
         if agents.iter().any(|agent| *agent != "reviewer") {
             *generation += 1;
             *last_reviewer = None;
+            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                if !id.is_empty() {
+                    *last_worker = Some(id.to_owned());
+                }
+            }
         }
         if agents.contains(&"reviewer") {
             if let Some(id) = block.get("id").and_then(Value::as_str) {
@@ -2040,7 +2123,7 @@ fn scan_subagent_calls(message: &Value, generation: &mut u32, last_reviewer: &mu
 /// tool result. This is deliberately domain-neutral: it checks tool facts only
 /// (call/result pairing, tool name, error flag, exit code), never the command's
 /// meaning or any artifact format. It mirrors `compaction::evidence`'s rules.
-fn verification_evidence_passed(payload: &Value) -> bool {
+fn verification_evidence_passed(payload: &Value, declared: Option<&[String]>) -> bool {
     let Some(messages) = payload
         .pointer("/context/llmMessages")
         .and_then(Value::as_array)
@@ -2057,8 +2140,9 @@ fn verification_evidence_passed(payload: &Value) -> bool {
         })
         .unwrap_or(0);
     let window = &messages[approval_index..];
-    // Map tool call id -> shell tool name (within the post-approval window).
-    let mut shell_calls: HashSet<String> = HashSet::new();
+    // Map tool call id -> (shell tool name, declared command argument). Mirrors
+    // compaction::evidence so the strict path can compare exact commands.
+    let mut shell_calls: HashMap<String, Option<String>> = HashMap::new();
     for message in window {
         let Some(assistant) = message.get("content").and_then(Value::as_array) else {
             continue;
@@ -2073,7 +2157,12 @@ fn verification_evidence_passed(payload: &Value) -> bool {
                 .unwrap_or_default();
             if matches!(name, "bash" | "shell" | "powershell" | "sh") {
                 if let Some(id) = block.get("id").and_then(Value::as_str) {
-                    shell_calls.insert(id.to_owned());
+                    let command = block
+                        .get("arguments")
+                        .and_then(|args| args.get("command"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    shell_calls.insert(id.to_owned(), command);
                 }
             }
         }
@@ -2087,10 +2176,25 @@ fn verification_evidence_passed(payload: &Value) -> bool {
             .get("toolName")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let is_shell = shell_calls.contains(call_id)
-            || matches!(tool_name, "bash" | "shell" | "powershell" | "sh");
+        let paired = shell_calls.get(call_id);
+        let is_shell =
+            paired.is_some() || matches!(tool_name, "bash" | "shell" | "powershell" | "sh");
         if !is_shell || result.get("isError").and_then(Value::as_bool) == Some(true) {
             return false;
+        }
+        // Strict contract: the executed command must equal one of the declared
+        // commands verbatim (trim only). No substring or shell-semantic parsing.
+        if let Some(declared) = declared {
+            let actual = paired
+                .and_then(|entry| entry.as_deref())
+                .or_else(|| result.pointer("/details/command").and_then(Value::as_str))
+                .map(str::trim);
+            let Some(actual) = actual else {
+                return false;
+            };
+            if !declared.iter().any(|expected| expected.trim() == actual) {
+                return false;
+            }
         }
         // Explicit non-zero exit code anywhere in details -> fail.
         if result
@@ -2107,10 +2211,6 @@ fn verification_evidence_passed(payload: &Value) -> bool {
                 return false;
             }
         }
-        // pir's bash tool appends "Command exited with code N"; accept only 0
-        // when such a status line is present, and require no status line to be
-        // flagged as a failure. A result with no command output at all is not
-        // evidence.
         let has_status = lower.contains("command exited with code ");
         if has_status {
             lower.contains("command exited with code 0")
@@ -2118,6 +2218,55 @@ fn verification_evidence_passed(payload: &Value) -> bool {
             !text.trim().is_empty()
         }
     })
+}
+
+/// Whether the worker tool result for `call_id` failed or was aborted. Used by
+/// the foreman gate so a failed worker cannot be followed by a reviewer PASS
+/// that lets the run settle as verified. Reads only generic tool-result facts.
+fn worker_failed(payload: &Value, call_id: &str) -> bool {
+    let Some(messages) = payload
+        .pointer("/context/llmMessages")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let Some(result) = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("toolCallId").and_then(Value::as_str) == Some(call_id))
+    else {
+        return false;
+    };
+    if result.get("toolName").and_then(Value::as_str) != Some("subagent") {
+        return false;
+    }
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let results = result.pointer("/details/results").and_then(Value::as_array);
+    if let Some(results) = results {
+        return results.iter().any(|entry| {
+            // Reviewers inside a shared call are not the worker.
+            if entry.get("agent").and_then(Value::as_str) == Some("reviewer") {
+                return false;
+            }
+            entry
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0)
+                || matches!(
+                    entry.get("stopReason").and_then(Value::as_str),
+                    Some("error" | "aborted")
+                )
+                || entry.get("stderr").is_some_and(|v| !v.is_null())
+                || entry.get("errorMessage").is_some_and(|v| !v.is_null())
+        });
+    }
+    // No structured details: fall back to the result's failure text.
+    let text = text_content(result.get("content")).to_ascii_lowercase();
+    text.contains("subagent was aborted")
+        || text.contains("agent error:")
+        || text.contains("agent aborted:")
 }
 
 /// Whether the reviewer tool result matching `call_id` is a non-error PASS.
@@ -2256,7 +2405,35 @@ fn structured_verdict(text: &str) -> Option<bool> {
     }
 }
 
-fn plan_approval_id(plan: &str, verification: Option<&str>) -> String {
+/// Parse the tool's `verification` input: a legacy free-form string, or a
+/// strict list of commands that must be executed verbatim. Unknown shapes are
+/// ignored (treated as no verification) rather than rejected.
+fn parse_verification(input: Option<&Value>) -> Option<Verification> {
+    let value = input?;
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| Verification::Text(text.to_owned()))
+        }
+        Value::Array(items) => {
+            let commands: Vec<String> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if commands.is_empty() {
+                None
+            } else {
+                Some(Verification::Commands(commands))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn plan_approval_id(plan: &str, verification: Option<&Verification>) -> String {
     let mut hasher = DefaultHasher::new();
     "plan".hash(&mut hasher);
     plan.hash(&mut hasher);
@@ -2265,7 +2442,7 @@ fn plan_approval_id(plan: &str, verification: Option<&str>) -> String {
     // old callers.
     if let Some(verification) = verification {
         "verification".hash(&mut hasher);
-        verification.hash(&mut hasher);
+        verification.hash_key().hash(&mut hasher);
     }
     format!("p{:016x}", hasher.finish())
 }
@@ -2743,16 +2920,17 @@ fn send_approval_message(
                  now. Use the appropriate tools and verify the result before reporting done.",
                 record.id, plan
             );
-            if let Some(verification) = record
-                .verification
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            {
-                content.push_str(
-                    "\n\nExecution verification criteria (a real tool result must show success):\n",
-                );
-                content.push_str(verification);
+            if let Some(verification) = record.verification.as_ref() {
+                let text = verification.display();
+                if !text.trim().is_empty() {
+                    content.push_str(
+                        "\n\nExecution verification criteria (a real tool result must show success):\n",
+                    );
+                    if verification.commands().is_some() {
+                        content.push_str("Run one of these commands EXACTLY:\n");
+                    }
+                    content.push_str(text.trim());
+                }
             }
             content
         } else {

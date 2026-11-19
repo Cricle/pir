@@ -45,12 +45,14 @@ impl AgentTool for SubmitPlanTool {
                     "description": "The concrete plan: ordered steps, files to change, risks, and verification."
                 },
                 "verification": {
-                    "type": "string",
-                    "description": "Optional execution-time acceptance criteria. When given, this is \
-                                   carried into the approved plan as a verification contract: the \
-                                   plan cannot be reported done until a real verification tool has \
-                                   been run with a successful result. Old callers that omit it keep \
-                                   the previous behavior."
+                  "description": "Optional execution-time acceptance criteria. A string is legacy \
+                                  free-form criteria (any successful command may satisfy it). An \
+                                  array of command strings is a strict contract: one listed command \
+                                  must be executed verbatim and succeed.",
+                  "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" } }
+                  ]
                 },
                 "questions": {
                     "type": "array",

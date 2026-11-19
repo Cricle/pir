@@ -1810,6 +1810,10 @@ fn submit_plan_input_with_verification(plan: &str, verification: &str) -> Value 
 /// A successful shell command: assistant toolCall paired with a zero-exit
 /// toolResult, matching the generic evidence rules used by the contract gate.
 fn successful_verification_turn(call_id: &str) -> Vec<Value> {
+    successful_verification_turn_with_command(call_id, "python -m unittest")
+}
+
+fn successful_verification_turn_with_command(call_id: &str, command: &str) -> Vec<Value> {
     vec![
         json!({
             "role": "assistant",
@@ -1817,7 +1821,7 @@ fn successful_verification_turn(call_id: &str) -> Vec<Value> {
                 "type": "toolCall",
                 "id": call_id,
                 "name": "bash",
-                "arguments": { "command": "python -m unittest" }
+                "arguments": { "command": command }
             }],
             "stopReason": "toolUse"
         }),
@@ -2048,6 +2052,19 @@ async fn approve_plan_with_contract(
     plan: &str,
     verification: &str,
 ) -> (PluginHost, Arc<FakeStatus>) {
+    approve_plan_with_verification_value(
+        dir,
+        plan,
+        submit_plan_input_with_verification(plan, verification)["verification"].clone(),
+    )
+    .await
+}
+
+async fn approve_plan_with_verification_value(
+    dir: &std::path::Path,
+    plan: &str,
+    verification: Value,
+) -> (PluginHost, Arc<FakeStatus>) {
     let path = dir.join("session.jsonl");
     let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
     let status = Arc::new(FakeStatus::default());
@@ -2061,7 +2078,7 @@ async fn approve_plan_with_contract(
         &host,
         "submit_plan",
         "call-plan",
-        submit_plan_input_with_verification(plan, verification),
+        json!({ "plan": plan, "verification": verification }),
     )
     .await;
     assert_eq!(outcome["block"], true, "{outcome}");
@@ -2301,6 +2318,150 @@ async fn a_new_worker_after_verification_invalidates_the_contract_evidence() {
     assert_eq!(
         gated["continue"], true,
         "new worker invalidates evidence: {gated}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn strict_verification_commands_require_the_exact_command_to_run() {
+    let dir = plan_dir("strict-verify-match");
+    let (host, _status) = approve_plan_with_verification_value(
+        &dir,
+        "1. build the thing",
+        json!(["python -m unittest"]),
+    )
+    .await;
+
+    // The exact declared command succeeds -> gate passes.
+    let passed = emit_settle(&host, successful_verification_turn("call-strict")).await;
+    assert_ne!(passed["continue"], true, "exact command passes: {passed}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_different_successful_command_does_not_satisfy_strict_verification() {
+    let dir = plan_dir("strict-verify-mismatch");
+    let (host, _status) = approve_plan_with_verification_value(
+        &dir,
+        "1. build the thing",
+        json!(["python -m unittest"]),
+    )
+    .await;
+
+    // A different command succeeds but is not the declared one -> still gated.
+    let gated = emit_settle(
+        &host,
+        successful_verification_turn_with_command("call-other", "echo ok"),
+    )
+    .await;
+    assert_eq!(
+        gated["continue"], true,
+        "undeclared command must not pass: {gated}"
+    );
+
+    // Running the declared command afterwards passes.
+    let passed = emit_settle(&host, successful_verification_turn("call-strict")).await;
+    assert_ne!(
+        passed["continue"], true,
+        "declared command passes: {passed}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_text_verification_still_accepts_any_successful_command() {
+    let dir = plan_dir("legacy-verify");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    let passed = emit_settle(
+        &host,
+        successful_verification_turn_with_command("call-any", "echo legacy-ok"),
+    )
+    .await;
+    assert_ne!(
+        passed["continue"], true,
+        "legacy text path accepts any successful command: {passed}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn worker_failure_result(call_id: &str, stop_reason: &str) -> Value {
+    json!({
+        "role": "toolResult",
+        "toolCallId": call_id,
+        "toolName": "subagent",
+        "isError": true,
+        "content": [{ "type": "text", "text": format!("Agent {stop_reason}: Subagent was aborted") }],
+        "details": {
+            "mode": "single",
+            "agentScope": "user",
+            "projectAgentsDir": null,
+            "results": [{
+                "agent": "worker",
+                "agentSource": "user",
+                "task": "write the file",
+                "exitCode": 1,
+                "stopReason": stop_reason,
+                "stderr": "worker failed",
+                "messages": []
+            }]
+        }
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_worker_blocks_reviewer_pass() {
+    let dir = plan_dir("worker-fail-gate");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+
+    host.dispatch_command("mode", "foreman").await.ok();
+    emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
+    emit_tool_input(&host, "subagent", "call-review", reviewer_input()).await;
+
+    let messages = vec![
+        json!({"role":"user","content":[{"type":"text","text":"do the task"}]}),
+        worker_failure_result("call-worker", "error"),
+        reviewer_tool_result("call-review", "PASS"),
+        json!({"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}),
+    ];
+    let result = emit_settle(&host, messages).await;
+    assert_eq!(
+        result["continue"], true,
+        "failed worker must block even a reviewer PASS: {result}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_aborted_worker_blocks_reviewer_pass() {
+    let dir = plan_dir("worker-abort-gate");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+
+    host.dispatch_command("mode", "foreman").await.ok();
+    emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
+    emit_tool_input(&host, "subagent", "call-review", reviewer_input()).await;
+
+    let messages = vec![
+        json!({"role":"user","content":[{"type":"text","text":"do the task"}]}),
+        worker_failure_result("call-worker", "aborted"),
+        reviewer_tool_result("call-review", "PASS"),
+        json!({"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}),
+    ];
+    let result = emit_settle(&host, messages).await;
+    assert_eq!(
+        result["continue"], true,
+        "aborted worker must block even a reviewer PASS: {result}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

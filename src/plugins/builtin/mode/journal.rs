@@ -19,17 +19,54 @@ const JOURNAL_VERSION: u8 = 1;
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024;
 const MAX_APPROVAL_HISTORY: usize = 64;
 
-/// Execution-time acceptance contract carried from an approved plan. Opaque
-/// text only: pir does not parse or validate the plan's domain, it only keeps
-/// the contract visible and requires a real verification tool result before
-/// the run may settle as complete.
+/// Verification clause of an approved plan.
+///
+/// `Text` is the legacy free-form criteria string: any successful shell
+/// command after approval may satisfy it. `Commands` is a strict contract:
+/// the exact command (one of the listed strings) must be executed and pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum Verification {
+    Commands(Vec<String>),
+    Text(String),
+}
+
+impl Verification {
+    pub(crate) fn commands(&self) -> Option<&[String]> {
+        match self {
+            Verification::Commands(items) => Some(items),
+            Verification::Text(_) => None,
+        }
+    }
+
+    pub(crate) fn display(&self) -> String {
+        match self {
+            Verification::Text(text) => text.clone(),
+            Verification::Commands(items) => items.join("\n"),
+        }
+    }
+
+    /// Deterministic material for approval-id hashing.
+    pub(crate) fn hash_key(&self) -> String {
+        match self {
+            Verification::Text(text) => text.clone(),
+            Verification::Commands(items) => {
+                let mut joined = String::from("commands:");
+                joined.push_str(&items.join("\u{1f}"));
+                joined
+            }
+        }
+    }
+}
+
+/// Execution-time acceptance contract carried from an approved plan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecutionContract {
     #[serde(default)]
     pub(crate) plan: String,
     #[serde(default)]
-    pub(crate) verification: Option<String>,
+    pub(crate) verification: Option<Verification>,
     #[serde(default)]
     pub(crate) approval_id: Option<String>,
 }
@@ -40,6 +77,8 @@ pub(crate) struct JournalState {
     pub(crate) mode: Mode,
     pub(crate) phase: Phase,
     pub(crate) generation: u32,
+    /// Latest worker (non-reviewer) subagent call id, for failure detection.
+    pub(crate) last_worker_call: Option<String>,
     pub(crate) reviewer: Option<String>,
     pub(crate) nudges: u32,
     /// Worker generation with a persisted reviewer PASS.
@@ -70,6 +109,7 @@ impl Default for JournalState {
             mode: Mode::Normal,
             phase: Phase::Idle,
             generation: 0,
+            last_worker_call: None,
             reviewer: None,
             nudges: 0,
             review_passed_generation: None,
@@ -92,6 +132,7 @@ impl JournalState {
                 mode,
                 phase,
                 generation,
+                last_worker_call,
                 reviewer,
                 nudges,
                 review_passed_generation,
@@ -107,6 +148,7 @@ impl JournalState {
                 self.mode = Mode::from_label(&mode).unwrap_or(Mode::Normal);
                 self.phase = Phase::from_label(&phase).unwrap_or(Phase::Idle);
                 self.generation = generation;
+                self.last_worker_call = last_worker_call;
                 self.reviewer = reviewer;
                 self.nudges = nudges;
                 self.review_passed_generation = review_passed_generation;
@@ -266,6 +308,8 @@ pub(super) enum JournalEvent {
         mode: String,
         phase: String,
         generation: u32,
+        #[serde(default)]
+        last_worker_call: Option<String>,
         reviewer: Option<String>,
         nudges: u32,
         #[serde(default)]
@@ -320,14 +364,14 @@ pub(super) enum JournalEvent {
         #[serde(default)]
         plan: Option<String>,
         #[serde(default)]
-        verification: Option<String>,
+        verification: Option<Verification>,
     },
     /// A plan was submitted for approval (plan mode).
     PlanSubmitted {
         id: String,
         plan: String,
         #[serde(default)]
-        verification: Option<String>,
+        verification: Option<Verification>,
     },
     /// The submitted plan was revised/replaced; clear the persisted copy.
     PlanRevision,
@@ -454,6 +498,7 @@ impl ForemanJournal {
                 mode: state.mode.label().to_owned(),
                 phase: state.phase.label().to_owned(),
                 generation: state.generation,
+                last_worker_call: state.last_worker_call.clone(),
                 reviewer: state.reviewer.clone(),
                 nudges: state.nudges,
                 review_passed_generation: state.review_passed_generation,

@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use super::journal::Verification;
+
 /// Lifecycle of one approval request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,7 +71,7 @@ pub(crate) struct ApprovalRecord {
     /// Optional execution-time verification contract, when `kind == Plan`.
     /// Old journals/sidecars without it replay as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) verification: Option<String>,
+    pub(crate) verification: Option<Verification>,
     #[serde(default)]
     pub(crate) kind: ApprovalKind,
 }
@@ -106,7 +108,7 @@ impl ApprovalRecord {
         call: String,
         summary: String,
         plan: String,
-        verification: Option<String>,
+        verification: Option<Verification>,
     ) -> Self {
         let mut record = Self::plan(id, call, summary, plan);
         record.verification = verification;

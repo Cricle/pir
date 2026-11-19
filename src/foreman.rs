@@ -92,7 +92,7 @@ pub fn read_status(session_path: &Path) -> Option<ForemanStatus> {
                 state: record.state.label().to_owned(),
                 kind: record.kind.label().to_owned(),
                 plan: record.plan.clone(),
-                verification: record.verification.clone(),
+                verification: record.verification.as_ref().map(|v| v.display()),
                 created_at_ms: record.created_at_ms,
             })
             .collect(),
@@ -125,7 +125,7 @@ pub fn decide_approval(
                     state: record.state.label().to_owned(),
                     kind: record.kind.label().to_owned(),
                     plan: record.plan.clone(),
-                    verification: record.verification.clone(),
+                    verification: record.verification.as_ref().map(|v| v.display()),
                     created_at_ms: record.created_at_ms,
                 })
                 .collect()

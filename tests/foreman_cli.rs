@@ -239,3 +239,51 @@ fn starting_a_foreman_run_overrides_an_existing_journal() {
     assert_eq!(status.generation, 0, "fresh run resets stale gate state");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn approving_a_plan_with_strict_commands_persists_the_contract() {
+    let dir = temp_dir("plan-strict-contract");
+    let session = dir.join("session.jsonl");
+    let mut journal_path = session.as_os_str().to_owned();
+    journal_path.push(".foreman.jsonl");
+    std::fs::write(
+        PathBuf::from(journal_path.clone()),
+        serde_json::to_string(&json!({
+            "v": 1,
+            "t": "snapshot",
+            "mode": "plan",
+            "phase": "PLANNING",
+            "generation": 0,
+            "reviewer": null,
+            "nudges": 0,
+            "settings": {"approvals": "auto", "router": "inline", "worktree": false},
+            "approvals": [{
+                "id": "p1",
+                "call": "call-plan",
+                "summary": "plan: step one",
+                "state": "requested",
+                "plan": "1. do step one",
+                "verification": ["cargo test --all", "cargo clippy --all"],
+                "kind": "plan",
+                "createdAtMs": now_ms()
+            }],
+            "allow_next_worker": false,
+            "submitted_plan": "1. do step one"
+        }))
+        .expect("snapshot JSON"),
+    )
+    .expect("write journal");
+
+    let decided = pir::foreman::decide_approval(&session, Some("p1"), true).expect("approve plan");
+    // Public CLI surface stays a plain string (commands joined for display).
+    assert_eq!(
+        decided[0].verification.as_deref(),
+        Some("cargo test --all\ncargo clippy --all")
+    );
+
+    let text = std::fs::read_to_string(PathBuf::from(journal_path)).expect("journal after");
+    assert!(text.contains("active_contract"), "{text}");
+    assert!(text.contains("cargo test --all"), "{text}");
+    assert!(text.contains("\"normal\""), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
