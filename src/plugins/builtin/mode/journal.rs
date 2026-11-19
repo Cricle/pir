@@ -19,6 +19,21 @@ const JOURNAL_VERSION: u8 = 1;
 const MAX_JOURNAL_BYTES: u64 = 256 * 1024;
 const MAX_APPROVAL_HISTORY: usize = 64;
 
+/// Execution-time acceptance contract carried from an approved plan. Opaque
+/// text only: pir does not parse or validate the plan's domain, it only keeps
+/// the contract visible and requires a real verification tool result before
+/// the run may settle as complete.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExecutionContract {
+    #[serde(default)]
+    pub(crate) plan: String,
+    #[serde(default)]
+    pub(crate) verification: Option<String>,
+    #[serde(default)]
+    pub(crate) approval_id: Option<String>,
+}
+
 /// Replayed foreman state.
 #[derive(Debug, Clone)]
 pub(crate) struct JournalState {
@@ -29,6 +44,11 @@ pub(crate) struct JournalState {
     pub(crate) nudges: u32,
     /// Worker generation with a persisted reviewer PASS.
     pub(crate) review_passed_generation: Option<u32>,
+    /// The approved plan's execution contract, carried into Normal mode.
+    pub(crate) active_contract: Option<ExecutionContract>,
+    /// The approval id whose verification tool evidence has passed, or `None`
+    /// when the active contract has not been verified yet.
+    pub(crate) verification_passed_id: Option<String>,
     pub(crate) settings: ModeSettings,
     pub(crate) approvals: Vec<ApprovalRecord>,
     /// Derived compatibility flag: true iff `allow_next_worker_id` is Some.
@@ -53,6 +73,8 @@ impl Default for JournalState {
             reviewer: None,
             nudges: 0,
             review_passed_generation: None,
+            active_contract: None,
+            verification_passed_id: None,
             settings: ModeSettings::default(),
             approvals: Vec::new(),
             allow_next_worker: false,
@@ -73,6 +95,8 @@ impl JournalState {
                 reviewer,
                 nudges,
                 review_passed_generation,
+                active_contract,
+                verification_passed_id,
                 settings,
                 approvals,
                 allow_next_worker,
@@ -86,6 +110,8 @@ impl JournalState {
                 self.reviewer = reviewer;
                 self.nudges = nudges;
                 self.review_passed_generation = review_passed_generation;
+                self.active_contract = active_contract;
+                self.verification_passed_id = verification_passed_id;
                 self.settings = settings;
                 self.approvals = approvals;
                 self.allow_next_worker_id = allow_next_worker_id;
@@ -137,6 +163,7 @@ impl JournalState {
                 summary,
                 kind,
                 plan,
+                verification,
             } => {
                 let Some(state) = ApprovalState::parse(&state) else {
                     return;
@@ -150,6 +177,7 @@ impl JournalState {
                         // expiry from the earlier request.
                         record.created_at_ms = now_ms();
                         record.plan = plan;
+                        record.verification = verification;
                         record.kind = kind;
                         record.summary = summary;
                     }
@@ -161,8 +189,26 @@ impl JournalState {
                         state,
                         created_at_ms: now_ms(),
                         plan,
+                        verification,
                         kind,
                     });
+                }
+                // An approved plan becomes the active execution contract. The
+                // verification text is copied from the approval record so a
+                // resumed journal does not need the original submitted plan.
+                if kind == ApprovalKind::Plan && state == ApprovalState::Approved {
+                    if let Some(record) = self
+                        .approvals
+                        .iter()
+                        .find(|record| record.id == approval_id)
+                    {
+                        self.active_contract = record.plan.as_ref().map(|plan| ExecutionContract {
+                            plan: plan.clone(),
+                            verification: record.verification.clone(),
+                            approval_id: Some(approval_id.clone()),
+                        });
+                        self.verification_passed_id = None;
+                    }
                 }
                 if kind == ApprovalKind::Worker {
                     if state == ApprovalState::Approved {
@@ -191,6 +237,21 @@ impl JournalState {
             }
             JournalEvent::PlanRevision => {
                 self.submitted_plan = None;
+                // A revised plan invalidates any contract derived from it.
+                self.active_contract = None;
+                self.verification_passed_id = None;
+            }
+            JournalEvent::Contract { contract } => {
+                self.active_contract = Some(contract);
+                self.verification_passed_id = None;
+            }
+            JournalEvent::Verification { approval_id, pass } => {
+                if pass {
+                    self.verification_passed_id = Some(approval_id);
+                    self.phase = Phase::Verified;
+                } else {
+                    self.verification_passed_id = None;
+                }
             }
         }
     }
@@ -218,6 +279,10 @@ pub(super) enum JournalEvent {
         allow_next_worker_ids: Vec<String>,
         #[serde(default)]
         submitted_plan: Option<String>,
+        #[serde(default)]
+        active_contract: Option<ExecutionContract>,
+        #[serde(default)]
+        verification_passed_id: Option<String>,
     },
     Mode {
         mode: String,
@@ -252,14 +317,27 @@ pub(super) enum JournalEvent {
         kind: ApprovalKind,
         #[serde(default)]
         plan: Option<String>,
+        #[serde(default)]
+        verification: Option<String>,
     },
     /// A plan was submitted for approval (plan mode).
     PlanSubmitted {
         id: String,
         plan: String,
+        #[serde(default)]
+        verification: Option<String>,
     },
     /// The submitted plan was revised/replaced; clear the persisted copy.
     PlanRevision,
+    /// An approved plan became the active execution contract (Normal mode).
+    Contract {
+        contract: ExecutionContract,
+    },
+    /// Execution-time verification evidence was judged (pass/fail) for a contract.
+    Verification {
+        approval_id: String,
+        pass: bool,
+    },
     Worktree {
         state: String,
         #[serde(default)]
@@ -383,6 +461,8 @@ impl ForemanJournal {
                 allow_next_worker_id: state.allow_next_worker_id.clone(),
                 allow_next_worker_ids: state.allow_next_worker_ids.clone(),
                 submitted_plan: state.submitted_plan.clone(),
+                active_contract: state.active_contract.clone(),
+                verification_passed_id: state.verification_passed_id.clone(),
             },
         };
         let mut bytes = serde_json::to_vec(&line).map_err(std::io::Error::other)?;
@@ -530,6 +610,19 @@ pub(crate) fn decide_approval_for_session(
         state.mode = Mode::Normal;
         state.phase = Phase::Idle;
         state.submitted_plan = None;
+        // Carry the approved plan into an execution contract instead of
+        // dropping it: the resumed Normal run must keep the acceptance criteria.
+        if let Some(record) = decided
+            .iter()
+            .find(|record| record.kind == ApprovalKind::Plan && record.plan.is_some())
+        {
+            state.active_contract = record.plan.as_ref().map(|plan| ExecutionContract {
+                plan: plan.clone(),
+                verification: record.verification.clone(),
+                approval_id: Some(record.id.clone()),
+            });
+            state.verification_passed_id = None;
+        }
     }
     let mut journal = ForemanJournal::open(session_path)
         .map_err(|error| format!("cannot open foreman journal: {error}"))?;
@@ -554,6 +647,7 @@ pub(crate) fn decide_approval_for_session(
                     summary: record.summary.clone(),
                     kind: record.kind,
                     plan: record.plan.clone(),
+                    verification: record.verification.clone(),
                 },
                 true,
             )

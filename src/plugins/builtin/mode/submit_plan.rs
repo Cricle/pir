@@ -44,6 +44,14 @@ impl AgentTool for SubmitPlanTool {
                     "type": "string",
                     "description": "The concrete plan: ordered steps, files to change, risks, and verification."
                 },
+                "verification": {
+                    "type": "string",
+                    "description": "Optional execution-time acceptance criteria. When given, this is \
+                                   carried into the approved plan as a verification contract: the \
+                                   plan cannot be reported done until a real verification tool has \
+                                   been run with a successful result. Old callers that omit it keep \
+                                   the previous behavior."
+                },
                 "questions": {
                     "type": "array",
                     "items": { "type": "string" },

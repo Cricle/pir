@@ -1803,6 +1803,40 @@ fn submit_plan_input(plan: &str) -> Value {
     json!({ "plan": plan })
 }
 
+fn submit_plan_input_with_verification(plan: &str, verification: &str) -> Value {
+    json!({ "plan": plan, "verification": verification })
+}
+
+/// A successful shell command: assistant toolCall paired with a zero-exit
+/// toolResult, matching the generic evidence rules used by the contract gate.
+fn successful_verification_turn(call_id: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": call_id,
+                "name": "bash",
+                "arguments": { "command": "python -m unittest" }
+            }],
+            "stopReason": "toolUse"
+        }),
+        json!({
+            "role": "toolResult",
+            "toolCallId": call_id,
+            "toolName": "bash",
+            "isError": false,
+            "content": [{ "type": "text", "text": "Ran 3 tests OK\nCommand exited with code 0" }],
+            "details": { "exitCode": 0 }
+        }),
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "done" }],
+            "stopReason": "stop"
+        }),
+    ]
+}
+
 fn plan_approval_id_from_journal(path: &std::path::Path) -> String {
     let mut os = path.as_os_str().to_owned();
     os.push(".foreman.jsonl");
@@ -1953,5 +1987,232 @@ async fn submit_plan_is_hidden_outside_plan_mode_and_rejects_empty_plans() {
         .as_str()
         .unwrap_or_default()
         .contains("non-empty"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn submit_plan_with_verification_journals_it_and_changes_the_approval_id() {
+    let dir = plan_dir("verify-submit");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+
+    host.dispatch_command("mode", "plan")
+        .await
+        .expect("enter plan mode");
+    let plan = "1. implement\n2. check";
+    let plain_id = {
+        emit_tool_input(&host, "submit_plan", "call-plain", submit_plan_input(plan)).await;
+        plan_approval_id_from_journal(&path)
+    };
+    // A different verification clause is a materially different plan.
+    host.dispatch_command("mode", "plan").await.ok();
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-verify",
+        submit_plan_input_with_verification(plan, "run the test suite"),
+    )
+    .await;
+    assert_eq!(outcome["block"], true, "{outcome}");
+
+    let mut os = path.as_os_str().to_owned();
+    os.push(".foreman.jsonl");
+    let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
+    assert!(journal.contains("run the test suite"), "{journal}");
+    assert!(journal.contains("plan_submitted"), "{journal}");
+    // Both approvals are journaled and distinct (different verification).
+    let ids: Vec<String> = journal
+        .lines()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            if value.get("t") == Some(&Value::String("approval".to_owned()))
+                && value.get("state") == Some(&Value::String("requested".to_owned()))
+            {
+                value.get("id")?.as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .filter(|id| id.starts_with('p'))
+        .collect();
+    assert!(ids.contains(&plain_id), "{ids:?}");
+    assert!(ids.iter().any(|id| id != &plain_id), "{ids:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Helper: drive an approved plan (with verification) through /approvals.
+async fn approve_plan_with_contract(
+    dir: &std::path::Path,
+    plan: &str,
+    verification: &str,
+) -> (PluginHost, Arc<FakeStatus>) {
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
+    let status = Arc::new(FakeStatus::default());
+    let ui = FakeUi::selecting("approve");
+    let messages = Arc::new(FakeMessages::default());
+    let (host, _plugin) = host_with_plan(session, Arc::clone(&status), ui, messages);
+    host.dispatch_command("mode", "plan")
+        .await
+        .expect("enter plan mode");
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification(plan, verification),
+    )
+    .await;
+    assert_eq!(outcome["block"], true, "{outcome}");
+    let result = host
+        .dispatch_command("approvals", "")
+        .await
+        .expect("approvals command");
+    assert!(result.ok, "{result:?}");
+    (host, status)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn approving_a_plan_keeps_a_contract_and_injects_it_into_normal_prompts() {
+    let dir = plan_dir("contract-prompt");
+    let (host, status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing\n2. verify it",
+        "run the unit tests successfully",
+    )
+    .await;
+    assert_eq!(status.text("mode"), None, "normal mode restored");
+
+    let payload = emit_prompt(&host, true).await;
+    let sections = &payload["systemPromptOptions"]["sections"];
+    let contract = sections["execution_contract"].as_str().unwrap_or_default();
+    assert!(contract.contains("build the thing"), "{contract}");
+    assert!(
+        contract.contains("run the unit tests successfully"),
+        "{contract}"
+    );
+    assert!(
+        contract.contains("real tool result"),
+        "evidence requirement is explicit: {contract}"
+    );
+
+    let mut os = dir.join("session.jsonl").as_os_str().to_owned();
+    os.push(".foreman.jsonl");
+    let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
+    assert!(journal.contains("active_contract"), "{journal}");
+    assert!(
+        journal.contains("run the unit tests successfully"),
+        "{journal}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_plain_normal_run_without_a_contract_is_not_gated() {
+    let dir = plan_dir("no-contract");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["bash"], path);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    let result = emit_settle(&host, completed_turn(vec![])).await;
+    assert_ne!(result["continue"], true, "plain normal settles: {result}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn contract_gate_nudges_until_a_successful_verification_tool_result() {
+    let dir = plan_dir("contract-gate");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    // No verification tool result yet: the gate asks for one (custom message).
+    let gated = emit_settle(&host, completed_turn(vec![])).await;
+    assert_eq!(gated["continue"], true, "gate demands evidence: {gated}");
+    assert_eq!(gated["entries"][0]["customType"], "verification_gate");
+    let content = gated["entries"][0]["content"].as_str().unwrap_or_default();
+    assert!(content.contains("verification"), "{content}");
+
+    // A successful shell command satisfies the contract; settle proceeds.
+    let passed = emit_settle(&host, successful_verification_turn("call-verify-1")).await;
+    assert_ne!(
+        passed["continue"], true,
+        "successful evidence settles: {passed}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_shell_command_does_not_satisfy_the_contract_gate() {
+    let dir = plan_dir("contract-fail");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    let failed_turn = vec![
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call-fail",
+                "name": "bash",
+                "arguments": { "command": "python -m unittest" }
+            }],
+            "stopReason": "toolUse"
+        }),
+        json!({
+            "role": "toolResult",
+            "toolCallId": "call-fail",
+            "toolName": "bash",
+            "isError": false,
+            "content": [{ "type": "text", "text": "FAILED (failures=1)\nCommand exited with code 1" }],
+            "details": { "exitCode": 1 }
+        }),
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "done" }],
+            "stopReason": "stop"
+        }),
+    ];
+    let gated = emit_settle(&host, failed_turn).await;
+    assert_eq!(
+        gated["continue"], true,
+        "failed evidence keeps gate: {gated}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn contract_gate_stops_after_three_nudges_and_marks_unverified() {
+    let dir = plan_dir("contract-cap");
+    let (host, status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    for _ in 0..3 {
+        let gated = emit_settle(&host, completed_turn(vec![])).await;
+        assert_eq!(gated["continue"], true, "nudge within cap: {gated}");
+    }
+    // Fourth boundary: cap reached, no more nudge, run settles as unverified.
+    let settled = emit_settle(&host, completed_turn(vec![])).await;
+    assert_ne!(settled["continue"], true, "cap allows settle: {settled}");
+    assert_eq!(status.text("mode"), None, "still in normal mode");
+    let mut os = dir.join("session.jsonl").as_os_str().to_owned();
+    os.push(".foreman.jsonl");
+    let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
+    assert!(
+        journal.to_ascii_lowercase().contains("unverified"),
+        "unverified phase persisted: {journal}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

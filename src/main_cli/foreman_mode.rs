@@ -291,12 +291,24 @@ async fn run_decision(
     manager.ensure_exclusive_writer()?;
     for record in &decisions {
         let text = if record.kind == "plan" && approved {
-            format!(
+            let mut text = format!(
                 "PLAN APPROVED: `{}` ({}).\n\n{}\n\nImplement this plan now and verify the result.",
                 record.id,
                 record.summary,
                 record.plan.as_deref().unwrap_or("(see session transcript)")
-            )
+            );
+            if let Some(verification) = record
+                .verification
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                text.push_str(
+                    "\n\nExecution verification criteria (a real tool result must show success):\n",
+                );
+                text.push_str(verification);
+            }
+            text
         } else if record.kind == "plan" {
             format!(
                 "PLAN DENIED: `{}` ({}). Revise the plan and submit it again, or ask a clarifying question.",

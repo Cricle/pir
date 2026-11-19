@@ -66,6 +66,10 @@ pub(crate) struct ApprovalRecord {
     /// The full submitted plan text, when `kind == Plan`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plan: Option<String>,
+    /// Optional execution-time verification contract, when `kind == Plan`.
+    /// Old journals/sidecars without it replay as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification: Option<String>,
     #[serde(default)]
     pub(crate) kind: ApprovalKind,
 }
@@ -79,6 +83,7 @@ impl ApprovalRecord {
             state: ApprovalState::Requested,
             created_at_ms: now_ms(),
             plan: None,
+            verification: None,
             kind: ApprovalKind::Worker,
         }
     }
@@ -91,8 +96,21 @@ impl ApprovalRecord {
             state: ApprovalState::Requested,
             created_at_ms: now_ms(),
             plan: Some(plan),
+            verification: None,
             kind: ApprovalKind::Plan,
         }
+    }
+
+    pub(crate) fn plan_with_verification(
+        id: String,
+        call: String,
+        summary: String,
+        plan: String,
+        verification: Option<String>,
+    ) -> Self {
+        let mut record = Self::plan(id, call, summary, plan);
+        record.verification = verification;
+        record
     }
 
     pub(crate) fn is_pending(&self) -> bool {
