@@ -883,6 +883,12 @@ impl ModeState {
             .last_reviewer_call_id
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // A new worker can change the artifact after an earlier verification;
+        // its evidence must not satisfy the contract any more.
+        *self
+            .verification_passed_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Record one `subagent` tool call. Worker calls start a new generation
@@ -899,6 +905,11 @@ impl ModeState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             *self
                 .last_reviewer_call_id
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            // New worker output invalidates prior verification evidence.
+            *self
+                .verification_passed_id
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             self.set_phase(Phase::Delegating);
@@ -1484,6 +1495,25 @@ impl AgentPlugin for ModePlugin {
                         };
                     }
                     if mode == Mode::Normal {
+                        // A contract-backed Normal run may still delegate to a
+                        // worker. Track worker generations so new output
+                        // invalidates earlier verification evidence (the same
+                        // rule the foreman gate uses), without applying the
+                        // foreman read-only fence to ordinary Normal sessions.
+                        if self.state.active_contract().is_some() && tool == "subagent" {
+                            let call_id =
+                                event.str_field("toolCallId").unwrap_or_default().to_owned();
+                            let agents = event
+                                .payload
+                                .get("input")
+                                .map(|input| subagent_agents(input))
+                                .unwrap_or_default();
+                            let agents: Vec<String> =
+                                agents.into_iter().map(str::to_owned).collect();
+                            if agents.iter().any(|agent| agent != "reviewer") {
+                                self.state.record_subagent_agents(Some(&call_id), &agents);
+                            }
+                        }
                         return PluginEventOutcome::None;
                     }
                     // Plan-mode exit surface: submit the plan for approval.
@@ -2017,9 +2047,19 @@ fn verification_evidence_passed(payload: &Value) -> bool {
     else {
         return false;
     };
-    // Map tool call id -> shell tool name.
+    // Only tool results after the most recent approval can satisfy the active
+    // contract; a command from plan-investigation or a previous run must not.
+    let approval_index = messages
+        .iter()
+        .rposition(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && text_content(message.get("content")).contains("PLAN APPROVED")
+        })
+        .unwrap_or(0);
+    let window = &messages[approval_index..];
+    // Map tool call id -> shell tool name (within the post-approval window).
     let mut shell_calls: HashSet<String> = HashSet::new();
-    for message in messages {
+    for message in window {
         let Some(assistant) = message.get("content").and_then(Value::as_array) else {
             continue;
         };
@@ -2038,7 +2078,7 @@ fn verification_evidence_passed(payload: &Value) -> bool {
             }
         }
     }
-    messages.iter().any(|result| {
+    window.iter().any(|result| {
         let call_id = result
             .get("toolCallId")
             .and_then(Value::as_str)

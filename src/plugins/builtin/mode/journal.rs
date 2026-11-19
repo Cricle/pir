@@ -134,6 +134,8 @@ impl JournalState {
                 self.generation = self.generation.saturating_add(1);
                 self.reviewer = None;
                 self.nudges = 0;
+                // New worker output invalidates prior verification evidence.
+                self.verification_passed_id = None;
                 self.phase = Phase::Delegating;
             }
             JournalEvent::Review { pass, .. } => {

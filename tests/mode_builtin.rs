@@ -2216,3 +2216,91 @@ async fn contract_gate_stops_after_three_nudges_and_marks_unverified() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn verification_from_before_approval_does_not_satisfy_the_contract() {
+    let dir = plan_dir("contract-preapproval");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    // A successful command that appears BEFORE the current PLAN APPROVED user
+    // turn is stale evidence and must not clear the gate.
+    let stale = vec![
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call-before",
+                "name": "bash",
+                "arguments": { "command": "python -m unittest" }
+            }],
+            "stopReason": "toolUse"
+        }),
+        json!({
+            "role": "toolResult",
+            "toolCallId": "call-before",
+            "toolName": "bash",
+            "isError": false,
+            "content": [{ "type": "text", "text": "Ran 3 tests OK
+        Command exited with code 0" }],
+            "details": { "exitCode": 0 }
+        }),
+        json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "PLAN APPROVED: current approval" }]
+        }),
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "done" }],
+            "stopReason": "stop"
+        }),
+    ];
+    let gated = emit_settle(&host, stale).await;
+    assert_eq!(
+        gated["continue"], true,
+        "pre-approval command is stale: {gated}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_worker_after_verification_invalidates_the_contract_evidence() {
+    let dir = plan_dir("contract-worker-invalidates");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "bash", "read"], path);
+    let status = Arc::new(FakeStatus::default());
+    let ui = FakeUi::selecting("approve");
+    let messages = Arc::new(FakeMessages::default());
+    let (host, _plugin) = host_with_plan(session, Arc::clone(&status), ui, messages);
+
+    host.dispatch_command("mode", "plan").await.ok();
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification("1. build", "run tests"),
+    )
+    .await;
+    assert_eq!(outcome["block"], true, "{outcome}");
+    host.dispatch_command("approvals", "").await.ok();
+
+    // Verification passes first.
+    let passed = emit_settle(&host, successful_verification_turn("call-verify")).await;
+    assert_ne!(
+        passed["continue"], true,
+        "first verification passes: {passed}"
+    );
+
+    // A new worker can change the artifact: old evidence must be invalidated.
+    emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
+    let gated = emit_settle(&host, completed_turn(vec![])).await;
+    assert_eq!(
+        gated["continue"], true,
+        "new worker invalidates evidence: {gated}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
