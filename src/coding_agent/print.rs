@@ -3046,6 +3046,55 @@ pub fn truncation_notice(stop_reason: crate::ai::types::StopReason) -> Option<&'
     (stop_reason == crate::ai::types::StopReason::Length).then_some(TRUNCATION_WARNING)
 }
 
+/// Whether a resumed session's leaf ends at a failed assistant request
+/// (`stopReason: error`, e.g. an HTTP 10054 connection reset). This is the
+/// recovery signal for opt-in "resume and continue from the breakpoint":
+/// the branch path is already persisted entry-by-entry, so the interrupted
+/// turn's context survives even though that request produced no answer.
+///
+/// Only the LAST message entry on the projected branch counts: a mid-run
+/// `error` followed by later user/toolResult entries is not a breakpoint.
+pub fn session_tail_is_error(session: &crate::session_manager::SessionManager) -> bool {
+    use crate::session_manager::{FileEntry, StoredMessage};
+    session
+        .projected_branch_path(None)
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            FileEntry::Message(m) => match &m.message {
+                StoredMessage::Assistant(a) => {
+                    Some(a.stop_reason == crate::ai::types::StopReason::Error)
+                }
+                // Skip non-assistant message entries while scanning back, but
+                // do not let an assistant buried under a later user turn count.
+                StoredMessage::User(_) | StoredMessage::Custom(_) => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// The synthetic continuation prompt injected when `PIR_RESUME_ON_ERROR=1`
+/// and a resumed session's leaf is a failed request. The approved plan (if
+/// any) is already in the replayed transcript as a `PLAN APPROVED` user turn,
+/// so the model sees it; this prompt only tells it to resume rather than
+/// re-planning or re-asking.
+pub const RESUME_ON_ERROR_PROMPT: &str = "The previous request ended in an error. Continue from where you left off: resume the approved plan using the work already done (files and progress are on disk), do not restart or re-plan, and verify the final result before reporting done.";
+
+/// Fallback continuation text when an explicit resume has no prompt but the
+/// leaf is not a failed request (e.g. a clean stop). Keeps a bare `--resume`
+/// from issuing an empty-string turn.
+pub const RESUME_CONTINUATION_PROMPT: &str = "Continue the previous task from where it left off using the work already done, without restarting, and verify the final result before reporting done.";
+
+/// Env switch for opt-in breakpoint continuation on resume. Off by default so
+/// ordinary `--resume` semantics are unchanged.
+pub fn resume_on_error_enabled() -> bool {
+    std::env::var("PIR_RESUME_ON_ERROR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// What a print run produced: the text to write on stdout plus the process
 /// exit code (upstream `runPrintMode` returns an exit code alongside the
 /// output it already wrote).
@@ -3508,7 +3557,26 @@ pub async fn run_print_with_environment(
 
     let mut registry = ToolRegistry::new();
     crate::coding_agent::tools::register_core_tools(&mut registry);
-    let prompt_text = options.prompt.clone();
+    let mut prompt_text = options.prompt.clone();
+    // Opt-in breakpoint continuation (A1+A2): on an explicit resume with no
+    // new prompt, inject a synthetic "continue" turn so the existing loop
+    // re-runs with the full replayed history (including any approved plan).
+    // The leaf's stop reason only selects the wording; either way a bare
+    // `--resume` with no prompt must never run an empty-string turn. This must
+    // stay in lockstep with run_mode.rs, which relaxes the "prompt required"
+    // check under the same (is_continuing && switch) condition.
+    if options.is_continuing && prompt_text.trim().is_empty() && resume_on_error_enabled() {
+        let tail_is_error = session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(session_tail_is_error);
+        prompt_text = if tail_is_error {
+            RESUME_ON_ERROR_PROMPT.to_owned()
+        } else {
+            RESUME_CONTINUATION_PROMPT.to_owned()
+        };
+    }
     // The unified plugin host is built BEFORE `session_start`: the event is
     // dispatched through the host's ordered list, so its native plugins
     // observe the same startup event the JS face does (the JS adapter is

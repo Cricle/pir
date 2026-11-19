@@ -1091,6 +1091,16 @@ pub(super) async fn run() -> Result<()> {
                 None => match pir::coding_agent::cli::read_piped_input(stdin_tty, std::io::stdin())
                 {
                     Some(prompt) => prompt,
+                    None if (cli.continue_session || cli.resume)
+                        && pir::coding_agent::print::resume_on_error_enabled() =>
+                    {
+                        // Opt-in breakpoint continuation: an explicit resume
+                        // with no prompt is valid; run_print injects the
+                        // synthetic continuation turn (error-aware wording).
+                        // Ordinary resume still requires a prompt and keeps
+                        // the upstream error above.
+                        String::new()
+                    }
                     None => {
                         return Err(anyhow::anyhow!(
                             "pir print requires a prompt (pass an argument or pipe stdin)"

@@ -997,6 +997,10 @@ path = "tests/g_durable.rs"
 name = "print_native_session"
 path = "tests/print_native_session.rs"
 
+[[test]]
+name = "resume_on_error"
+path = "tests/resume_on_error.rs"
+
 # END GENERATED MERGED TEST TARGETS
 
 # The RustPython 0.4.0 stack trips rustc 1.99's `hint::assert_unchecked`
