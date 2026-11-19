@@ -1620,6 +1620,17 @@ impl AgentPlugin for ModePlugin {
                                 .get("input")
                                 .and_then(|input| input.get("verification")),
                         );
+                        if verification.is_none() {
+                            return PluginEventOutcome::ToolCall {
+                                block: true,
+                                reason: Some(
+                                    "submit_plan requires a non-empty `verification` field \
+                                     (a criteria string, or a list of commands to run exactly)."
+                                        .to_owned(),
+                                ),
+                                terminate: false,
+                            };
+                        }
                         let (id, created) = self.state.submit_plan(&call_id, &plan, verification);
                         if created {
                             self.state.notify_level(

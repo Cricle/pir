@@ -45,10 +45,11 @@ impl AgentTool for SubmitPlanTool {
                     "description": "The concrete plan: ordered steps, files to change, risks, and verification."
                 },
                 "verification": {
-                  "description": "Optional execution-time acceptance criteria. A string is legacy \
+                  "description": "REQUIRED execution-time acceptance criteria. A string is \
                                   free-form criteria (any successful command may satisfy it). An \
                                   array of command strings is a strict contract: one listed command \
-                                  must be executed verbatim and succeed.",
+                                  must be executed verbatim and succeed. An empty string/array is \
+                                  rejected.",
                   "oneOf": [
                     { "type": "string" },
                     { "type": "array", "items": { "type": "string" } }
@@ -60,7 +61,7 @@ impl AgentTool for SubmitPlanTool {
                     "description": "Optional open questions that block a correct plan."
                 }
             },
-            "required": ["plan"]
+            "required": ["plan", "verification"]
         }))
     }
 

@@ -1870,7 +1870,13 @@ async fn plan_submission_blocks_and_journals_a_plan_approval() {
         .await
         .expect("enter plan mode");
     let plan = "1. read src/lib.rs\n2. add a helper\n3. run tests";
-    let outcome = emit_tool_input(&host, "submit_plan", "call-plan", submit_plan_input(plan)).await;
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification(plan, "cargo test"),
+    )
+    .await;
     assert_eq!(outcome["block"], true, "{outcome}");
     let reason = outcome["reason"].as_str().unwrap_or_default();
     assert!(reason.contains("Plan approval pending"), "{reason}");
@@ -1899,7 +1905,13 @@ async fn approving_a_plan_switches_to_normal_and_sends_an_execution_follow_up() 
         .await
         .expect("enter plan mode");
     let plan = "1. change foo\n2. verify bar";
-    let outcome = emit_tool_input(&host, "submit_plan", "call-plan", submit_plan_input(plan)).await;
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification(plan, "cargo test"),
+    )
+    .await;
     assert_eq!(outcome["block"], true, "{outcome}");
 
     // The session is idle in tests, so /approvals shows the dialog and our
@@ -1944,7 +1956,13 @@ async fn denying_a_plan_keeps_plan_mode_and_asks_for_revision() {
         .await
         .expect("enter plan mode");
     let plan = "1. do the thing";
-    emit_tool_input(&host, "submit_plan", "call-plan", submit_plan_input(plan)).await;
+    emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification(plan, "cargo test"),
+    )
+    .await;
 
     host.dispatch_command("approvals", "")
         .await
@@ -2007,7 +2025,13 @@ async fn submit_plan_with_verification_journals_it_and_changes_the_approval_id()
         .expect("enter plan mode");
     let plan = "1. implement\n2. check";
     let plain_id = {
-        emit_tool_input(&host, "submit_plan", "call-plain", submit_plan_input(plan)).await;
+        emit_tool_input(
+            &host,
+            "submit_plan",
+            "call-plain",
+            submit_plan_input_with_verification(plan, "cargo test"),
+        )
+        .await;
         plan_approval_id_from_journal(&path)
     };
     // A different verification clause is a materially different plan.
@@ -2463,5 +2487,68 @@ async fn an_aborted_worker_blocks_reviewer_pass() {
         result["continue"], true,
         "aborted worker must block even a reviewer PASS: {result}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn submit_plan_requires_a_non_empty_verification_field() {
+    let dir = plan_dir("require-verify");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "plan").await.ok();
+
+    // Missing verification is rejected.
+    let missing =
+        emit_tool_input(&host, "submit_plan", "call-1", submit_plan_input("1. do x")).await;
+    assert_eq!(missing["block"], true, "{missing}");
+    assert!(
+        missing["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verification"),
+        "{}",
+        missing["reason"]
+    );
+
+    // Empty verification string and empty array are rejected too.
+    let empty_text = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-2",
+        json!({"plan": "1. do x", "verification": "   "}),
+    )
+    .await;
+    assert_eq!(empty_text["block"], true, "{empty_text}");
+    assert!(empty_text["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("verification"));
+
+    let empty_array = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-3",
+        json!({"plan": "1. do x", "verification": []}),
+    )
+    .await;
+    assert_eq!(empty_array["block"], true, "{empty_array}");
+    assert!(empty_array["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("verification"));
+
+    // A valid verification is accepted (blocked for approval, not rejected).
+    let ok = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-4",
+        submit_plan_input_with_verification("1. do x", "run tests"),
+    )
+    .await;
+    let reason = ok["reason"].as_str().unwrap_or_default();
+    assert_eq!(ok["block"], true, "{ok}");
+    assert!(reason.contains("Plan approval pending"), "{reason}");
     let _ = std::fs::remove_dir_all(&dir);
 }
