@@ -1128,7 +1128,8 @@ async fn node_phase2_crypto_buffer_os_process() {
         "randomBytes must return a Buffer: {v}"
     );
     assert_eq!(
-        v["hashes"], "md5,sha1,sha256,sha512",
+        v["hashes"],
+        "md5,sha1,sha224,sha256,sha384,sha512,sha3-224,sha3-256,sha3-384,sha3-512,shake128,shake256",
         "getHashes mismatch: {v}"
     );
     assert_eq!(v["timingEqual"], true, "timingSafeEqual equal case: {v}");
@@ -4126,5 +4127,356 @@ async fn fs_write_text_channel_is_byte_identical() {
             )
         });
         assert_eq!(bytes, expected, "bytes written to {name}: {bytes:02x?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// util.inspect native fast path: byte-for-byte Node 24 parity corpus
+// ---------------------------------------------------------------------------
+
+/// Expected `util.inspect` output captured from Node v24.22.1 (the corpus is
+/// shared with the native fast path in `host_functions/inspect_ops.rs`). It
+/// covers every shape the fast path renders natively (primitives incl. string
+/// escapes and lone surrogates, plain/null-prototype objects, dense arrays
+/// incl. compact-3 grouping, nested depth cut-offs, Map/Set, Date valid and
+/// invalid, RegExp, symbols, named class instances) and every shape it
+/// delegates (sparse/extended arrays, own accessors, custom inspect, proxies,
+/// circular values, functions, typed arrays, built-in subclasses, boxed
+/// primitives and non-default options). `Error` is intentionally absent: its
+/// stack embeds the file path, which differs between the two processes.
+const INSPECT_CORPUS_EXPECTED: &str = r#"{"undefined_v":"undefined","null_v":"null","true_v":"true","false_v":"false","zero":"0","neg_zero":"-0","int42":"42","neg17":"-17","nan":"NaN","inf":"Infinity","neg_inf":"-Infinity","float":"1.5","exp":"1e+21","tiny":"1e-7","bigint":"123n","bigint_neg":"-9007199254740993n","str_empty":"''","str_hello":"'hello'","str_dquote":"'with \"double\"'","str_squote":"\"it's here\"","str_both":"`it's \"quoted\"`","str_backtick":"'it\\'s \"q\" and `tick`'","str_escapes":"\"a\\nb\\tc\\\\d'e\\x00\\x7F\"","str_unicode":"'héllo 你好 😀'","str_lone_surrogate":"'a\\ud800b'","str_long":"'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'","str_long_nl":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' +\n  'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'","obj_empty":"{}","obj_a":"{ a: 1 }","obj_abc":"{ a: 1, b: 2, c: 3 }","obj_nested":"{ a: { b: { c: 1 } } }","obj_deep":"{ a: { b: { c: [Object] } } }","obj_wide":"{\n  aaaaaaaaaa: 'bbbbbbbbbb',\n  cccccccccc: 'dddddddddd',\n  eeeeeeeeee: 'ffffffffff',\n  gggggggggg: 'hhhhhhhhhh'\n}","obj_nullproto":"[Object: null prototype] { a: 1 }","obj_nullproto_empty":"[Object: null prototype] {}","obj_key_nonident":"{ 'a-b': 1, 'x y': 2, __proto__x: 3 }","obj_symbol_key":"{ a: 2, Symbol(skey): 1 }","class_foo":"Foo { a: 1 }","class_empty":"Empty {}","arr_empty":"[]","arr_one":"[ 1 ]","arr_three":"[ 1, 2, 3 ]","arr_seven":"[\n  1, 2, 3, 4,\n  5, 6, 7\n]","arr_twenty":"[\n   1,  2,  3,  4,  5,  6,  7,\n   8,  9, 10, 11, 12, 13, 14,\n  15, 16, 17, 18, 19, 20\n]","arr_strings_seven":"[\n  'a', 'b', 'c',\n  'd', 'e', 'f',\n  'g'\n]","arr_nested":"[ [ 1, 2 ], [ 3, 4 ] ]","arr_deep":"[ [ [ [Array] ] ] ]","map_empty":"Map(0) {}","map_two":"Map(2) { 'a' => 1, 'b' => 2 }","set_empty":"Set(0) {}","set_three":"Set(3) { 1, 2, 3 }","map_nested":"Map(1) { 'k' => { x: [ 1, 2 ] } }","date_epoch":"1970-01-01T00:00:00.000Z","date_iso":"2020-05-06T07:08:09.123Z","date_invalid":"Invalid Date","regexp":"/abc/gi","regexp_empty":"/(?:)/","symbol":"Symbol(x)","symbol_empty":"Symbol()","symbol_space":"Symbol(a b)","boxed_number":"[Number: 3]","boxed_string":"[String: 'ab']","boxed_boolean":"[Boolean: false]","holey_arr":"[ 1, <1 empty item>, 3 ]","extra_arr":"[ 1, 2, extra: 3 ]","map_with_prop":"Map(1) { 'a' => 1, extra: 2 }","fn":"[Function: namedFn]","uint8":"Uint8Array(3) [ 1, 2, 3 ]","proxy":"{ a: 1 }","circular":"<ref *1> { a: 1, self: [Circular *1] }","getter_obj":"WithGetter {}","custom_obj":"CUSTOM","sub_date":"SubDate 1970-01-01T00:00:00.000Z","sub_array":"SubArray(2) [ 1, 2 ]","sub_map":"SubMap(1) [Map] { 'a' => 1 }","opt_empty":"{ a: [ 1, 2, 3 ] }","opt_depth0":"{ a: [Object] }","opt_depth1":"{ a: { b: [Object] } }","opt_depth5":"{\n  a: {\n    b: { c: { d: { e: 1 } } }\n  }\n}","opt_depth0_empty":"{ a: {} }","opt_depth0_arr":"[ [] ]","opt_depth0_nullproto":"{ a: [Object: null prototype] }","opt_depth0_date":"{ a: 1970-01-01T00:00:00.000Z }","opt_compact1":"{ a: 1, b: 2 }","opt_break40":"{ a: 1, b: 2, c: 3 }","opt_showhidden":"{ a: 1 }","opt_getters":"WithGetter {}","opt_sorted":"{ a: 2, b: 1 }","opt_colors_false":"{ a: 1 }","opt_depth2":"{ a: [ 1, 2 ] }","opt_unknown":"{ a: 1 }","opt_depth0_map":"{ a: [Map] }","opt_depth0_set":"{ a: [Set] }","legacy_depth":"{ a: { b: 1 } }","legacy_default":"{ a: { b: 1 } }","opt_shownull":"undefined","date_max":"+275760-09-13T00:00:00.000Z","date_min":"-271821-04-20T00:00:00.000Z","date_year10000":"+010000-01-01T00:00:00.000Z","date_year0":"0000-01-01T00:00:00.000Z","date_neg1":"1969-12-31T23:59:59.999Z","arr_100":"[\n   1,  2,  3,   4,  5,  6,  7,  8,  9, 10, 11, 12,\n  13, 14, 15,  16, 17, 18, 19, 20, 21, 22, 23, 24,\n  25, 26, 27,  28, 29, 30, 31, 32, 33, 34, 35, 36,\n  37, 38, 39,  40, 41, 42, 43, 44, 45, 46, 47, 48,\n  49, 50, 51,  52, 53, 54, 55, 56, 57, 58, 59, 60,\n  61, 62, 63,  64, 65, 66, 67, 68, 69, 70, 71, 72,\n  73, 74, 75,  76, 77, 78, 79, 80, 81, 82, 83, 84,\n  85, 86, 87,  88, 89, 90, 91, 92, 93, 94, 95, 96,\n  97, 98, 99, 100\n]","arr_101":"[\n   1,  2,  3,   4,  5,  6,  7,  8,  9, 10, 11, 12,\n  13, 14, 15,  16, 17, 18, 19, 20, 21, 22, 23, 24,\n  25, 26, 27,  28, 29, 30, 31, 32, 33, 34, 35, 36,\n  37, 38, 39,  40, 41, 42, 43, 44, 45, 46, 47, 48,\n  49, 50, 51,  52, 53, 54, 55, 56, 57, 58, 59, 60,\n  61, 62, 63,  64, 65, 66, 67, 68, 69, 70, 71, 72,\n  73, 74, 75,  76, 77, 78, 79, 80, 81, 82, 83, 84,\n  85, 86, 87,  88, 89, 90, 91, 92, 93, 94, 95, 96,\n  97, 98, 99, 100,\n  ... 1 more item\n]","set_101":"Set(101) {\n  1,\n  2,\n  3,\n  4,\n  5,\n  6,\n  7,\n  8,\n  9,\n  10,\n  11,\n  12,\n  13,\n  14,\n  15,\n  16,\n  17,\n  18,\n  19,\n  20,\n  21,\n  22,\n  23,\n  24,\n  25,\n  26,\n  27,\n  28,\n  29,\n  30,\n  31,\n  32,\n  33,\n  34,\n  35,\n  36,\n  37,\n  38,\n  39,\n  40,\n  41,\n  42,\n  43,\n  44,\n  45,\n  46,\n  47,\n  48,\n  49,\n  50,\n  51,\n  52,\n  53,\n  54,\n  55,\n  56,\n  57,\n  58,\n  59,\n  60,\n  61,\n  62,\n  63,\n  64,\n  65,\n  66,\n  67,\n  68,\n  69,\n  70,\n  71,\n  72,\n  73,\n  74,\n  75,\n  76,\n  77,\n  78,\n  79,\n  80,\n  81,\n  82,\n  83,\n  84,\n  85,\n  86,\n  87,\n  88,\n  89,\n  90,\n  91,\n  92,\n  93,\n  94,\n  95,\n  96,\n  97,\n  98,\n  99,\n  100,\n  ... 1 more item\n}","map_101":"Map(101) {\n  0 => 1,\n  1 => 2,\n  2 => 3,\n  3 => 4,\n  4 => 5,\n  5 => 6,\n  6 => 7,\n  7 => 8,\n  8 => 9,\n  9 => 10,\n  10 => 11,\n  11 => 12,\n  12 => 13,\n  13 => 14,\n  14 => 15,\n  15 => 16,\n  16 => 17,\n  17 => 18,\n  18 => 19,\n  19 => 20,\n  20 => 21,\n  21 => 22,\n  22 => 23,\n  23 => 24,\n  24 => 25,\n  25 => 26,\n  26 => 27,\n  27 => 28,\n  28 => 29,\n  29 => 30,\n  30 => 31,\n  31 => 32,\n  32 => 33,\n  33 => 34,\n  34 => 35,\n  35 => 36,\n  36 => 37,\n  37 => 38,\n  38 => 39,\n  39 => 40,\n  40 => 41,\n  41 => 42,\n  42 => 43,\n  43 => 44,\n  44 => 45,\n  45 => 46,\n  46 => 47,\n  47 => 48,\n  48 => 49,\n  49 => 50,\n  50 => 51,\n  51 => 52,\n  52 => 53,\n  53 => 54,\n  54 => 55,\n  55 => 56,\n  56 => 57,\n  57 => 58,\n  58 => 59,\n  59 => 60,\n  60 => 61,\n  61 => 62,\n  62 => 63,\n  63 => 64,\n  64 => 65,\n  65 => 66,\n  66 => 67,\n  67 => 68,\n  68 => 69,\n  69 => 70,\n  70 => 71,\n  71 => 72,\n  72 => 73,\n  73 => 74,\n  74 => 75,\n  75 => 76,\n  76 => 77,\n  77 => 78,\n  78 => 79,\n  79 => 80,\n  80 => 81,\n  81 => 82,\n  82 => 83,\n  83 => 84,\n  84 => 85,\n  85 => 86,\n  86 => 87,\n  87 => 88,\n  88 => 89,\n  89 => 90,\n  90 => 91,\n  91 => 92,\n  92 => 93,\n  93 => 94,\n  94 => 95,\n  95 => 96,\n  96 => 97,\n  97 => 98,\n  98 => 99,\n  99 => 100,\n  ... 1 more item\n}","error_fixed":"Error: boom\n    at fixed (file.js:1:1)","revoked_proxy":"<Revoked Proxy>","weakmap":"WeakMap { <items unknown> }","weakset":"WeakSet { <items unknown> }","arraybuffer":"ArrayBuffer { [Uint8Contents]: <00 00 00 00>, [byteLength]: 4 }","dataview":"DataView {\n  [byteLength]: 4,\n  [byteOffset]: 0,\n  [buffer]: ArrayBuffer { [Uint8Contents]: <00 00 00 00>, [byteLength]: 4 }\n}","boxed_bigint":"[BigInt: 1n]","boxed_symbol":"[Symbol: Symbol(x)]","float64array":"Float64Array(2) [ 1.5, -0 ]","fmt_all":"str 42 16 150 {\"a\":1} { b: 2 }","fmt_s_only":"x","fmt_s_missing":"%s","fmt_s_number":"1.5","fmt_s_negzero":"-0","fmt_s_bigint":"123n","fmt_s_null":"null","fmt_s_undefined":"undefined","fmt_s_bool":"true","fmt_s_symbol":"Symbol(s)","fmt_s_array":"[ 1, 2 ]","fmt_s_date":"1970-01-01T00:00:00.000Z","fmt_s_regexp":"/re/gi","fmt_s_object_nested":"{ a: [Object] }","fmt_s_class":"Foo { a: 1 }","fmt_s_nullproto":"[Object: null prototype] { a: 1 }","fmt_s_custom_tostring":"CUSTOM","fmt_s_function":"function namedFn() {}","fmt_s_map":"Map(1) { 'a' => 1 }","fmt_d_string":"42","fmt_d_hex":"16","fmt_d_empty":"0","fmt_d_negzero_str":"-0","fmt_d_nan":"NaN","fmt_d_inf":"Infinity","fmt_d_bigint":"123n","fmt_d_symbol":"NaN","fmt_d_null":"0","fmt_d_undefined":"NaN","fmt_i_hex":"16","fmt_i_float":"3","fmt_i_exp":"1","fmt_i_negzero":"-0","fmt_i_bigint":"7n","fmt_f_exp":"150","fmt_f_text":"NaN","fmt_f_bigint":"5","fmt_f_symbol":"NaN","fmt_j_obj":"{\"a\":[1,2]}","fmt_j_str":"\"s\"","fmt_j_undefined":"undefined","fmt_j_fn":"undefined","fmt_j_nan":"null","fmt_j_circular":"[Circular]","fmt_O_obj":"{ a: { b: 1 } }","fmt_O_nested":"{ a: { b: { c: 1 } } }","fmt_O_string":"'x'","fmt_o_obj":"{ a: 1 }","fmt_percent":"100%%","fmt_percent_args":"%s x","fmt_percent_mix":"a%bc","fmt_pct_invalid":"%q x","fmt_trailing_pct":"abc%","fmt_c":"!","fmt_missing":"a %s","fmt_missing2":"1 %d","fmt_trailing_ints":"x 1 2","fmt_extra_mixed":"a b { c: 1 }","fmt_extra_bool":"a undefined null true","fmt_only_fmt":"hello","fmt_noargs":"","fmt_nonstring":"1 2 { a: 1 }","fmt_with_options_default":"{ a: 1 }","fmt_with_options_depth":"{ a: [Object] }","fmt_O":"{ a: [ 1, 2 ] }","fmt_o":"{ a: [ 1, 2, [length]: 2 ] }","fmt_s":"{ a: 1 }","fmt_plain":"s 42 {\"a\":1}","fmt_extra":"x { a: 1 } [ 1, 2 ]","buffer_small":"<Buffer 01 02 03>","buffer_text":"<Buffer 68 65 6c 6c 6f>","buffer_empty":"<Buffer >","buffer_51":"<Buffer ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ... 1 more byte>","buffer_100":"<Buffer ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ab ... 50 more bytes>","buffer_custom_false":"Buffer(3) [Uint8Array] [ 1, 2, 3 ]","buffer_extra":"<Buffer 01 02 03, foo: 'bar'>","buffer_extra_hidden":"<Buffer 01 02 03, foo: 'bar'>","buffer_nested":"{ b: <Buffer 01 02> }","buffer_depth0":"{ b: <Buffer 01 02> }","buffer_max_array":"<Buffer 01 02 03 04>","buffer_fmt_s":"hi","buffer_fmt_O":"<Buffer 01 02>","buffer_inspect_method":"<Buffer 01 02>","buffer_custom_symbol":"<Buffer 01 02>","usp_fmt_s":"a=1","agen":"[AsyncGeneratorFunction: agen]","agen_named":"[AsyncGeneratorFunction: named]","agen_anon":"[AsyncGeneratorFunction (anonymous)]","gen_fn":"[GeneratorFunction: gen]","async_fn":"[AsyncFunction: af]","tag_map":"Map(1) [Foo] { 'a' => 1 }","tag_set":"Set(1) [Bar] { 1 }","tag_date":"Date [When] 1970-01-01T00:00:00.000Z","tag_regexp":"RegExp [Pat] /a/g"}"#;
+
+const INSPECT_CORPUS_TS: &str = r#"
+import { inspect, format, formatWithOptions } from "node:util";
+
+class Foo { constructor() { (this as any).a = 1; } }
+class Empty {}
+class WithGetter { get x() { return 1; } }
+class Custom {}
+(Custom.prototype as any)[inspect.custom] = function () { return "CUSTOM"; };
+class SubDate extends Date {}
+class SubArray extends Array {}
+class SubMap extends Map {}
+
+const sym = Symbol("x");
+const sym2 = Symbol();
+const symSpace = Symbol("a b");
+const symKey = Symbol("skey");
+const circ: any = { a: 1 }; circ.self = circ;
+const holey = [1, , 3];
+const extraArr: any = [1, 2]; extraArr.extra = 3;
+const nullProto = Object.assign(Object.create(null), { a: 1 });
+const nullProtoEmpty = Object.create(null);
+const longStr = "x".repeat(90);
+const longStrNl = "aaa".repeat(30) + String.fromCharCode(10) + "bbb".repeat(30);
+const deepObj = { a: { b: { c: { d: 1 } } } };
+const deepArr = [[[[1]]]];
+const mapTwo = new Map([["a", 1], ["b", 2]]);
+const nestedMap = new Map([["k", { x: [1, 2] }]]);
+const mapWithProp: any = new Map([["a", 1]]); mapWithProp.extra = 2;
+const arr7 = [1, 2, 3, 4, 5, 6, 7];
+const arr20 = Array.from({ length: 20 }, (_, i) => i + 1);
+const arrStr7 = ["a", "b", "c", "d", "e", "f", "g"];
+const obj6long = { aaaaaaaaaa: "bbbbbbbbbb", cccccccccc: "dddddddddd", eeeeeeeeee: "ffffffffff", gggggggggg: "hhhhhhhhhh" };
+const namedFn = function namedFn() {};
+const uint8 = new Uint8Array([1, 2, 3]);
+const proxy = new Proxy({ a: 1 }, {});
+
+const NL = String.fromCharCode(10);
+const TAB = String.fromCharCode(9);
+const BS = String.fromCharCode(92);
+const NUL = String.fromCharCode(0);
+const DEL = String.fromCharCode(127);
+const LONE = String.fromCharCode(0xD800);
+
+const cases: any = {
+  undefined_v: undefined,
+  null_v: null,
+  true_v: true,
+  false_v: false,
+  zero: 0,
+  neg_zero: -0,
+  int42: 42,
+  neg17: -17,
+  nan: NaN,
+  inf: Infinity,
+  neg_inf: -Infinity,
+  float: 1.5,
+  exp: 1e21,
+  tiny: 1e-7,
+  bigint: 123n,
+  bigint_neg: -9007199254740993n,
+  str_empty: "",
+  str_hello: "hello",
+  str_dquote: 'with "double"',
+  str_squote: "it's here",
+  str_both: 'it\'s "quoted"',
+  str_backtick: 'it\'s "q" and `tick`',
+  str_escapes: "a" + NL + "b" + TAB + "c" + BS + "d'e" + NUL + DEL,
+  str_unicode: "héllo 你好 😀",
+  str_lone_surrogate: "a" + LONE + "b",
+  str_long: longStr,
+  str_long_nl: longStrNl,
+  obj_empty: {},
+  obj_a: { a: 1 },
+  obj_abc: { a: 1, b: 2, c: 3 },
+  obj_nested: { a: { b: { c: 1 } } },
+  obj_deep: deepObj,
+  obj_wide: obj6long,
+  obj_nullproto: nullProto,
+  obj_nullproto_empty: nullProtoEmpty,
+  obj_key_nonident: { "a-b": 1, "x y": 2, __proto__x: 3 },
+  obj_symbol_key: { [symKey]: 1, a: 2 },
+  class_foo: new Foo(),
+  class_empty: new Empty(),
+  arr_empty: [],
+  arr_one: [1],
+  arr_three: [1, 2, 3],
+  arr_seven: arr7,
+  arr_twenty: arr20,
+  arr_strings_seven: arrStr7,
+  arr_nested: [[1, 2], [3, 4]],
+  arr_deep: deepArr,
+  map_empty: new Map(),
+  map_two: mapTwo,
+  set_empty: new Set(),
+  set_three: new Set([1, 2, 3]),
+  map_nested: nestedMap,
+  date_epoch: new Date(0),
+  date_iso: new Date("2020-05-06T07:08:09.123Z"),
+  date_invalid: new Date(NaN),
+  regexp: /abc/gi,
+  regexp_empty: new RegExp(""),
+  symbol: sym,
+  symbol_empty: sym2,
+  symbol_space: symSpace,
+  boxed_number: new Number(3),
+  boxed_string: new String("ab"),
+  boxed_boolean: new Boolean(false),
+  holey_arr: holey,
+  extra_arr: extraArr,
+  map_with_prop: mapWithProp,
+  fn: namedFn,
+  uint8: uint8,
+  proxy: proxy,
+  circular: circ,
+  getter_obj: new WithGetter(),
+  custom_obj: new Custom(),
+  sub_date: new SubDate(0),
+  sub_array: new SubArray(1, 2),
+  sub_map: new SubMap([["a", 1]]),
+};
+
+export default (pi: any) => {
+  pi.on("session_start", () => {
+    const out: any = {};
+    for (const key of Object.keys(cases)) out[key] = inspect(cases[key]);
+
+    out.opt_empty = inspect({ a: [1, 2, 3] }, {});
+    out.opt_depth0 = inspect({ a: { b: { c: 1 } } }, { depth: 0 });
+    out.opt_depth1 = inspect({ a: { b: { c: 1 } } }, { depth: 1 });
+    out.opt_depth5 = inspect({ a: { b: { c: { d: { e: 1 } } } } }, { depth: 5 });
+    out.opt_depth0_empty = inspect({ a: {} }, { depth: 0 });
+    out.opt_depth0_arr = inspect([[]], { depth: 0 });
+    out.opt_depth0_nullproto = inspect({ a: Object.assign(Object.create(null), { b: 1 }) }, { depth: 0 });
+    out.opt_depth0_date = inspect({ a: new Date(0) }, { depth: 0 });
+    out.opt_compact1 = inspect({ a: 1, b: 2 }, { compact: 1 });
+    out.opt_break40 = inspect({ a: 1, b: 2, c: 3 }, { breakLength: 40 });
+    out.opt_showhidden = inspect({ a: 1 }, { showHidden: true });
+    out.opt_getters = inspect(new WithGetter(), { getters: true });
+    out.opt_sorted = inspect({ b: 1, a: 2 }, { sorted: true });
+    out.opt_colors_false = inspect({ a: 1 }, { colors: false });
+    out.opt_depth2 = inspect({ a: [1, 2] }, { depth: 2 });
+    out.opt_unknown = inspect({ a: 1 }, { foo: 1 } as any);
+    out.opt_depth0_map = inspect({ a: new Map([["k", 1]]) }, { depth: 0 });
+    out.opt_depth0_set = inspect({ a: new Set([1]) }, { depth: 0 });
+    out.legacy_depth = (inspect as any)({ a: { b: 1 } }, false, 1);
+    out.legacy_default = (inspect as any)({ a: { b: 1 } }, false);
+    out.opt_shownull = inspect(undefined);
+    out.date_max = inspect(new Date(8.64e15));
+    out.date_min = inspect(new Date(-8.64e15));
+    out.date_year10000 = inspect(new Date("+010000-01-01T00:00:00.000Z"));
+    out.date_year0 = inspect(new Date("0000-01-01T00:00:00.000Z"));
+    out.date_neg1 = inspect(new Date(-1));
+    out.arr_100 = inspect(Array.from({ length: 100 }, (_, i) => i + 1));
+    out.arr_101 = inspect(Array.from({ length: 101 }, (_, i) => i + 1));
+    out.set_101 = inspect(new Set(Array.from({ length: 101 }, (_, i) => i + 1)));
+    out.map_101 = inspect(new Map(Array.from({ length: 101 }, (_, i) => [i, i + 1])));
+    const fixedErr = new Error("boom");
+    fixedErr.stack = "Error: boom" + String.fromCharCode(10) + "    at fixed (file.js:1:1)";
+    const revoked = Proxy.revocable({ a: 1 }, {});
+    revoked.revoke();
+    out.error_fixed = inspect(fixedErr);
+    out.revoked_proxy = inspect(revoked.proxy);
+    out.weakmap = inspect(new WeakMap());
+    out.weakset = inspect(new WeakSet());
+    const ab = new ArrayBuffer(4);
+    out.arraybuffer = inspect(ab);
+    out.dataview = inspect(new DataView(ab));
+    out.boxed_bigint = inspect(Object(1n));
+    out.boxed_symbol = inspect(Object(Symbol("x")));
+    out.float64array = inspect(new Float64Array([1.5, -0]));
+    const customToString = { toString() { return "CUSTOM"; } };
+    const fmtMap = new Map([["a", 1]]);
+    const fmtArr = [1, 2];
+    const fmtCases: any = {
+      fmt_all: format("%s %d %i %f %j %O", "str", 42, "0x10", "1.5e2", { a: 1 }, { b: 2 }),
+      fmt_s_only: format("%s", "x"),
+      fmt_s_missing: format("%s"),
+      fmt_s_number: format("%s", 1.5),
+      fmt_s_negzero: format("%s", -0),
+      fmt_s_bigint: format("%s", 123n),
+      fmt_s_null: format("%s", null),
+      fmt_s_undefined: format("%s", undefined),
+      fmt_s_bool: format("%s", true),
+      fmt_s_symbol: format("%s", Symbol("s")),
+      fmt_s_array: format("%s", fmtArr),
+      fmt_s_date: format("%s", new Date(0)),
+      fmt_s_regexp: format("%s", /re/gi),
+      fmt_s_object_nested: format("%s", { a: { b: 1 } }),
+      fmt_s_class: format("%s", new Foo()),
+      fmt_s_nullproto: format("%s", Object.assign(Object.create(null), { a: 1 })),
+      fmt_s_custom_tostring: format("%s", customToString),
+      fmt_s_function: format("%s", function namedFn() {}),
+      fmt_s_map: format("%s", fmtMap),
+      fmt_d_string: format("%d", "42"),
+      fmt_d_hex: format("%d", "0x10"),
+      fmt_d_empty: format("%d", ""),
+      fmt_d_negzero_str: format("%d", "-0"),
+      fmt_d_nan: format("%d", "abc"),
+      fmt_d_inf: format("%d", Infinity),
+      fmt_d_bigint: format("%d", 123n),
+      fmt_d_symbol: format("%d", Symbol("d")),
+      fmt_d_null: format("%d", null),
+      fmt_d_undefined: format("%d", undefined),
+      fmt_i_hex: format("%i", "0x10"),
+      fmt_i_float: format("%i", "3.9"),
+      fmt_i_exp: format("%i", "1e3"),
+      fmt_i_negzero: format("%i", "-0"),
+      fmt_i_bigint: format("%i", 7n),
+      fmt_f_exp: format("%f", "1.5e2"),
+      fmt_f_text: format("%f", "abc"),
+      fmt_f_bigint: format("%f", 5n),
+      fmt_f_symbol: format("%f", Symbol("f")),
+      fmt_j_obj: format("%j", { a: [1, 2] }),
+      fmt_j_str: format("%j", "s"),
+      fmt_j_undefined: format("%j", undefined),
+      fmt_j_fn: format("%j", function namedFn() {}),
+      fmt_j_nan: format("%j", NaN),
+      fmt_j_circular: format("%j", circ),
+      fmt_O_obj: format("%O", { a: { b: 1 } }),
+      fmt_O_nested: format("%O", { a: { b: { c: 1 } } }),
+      fmt_O_string: format("%O", "x"),
+      fmt_o_obj: format("%o", { a: 1 }),
+      fmt_percent: format("100%%"),
+      fmt_percent_args: format("%%s", "x"),
+      fmt_percent_mix: format("a%%b%s", "c"),
+      fmt_pct_invalid: format("%q", "x"),
+      fmt_trailing_pct: format("abc%"),
+      fmt_c: format("%c!", "red"),
+      fmt_missing: format("%s %s", "a"),
+      fmt_missing2: format("%d %d", 1),
+      fmt_trailing_ints: format("x", 1, 2),
+      fmt_extra_mixed: format("%s", "a", "b", { c: 1 }),
+      fmt_extra_bool: format("%s", "a", undefined, null, true),
+      fmt_only_fmt: format("hello"),
+      fmt_noargs: format(),
+      fmt_nonstring: format(1, 2, { a: 1 }),
+      fmt_with_options_default: formatWithOptions({}, "%s", { a: 1 }),
+      fmt_with_options_depth: formatWithOptions({ depth: 0 }, "%O", { a: { b: 1 } }),
+    };
+    for (const key of Object.keys(fmtCases)) out[key] = fmtCases[key];
+    out.fmt_O = format("%O", { a: [1, 2] });
+    out.fmt_o = format("%o", { a: [1, 2] });
+    out.fmt_s = format("%s", { a: 1 });
+    out.fmt_plain = format("%s %d %j", "s", 42, { a: 1 });
+    out.fmt_extra = format("%s", "x", { a: 1 }, [1, 2]);
+
+    // Buffer's util.inspect.custom hook (node lib/buffer.js): `<Buffer 01 02>`
+    // with the 50-byte cap and the extra-property tail; `customInspect: false`
+    // keeps the typed-array rendering. Node v24.22.1 is the oracle.
+    out.buffer_small = inspect(Buffer.from([1, 2, 3]));
+    out.buffer_text = inspect(Buffer.from("hello"));
+    out.buffer_empty = inspect(Buffer.alloc(0));
+    out.buffer_51 = inspect(Buffer.alloc(51, 0xab));
+    out.buffer_100 = inspect(Buffer.alloc(100, 0xab));
+    out.buffer_custom_false = inspect(Buffer.from([1, 2, 3]), { customInspect: false });
+    const bufExtra = Buffer.from([1, 2, 3]);
+    (bufExtra as any).foo = "bar";
+    out.buffer_extra = inspect(bufExtra);
+    out.buffer_extra_hidden = inspect(bufExtra, { showHidden: true });
+    out.buffer_nested = inspect({ b: Buffer.from([1, 2]) });
+    out.buffer_depth0 = inspect({ b: Buffer.from([1, 2]) }, { depth: 0 });
+    out.buffer_max_array = inspect(Buffer.from([1, 2, 3, 4]), { maxArrayLength: 1 });
+    out.buffer_fmt_s = format("%s", Buffer.from("hi"));
+    out.buffer_fmt_O = format("%O", Buffer.from([1, 2]));
+    out.buffer_inspect_method = (Buffer.from([1, 2]) as any).inspect();
+    out.buffer_custom_symbol = (Buffer.from([1, 2]) as any)[inspect.custom]();
+    // Node's builtInObjects snapshot predates Buffer/URLSearchParams, so %s
+    // takes String(value) for both.
+    out.usp_fmt_s = format("%s", new URLSearchParams("a=1"));
+    // Function tags: util.types.isGeneratorFunction/isAsyncFunction are both
+    // true for async generator functions.
+    out.agen = inspect(async function* agen() {});
+    out.agen_named = inspect(async function* named() {});
+    out.agen_anon = inspect(async function* () {});
+    out.gen_fn = inspect(function* gen() {});
+    out.async_fn = inspect(async function af() {});
+
+    // Inherited Symbol.toStringTag: Node prefixes Map/Set/Date/RegExp. The
+    // native renderer must delegate these to the JS formatter.
+    Object.defineProperty(Map.prototype, Symbol.toStringTag, { value: "Foo", configurable: true });
+    Object.defineProperty(Set.prototype, Symbol.toStringTag, { value: "Bar", configurable: true });
+    Object.defineProperty(Date.prototype, Symbol.toStringTag, { value: "When", configurable: true });
+    Object.defineProperty(RegExp.prototype, Symbol.toStringTag, { value: "Pat", configurable: true });
+    out.tag_map = inspect(new Map([["a", 1]]));
+    out.tag_set = inspect(new Set([1]));
+    out.tag_date = inspect(new Date(0));
+    out.tag_regexp = inspect(/a/g);
+
+    (globalThis as any).__inspectCorpus = out;
+  });
+};
+"#;
+
+#[tokio::test(flavor = "current_thread")]
+async fn util_inspect_matches_node_24_corpus() {
+    let rt = new_runtime().await;
+    rt.seed_module("pir-ext:inspect-corpus.ts", INSPECT_CORPUS_TS)
+        .expect("seed inspect corpus fixture");
+    let loaded = rt.seeded_load("pir-ext:inspect-corpus.ts").await;
+    assert_eq!(loaded.expect("seeded load"), 1);
+
+    let mut payload = json!({ "reason": "startup" });
+    let outcome = rt
+        .emit("session_start", &mut payload)
+        .await
+        .expect("emit session_start");
+    assert!(
+        outcome.errors.is_empty(),
+        "inspect corpus handler errors: {:?}",
+        outcome.errors
+    );
+
+    let actual: Value = rt
+        .eval_json("JSON.stringify(globalThis.__inspectCorpus)")
+        .await
+        .expect("read inspect corpus");
+    let expected: Value =
+        serde_json::from_str(INSPECT_CORPUS_EXPECTED).expect("parse expected inspect corpus");
+    let actual = actual.as_object().expect("actual corpus object");
+    let expected = expected.as_object().expect("expected corpus object");
+
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "corpus case count: actual={:?}",
+        actual.keys().collect::<Vec<_>>()
+    );
+    for (label, want) in expected {
+        let got = actual
+            .get(label)
+            .unwrap_or_else(|| panic!("missing inspect case {label}: {actual:?}"));
+        assert_eq!(got, want, "util.inspect parity for case {label}");
     }
 }

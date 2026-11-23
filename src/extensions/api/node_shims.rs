@@ -7,7 +7,8 @@
 //! fs/os/crypto sources call `__pir_host.node(module, op, payloadJson)`
 //! (registered by `runtime::host_functions::node_fns`), which enforces the
 //! extension sandbox roots. Phase 3 adds child_process + zlib (host ops behind
-//! the second entry `__pir_host.nodeExt`, see `child_fns`) and the minimal
+//! the second entry `__pir_host.nodeExt`, implemented in
+//! `crates/pir-node/src/modules/child.rs`) and the minimal
 //! `stream` shim. Phase 4a.1 fills the real-extension gaps: the fs fd family
 //! plus chmod/cp/mkdtemp/rmdir/symlink, `fs/promises` open/opendir/mkdtemp
 //! (`FileHandle`/`Dir`), `stream/promises` (`finished`/`pipeline`), the
@@ -149,6 +150,9 @@ pub fn canonical_node_name(name: &str) -> Option<&'static str> {
 /// compiled it. Returning a fresh exact-sized `String` keeps the decoded
 /// bytes out of the resident set after boot.
 pub(super) fn shim_source(shim: &Shim) -> Option<String> {
+    if let Some(source) = dev_shim_source(shim.name()) {
+        return Some(source);
+    }
     match shim.inflate() {
         Ok(source) => Some(source),
         Err(error) => {
@@ -156,6 +160,40 @@ pub(super) fn shim_source(shim: &Shim) -> Option<String> {
             None
         }
     }
+}
+
+/// Development override: `PIR_EXT_SHIM_SRC=1` reads a virtual module's source
+/// from `src/extensions/api/js/<name>` on disk instead of the embedded deflate
+/// blob.
+///
+/// The blobs are `include_bytes!`-ed into the host, so without this switch
+/// every shim edit forces a full `pir-sdk` rebuild and relink (~3-5 minutes,
+/// and all test harnesses are 300MB+ binaries). With it, the edit-test loop
+/// for shims needs no build at all: run the existing binary with
+/// `PIR_EXT_SHIM_SRC=1 PIR_EXT_BYTECODE=0`.
+///
+/// Only active when the checkout path recorded at compile time still contains
+/// the file; an installed binary (or a moved checkout) silently keeps using
+/// the embedded blob, so production behavior is unchanged.
+fn dev_shim_source(name: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("PIR_EXT_SHIM_SRC").ok().as_deref(),
+            None | Some("0") | Some("false") | Some("off")
+        )
+    });
+    if !enabled {
+        return None;
+    }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("extensions")
+        .join("api")
+        .join("js")
+        .join(name);
+    std::fs::read_to_string(path).ok()
 }
 
 pub fn source_for(canonical: &str) -> Option<String> {
@@ -236,6 +274,97 @@ pub fn source_for(canonical: &str) -> Option<String> {
     }
 }
 
+/// Shim handle for a canonical node name, when the entry is file-backed.
+///
+/// Mirrors [`source_for`] minus entries served from a raw `&str` constant;
+/// those have no embedded `Shim` and therefore no AOT bytecode.
+pub fn shim_for(canonical: &str) -> Option<&'static Shim> {
+    match canonical {
+        "@node/path" => Some(&PATH_SHIM),
+        "@node/url" => Some(&URL_SHIM),
+        "@node/util" => Some(&UTIL_SHIM),
+        "@node/util/types" => Some(&UTIL_TYPES_SHIM),
+        "@node/events" => Some(&EVENTS_SHIM),
+        "@node/querystring" => Some(&QUERYSTRING_SHIM),
+        "@node/string_decoder" => Some(&STRING_DECODER_SHIM),
+        "@node/assert" => Some(&ASSERT_SHIM),
+        "@node/assert/strict" => Some(&ASSERT_STRICT_SHIM),
+        "@node/process" => Some(&PROCESS_SHIM),
+        "@node/fs" => Some(&FS_SHIM),
+        "@node/fs/promises" => Some(&FS_PROMISES_SHIM),
+        "@node/os" => Some(&OS_SHIM),
+        "@node/crypto" => Some(&CRYPTO_SHIM),
+        "@node/child_process" => Some(&CHILD_PROCESS_SHIM),
+        "@node/stream" => Some(&STREAM_SHIM),
+        "@node/stream/promises" => Some(&STREAM_PROMISES_SHIM),
+        "@node/zlib" => Some(&ZLIB_SHIM),
+        "@node/module" => Some(&MODULE_SHIM),
+        "@node/worker_threads" => Some(&WORKER_THREADS_SHIM),
+        "@node/net" => Some(&NET_SHIM),
+        "@node/dns" => Some(&DNS_SHIM),
+        "@node/dns/promises" => Some(&DNS_PROMISES_SHIM),
+        "@node/http" => Some(&HTTP_SHIM),
+        "@node/https" => Some(&HTTPS_SHIM),
+        "@node/sqlite" => Some(&SQLITE_SHIM),
+        "@node/async_hooks" => Some(&ASYNC_HOOKS_SHIM),
+        "@node/tty" => Some(&TTY_SHIM),
+        "@node/readline" => Some(&READLINE_SHIM),
+        "@node/readline/promises" => Some(&READLINE_PROMISES_SHIM),
+        "@node/v8" => Some(&V8_SHIM),
+        "@node/vm" => Some(&VM_SHIM),
+        "@node/constants" => Some(&CONSTANTS_SHIM),
+        "@node/punycode" => Some(&PUNYCODE_SHIM),
+        "@node/console" => Some(&CONSOLE_SHIM),
+        "@node/sys" => Some(&SYS_SHIM),
+        "@node/diagnostics_channel" => Some(&DIAGNOSTICS_CHANNEL_SHIM),
+        "@node/stream/web" => Some(&STREAM_WEB_SHIM),
+        "@node/stream/consumers" => Some(&STREAM_CONSUMERS_SHIM),
+        "@node/inspector" => Some(&INSPECTOR_SHIM),
+        "@node/inspector/promises" => Some(&INSPECTOR_PROMISES_SHIM),
+        "@node/http2" => Some(&HTTP2_SHIM),
+        "@node/cluster" => Some(&CLUSTER_SHIM),
+        "@node/dgram" => Some(&DGRAM_SHIM),
+        "@node/repl" => Some(&REPL_SHIM),
+        "@node/trace_events" => Some(&TRACE_EVENTS_SHIM),
+        "@node/domain" => Some(&DOMAIN_SHIM),
+        "@node/wasi" => Some(&WASI_SHIM),
+        "@node/test" => Some(&TEST_SHIM),
+        "@node/test/reporters" => Some(&TEST_REPORTERS_SHIM),
+        "@node/sea" => Some(&SEA_SHIM),
+        "@node/_http_agent" => Some(&HTTP_INTERNAL_SHIM),
+        "@node/_http_client" => Some(&HTTP_INTERNAL_SHIM),
+        "@node/_http_common" => Some(&HTTP_COMMON_SHIM),
+        "@node/_http_incoming" => Some(&HTTP_INCOMING_SHIM),
+        "@node/_http_outgoing" => Some(&HTTP_OUTGOING_SHIM),
+        "@node/_http_server" => Some(&HTTP_SERVER_SHIM),
+        "@node/_stream_duplex" => Some(&STREAM_INTERNALS_SHIM),
+        "@node/_stream_passthrough" => Some(&STREAM_EMPTY_INTERNALS_SHIM),
+        "@node/_stream_readable" => Some(&STREAM_INTERNALS_SHIM),
+        "@node/_stream_transform" => Some(&STREAM_EMPTY_INTERNALS_SHIM),
+        "@node/_stream_wrap" => Some(&STREAM_EMPTY_INTERNALS_SHIM),
+        "@node/_stream_writable" => Some(&STREAM_INTERNALS_SHIM),
+        "@node/_tls_common" => Some(&TLS_INTERNALS_SHIM),
+        "@node/_tls_wrap" => Some(&TLS_INTERNALS_SHIM),
+        _ => None,
+    }
+}
+
+/// Every file-backed node module, keyed by canonical `@node/<name>` (duplicate
+/// aliases collapse onto one entry). AOT generation input.
+pub fn known_modules() -> Vec<(&'static str, &'static Shim)> {
+    let mut out: Vec<(&'static str, &'static Shim)> = Vec::new();
+    for (_, canonical) in NODE_KNOWN {
+        let canonical = *canonical;
+        if out.iter().any(|(name, _)| *name == canonical) {
+            continue;
+        }
+        if let Some(shim) = shim_for(canonical) {
+            out.push((canonical, shim));
+        }
+    }
+    out
+}
+
 /// `process.platform`/`path` platform value, chosen at compile time.
 pub const NODE_PLATFORM: &str = if cfg!(windows) {
     "win32"
@@ -254,21 +383,55 @@ const NODE_ARCH: &str = if cfg!(target_arch = "x86_64") {
     std::env::consts::ARCH
 };
 
-/// One JS snippet injected once before `HOST_PRELUDE`: the platform constant,
-/// the shared `__pir_host.node` bridge, the CJS require runtime, the global
-/// `Buffer` backfill and the `process` global (LLRT-style compatibility
-/// label: the values describe a Node-compatible surface, not the actual
-/// host), plus the Web primitives (abort/events family, minimal streams,
-/// TextEncoder/TextDecoder and the global `fetch` surface) — every one of
-/// them guarded with `??` so an engine-provided global is never shadowed.
+/// Synthetic names for the two assembled boot bundles in the AOT registry
+/// (`assets/bytecode/<name>.qc`). They are not file-backed `Shim`s: the text
+/// is assembled from several shims, so the generator compiles the assembled
+/// bundle under these names and `runtime.rs` looks the blob up by them.
+pub const GLOBALS_BUNDLE: &str = "node_globals.js.txt";
+pub const NODE_MODULES_BOOTSTRAP_BUNDLE: &str = "node_modules_bootstrap.js.txt";
+
+/// One JS snippet injected once before the static globals bundle: the only
+/// per-build values (platform/arch), installed as JSON literals so the rest of
+/// the bundle stays byte-identical across targets and can be AOT-compiled.
+pub fn globals_constants_source() -> String {
+    format!(
+        "globalThis.__pirPlatform = {};\nglobalThis.__pirNodeArch = {};",
+        serde_json::to_string(NODE_PLATFORM).unwrap_or_else(|e| panic!("platform literal: {e}")),
+        serde_json::to_string(NODE_ARCH).unwrap_or_else(|e| panic!("arch literal: {e}")),
+    )
+}
+
+/// The full boot snippet: dynamic constants plus the static bundle. Retained
+/// for callers that evaluate the globals from source in one shot (tests and
+/// the `PIR_EXT_BYTECODE=0` fallback); the normal boot path installs the
+/// constants and then evaluates [`globals_bundle_source`] from AOT bytecode.
 pub fn globals_source() -> String {
-    let stub = PROCESS_GLOBAL_STUB.replace("__PIR_NODE_ARCH__", NODE_ARCH);
+    format!(
+        "{}\n{}",
+        globals_constants_source(),
+        globals_bundle_source()
+    )
+}
+
+/// One static JS snippet injected once before `HOST_PRELUDE`: the shared
+/// `__pir_host.node` bridge, the CJS require runtime, the global `Buffer`
+/// backfill and the `process` global (LLRT-style compatibility label: the
+/// values describe a Node-compatible surface, not the actual host), plus the
+/// Web primitives (abort/events family, minimal streams, TextEncoder/
+/// TextDecoder and the global `fetch` surface) — every one of them guarded
+/// with `??` so an engine-provided global is never shadowed.
+///
+/// Called separately from [`globals_constants_source`] so this entire text is
+/// compile-time static (and AOT-compiled); the arch placeholder is replaced by
+/// a read of the runtime-installed `globalThis.__pirNodeArch`.
+pub fn globals_bundle_source() -> String {
+    let stub = PROCESS_GLOBAL_STUB.replace("\"__PIR_NODE_ARCH__\"", "globalThis.__pirNodeArch");
     let names: Vec<String> = builtin_short_names()
         .iter()
         .map(|name| format!("\"{name}\""))
         .collect();
     format!(
-        "globalThis.__pirPlatform = \"{NODE_PLATFORM}\";\n{NODE_CALL_HELPER}\n{NODE_CJS_RUNTIME}\n\
+        "{NODE_CALL_HELPER}\n{NODE_CJS_RUNTIME}\n\
          globalThis.require ?? (globalThis.require = globalThis.__pirMakeRequire(\"\"));\n\
          globalThis.__pirBuiltinModuleNames = [{}];\n\
          globalThis.__pirNodeModules = globalThis.__pirNodeModules || {{}};\n{BUFFER_GLOBAL}\n{INTL_PAD}\n{stub}\n\
@@ -308,6 +471,31 @@ globalThis.__pirLoadNodeBuiltins = async function () {
     }
   }
   globalThis.__pirBootErrors = failures;
+  // Builtin subpath identity (Node contract): `path/posix` and `path/win32`
+  // are the SAME objects as `path.posix` / `path.win32`, not copies. The CJS
+  // builtin path materializes a per-name plain copy from the namespace; the
+  // copy cache is the module-table's identity point, so seeding it with the
+  // namespace's own members gives reference equality for both bare and
+  // `node:`-prefixed specifiers (canonicalization maps both to one cache
+  // key). Boundary: `fs/promises === fs.promises` is owned by the fs shim
+  // (its `promises` property must be that module's namespace object) and is
+  // deliberately not seeded here; `stream/promises` / `dns/promises` are
+  // still unequal to their parent-module properties (their shims own that).
+  try {
+    const cache = globalThis.__pirBuiltinRequireCache;
+    const pathMod = mods.path;
+    const pathNs = pathMod && (pathMod.default || pathMod);
+    if (cache && pathNs) {
+      if (pathNs.posix !== undefined) cache.set("path/posix", pathNs.posix);
+      if (pathNs.win32 !== undefined) cache.set("path/win32", pathNs.win32);
+    }
+  } catch (error) { /* identity seeding is best-effort */ }
+  // Node-parity global visibility: hide the runtime internals installed by
+  // the shims during this sweep (the prelude already hid its own), so
+  // test/common's known-globals check sees Node's surface.
+  if (typeof globalThis.__pirHideGlobals === "function") {
+    globalThis.__pirHideGlobals();
+  }
   return failures.length > 0 ? "failures" : "ok";
 };
 "#
@@ -318,15 +506,20 @@ globalThis.__pirLoadNodeBuiltins = async function () {
 /// teardown): Node's final event, with the exit code the process would
 /// carry. A throwing exit handler is swallowed — Node prints and continues,
 /// and teardown must not be aborted by extension code.
-pub const PROCESS_EXIT_SOURCE: &str =
-    "try { process.emit(\"exit\", process.exitCode || 0); } catch (e) {}";
+/// Any `__pir*`/web global a late host call installed is hidden first: the
+/// `exit` listeners are where `test/common` runs its known-globals leak check
+/// (before its mustCall accounting), so visibility must already match Node.
+pub const PROCESS_EXIT_SOURCE: &str = "\
+try { if (typeof __pirHideGlobals === \"function\") __pirHideGlobals(); } catch (e) {} \
+try { process.emit(\"exit\", process.exitCode || 0); } catch (e) {}";
 
 /// Shared JSON bridge to `__pir_host.node`: unwraps the `{ok,value}` /
 /// `{ok:false,code,message,syscall,path}` envelope and raises a Node-shaped
 /// `Error`; the fs/os/crypto/process shims all route through this helper. The
 /// `child`/`zlib` module names ride the second native entry
-/// (`__pir_host.nodeExt`, registered by `child_fns`) — the primary dispatcher
-/// is the phase-2 fs/os/crypto table's own — with the identical envelope.
+/// (`__pir_host.nodeExt`, dispatched into `pir-node`'s child_process table) —
+/// the primary dispatcher is the fs/os/crypto table's own — with the
+/// identical envelope.
 static NODE_CALL_HELPER: Shim = Shim::new(
     "node_call_helper.js.txt",
     include_bytes!("../../../assets/shims/node_call_helper.js.txt.deflate"),
@@ -1653,8 +1846,31 @@ function btoa(input) {
   return Buffer.from(String(input), "latin1").toString("base64");
 }
 
+// `buffer.isUtf8` / `buffer.isAscii` take a string, an ArrayBuffer or any
+// ArrayBufferView, and throw ERR_INVALID_ARG_TYPE for everything else (Node
+// v24). A detached buffer (and every view over it) reads as empty, so the
+// zero-length case is decided before the view is constructed -- building a
+// TypedArray over a detached buffer throws.
+function pirByteSource(value) {
+  if (typeof value === "string") return Buffer.from(value, "utf8");
+  if (value instanceof ArrayBuffer) {
+    return value.byteLength === 0 ? new Uint8Array(0) : new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return value.byteLength === 0
+      ? new Uint8Array(0)
+      : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  const received = value === null ? "null" : "type " + typeof value;
+  const error = new TypeError(
+    'The "buf" argument must be an instance of Buffer, TypedArray, or DataView. Received ' + received,
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+}
+
 function isAscii(value) {
-  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8");
+  const bytes = pirByteSource(value);
   for (let i = 0; i < bytes.length; i++) {
     if (bytes[i] > 0x7f) return false;
   }
@@ -1662,24 +1878,25 @@ function isAscii(value) {
 }
 
 function isUtf8(value) {
-  if (!Buffer.isBuffer(value)) return false;
+  const bytes = pirByteSource(value);
+  const length = bytes.length;
   let i = 0;
-  while (i < value.length) {
-    const byte = value[i];
+  while (i < length) {
+    const byte = bytes[i];
     if (byte <= 0x7f) {
       i += 1;
     } else if (byte >= 0xc2 && byte <= 0xdf) {
-      if (i + 1 >= value.length || (value[i + 1] & 0xc0) !== 0x80) return false;
+      if (i + 1 >= length || (bytes[i + 1] & 0xc0) !== 0x80) return false;
       i += 2;
     } else if (byte >= 0xe0 && byte <= 0xef) {
-      if (i + 2 >= value.length || (value[i + 1] & 0xc0) !== 0x80 || (value[i + 2] & 0xc0) !== 0x80) return false;
-      if (byte === 0xe0 && value[i + 1] < 0xa0) return false;
-      if (byte === 0xed && value[i + 1] > 0x9f) return false;
+      if (i + 2 >= length || (bytes[i + 1] & 0xc0) !== 0x80 || (bytes[i + 2] & 0xc0) !== 0x80) return false;
+      if (byte === 0xe0 && bytes[i + 1] < 0xa0) return false;
+      if (byte === 0xed && bytes[i + 1] > 0x9f) return false;
       i += 3;
     } else if (byte >= 0xf0 && byte <= 0xf4) {
-      if (i + 3 >= value.length || (value[i + 1] & 0xc0) !== 0x80 || (value[i + 2] & 0xc0) !== 0x80 || (value[i + 3] & 0xc0) !== 0x80) return false;
-      if (byte === 0xf0 && value[i + 1] < 0x90) return false;
-      if (byte === 0xf4 && value[i + 1] > 0x8f) return false;
+      if (i + 3 >= length || (bytes[i + 1] & 0xc0) !== 0x80 || (bytes[i + 2] & 0xc0) !== 0x80 || (bytes[i + 3] & 0xc0) !== 0x80) return false;
+      if (byte === 0xf0 && bytes[i + 1] < 0x90) return false;
+      if (byte === 0xf4 && bytes[i + 1] > 0x8f) return false;
       i += 4;
     } else {
       return false;
@@ -2234,7 +2451,8 @@ static TEXT_CODEC_GLOBAL: Shim = Shim::new(
 );
 
 /// Global `fetch` + `Request`/`Response`/`Headers` (engine global) over the
-/// `__pir_host.http` bridge (`http_fns.rs`): headers return first, the body
+/// `__pir_host.http` bridge (`crates/pir-node/src/modules/http.rs`): headers
+/// return first, the body
 /// streams through poll windows into `Response.body`'s ReadableStream,
 /// `text()`/`json()`/`arrayBuffer()` aggregate through the same reader, and
 /// an aborted `AbortSignal` cancels the host request. Real tier for the

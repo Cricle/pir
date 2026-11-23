@@ -3,6 +3,83 @@ import { EventEmitter } from "@node/events";
 
 const Buffer = globalThis.Buffer;
 const call = globalThis.__pirNodeCall;
+const PIR_ZLIB_EMPTY = Buffer.alloc(0);
+
+/// Node's lib/zlib.js captures `require('buffer').kMaxLength` at module load
+/// and refuses to concatenate a result larger than it. The buffer module lets
+/// a caller mutate that export before the first `require('zlib')`
+/// (test-zlib-kmaxlength-rangeerror does exactly that), so the value is read
+/// once here too.
+const PIR_KMAXLENGTH = (() => {
+  try {
+    // The CJS builtin cache is the object `require('buffer')` returns (and
+    // therefore the one a caller mutates); `process.getBuiltinModule` hands
+    // back a separate copy in this runtime.
+    const cache = globalThis.__pirBuiltinRequireCache;
+    let buffer = cache !== undefined && typeof cache.get === "function"
+      ? cache.get("buffer")
+      : undefined;
+    if (buffer === undefined && typeof process === "object" && process !== null &&
+        typeof process.getBuiltinModule === "function") {
+      buffer = process.getBuiltinModule("buffer");
+    }
+    if (buffer !== undefined && typeof buffer.kMaxLength === "number") {
+      return buffer.kMaxLength;
+    }
+  } catch (_error) {
+    // Fall through to the permissive default.
+  }
+  return 9007199254740991;
+})();
+
+/// The live cap. Node's zlib captures `require('buffer').kMaxLength` at load
+/// time, but this runtime imports every builtin eagerly during bootstrap,
+/// before a test can mutate the module export (test-zlib-kmaxlength-rangeerror
+/// does `require('buffer'); buffer.kMaxLength = 64; require('zlib')`). The
+/// require hook below snapshots the value when `require('zlib')` first hands
+/// out this module — the same observable moment Node captures it.
+let pirZlibCapturedKMaxLength;
+
+function pirZlibKMaxLength() {
+  if (pirZlibCapturedKMaxLength !== undefined) return pirZlibCapturedKMaxLength;
+  try {
+    const cache = globalThis.__pirBuiltinRequireCache;
+    const buffer = cache !== undefined && typeof cache.get === "function"
+      ? cache.get("buffer")
+      : undefined;
+    if (buffer !== undefined && typeof buffer.kMaxLength === "number") {
+      return buffer.kMaxLength;
+    }
+  } catch (_error) {
+    // Fall through to the snapshot/default.
+  }
+  return PIR_KMAXLENGTH;
+}
+
+function pirZlibTooLarge() {
+  const error = new RangeError(
+    "Cannot create a Buffer larger than " + pirZlibKMaxLength() + " bytes");
+  error.code = "ERR_BUFFER_TOO_LARGE";
+  return error;
+}
+
+// Node exposes libzstd's error enum on the error object: `errno` is the
+// numeric ZSTD_error_* code and `code` is its name. The host encoder accepts
+// `pledgedSrcSize` but does not enforce it, so the shim checks the (fully
+// buffered) input length against the pledge the way ZSTD_compress2 does at
+// finish (test-zlib-zstd-pledged-src-size).
+function pirZstdPledgedError() {
+  const error = new Error("Src size is incorrect");
+  error.code = "ZSTD_error_srcSize_wrong";
+  error.errno = 72; // ZSTD_error_srcSize_wrong
+  return error;
+}
+
+function pirZlibOutOfBounds() {
+  const error = new RangeError("input buffer is out of bounds");
+  error.code = "ERR_OUT_OF_RANGE";
+  return error;
+}
 
 // ---------------------------------------------------------------------------
 // Node-shaped argument errors
@@ -57,14 +134,30 @@ function pirOutOfRange(name, range, value) {
 
 function zlibBytes(data, encoding) {
   if (typeof data === "string") return Buffer.from(data, encoding === undefined ? "utf8" : encoding);
-  if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
+  // Buffers are already the right shape: re-wrapping one in another view (as
+  // this used to) copies the whole payload before every codec call.
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
   // Every ArrayBuffer view kind is a valid chunk in node (test-zlib-convenience-methods
   // feeds Int8Array..DataView), so the check is the view brand, not Uint8Array.
+  // `Buffer.from(arrayBuffer, offset, length)` is a shared view in node (and
+  // in this shim), so no byte copy happens here either. A view whose
+  // `byteOffset`/`byteLength` getters were overridden past the backing store is
+  // Node's `ERR_OUT_OF_RANGE` "input buffer is out of bounds"
+  // (test-zlib-invalid-input's spoofedLength).
   if (ArrayBuffer.isView(data)) {
-    return Buffer.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    const offset = data.byteOffset;
+    const length = data.byteLength;
+    const capacity = data.buffer === undefined || data.buffer === null
+      ? 0
+      : data.buffer.byteLength;
+    if (!(offset >= 0) || !(length >= 0) || offset + length > capacity) {
+      throw pirZlibOutOfBounds();
+    }
+    return Buffer.from(data.buffer, offset, length);
   }
   throw pirInvalidArgType(
-    "chunk",
+    "buffer",
     "of type string or an instance of Buffer, TypedArray, DataView, or ArrayBuffer",
     data,
   );
@@ -85,6 +178,9 @@ function pirZlibOption(options, name, min, max) {
   if (typeof value !== "number") {
     throw pirInvalidArgType("options." + name, "of type number", value);
   }
+  // Node's `checkRangesOrGetDefault`: NaN means "use the default", while an
+  // infinite value is an ERR_OUT_OF_RANGE ("a finite number").
+  if (Number.isNaN(value)) return undefined;
   if (!Number.isFinite(value)) {
     throw pirOutOfRange("options." + name, "a finite number", value);
   }
@@ -113,20 +209,42 @@ function pirZlibDictionary(options) {
 }
 
 /// The option surface shared by every deflate/inflate family constructor.
-function pirZlibValidateOptions(options) {
+/// `op` selects the family-specific windowBits contract (lib/zlib.js Zlib):
+/// GZIP/GUNZIP require 9..15, the others 8..15, and the decoders accept 0 to
+/// "use the window size from the stream header".
+function pirZlibValidateOptions(options, op) {
   const opts = options === undefined || options === null ? {} : options;
   pirZlibOption(opts, "chunkSize", 64, Infinity);
-  pirZlibOption(opts, "windowBits", 8, 15);
+  const mode = op === undefined ? "deflate" : op;
+  const windowBits = opts.windowBits;
+  if (windowBits === undefined) {
+    // default 15
+  } else if ((windowBits === null || windowBits === 0) &&
+             (mode === "inflate" || mode === "gunzip" || mode === "unzip")) {
+    // null/0 = derive the window size from the compressed stream.
+  } else {
+    const min = mode === "gzip" || mode === "gunzip" ? 9 : 8;
+    pirZlibOption(opts, "windowBits", min, 15);
+  }
   pirZlibOption(opts, "level", -1, 9);
   pirZlibOption(opts, "memLevel", 1, 9);
   pirZlibOption(opts, "strategy", 0, 4);
+  // lib/zlib.js: the deflate family accepts every Z_* flush value (0..Z_BLOCK).
+  pirZlibOption(opts, "flush", 0, 5);
+  pirZlibOption(opts, "finishFlush", 0, 5);
   pirZlibDictionary(opts);
+  if (opts.rejectGarbageAfterEnd !== undefined &&
+      typeof opts.rejectGarbageAfterEnd !== "boolean") {
+    throw pirInvalidArgType("options.rejectGarbageAfterEnd", "of type boolean",
+                            opts.rejectGarbageAfterEnd);
+  }
   return opts;
 }
 
 /// `zlib.<Family>#params(level, strategy)` — Node's ranges for the deflate
 /// family (zlib.h's Z_MIN_LEVEL..Z_MAX_LEVEL / Z_DEFAULT_STRATEGY..Z_FIXED).
-function pirZlibParams(self, level, strategy) {
+function pirZlibParams(self, level, strategy, callback) {
+  if (typeof strategy === "function") { callback = strategy; strategy = undefined; }
   if (typeof level !== "number") {
     throw pirInvalidArgType("level", "of type number", level);
   }
@@ -139,31 +257,55 @@ function pirZlibParams(self, level, strategy) {
     if (!Number.isFinite(strategy)) throw pirOutOfRange("strategy", "a finite number", strategy);
     if (strategy < 0 || strategy > 4) throw pirOutOfRange("strategy", ">= 0 and <= 4", strategy);
   }
+  // Node's params() applies after a full flush of the input written so far.
+  // Run the buffered input through the codec with the *current* knobs and
+  // queue the output (readable via read()/data events), then start fresh.
+  if (Array.isArray(self._chunks) && self._chunks.length > 0) {
+    try {
+      const out = zlibCodec(self._op, Buffer.concat(self._chunks), undefined, self._options,
+                            self._paramsLevel);
+      self._chunks = [];
+      if (self._writableState !== undefined) self._writableState.length = 0;
+      if (typeof self._enqueueReadable === "function") self._enqueueReadable(out);
+    } catch (error) {
+      self.emit("error", zlibError(error, self._op));
+    }
+  }
   self._level = level;
   self._strategy = strategy === undefined ? 0 : strategy;
+  // `params()` is the post-construction knob; the next one-shot codec call
+  // forwards it without mutating the caller's options object.
+  self._paramsLevel = level;
+  // Node calls the optional callback asynchronously (test-zlib-reset-before-
+  // write passes one both before and after reset).
+  if (callback !== undefined && typeof callback !== "function") {
+    throw pirInvalidArgType("callback", "of type function", callback);
+  }
+  if (typeof callback === "function") globalThis.__pirMicrotask(callback);
   return undefined;
 }
 
-// Host op names as routed by __pirNodeCall: the gzip/zlib-wrapped family
-// lives on the legacy nodeExt table, the raw-DEFLATE pair on the primary
-// table (see js/node_call_helper.js.txt). The brotli/zstd ops have no entry
+// Host op names as routed by __pirNodeCall: every family now rides the legacy
+// nodeExt table (`child::zlib_op`), including the raw-DEFLATE pair (whose
+// former `deflateRawSync`/`inflateRawSync` names doubled as the primary-table
+// whitelist in js/node_call_helper.js.txt). The brotli/zstd ops have no entry
 // here — they keep their own name and fall through to the legacy table
-// (`CODEC_OPS[resolved] || resolved`), where child_fns.rs::zlib_op serves them.
+// (`CODEC_OPS[resolved] || resolved`).
 const CODEC_OPS = {
   gzip: "gzip",
   gunzip: "gunzip",
   deflate: "deflate",
   inflate: "inflate",
-  deflateRaw: "deflateRawSync",
-  inflateRaw: "inflateRawSync",
+  deflateRaw: "deflateRaw",
+  inflateRaw: "inflateRaw",
 };
 
 /// The option window of the modern codecs (brotli/zstd): node validates
-/// `chunkSize` (Z_MIN_CHUNK..Z_MAX_CHUNK) and the two operation knobs
+/// `chunkSize` (Z_MIN_CHUNK..Z_MAX_CHUNK), the two operation knobs
 /// (`flush`/`finishFlush`, 0..=BROTLI_OPERATION_EMIT_METADATA for brotli,
-/// 0..=ZSTD_e_end for zstd). The deflate-family window
-/// (level/windowBits/memLevel/strategy) does NOT apply — real node ignores
-/// those keys here, so they must not be rejected.
+/// 0..=ZSTD_e_end for zstd) and the `params` dictionary. The deflate-family
+/// window (level/windowBits/memLevel/strategy) does NOT apply — real node
+/// ignores those keys here, so they must not be rejected.
 function pirZlibModernOptions(op, options) {
   const opts = options === undefined || options === null ? {} : options;
   const isZstd = op.indexOf("zstd") === 0;
@@ -171,40 +313,407 @@ function pirZlibModernOptions(op, options) {
   pirZlibOption(opts, "chunkSize", 64, Infinity);
   pirZlibOption(opts, "flush", 0, flushMax);
   pirZlibOption(opts, "finishFlush", 0, flushMax);
+  pirZlibDictionary(opts);
+  if (isZstd && opts.pledgedSrcSize !== undefined) {
+    pirZstdPledgedSrcSize(opts.pledgedSrcSize);
+  }
+  if (opts.rejectGarbageAfterEnd !== undefined &&
+      typeof opts.rejectGarbageAfterEnd !== "boolean") {
+    throw pirInvalidArgType("options.rejectGarbageAfterEnd", "of type boolean",
+                            opts.rejectGarbageAfterEnd);
+  }
+  pirCodecParams(op, opts.params);
   return opts;
 }
 
+/// Node's zstd pledged-size validation (`validateInteger(..., 0,
+/// MAX_SAFE_INTEGER)`): a non-number is ERR_INVALID_ARG_TYPE, a non-integer or
+/// out-of-range value is ERR_OUT_OF_RANGE.
+function pirZstdPledgedSrcSize(value) {
+  if (typeof value !== "number") {
+    throw pirInvalidArgType("options.pledgedSrcSize", "of type number", value);
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 9007199254740991) {
+    throw pirOutOfRange("options.pledgedSrcSize", ">= 0 and <= 9007199254740991", value);
+  }
+  return value;
+}
+
+/// Node's brotli parameter enum stops at BROTLI_PARAM_NPOSTFIX (8); anything
+/// else is ERR_BROTLI_INVALID_PARAM. libzstd's enum is much wider, and only a
+/// key outside it is ERR_ZSTD_INVALID_PARAM (an in-range but unsupported
+/// parameter fails later inside libzstd, which this host does not model).
+const PIR_BROTLI_MAX_PARAM = 8;
+const PIR_ZSTD_MAX_PARAM = 499;
+
+/// One `[key, value]` pair list over either an object (Node tests use plain
+/// objects) or a `Map` (Node accepts both).
+function pirParamEntries(params) {
+  if (params === undefined || params === null) return [];
+  if (typeof Map === "function" && params instanceof Map) return Array.from(params.entries());
+  if (typeof params !== "object") return [];
+  const entries = [];
+  for (const key of Object.keys(params)) entries.push([key, params[key]]);
+  return entries;
+}
+
+function pirZlibInitFailed(message) {
+  const error = new Error(message);
+  error.code = "ERR_ZLIB_INITIALIZATION_FAILED";
+  return error;
+}
+
+/// Validate `options.params` the way node's brotli/zstd encoders do: the key
+/// is `+key`, must be a non-negative integer inside that codec's parameter
+/// enum and must not repeat another key numerically (`'0'` and `'00'` are the
+/// same parameter), and every value must be a number or boolean. The handful
+/// of native-enforced ranges are checked too, so an out-of-range knob surfaces
+/// as node's ERR_ZLIB_INITIALIZATION_FAILED instead of being silently ignored.
+function pirCodecParams(op, params) {
+  const isBrotli = op.indexOf("brotli") === 0;
+  const isZstdCompress = op.indexOf("zstdCompress") === 0;
+  const max = isBrotli ? PIR_BROTLI_MAX_PARAM : PIR_ZSTD_MAX_PARAM;
+  const seen = new Set();
+  for (const [rawKey, value] of pirParamEntries(params)) {
+    const key = Number(rawKey);
+    if (!Number.isInteger(key) || key < 0 || key > max || seen.has(key)) {
+      const error = new RangeError(
+        rawKey + " is not a valid " + (isBrotli ? "Brotli" : "zstd") + " parameter");
+      error.code = isBrotli ? "ERR_BROTLI_INVALID_PARAM" : "ERR_ZSTD_INVALID_PARAM";
+      throw error;
+    }
+    if (typeof value !== "number" && typeof value !== "boolean") {
+      throw pirInvalidArgType("options.params[key]", "of type number", value);
+    }
+    seen.add(key);
+    if (isBrotli) {
+      // BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING is a boolean flag; lib
+      // brotli rejects any other value at encoder init.
+      if (key === 4 && value !== true && value !== false && value !== 0 && value !== 1) {
+        throw pirZlibInitFailed("Initialization failed");
+      }
+    } else if (isZstdCompress) {
+      // ZSTD_c_strategy must be a ZSTD_strategy enum value.
+      if (key === 107 && !(value >= 1 && value <= 9)) {
+        throw pirZlibInitFailed("Setting parameter failed");
+      }
+    } else {
+      // ZSTD_d_windowLogMax has a hard minimum (ZSTD_WINDOWLOG_ABSOLUTEMIN).
+      if (key === 100 && !(value >= 10 && value <= 31)) {
+        throw pirZlibInitFailed("Setting parameter failed");
+      }
+    }
+  }
+}
+
+/// `params` lookup over either an object or a Map.
+function pirParamGet(params, key) {
+  if (params === undefined || params === null) return undefined;
+  if (typeof Map === "function" && params instanceof Map) return params.get(key);
+  return params[key];
+}
+
 /// The encoder knobs the host ops understand, read from `options.params` by
-/// node's integer keys on a plain object (a Map is ignored, as in node):
-/// BROTLI_PARAM_QUALITY(1) / BROTLI_PARAM_LGWIN(2) and
+/// node's integer keys: BROTLI_PARAM_QUALITY(1) / BROTLI_PARAM_LGWIN(2) and
 /// ZSTD_c_compressionLevel(100). `options.level` is deliberately not read —
 /// probed on node v24.19.0, `zstdCompressSync(_, { level: 1 | 19 })` produces
 /// byte-identical output (only `params` reaches the encoder), and brotli does
-/// not have a `level` key at all.
+/// not have a `level` key at all. libzstd clamps levels above its maximum
+/// (22); mirror that so level 99 matches Node's output.
 function pirCodecKnobs(op, options) {
   const params = options === undefined || options === null ? undefined : options.params;
-  if (params === undefined || params === null || typeof params !== "object") return undefined;
+  if (params === undefined || params === null) return undefined;
   if (op === "brotliCompress") {
     const knobs = {};
-    if (typeof params[1] === "number") knobs.quality = params[1];
-    if (typeof params[2] === "number") knobs.lgwin = params[2];
+    const quality = pirParamGet(params, 1);
+    const lgwin = pirParamGet(params, 2);
+    if (typeof quality === "number") knobs.quality = quality;
+    if (typeof lgwin === "number") knobs.lgwin = lgwin;
     return knobs;
   }
-  if (op === "zstdCompress" && typeof params[100] === "number") {
-    return { level: params[100] };
+  const level = pirParamGet(params, 100);
+  if (op === "zstdCompress" && typeof level === "number") {
+    return { level: Math.min(level, 22) };
   }
   return undefined;
 }
 
-function zlibCodec(op, data, encoding, options) {
-  const bytes = zlibBytes(data, encoding);
-  const resolved = pirResolveCodecOp(op, bytes);
+/// `options.maxOutputLength` (node's hard cap on the result buffer). Node
+/// accepts a positive number up to MAX_SAFE_INTEGER, rejects other types with
+/// ERR_INVALID_ARG_TYPE and out-of-range/infinite values with ERR_OUT_OF_RANGE
+/// (`NaN` passes, as it does in node, and means "no cap").
+function pirZlibMaxOutputLength(options) {
+  if (options === undefined || options === null) return undefined;
+  const value = options.maxOutputLength;
+  if (value === undefined) return undefined;
+  if (typeof value !== "number") {
+    throw pirInvalidArgType("options.maxOutputLength", "of type number", value);
+  }
+  if (value === Infinity) {
+    throw pirOutOfRange("options.maxOutputLength", "a finite number", value);
+  }
+  if (value < 1 || value > 9007199254740991) {
+    throw pirOutOfRange(
+      "options.maxOutputLength",
+      ">= 1 and <= 9007199254740991",
+      value,
+    );
+  }
+  return value;
+}
+
+/// A dictionary crosses as base64 (the host op speaks the same wire as the
+/// payload); only buffers/views reach here — `pirZlibDictionary` validated it.
+function pirDictionaryBase64(dictionary) {
+  const bytes = dictionary instanceof ArrayBuffer
+    ? Buffer.from(dictionary)
+    : Buffer.from(dictionary.buffer, dictionary.byteOffset, dictionary.byteLength);
+  return bytes.toString("base64");
+}
+
+/// The host payload for one codec call. The common path (`options` absent)
+/// builds the one-field object only; every option key is read once and only
+/// forwarded when present, so the hot path stays allocation-light.
+function zlibPayload(op, bytes, options, levelOverride) {
   const payload = { data: bytes.toString("base64") };
-  const knobs = pirCodecKnobs(resolved, options);
+  if (levelOverride !== undefined) payload.level = levelOverride;
+  if (options === undefined || options === null) return payload;
+  const level = options.level;
+  if (level !== undefined && levelOverride === undefined) payload.level = level;
+  const windowBits = options.windowBits;
+  if (windowBits !== undefined) payload.windowBits = windowBits;
+  const maxOutputLength = options.maxOutputLength;
+  if (maxOutputLength !== undefined && maxOutputLength === maxOutputLength) {
+    payload.maxOutputLength = maxOutputLength;
+  }
+  const dictionary = options.dictionary;
+  if (dictionary !== undefined) payload.dictionary = pirDictionaryBase64(dictionary);
+  // knobs the host ops may understand (partial-flush decoding, zstd frame
+  // size/dictionary and trailing-garbage policy); unknown keys are ignored by
+  // the older op table, so forwarding them is safe.
+  if (options.finishFlush !== undefined) payload.finishFlush = options.finishFlush;
+  if (options.flush !== undefined) payload.flush = options.flush;
+  if (options.pledgedSrcSize !== undefined) payload.pledgedSrcSize = options.pledgedSrcSize;
+  if (options.rejectGarbageAfterEnd === true) payload.rejectGarbageAfterEnd = true;
+  if (options.params !== undefined) payload.params = options.params;
+  const knobs = pirCodecKnobs(op, options);
   if (knobs !== undefined) {
     for (const key of Object.keys(knobs)) payload[key] = knobs[key];
   }
-  return Buffer.from(call("zlib", CODEC_OPS[resolved] || resolved, payload), "base64");
+  return payload;
+}
+
+/// A plain coded `Error` (Node's zlib error shape).
+function pirZlibCode(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+/// `ERR_BUFFER_TOO_LARGE` is Node's RangeError; both host tiers report only
+/// the code, so the shim restores the error class. The brotli/zstd crates
+/// collapse "the input ended early" and "the payload is corrupt" into one
+/// `Invalid Data`/incomplete-frame error; Node reports a truncated stream as
+/// Z_BUF_ERROR, and zstd's distinct frame errors survive under their own
+/// codes. Everything else passes through with its code already attached.
+function zlibError(error, op) {
+  if (error !== null && typeof error === "object" &&
+      error.code === "ERR_TRAILING_JUNK_AFTER_STREAM_END") {
+    const type = new TypeError(error.message);
+    type.code = error.code;
+    return type;
+  }
+  if (error !== null && typeof error === "object" && error.code === "ERR_BUFFER_TOO_LARGE") {
+    const range = new RangeError(error.message);
+    range.code = error.code;
+    return range;
+  }
+  if (error !== null && typeof error === "object" && error.code === "ZSTD_error_checksum_wrong") {
+    return pirZlibCode(error.code, error.message);
+  }
+  if (error !== null && typeof error === "object" && error.code === "Z_DATA_ERROR") {
+    const message = String(error.message === undefined ? "" : error.message);
+    if (op === "brotliDecompress") {
+      // Node's common one-shot failure for a truncated brotli stream.
+      return pirZlibCode("Z_BUF_ERROR", "unexpected end of file");
+    }
+    if (op === "zstdDecompress") {
+      if (message.indexOf("incomplete frame") !== -1) {
+        return pirZlibCode("Z_BUF_ERROR", "unexpected end of file");
+      }
+      if (message.indexOf("Unknown frame descriptor") !== -1) {
+        return pirZlibCode("ZSTD_error_prefix_unknown", "Unknown frame descriptor");
+      }
+      if (message.indexOf("corruption") !== -1) {
+        return pirZlibCode("ZSTD_error_corruption_detected", "Data corruption detected");
+      }
+    }
+  }
+  // The flate2-backed decoders word "input ended before the frame finished" in
+  // several ways; Node reports every truncated zlib/gzip stream as
+  // Z_BUF_ERROR with "unexpected end of file".
+  if (error !== null && typeof error === "object" &&
+      (op === "gunzip" || op === "inflate" || op === "inflateRaw" || op === "unzip") &&
+      (error.code === "Z_DATA_ERROR" || error.code === "Z_BUF_ERROR")) {
+    const message = String(error.message === undefined ? "" : error.message);
+    if (/unexpected end|unexpected eof|incomplete|truncat|needs more input|end of (file|stream)|buffer error/i.test(message)) {
+      return pirZlibCode("Z_BUF_ERROR", "unexpected end of file");
+    }
+  }
+  return error;
+}
+
+/// One envelope (`__pirNode.invoke`) call through `node_call_helper`.
+function zlibHostCall(op, payload) {
+  try {
+    return call("zlib", CODEC_OPS[op] || op, payload);
+  } catch (error) {
+    throw zlibError(error, op);
+  }
+}
+
+function zlibCodec(op, data, encoding, options, levelOverride) {
+  const bytes = zlibBytes(data, encoding);
+  const resolved = pirResolveCodecOp(op, bytes);
+  if (resolved === "zstdCompress" && options !== undefined && options !== null &&
+      options.pledgedSrcSize !== undefined && options.pledgedSrcSize !== bytes.length) {
+    throw pirZstdPledgedError();
+  }
+  const payload = zlibPayload(resolved, bytes, options, levelOverride);
+  if (options && options.rejectGarbageAfterEnd === true) payload.rejectGarbageAfterEnd = true;
+  const out = Buffer.from(zlibHostCall(resolved, payload), "base64");
+  if (out.length > pirZlibKMaxLength()) throw pirZlibTooLarge();
+  return out;
+}
+
+/// `zlibCodec` plus the host's consumed-input count. Node's `bytesWritten` on a
+/// decompression stream is zlib's total_in — input the codec actually
+/// consumed — so trailing bytes after the stream's end do not count. Used by
+/// the stream's final decode; the one-shot `*Sync` methods ignore the count.
+function pirDeflateLevel0FlushBlock(bytes) {
+  // zlib's level-0 full flush is a stored block, not the final block emitted
+  // by the one-shot codec. The block header encodes LEN/NLEN little-endian;
+  // the trailing empty stored block is the sync-flush marker.
+  let out = Buffer.alloc(5 + bytes.length + 5);
+  out[0] = 0x00;
+  out[1] = bytes.length & 0xff;
+  out[2] = (bytes.length >>> 8) & 0xff;
+  out[3] = (~bytes.length) & 0xff;
+  out[4] = ((~bytes.length) >>> 8) & 0xff;
+  bytes.copy(out, 5);
+  out[5 + bytes.length] = 0x00;
+  out[6 + bytes.length] = 0x00;
+  out[7 + bytes.length] = 0x00;
+  out[8 + bytes.length] = 0xff;
+  out[9 + bytes.length] = 0xff;
+  return out;
+}
+
+function zlibCodecStats(op, data, encoding, options, levelOverride) {
+  const bytes = zlibBytes(data, encoding);
+  const resolved = pirResolveCodecOp(op, bytes);
+  if (resolved === "zstdCompress" && options !== undefined && options !== null &&
+      options.pledgedSrcSize !== undefined && options.pledgedSrcSize !== bytes.length) {
+    throw pirZstdPledgedError();
+  }
+  const payload = zlibPayload(resolved, bytes, options, levelOverride);
+  if (options !== undefined && options !== null && options.rejectGarbageAfterEnd === true) {
+    payload.rejectGarbageAfterEnd = true;
+  }
+  if (options !== undefined && options !== null && options.params !== undefined) {
+    payload.params = options.params;
+  }
+  payload.consumed = true;
+  const raw = zlibHostCall(resolved, payload);
+  let reply;
+  if (typeof raw === "string") {
+    try { reply = JSON.parse(raw); } catch (error) { reply = null; }
+  } else {
+    reply = raw;
+  }
+  if (reply === null || typeof reply !== "object" || typeof reply.data !== "string") {
+    throw new Error("zlib host consumed-byte reply is malformed");
+  }
+  const out = Buffer.from(reply.data, "base64");
+  if (out.length > pirZlibKMaxLength()) throw pirZlibTooLarge();
+  const consumed = typeof reply.consumed === "number" && reply.consumed >= 0
+    ? reply.consumed
+    : bytes.length;
+  return { out, consumed };
+}
+
+// --- stateful host decoder session (streaming decompressors) ----------------
+// The host keeps one decoder state per stream (zlib_stream.rs), so output can
+// stop at the readable high-water mark and resume later without re-decoding.
+
+function zlibStreamOpen(op, options, levelOverride) {
+  const payload = zlibPayload(op, PIR_ZLIB_EMPTY, options, levelOverride);
+  delete payload.data;
+  payload.op = op;
+  let raw;
+  try {
+    raw = call("zlib", "zlibStreamOpen", payload);
+  } catch (error) {
+    throw zlibError(error, op);
+  }
+  let reply = raw;
+  if (typeof raw === "string") {
+    try { reply = JSON.parse(raw); } catch (error) { reply = null; }
+  }
+  if (reply === null || typeof reply !== "object" || typeof reply.id !== "number") {
+    throw new Error("zlib host stream-open reply is malformed");
+  }
+  return reply.id;
+}
+
+function zlibStreamStep(hostOp, id, bytes, maxOut, op) {
+  let raw;
+  try {
+    raw = call("zlib", hostOp, {
+      id: id,
+      data: bytes.toString("base64"),
+      maxOut: maxOut,
+    });
+  } catch (error) {
+    throw zlibError(error, op);
+  }
+  let reply = raw;
+  if (typeof raw === "string") {
+    try { reply = JSON.parse(raw); } catch (error) { reply = null; }
+  }
+  if (reply === null || typeof reply !== "object" || typeof reply.data !== "string") {
+    throw new Error("zlib host stream reply is malformed");
+  }
+  return {
+    out: Buffer.from(reply.data, "base64"),
+    consumed: typeof reply.consumed === "number" && reply.consumed >= 0 ? reply.consumed : 0,
+    ended: reply.ended === true,
+  };
+}
+
+function zlibStreamFinishStep(id, maxOut, op) {
+  let raw;
+  try {
+    raw = call("zlib", "zlibStreamFinish", { id: id, maxOut: maxOut });
+  } catch (error) {
+    throw zlibError(error, op);
+  }
+  let reply = raw;
+  if (typeof raw === "string") {
+    try { reply = JSON.parse(raw); } catch (error) { reply = null; }
+  }
+  if (reply === null || typeof reply !== "object" || typeof reply.data !== "string") {
+    throw new Error("zlib host stream reply is malformed");
+  }
+  return {
+    out: Buffer.from(reply.data, "base64"),
+    consumed: typeof reply.consumed === "number" && reply.consumed >= 0 ? reply.consumed : 0,
+    ended: reply.ended === true,
+  };
+}
+
+function zlibStreamCloseHost(id) {
+  try { call("zlib", "zlibStreamClose", { id: id }); } catch (error) { /* already gone */ }
 }
 
 // `unzip` sniffs the container instead of assuming one: the host decoders are
@@ -240,36 +749,155 @@ const MODERN_CODEC_OPS = {
   zstdDecompress: true,
 };
 
+/// Decompressing stream ops whose `bytesWritten` is the consumed input count
+/// (Node's zlib total_in). The others (compressors) consume everything they
+/// were given, which `write()` already accumulates.
+const DECOMPRESS_STREAM_OPS = {
+  inflate: true,
+  inflateRaw: true,
+  unzip: true,
+  gunzip: true,
+  brotliDecompress: true,
+  zstdDecompress: true,
+};
+
+/// Ops with a stateful host decoder session: `write()` can finish the frame,
+/// output is capped per call at the readable high-water mark, and decoding
+/// resumes from the same state after the consumer drains (see
+/// crates/pir-node/src/modules/child/zlib_stream.rs). The rest keep the
+/// whole-input codec path.
+const STREAMABLE_DECOMPRESS_OPS = {
+  inflate: true,
+  inflateRaw: true,
+  brotliDecompress: true,
+};
+
 function pirValidateCodecOptions(op, options) {
-  return MODERN_CODEC_OPS[op] ? pirZlibModernOptions(op, options) : options;
+  if (options === undefined || options === null) return options;
+  // Node constructs the transform eagerly, so both families' option windows
+  // (and `maxOutputLength`) throw from the *Sync convenience methods too.
+  const validated = MODERN_CODEC_OPS[op]
+    ? pirZlibModernOptions(op, options)
+    : pirZlibValidateOptions(options, op);
+  pirZlibMaxOutputLength(validated);
+  return validated;
+}
+
+/// The typed C-ABI zlib entry (`bytes_ops.rs::zlib`), captured once at module
+/// evaluation like the Buffer codec: absent in a bare (non-host) context, in
+/// which case every call takes the envelope path.
+const typedZlib = typeof globalThis.__pirZlib === "function" ? globalThis.__pirZlib : null;
+
+/// The ops the typed entry serves. Brotli/zstd stay on the envelope (their
+/// option plumbing is richer than the typed shape).
+const TYPED_CODEC_OPS = {
+  gzip: true,
+  gunzip: true,
+  deflate: true,
+  inflate: true,
+  deflateRaw: true,
+  inflateRaw: true,
+};
+
+/// The typed entry takes the options object directly (level/windowBits/
+/// dictionary/maxOutputLength). Build the minimal object, or return `null`
+/// when a shape it cannot serve exactly (a dictionary that is not a
+/// Uint8Array) must go through the envelope instead.
+function zlibTypedOptions(options) {
+  if (options === undefined || options === null) return undefined;
+  // The typed C-ABI entry only speaks level/windowBits/dictionary/
+  // maxOutputLength. A partial-flush decode (`finishFlush`), an explicit
+  // `flush`, a zstd pledge or the trailing-garbage policy must ride the
+  // envelope, whose payload carries them.
+  if (options.flush !== undefined || options.finishFlush !== undefined ||
+      options.pledgedSrcSize !== undefined || options.rejectGarbageAfterEnd !== undefined) {
+    return null;
+  }
+  const typed = {};
+  if (options.level !== undefined) typed.level = options.level;
+  if (options.windowBits !== undefined) typed.windowBits = options.windowBits;
+  if (options.maxOutputLength !== undefined) typed.maxOutputLength = options.maxOutputLength;
+  const dictionary = options.dictionary;
+  if (dictionary !== undefined) {
+    // `__pirZlib` borrows a Uint8Array; an ArrayBuffer is wrapped (a view, no
+    // copy), while other view kinds keep the envelope's copy path.
+    if (dictionary instanceof ArrayBuffer) typed.dictionary = new Uint8Array(dictionary);
+    else if (dictionary instanceof Uint8Array) typed.dictionary = dictionary;
+    else return null;
+  }
+  return typed;
+}
+
+/// Fast path for the `*Sync` convenience methods: one C-ABI call with the
+/// caller's bytes and a `Uint8Array` back. `undefined` means "not served"
+/// (the caller runs the envelope path, which also owns error wording).
+function zlibTyped(op, bytes, options) {
+  if (typedZlib === null || !TYPED_CODEC_OPS[op]) return undefined;
+  const typedOptions = zlibTypedOptions(options);
+  if (typedOptions === null) return undefined;
+  let out;
+  try {
+    out = typedOptions === undefined
+      ? typedZlib(op, bytes)
+      : typedZlib(op, bytes, typedOptions);
+  } catch (error) {
+    throw zlibError(error, op);
+  }
+  if (out === undefined || out === null) return undefined;
+  // Shared view over the entry's freshly allocated buffer: only the header,
+  // no second copy of the (possibly multi-MB) output.
+  return Buffer.from(out.buffer, out.byteOffset, out.byteLength);
 }
 
 function zlibSync(op, data, options) {
   const validated = pirValidateCodecOptions(op, options);
-  const encoding = validated === undefined || validated === null ? undefined : validated.encoding;
-  return zlibInfoWrap(op, zlibCodec(op, data, encoding, validated), validated);
+  // Node's convenience methods ignore `options.encoding`: a string input is
+  // always read as UTF-8 (probed on v24.22.1 for both the sync and callback
+  // forms, and for the transform constructor).
+  const bytes = zlibBytes(data, undefined);
+  // Decoding an empty buffer is an incomplete gzip stream in Node: gunzipSync
+  // throws Z_BUF_ERROR (the host one-shot would otherwise accept it as an
+  // empty member and return an empty buffer).
+  if (op === "gunzip" && bytes.length === 0) {
+    throw pirZlibCode("Z_BUF_ERROR", "unexpected end of file");
+  }
+  const resolved = pirResolveCodecOp(op, bytes);
+  const fast = zlibTyped(resolved, bytes, validated);
+  if (fast !== undefined) {
+    if (fast.length > pirZlibKMaxLength()) throw pirZlibTooLarge();
+    return zlibInfoWrap(op, fast, validated);
+  }
+  return zlibInfoWrap(op, zlibCodec(op, bytes, undefined, validated), validated);
 }
 
 function zlibCallback(op, data, options, callback) {
-  let encoding;
   if (typeof options === "function") { callback = options; options = undefined; }
-  else if (options !== undefined && options !== null) encoding = options.encoding;
-  const done = typeof callback === "function" ? callback : function () {};
   // Node requires the callback: gzip('abc') with no callback is an
-  // ERR_INVALID_ARG_TYPE, not a silent no-op.
+  // ERR_INVALID_ARG_TYPE, not a silent no-op, and the callback is validated
+  // before the options/chunk.
   if (typeof callback !== "function") {
     throw pirInvalidArgType("callback", "of type function", callback);
   }
+  // Node's callback forms validate the input synchronously, but callback-style
+  // invalid streams report one async error event rather than surfacing a
+  // promise rejection from the microtask itself.
+  try {
+    zlibBytes(data, undefined);
+  } catch (error) {
+    globalThis.__pirMicrotask(() => callback(error));
+    return;
+  }
   options = pirValidateCodecOptions(op, options);
+  const bytes = zlibBytes(data, undefined);
   globalThis.__pirMicrotask(() => {
     let out;
     try {
-      out = zlibInfoWrap(op, zlibCodec(op, data, encoding, options), options);
+      out = zlibInfoWrap(op, zlibCodec(op, bytes, undefined, options), options);
     } catch (error) {
-      done(error);
+      callback(error);
       return;
     }
-    done(null, out);
+    callback(null, out);
   });
 }
 
@@ -302,23 +930,201 @@ function zstdDecompressSync(data, options) { return zlibSync("zstdDecompress", d
 // ---------------------------------------------------------------------------
 
 // LIMIT (documented): each class buffers every `write()` and runs one host
-// codec call at `end()`, then emits the whole output as a single `data`
+// codec call at `flush()`/`end()`, then emits the output as a single `data`
 // chunk — not byte-faithful streaming (see fs ReadStream for the same
-// posture), but real compression with working write/end/pipe plumbing.
+// posture), but real compression with working write/end/flush/read/pipe
+// plumbing. A `flush()` closes the pending input as its own codec frame, so
+// subsequent writes start a fresh frame (concatenated gzip/zstd frames stay
+// decodable; byte-exact continuation across a flush is not modelled).
 class PirZlibTransform extends EventEmitter {
   constructor(op, options, validate) {
     super();
     this._op = op;
-    this._options = (validate === undefined ? pirZlibValidateOptions : validate)(options);
+    this._options = (validate === undefined
+      ? (opts) => pirZlibValidateOptions(opts, op)
+      : validate)(options);
     this._chunks = [];
+    // Deflate-family transforms emit their wrapper header as soon as the first
+    // write reaches the native encoder. Keep that prefix visible to read() even
+    // though this compatibility stream buffers the payload until flush()/end().
+    this._headerEmitted = false;
+    this._pendingHeader = null;
     this._ended = false;
-    this._level = this._options.level === undefined ? -1 : this._options.level;
-    this._strategy = this._options.strategy === undefined ? 0 : this._options.strategy;
+    // Node's `checkRangesOrGetDefault`: an absent OR NaN level/strategy takes
+    // the family default (Z_DEFAULT_COMPRESSION / Z_DEFAULT_STRATEGY). The
+    // raw options object is kept for the host payload, so normalize here
+    // instead of mutating it (test-zlib-failed-init reads `_level`).
+    const rawLevel = this._options.level;
+    const rawStrategy = this._options.strategy;
+    this._level = rawLevel === undefined || (typeof rawLevel === "number" && Number.isNaN(rawLevel))
+      ? -1
+      : rawLevel;
+    this._strategy = rawStrategy === undefined || (typeof rawStrategy === "number" && Number.isNaN(rawStrategy))
+      ? 0
+      : rawStrategy;
+    this._paramsLevel = undefined;
+    // Node's ZlibBase instance fields. `_flushFlag` stays undefined until a
+    // write/flush chooses one; the full-flush and finish defaults differ by
+    // codec family (zlib uses Z_FULL_FLUSH/Z_FINISH, brotli/zstd use
+    // OPERATION_FLUSH/OPERATION_FINISH).
+    const modern = MODERN_CODEC_OPS[op] === true;
+    const zstd = op.indexOf("zstd") === 0;
+    this._finishFlushFlag = modern ? 2 : 4;
+    this._defaultFullFlushFlag = modern ? 1 : 3;
+    this._flushMax = zstd ? 2 : modern ? 3 : 5;
+    this._chunkSize = 16384;
+    this._outOffset = 0;
+    this._writeState = new Uint32Array(2);
     this.bytesWritten = 0;
     this.bytesRead = 0;
+    // Readable-side state: output produced by flush()/end() is either emitted
+    // to 'data' listeners (flowing/pipe) or queued for `.read()` (paused).
+    this._readQueue = [];
+    this._encoding = null;
+    this._flowing = false;
+    this._readableEnded = false;
+    this._destroyed = false;
+    this._closed = false;
+    this._closeCallback = undefined;
+    const highWaterMark = this._options.highWaterMark === undefined
+      ? 16384
+      : this._options.highWaterMark;
+    this._writableState = {
+      needDrain: false,
+      highWaterMark: highWaterMark,
+      length: 0,
+    };
+    // Node writes run on the thread pool, so `reset()`/`_handle.reset()`
+    // between a `write()` and its completion throws. This transform is
+    // synchronous, so a write is "in progress" for one microtask — enough to
+    // reproduce the guard (test-zlib-reset-during-write) while a fresh or
+    // quiescent stream still resets normally.
+    this._writeInProgress = false;
+    const self = this;
+    this._handle = {
+      reset() { return self.reset(); },
+      close() { self._writeInProgress = false; },
+    };
+    // Streaming decoders keep a host session instead of buffering the whole
+    // input: see STREAMABLE_DECOMPRESS_OPS. `_readableState.buffer` is the
+    // same array `read()` drains, so Node's high-water-mark accounting (and
+    // test-zlib-brotli-16GB) observes chunks as they are decoded.
+    this._streaming = STREAMABLE_DECOMPRESS_OPS[op] === true &&
+      typeof globalThis.__pirNodeCall === "function";
+    if (this._streaming) {
+      this._session = 0;
+      this._pendingInput = [];
+      this._inputFedBytes = 0;
+      this._streamHasWork = false;
+      this._decoderEnded = false;
+      this._streamFinish = undefined;
+      this._finishCallback = undefined;
+      this._finishEmitted = false;
+      this._endEmitted = false;
+      this._streamFailed = false;
+      this._pumping = false;
+      this._decodeFailed = false;
+      this._readableState = {
+        buffer: this._readQueue,
+        length: 0,
+        highWaterMark: highWaterMark,
+        objectMode: false,
+        ended: false,
+        endEmitted: false,
+        destroyed: false,
+      };
+    }
+  }
+  _headerLength() {
+    return this._op === "gzip" ? 10 : this._op === "deflate" ? 2 : 0;
+  }
+  _emitBufferedHeader() {
+    const length = this._headerLength();
+    if (length === 0 || this._headerEmitted) return;
+    const empty = zlibCodec(this._op, PIR_ZLIB_EMPTY, undefined, this._options,
+                            this._paramsLevel);
+    this._headerEmitted = true;
+    this._pendingHeader = empty.subarray(0, length);
+  }
+  _stripBufferedHeader(out) {
+    const length = this._headerLength();
+    return this._headerEmitted && length > 0 && out.length >= length
+      ? out.subarray(length)
+      : out;
+  }
+  _markWriteInProgress() {
+    this._writeInProgress = true;
+    globalThis.__pirMicrotask(() => { this._writeInProgress = false; });
+  }
+  /// Deliver one decoded output chunk: to `data` listeners when the readable
+  /// side is flowing (pipe/on('data')), otherwise into the `.read()` queue.
+  _enqueueReadable(out) {
+    if (out.length === 0) return;
+    const chunk = this._encoding === null || typeof out === "string"
+      ? out
+      : out.toString(this._encoding);
+    this.bytesRead += out.length;
+    const listeners = typeof this.listenerCount === "function"
+      ? this.listenerCount("data")
+      : 0;
+    if (listeners > 0 || this._flowing) this.emit("data", chunk);
+    else {
+      this._readQueue.push(chunk);
+      if (this._readableState !== undefined) {
+        this._readableState.length += chunk.length;
+      }
+      this.emit("readable");
+    }
+  }
+  _enqueueDecoded(out) {
+    if (out.length === 0) return;
+    const configured = this._options && this._options.highWaterMark;
+    const size = configured === undefined ? 16384 : Math.max(1, Number(configured) || 16384);
+    for (let offset = 0; offset < out.length; offset += size) {
+      this._enqueueReadable(out.subarray(offset, Math.min(out.length, offset + size)));
+    }
+  }
+  _drainBufferedData() {
+    if (this._streaming || this.listenerCount("data") === 0) return;
+    this._flowing = true;
+    while (this._readQueue.length > 0 && !this._destroyed) {
+      const chunk = this._readQueue.shift();
+      if (this._readableState !== undefined) {
+        this._readableState.length = Math.max(0, this._readableState.length - chunk.length);
+      }
+      this.emit("data", chunk);
+    }
+  }
+  on(type, listener) {
+    const result = super.on(type, listener);
+    if (!this._streaming && type === "data") this._drainBufferedData();
+    if (this._streaming && (type === "data" || type === "readable" || type === "end")) {
+      this._safeStreamPump();
+    }
+    return result;
+  }
+  addListener(type, listener) {
+    const result = super.addListener(type, listener);
+    if (this._streaming && (type === "data" || type === "readable" || type === "end")) {
+      this._safeStreamPump();
+    }
+    return result;
+  }
+  once(type, listener) {
+    const result = super.once(type, listener);
+    if (this._streaming && (type === "data" || type === "readable" || type === "end")) {
+      this._safeStreamPump();
+    }
+    return result;
   }
   write(chunk, encoding, callback) {
     if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    if (this._destroyed) {
+      const error = new Error("Cannot call write after a stream was destroyed");
+      error.code = "ERR_STREAM_DESTROYED";
+      if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return false; }
+      throw error;
+    }
     if (this._ended) {
       const error = new Error("write after end");
       error.code = "ERR_STREAM_WRITE_AFTER_END";
@@ -326,35 +1132,467 @@ class PirZlibTransform extends EventEmitter {
       throw error;
     }
     const bytes = zlibBytes(chunk, encoding);
+    if (!this._streaming) this._emitBufferedHeader();
+    if (this._streaming) {
+      if (this._streamFailed) {
+        if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+        return false;
+      }
+      if (this._decoderEnded) {
+        // The decoder already consumed a complete frame; Node's zlib feed
+        // ignores trailing bytes and `bytesWritten` stays at the consumed
+        // count (test-zlib-premature-end).
+        this._markWriteInProgress();
+        if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+        return true;
+      }
+      this._pendingInput.push(bytes);
+      this._inputFedBytes += bytes.length;
+      this._syncWritableLength();
+      this._markWriteInProgress();
+      this._safeStreamPump();
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      return !this._writableState.needDrain;
+    }
     this._chunks.push(bytes);
     this.bytesWritten += bytes.length;
+    this._decodeFailed = false;
+    this._writableState.length += bytes.length;
+    if (this._writableState.length >= this._writableState.highWaterMark) {
+      this._writableState.needDrain = true;
+    }
+    this._markWriteInProgress();
+    // Node decodes on the thread pool, so a decode failure surfaces from
+    // write()/end() without waiting for the stream to finish. The streaming
+    // decoders report it from their own session; the whole-input ones
+    // (gunzip/unzip/zstd) probe the buffered bytes and only fail when the
+    // error is definitive — a truncated-but-valid prefix keeps buffering.
+    const zstdProbe = this._op === "zstdDecompress" && (() => {
+      const prefix = Buffer.concat(this._chunks).subarray(0, 4);
+      if (prefix.length < 4) return false;
+      const standard = prefix[0] === 0x28 && prefix[1] === 0xb5 &&
+        prefix[2] === 0x2f && prefix[3] === 0xfd;
+      const skippable = prefix[0] >= 0x50 && prefix[0] <= 0x5f &&
+        prefix[1] === 0x2a && prefix[2] === 0x4d && prefix[3] === 0x18;
+      return !standard && !skippable;
+    })();
+    const bufferedProbe = this._op === "gunzip" || this._op === "unzip" ||
+      this._op === "zstdDecompress";
+    if (DECOMPRESS_STREAM_OPS[this._op] === true || zstdProbe || bufferedProbe) {
+      globalThis.__pirMicrotask(() => {
+        if (this._destroyed || this._ended || this._decodeFailed) return;
+        try {
+          const decoded = zlibCodec(this._op, Buffer.concat(this._chunks), undefined, this._options,
+                                    this._paramsLevel);
+          if (!this._streaming) {
+            // Whole-input decoders (gunzip/unzip/zstd) can complete a frame
+            // on write() before end() is called. Node exposes that output at
+            // the readable side immediately; keep it queued until a data
+            // listener is attached, then start a fresh frame for later writes.
+            this._chunks = [];
+            this._writableState.length = 0;
+            this._enqueueDecoded(decoded);
+          }
+        } catch (error) {
+          const mapped = zlibError(error, this._op);
+          const text = String(mapped && mapped.message !== undefined ? mapped.message : mapped);
+          const truncated = mapped && (mapped.code === "Z_BUF_ERROR" ||
+            /unexpected end|incomplete|truncat|needs more input|end of (file|stream)/i.test(text));
+          if (truncated) return;
+          this._decodeFailed = true;
+          this._closed = true;
+          this.emit("error", mapped);
+          this.destroy();
+        }
+      });
+    }
     if (typeof callback === "function") globalThis.__pirMicrotask(callback);
-    return true;
+    return !this._writableState.needDrain;
+  }
+  // --- streaming decoder plumbing -----------------------------------------
+  _ensureSession() {
+    if (this._session === 0) {
+      this._session = zlibStreamOpen(this._op, this._options, this._paramsLevel);
+    }
+  }
+  _closeSession() {
+    if (this._session !== 0) {
+      const id = this._session;
+      this._session = 0;
+      zlibStreamCloseHost(id);
+    }
+  }
+  _syncWritableLength() {
+    const pending = Math.max(0, this._inputFedBytes - this.bytesWritten);
+    this._writableState.length = pending;
+    if (pending >= this._writableState.highWaterMark) {
+      this._writableState.needDrain = true;
+    } else if (this._writableState.needDrain) {
+      this._writableState.needDrain = false;
+      globalThis.__pirMicrotask(() => {
+        if (!this._destroyed) this.emit("drain");
+      });
+    }
+  }
+  /// Drive the host decoder until the readable buffer reaches its high-water
+  /// mark, the input runs out, or the frame ends. Backpressure is the loop
+  /// bound: `_readableState.length` only shrinks when a consumer reads.
+  _streamPump() {
+    if (!this._streaming || this._destroyed || this._streamFailed) return;
+    const state = this._readableState;
+    const limit = Math.max(1, state.highWaterMark);
+    let guard = 0;
+    while (!this._destroyed && !this._streamFailed && !this._decoderEnded &&
+           state.length < limit && guard < 4096) {
+      guard += 1;
+      const room = Math.max(1, Math.min(this._chunkSize, limit - state.length));
+      let result;
+      if (this._pendingInput.length > 0) {
+        this._ensureSession();
+        result = zlibStreamStep("zlibStreamPush", this._session,
+                                this._pendingInput.shift(), room, this._op);
+        this._streamHasWork = !result.ended && result.out.length >= room;
+      } else if (this._streamFinish !== undefined) {
+        this._ensureSession();
+        result = zlibStreamFinishStep(this._session, room, this._op);
+        this._streamHasWork = !result.ended && result.out.length >= room;
+        if (result.ended) {
+          const finish = this._streamFinish;
+          this._streamFinish = undefined;
+          if (typeof finish.callback === "function") this._finishCallback = finish.callback;
+        }
+      } else if (this._streamHasWork) {
+        this._ensureSession();
+        result = zlibStreamStep("zlibStreamDrain", this._session,
+                                PIR_ZLIB_EMPTY, room, this._op);
+        this._streamHasWork = !result.ended && result.out.length >= room;
+      } else {
+        break;
+      }
+      if (result.consumed > 0) {
+        this.bytesWritten += result.consumed;
+        this._syncWritableLength();
+      }
+      if (result.out.length > 0) this._enqueueReadable(result.out);
+      if (result.ended) {
+        this._markDecoderEnded();
+        break;
+      }
+      if (this._pendingInput.length === 0 && result.out.length === 0 &&
+          !this._streamHasWork) {
+        break;
+      }
+    }
+    this._maybeEmitStreamEnd();
+    this._emitFinish(this._finishCallback);
+  }
+  _safeStreamPump() {
+    if (!this._streaming || this._pumping) return;
+    this._pumping = true;
+    try {
+      this._streamPump();
+    } catch (error) {
+      if (this._streamFailed || this._destroyed) return;
+      this._streamFailed = true;
+      this._closeSession();
+      this.emit("error", zlibError(error, this._op));
+    } finally {
+      this._pumping = false;
+    }
+  }
+  _markDecoderEnded() {
+    if (this._decoderEnded) return;
+    this._decoderEnded = true;
+    this._pendingInput = [];
+    this._streamHasWork = false;
+    this._streamFinish = undefined;
+    // Trailing bytes after the frame's end are ignored, not pending writable
+    // work (they never count in `bytesWritten`).
+    this._inputFedBytes = this.bytesWritten;
+    if (this._readableState !== undefined) this._readableState.ended = true;
+    this._syncWritableLength();
+    this._maybeEmitStreamEnd();
+    this._emitFinish(this._finishCallback);
+  }
+  _maybeEmitStreamEnd() {
+    if (!this._streaming || this._destroyed || this._endEmitted || !this._decoderEnded) {
+      return;
+    }
+    const flowing = this._flowing || this.listenerCount("data") > 0;
+    if (flowing || this._readableState.length === 0) {
+      this._endEmitted = true;
+      this._readableEnded = true;
+      this._readableState.endEmitted = true;
+      this.emit("end");
+    }
+  }
+  _emitFinish(callback) {
+    if (!this._streaming || this._destroyed || this._finishEmitted) return;
+    if (!this._ended || !this._decoderEnded) return;
+    this._finishEmitted = true;
+    this.emit("finish");
+    const cb = callback === undefined ? this._finishCallback : callback;
+    this._finishCallback = undefined;
+    if (typeof cb === "function") cb();
   }
   end(chunk, encoding, callback) {
     if (typeof chunk === "function") { callback = chunk; chunk = undefined; encoding = undefined; }
     else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+    if (this._destroyed) {
+      const error = new Error("Cannot call end after a stream was destroyed");
+      error.code = "ERR_STREAM_DESTROYED";
+      if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return this; }
+      throw error;
+    }
     if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+    if (this._streaming) {
+      this._ended = true;
+      this._markWriteInProgress();
+      this._finishCallback = callback;
+      if (!this._decoderEnded && this._streamFinish === undefined) {
+        this._streamFinish = { callback: callback };
+      }
+      this._safeStreamPump();
+      this._maybeEmitStreamEnd();
+      this._emitFinish(callback);
+      return this;
+    }
     this._ended = true;
+    this._markWriteInProgress();
     globalThis.__pirMicrotask(() => {
+      if (this._destroyed) return;
       let out;
       try {
-        out = zlibCodec(this._op, Buffer.concat(this._chunks), undefined, this._options);
+        const input = Buffer.concat(this._chunks);
+        if (DECOMPRESS_STREAM_OPS[this._op] === true) {
+          const stats = zlibCodecStats(this._op, input, undefined, this._options,
+                                       this._paramsLevel);
+          this.bytesWritten = stats.consumed;
+          out = stats.out;
+          // Node reports the decoder's consumed bytes; trailing garbage after
+        } else {
+          out = zlibCodec(this._op, input, undefined, this._options,
+                          this._paramsLevel);
+          // Only drop the wrapper header when a buffered one will be
+          // re-attached below. Every flush()/end() emits a complete codec
+          // member; stripping a header without replacing it leaves a
+          // headerless stream that Gunzip rejects ("incorrect header check").
+          if (this._pendingHeader !== null) out = this._stripBufferedHeader(out);
+        }
       } catch (error) {
-        this.emit("error", error);
+        this.emit("error", zlibError(error, this._op));
         return;
       }
-      this.bytesRead = out.length;
-      if (out.length > 0) this.emit("data", out);
+      this._chunks = [];
+      this._writableState.length = 0;
+      if (this._pendingHeader !== null) {
+        out = Buffer.concat([this._pendingHeader, out]);
+        this._pendingHeader = null;
+      }
+      this._enqueueReadable(out);
+      if (this._destroyed) return;
+      this._readableEnded = true;
       this.emit("end");
       this.emit("finish");
       if (typeof callback === "function") callback();
     });
     return this;
   }
-  flush(callback) {
-    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+  /// Node's readable side, reduced to what a whole-input codec can model:
+  /// `read()` drains the queue written by flush()/end(), `setEncoding()`
+  /// decodes future chunks, and `resume()`/`pause()` toggle flowing delivery.
+  read(_size) {
+    if (this._streaming) {
+      if (this._readQueue.length === 0) this._safeStreamPump();
+      if (this._readQueue.length === 0) {
+        this._maybeEmitStreamEnd();
+        return null;
+      }
+      const chunk = this._readQueue.shift();
+      this._readableState.length = Math.max(0, this._readableState.length - chunk.length);
+      this._safeStreamPump();
+      return chunk;
+    }
+    if (this._readQueue.length === 0) return null;
+    return this._readQueue.shift();
+  }
+  setEncoding(encoding) {
+    this._encoding = String(encoding);
+    for (let i = 0; i < this._readQueue.length; i++) {
+      const chunk = this._readQueue[i];
+      if (typeof chunk !== "string") this._readQueue[i] = chunk.toString(this._encoding);
+    }
     return this;
+  }
+  resume() {
+    this._flowing = true;
+    if (this._streaming) this._safeStreamPump();
+    return this;
+  }
+  pause() {
+    this._flowing = false;
+    return this;
+  }
+  isPaused() {
+    return !this._flowing;
+  }
+  get destroyed() { return this._destroyed; }
+  get closed() { return this._closed; }
+  get writableEnded() { return this._ended; }
+  get writableFinished() {
+    if (this._streaming) {
+      return this._ended && this._decoderEnded && this._pendingInput.length === 0;
+    }
+    return this._ended && this._chunks.length === 0;
+  }
+  get writableLength() { return this._writableState.length; }
+  get writableNeedDrain() { return this._writableState.needDrain; }
+  /// Node's synchronous internal entry (`ZlibBase#_processChunk`). This
+  /// buffered transform runs the whole chunk through the one-shot codec: a
+  /// finish flag returns the complete output, a non-finish flag returns the
+  /// wrapper header (or nothing for a raw/decode stream), matching the bytes
+  /// Node's still-open stream would have emitted so far.
+  _processChunk(chunk, flushFlag) {
+    // test-zlib-invalid-input pokes `_outOffset` past the chunk buffer to
+    // exercise the RangeError guard.
+    if (this._outOffset > this._chunkSize) {
+      throw pirOutOfRange("outOffset", "<= " + this._chunkSize, this._outOffset);
+    }
+    const bytes = zlibBytes(chunk, undefined);
+    const finish = flushFlag === undefined || flushFlag === this._finishFlushFlag ||
+      (typeof flushFlag === "number" && flushFlag > this._defaultFullFlushFlag);
+    if (!finish) {
+      if (flushFlag === 0) {
+        const encoder = this._op === "gzip" || this._op === "deflate" ||
+          this._op === "deflateRaw" || this._op === "brotliCompress" ||
+          this._op === "zstdCompress";
+        if (encoder) {
+          // The wrapper header is what the encoder has emitted before any
+          // block: take it from the empty-input one-shot output.
+          const empty = zlibCodec(this._op, PIR_ZLIB_EMPTY, undefined, this._options,
+                                  this._paramsLevel);
+          const headerLength = this._op === "gzip" ? 10 : this._op === "deflate" ? 2 : 0;
+          return Buffer.from(empty.subarray(0, headerLength));
+        }
+      }
+      return Buffer.alloc(0);
+    }
+    const out = zlibCodec(this._op, bytes, undefined, this._options, this._paramsLevel);
+    this._ended = true;
+    return out;
+  }
+  /// Node's `reset()`: drop buffered input and the per-stream `params()`
+  /// override, keeping the constructor options (zstd reset preserves its
+  /// dictionary/params).
+  reset() {
+    if (this._writeInProgress) {
+      throw new Error("Cannot reset zlib stream while a write is in progress");
+    }
+    this._chunks = [];
+    this._headerEmitted = false;
+    this._pendingHeader = null;
+    this._ended = false;
+    this._paramsLevel = undefined;
+    this.bytesWritten = 0;
+    this.bytesRead = 0;
+    if (this._streaming) {
+      this._closeSession();
+      this._pendingInput = [];
+      this._inputFedBytes = 0;
+      this._streamHasWork = false;
+      this._decoderEnded = false;
+      this._streamFinish = undefined;
+      this._finishCallback = undefined;
+      this._finishEmitted = false;
+      this._endEmitted = false;
+      this._streamFailed = false;
+      this._readableEnded = false;
+      this._readableState.length = 0;
+      this._readableState.ended = false;
+      this._readableState.endEmitted = false;
+      this._writableState.length = 0;
+      this._writableState.needDrain = false;
+    }
+    return undefined;
+  }
+  flush(kind, callback) {
+    if (typeof kind === "function" || (kind === undefined && callback === undefined)) {
+      callback = kind;
+      kind = undefined;
+    }
+    if (callback !== undefined && typeof callback !== "function") {
+      throw pirInvalidArgType("callback", "of type function", callback);
+    }
+    let effective = kind;
+    // Node's `checkRangesOrGetDefault(kind, ..., default)`: NaN means the
+    // default full-flush kind, infinities are "a finite number".
+    if (effective === undefined || (typeof effective === "number" && Number.isNaN(effective))) {
+      effective = this._defaultFullFlushFlag;
+    } else {
+      if (typeof effective !== "number") throw pirInvalidArgType("kind", "of type number", effective);
+      if (!Number.isFinite(effective)) throw pirOutOfRange("kind", "a finite number", effective);
+      if (effective < 0 || effective > this._flushMax) {
+        throw pirOutOfRange("kind", ">= 0 and <= " + this._flushMax, effective);
+      }
+    }
+    if (this._streaming) {
+      this._safeStreamPump();
+      if (this._writableState.needDrain) {
+        this._writableState.needDrain = false;
+        globalThis.__pirMicrotask(() => this.emit("drain"));
+      }
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      return undefined;
+    }
+    // Z_NO_FLUSH is not a flush: it produces nothing. Any other kind closes
+    // the buffered input as its own codec frame, which is the closest a
+    // whole-input codec can get to Node's incremental flush (subsequent writes
+    // start a new frame; concatenated gzip/zstd frames remain decodable).
+    if (this._op === "gzip" && effective === 5) {
+      // Z_PARTIAL_FLUSH keeps the current gzip member open. The buffered
+      // whole-input fallback cannot encode that boundary, so emit a complete
+      // member for each pre-flush chunk; Gunzip accepts concatenated members.
+    }
+    // Node exposes the wrapper header as soon as the encoder has produced it,
+    // before any real flush. `flush(Z_NO_FLUSH)` is the first point a caller
+    // can read() after a write, so deliver the buffered header here (the
+    // level-0 stored-block helper below never includes it).
+    if (effective === 0 && this._pendingHeader !== null && this._chunks.length > 0) {
+      this._enqueueReadable(this._pendingHeader);
+      this._pendingHeader = null;
+    }
+    if (effective !== 0 && this._chunks.length > 0) {
+      let out;
+      try {
+        if (this._op === "deflate" && this._level === 0) {
+          out = pirDeflateLevel0FlushBlock(Buffer.concat(this._chunks));
+        } else {
+          out = zlibCodec(this._op, Buffer.concat(this._chunks), undefined, this._options,
+                          this._paramsLevel);
+          // See end(): strip only when the buffered header is re-attached.
+          // Each flush is a standalone member and must keep its own header.
+          if (this._pendingHeader !== null) out = this._stripBufferedHeader(out);
+        }
+      } catch (error) {
+        const mapped = zlibError(error, this._op);
+        if (typeof callback === "function") globalThis.__pirMicrotask(() => callback(mapped));
+        else this.emit("error", mapped);
+        return undefined;
+      }
+      this._chunks = [];
+      this._writableState.length = 0;
+      if (this._pendingHeader !== null) {
+        out = Buffer.concat([this._pendingHeader, out]);
+        this._pendingHeader = null;
+      }
+      this._enqueueReadable(out);
+    }
+    if (this._writableState.needDrain) {
+      this._writableState.needDrain = false;
+      globalThis.__pirMicrotask(() => this.emit("drain"));
+    }
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+    return undefined;
   }
   pipe(destination, options) {
     this.on("data", (chunk) => destination.write(chunk));
@@ -363,14 +1601,37 @@ class PirZlibTransform extends EventEmitter {
     });
     return destination;
   }
+  /// Node's `close()` is `finished() + destroy()`: the optional callback runs
+  /// after 'close' (immediately in a microtask when already destroyed).
   close(callback) {
-    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
-    return this;
+    if (callback !== undefined && typeof callback !== "function") {
+      throw pirInvalidArgType("callback", "of type function", callback);
+    }
+    if (this._destroyed) {
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      return undefined;
+    }
+    this._closeCallback = callback;
+    this.destroy();
+    return undefined;
   }
   destroy(error) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
     this._ended = true;
-    if (error) this.emit("error", error);
-    this.emit("close");
+    this._handle = null;
+    if (this._streaming) {
+      this._streamFailed = true;
+      this._closeSession();
+    }
+    globalThis.__pirMicrotask(() => {
+      if (error !== undefined && error !== null) this.emit("error", error);
+      this._closed = true;
+      this.emit("close");
+      const callback = this._closeCallback;
+      this._closeCallback = undefined;
+      if (typeof callback === "function") callback();
+    });
     return this;
   }
 }
@@ -393,14 +1654,19 @@ class BrotliDecompress extends PirZlibTransform {
   constructor(options) { super("brotliDecompress", options, pirBrotliOptions); }
 }
 class ZstdCompress extends PirZlibTransform {
-  constructor(options) { super("zstdCompress", options, pirZstdOptions); }
+  constructor(options) { super("zstdCompress", options, pirZstdCompressOptions); }
 }
 class ZstdDecompress extends PirZlibTransform {
-  constructor(options) { super("zstdDecompress", options, pirZstdOptions); }
+  constructor(options) { super("zstdDecompress", options, pirZstdDecompressOptions); }
 }
 
 function pirBrotliOptions(options) { return pirZlibModernOptions("brotliCompress", options); }
-function pirZstdOptions(options) { return pirZlibModernOptions("zstdCompress", options); }
+// The zstd pair shares the modern window but validates `params` against its
+// own direction: the decompressor checks ZSTD_d_windowLogMax (100), the
+// compressor checks ZSTD_c_strategy (107). Reusing the compress op for both
+// silently accepted the decompressor's invalid windowLogMax test case.
+function pirZstdCompressOptions(options) { return pirZlibModernOptions("zstdCompress", options); }
+function pirZstdDecompressOptions(options) { return pirZlibModernOptions("zstdDecompress", options); }
 
 // Node's `params(level, strategy)` lives on the deflate family (`Zlib`) and on
 // the brotli pair; the zstd engines have no such method (probed on v24.19.0:
@@ -410,7 +1676,9 @@ const PARAMS_ENGINES = [Gzip, Gunzip, Deflate, DeflateRaw, Inflate, InflateRaw, 
                         BrotliCompress, BrotliDecompress];
 for (const impl of PARAMS_ENGINES) {
   Object.defineProperty(impl.prototype, "params", {
-    value: function (level, strategy) { return pirZlibParams(this, level, strategy); },
+    value: function (level, strategy, callback) {
+      return pirZlibParams(this, level, strategy, callback);
+    },
     writable: true,
     enumerable: false,
     configurable: true,
@@ -424,7 +1692,32 @@ for (const impl of PARAMS_ENGINES) {
 // zstd pair stays a plain class: node's throws when called without `new`.
 function pirCallableCtor(impl) {
   const callable = function (...args) {
-    return new.target === undefined ? new impl(...args) : Reflect.construct(impl, args, new.target);
+    if (new.target === undefined) {
+      const instance = new impl(...args);
+      // Node's zlib classes are function constructors, so an inheriting
+      // constructor may call `DeflateRaw.call(this, options)` (see
+      // test-zlib-deflate-raw-inherits). `this` is then an object whose
+      // prototype chain already includes DeflateRaw.prototype; initialize it
+      // in place by adopting the freshly constructed instance's own fields.
+      if (this !== undefined && this !== null && typeof this === "object" &&
+          impl.prototype.isPrototypeOf(this)) {
+        for (const key of Reflect.ownKeys(instance)) {
+          Object.defineProperty(this, key, Object.getOwnPropertyDescriptor(instance, key));
+        }
+        // `_handle`'s closures captured the throwaway instance; rebind them to
+        // the receiver so reset/close act on the object the caller keeps.
+        if (this._handle !== undefined && this._handle !== null) {
+          const self = this;
+          this._handle = {
+            reset() { return self.reset(); },
+            close() { self._writeInProgress = false; },
+          };
+        }
+        return this;
+      }
+      return instance;
+    }
+    return Reflect.construct(impl, args, new.target);
   };
   callable.prototype = impl.prototype;
   impl.prototype.constructor = callable;
@@ -562,6 +1855,7 @@ const constants = pirDefineConstants({
   BROTLI_DECODER_ERROR_DICTIONARY_NOT_SET: -19,
   BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_1: -9,
   BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_2: -10,
+  BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH: -17,
   BROTLI_DECODER_ERROR_FORMAT_CL_SPACE: -6,
   BROTLI_DECODER_ERROR_FORMAT_CONTEXT_MAP_REPEAT: -8,
   BROTLI_DECODER_ERROR_FORMAT_DICTIONARY: -12,
@@ -805,6 +2099,33 @@ Object.defineProperty(zlibApi, "constants", {
 if (globalThis.__pirBuiltinRequireCache !== undefined &&
     !globalThis.__pirBuiltinRequireCache.has("zlib")) {
   globalThis.__pirBuiltinRequireCache.set("zlib", zlibApi);
+}
+
+// Node captures `require('buffer').kMaxLength` while evaluating lib/zlib.js.
+// This shim is evaluated eagerly, so the moment the caller's first
+// `require('zlib')` hands out the module is the observable equivalent.
+if (typeof globalThis.__pirRequireFrom === "function" &&
+    globalThis.__pirRequireFrom.__pirZlibKMaxHook !== true) {
+  const pirBaseRequireFrom = globalThis.__pirRequireFrom;
+  const pirRequireFromHook = function (fromDir, spec) {
+    const result = pirBaseRequireFrom.apply(this, arguments);
+    try {
+      if (result === zlibApi && pirZlibCapturedKMaxLength === undefined) {
+        const cache = globalThis.__pirBuiltinRequireCache;
+        const buffer = cache !== undefined && typeof cache.get === "function"
+          ? cache.get("buffer")
+          : undefined;
+        if (buffer !== undefined && typeof buffer.kMaxLength === "number") {
+          pirZlibCapturedKMaxLength = buffer.kMaxLength;
+        }
+      }
+    } catch (error) { /* capture is best-effort */ }
+    return result;
+  };
+  Object.defineProperty(pirRequireFromHook, "__pirZlibKMaxHook", {
+    value: true, enumerable: false, configurable: true,
+  });
+  globalThis.__pirRequireFrom = pirRequireFromHook;
 }
 
 export default zlibApi;

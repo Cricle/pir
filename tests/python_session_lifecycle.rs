@@ -108,24 +108,6 @@ fn parse_json(result: &pir::agent::tool_batch::ToolResult) -> Value {
         .unwrap_or_else(|error| panic!("expected JSON result, got `{}` ({error})", result.content))
 }
 
-/// Wait until `probe` exists (the runaway loop demonstrably started), or the
-/// task finishes early. Returns whether the loop started.
-async fn wait_for_probe(
-    probe: &Path,
-    task: &tokio::task::JoinHandle<pir::agent::tool_batch::ToolResult>,
-) -> bool {
-    for _ in 0..400 {
-        if probe.exists() {
-            return true;
-        }
-        if task.is_finished() {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    false
-}
-
 // ---------------------------------------------------------------------------
 // P1-1: the session is owned by the plugin, not the tool object
 // ---------------------------------------------------------------------------
@@ -137,7 +119,7 @@ async fn python_session_survives_registry_rebuild() {
     let ctx = ToolContext::new(std::env::current_dir().expect("cwd"));
 
     let first_tool = host_tool(&host, PYTHON_TOOL_NAME);
-    let warm = first_tool.run(&json!({ "code": "x = 41" }), &ctx).await;
+    let warm = first_tool.run(&json!({ "code": "var x = 41" }), &ctx).await;
     assert!(!warm.is_error, "{}", warm.content);
     assert_eq!(
         plugin.python_spawn_count(),
@@ -256,7 +238,7 @@ async fn fresh_plugin_instance_starts_a_fresh_session() {
     let first = PythonPlugin::with_config(true);
     let first_tool = only_tool(&first, PYTHON_TOOL_NAME);
     let set = first_tool
-        .run(&json!({ "code": "leaked = 41" }), &ctx)
+        .run(&json!({ "code": "var leaked = 41" }), &ctx)
         .await;
     assert!(!set.is_error, "{}", set.content);
     assert_eq!(first.python_spawn_count(), 1);
@@ -267,11 +249,11 @@ async fn fresh_plugin_instance_starts_a_fresh_session() {
     assert!(!second.has_python_worker());
     let second_tool = only_tool(&second, PYTHON_TOOL_NAME);
     let check = second_tool
-        .run(&json!({ "code": "'leaked' in globals()" }), &ctx)
+        .run(&json!({ "code": "typeof leaked !== 'undefined'" }), &ctx)
         .await;
     assert!(!check.is_error, "{}", check.content);
     assert_eq!(
-        check.content, "False",
+        check.content, "false",
         "a new plugin instance must not see another instance's globals"
     );
     assert_eq!(second.python_spawn_count(), 1);
@@ -317,16 +299,15 @@ async fn context_mode_shutdown_interrupts_a_running_job() {
     assert!(!warm.is_error, "{}", warm.content);
     assert_eq!(plugin.python_spawn_count(), 1);
 
-    let probe = dir.path().join("running.txt");
-    let probe_path = probe.to_string_lossy().replace('\\', "/");
-    let code = format!("open(\"{probe_path}\", \"w\").write(\"started\")\nwhile True:\n    pass");
+    let code = "while (true) {}".to_owned();
     let run_tool = Arc::clone(&exec_tool);
     let run_ctx = ctx.clone();
     let run_task =
         tokio::spawn(async move { run_tool.run(&json!({ "code": code }), &run_ctx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        wait_for_probe(&probe, &run_task).await,
-        "the runaway ctx_execute loop never started"
+        !run_task.is_finished(),
+        "the runaway JavaScript loop must still be running"
     );
 
     let started = Instant::now();
@@ -353,8 +334,8 @@ async fn context_mode_shutdown_interrupts_a_running_job() {
         result.content
     );
     assert!(
-        result.content.contains("KeyboardInterrupt"),
-        "the interrupt reached the eval loop, got: {}",
+        result.content.contains("execution timed out"),
+        "the deadline interrupt reached the eval loop, got: {}",
         result.content
     );
     assert!(
@@ -401,21 +382,19 @@ async fn python_tool_shutdown_interrupts_a_running_job() {
     let ctx = ToolContext::new(std::env::current_dir().expect("cwd"));
 
     let tool = host_tool(&host, PYTHON_TOOL_NAME);
-    let warm = tool.run(&json!({ "code": "x = 1" }), &ctx).await;
+    let warm = tool.run(&json!({ "code": "var x = 1" }), &ctx).await;
     assert!(!warm.is_error, "{}", warm.content);
     assert_eq!(plugin.python_spawn_count(), 1);
 
-    let dir = TestDir::new("python-shutdown");
-    let probe = dir.path().join("running.txt");
-    let probe_path = probe.to_string_lossy().replace('\\', "/");
-    let code = format!("open(\"{probe_path}\", \"w\").write(\"started\")\nwhile True:\n    pass");
+    let code = "while (true) {}".to_owned();
     let run_tool = Arc::clone(&tool);
     let run_ctx = ctx.clone();
     let run_task =
         tokio::spawn(async move { run_tool.run(&json!({ "code": code }), &run_ctx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        wait_for_probe(&probe, &run_task).await,
-        "the runaway python loop never started"
+        !run_task.is_finished(),
+        "the runaway JavaScript loop must still be running"
     );
 
     let started = Instant::now();
@@ -438,13 +417,13 @@ async fn python_tool_shutdown_interrupts_a_running_job() {
         result.content
     );
     assert!(
-        result.content.contains("KeyboardInterrupt"),
-        "the interrupt reached the eval loop, got: {}",
+        result.content.contains("execution timed out"),
+        "the deadline interrupt reached the eval loop, got: {}",
         result.content
     );
     assert!(
-        result.content.contains("python tool"),
-        "python errors must name the python tool, got: {}",
+        result.content.contains("javascript tool"),
+        "errors must name the tool, got: {}",
         result.content
     );
 
@@ -471,10 +450,7 @@ async fn context_mode_timeout_errors_name_ctx_execute() {
     assert!(!warm.is_error, "{}", warm.content);
 
     let result = tool
-        .run(
-            &json!({ "code": "while True:\n    pass", "timeout": 1 }),
-            &ctx,
-        )
+        .run(&json!({ "code": "while (true) {}", "timeout": 1 }), &ctx)
         .await;
     assert!(result.is_error, "expected a timeout error");
     assert!(

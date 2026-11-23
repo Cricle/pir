@@ -16,8 +16,17 @@
 //! 4. the built-in defaults: a 128 MiB JS heap cap (low-resource default: a
 //!    runaway extension must fail its own call instead of OOM-killing the
 //!    host process), 16 MiB JS stack, 30 s call timeout, 30 min hook timeout,
-//!    no GC threshold. `memoryMb`/`memory_bytes: None` (the explicit `0`
-//!    spelling) restores QuickJS's unlimited heap.
+//!    no GC threshold (`None` = QuickJS's own pacing). `memoryMb` /
+//!    `memory_bytes: None` (the explicit `0` spelling) restores QuickJS's
+//!    unlimited heap.
+//!
+//! GC pacing profile: `PIR_GC_PROFILE` (`low` | `balanced` | `throughput`,
+//! see [`GcProfile`]) only replaces the built-in default of step 4 — the
+//! settings file and `PI_EXT_GC_THRESHOLD_MB` still win over it, and an
+//! explicit injection bypasses it entirely. `low` (the historical default)
+//! leaves QuickJS at its 256 KiB start threshold; `balanced` = 4 MiB;
+//! `throughput` = 16 MiB. The profile is an A/B lever: it does not change
+//! the default behavior unless selected.
 //!
 //! Project-scope `.pi/settings.json` is deliberately NOT consulted, not even
 //! when the project is trusted: a repository must never be able to loosen the
@@ -69,6 +78,25 @@ pub const ENV_MEMORY_MB: &str = "PI_EXT_MEMORY_MB";
 pub const ENV_STACK_MB: &str = "PI_EXT_STACK_MB";
 /// `PI_EXT_GC_THRESHOLD_MB`: GC threshold in MiB (`0` = no threshold).
 pub const ENV_GC_THRESHOLD_MB: &str = "PI_EXT_GC_THRESHOLD_MB";
+/// `PIR_GC_PROFILE`: named GC-pacing profile (`low` | `balanced` |
+/// `throughput`, see [`GcProfile`]). Sets only the BASE default; the settings
+/// file and [`ENV_GC_THRESHOLD_MB`] override it. An empty or unknown value is
+/// ignored (with a diagnostic) and keeps the built-in default (`None`).
+pub const ENV_GC_PROFILE: &str = "PIR_GC_PROFILE";
+/// GC threshold of [`GcProfile::Balanced`]: 4 MiB.
+///
+/// Candidate default for the long-lived extension runtime: the JS state,
+/// shim loading and per-call garbage are big enough that QuickJS's 256 KiB
+/// start threshold collects many times per call. 4 MiB amortizes that while
+/// staying far below the 128 MiB heap cap.
+pub const GC_PROFILE_BALANCED_BYTES: usize = 4 * 1024 * 1024;
+/// GC threshold of [`GcProfile::Throughput`]: 16 MiB.
+///
+/// For bulk transforms / large query materialization, where the goal is few
+/// collections. The tradeoff is peak heap: with the 128 MiB cap, collections
+/// then run in large steps and a single 16 MiB burst can be retained until
+/// the next threshold crossing.
+pub const GC_PROFILE_THROUGHPUT_BYTES: usize = 16 * 1024 * 1024;
 /// `PI_EXT_CALL_TIMEOUT_MS`: per-call timeout in milliseconds (`0` keeps the
 /// default).
 pub const ENV_CALL_TIMEOUT_MS: &str = "PI_EXT_CALL_TIMEOUT_MS";
@@ -90,6 +118,104 @@ pub const ENV_NAMES: [&str; 6] = [
     ENV_HOOK_TIMEOUT_MS,
     ENV_BEFORE_AGENT_START_TIMEOUT_MS,
 ];
+
+/// Named GC-pacing profiles for [`ExtensionLimits::gc_threshold_bytes`].
+///
+/// QuickJS starts each runtime with a 256 KiB collection threshold
+/// (`rt->malloc_gc_threshold = 256 * 1024` in `quickjs.c`) and, after every
+/// automatic collection, re-arms it at `live + live / 2` (`js_trigger_gc`).
+/// That is tuned for short scripts; a long-lived extension runtime (module
+/// graph, shims, repeated tool calls) crosses 256 KiB of garbage constantly
+/// and pays a collection per few hundred KiB of churn. The profiles are the
+/// candidate points for the A/B, mapped to runtime scenarios:
+///
+/// - [`GcProfile::Low`] — keep QuickJS's pacing (`None`). The default and the
+///   best fit for short-lived calls, small heaps, and worker runtimes whose
+///   per-worker footprint must stay small.
+/// - [`GcProfile::Balanced`] — 4 MiB start threshold. Recommended candidate
+///   for the extension runtime (long-lived context, shim/module loading, many
+///   small host calls).
+/// - [`GcProfile::Throughput`] — 16 MiB start threshold. For bulk transforms
+///   / large query materialization: fewer collections at the cost of peak
+///   heap (still bounded by the 128 MiB cap by default).
+///
+/// None of these changes the compiled-in default; the host opts in with
+/// `PIR_GC_PROFILE` after measuring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GcProfile {
+    /// Keep QuickJS's own pacing (no threshold configured).
+    Low,
+    /// 4 MiB start threshold: extension runtime.
+    Balanced,
+    /// 16 MiB start threshold: bulk/throughput workloads.
+    Throughput,
+}
+
+impl GcProfile {
+    /// The spelling accepted by `PIR_GC_PROFILE`, in documentation order.
+    pub const NAMES: [&'static str; 3] = ["low", "balanced", "throughput"];
+
+    /// Parse a `PIR_GC_PROFILE` value. Case-insensitive and trimmed;
+    /// anything else (including the empty string) is `None`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "balanced" => Some(Self::Balanced),
+            "throughput" => Some(Self::Throughput),
+            _ => None,
+        }
+    }
+
+    /// The canonical profile name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Balanced => "balanced",
+            Self::Throughput => "throughput",
+        }
+    }
+
+    /// The GC threshold this profile configures; `None` = leave QuickJS's
+    /// default pacing.
+    pub const fn gc_threshold_bytes(self) -> Option<usize> {
+        match self {
+            Self::Low => None,
+            Self::Balanced => Some(GC_PROFILE_BALANCED_BYTES),
+            Self::Throughput => Some(GC_PROFILE_THROUGHPUT_BYTES),
+        }
+    }
+}
+
+/// Parse `PIR_GC_PROFILE` from `vars` (the pure seam; the caller decides the
+/// priority of the result). Absent → `(None, [])`; an empty or unknown value
+/// → `(None, [diagnostic])`, i.e. the built-in default stands.
+pub fn gc_profile_from_vars(vars: &[(&str, &str)]) -> (Option<GcProfile>, Vec<String>) {
+    let Some(raw) = lookup(vars, ENV_GC_PROFILE) else {
+        return (None, Vec::new());
+    };
+    match GcProfile::parse(raw) {
+        Some(profile) => (Some(profile), Vec::new()),
+        None => (
+            None,
+            vec![format!(
+                "{ENV_GC_PROFILE}=\"{raw}\" ignored: expected one of {}",
+                GcProfile::NAMES.join("|")
+            )],
+        ),
+    }
+}
+
+/// [`gc_profile_from_vars`] against the real process environment.
+///
+/// Kept out of [`ExtensionLimits::apply_env`]/[`ENV_NAMES`] on purpose: the
+/// profile is a base-default selector, not a `PI_EXT_*` override, so it is
+/// resolved once by [`ExtensionLimits::load`].
+pub fn gc_profile_from_env() -> (Option<GcProfile>, Vec<String>) {
+    match std::env::var(ENV_GC_PROFILE) {
+        Ok(value) => gc_profile_from_vars(&[(ENV_GC_PROFILE, value.as_str())]),
+        Err(_) => (None, Vec::new()),
+    }
+}
 
 /// Default budget for the `before_agent_start` lifecycle dispatch.
 ///
@@ -168,16 +294,35 @@ impl ExtensionLimits {
         explicit.unwrap_or_else(Self::load)
     }
 
-    /// Load the limits the way a host does: global settings file, then the
-    /// process environment, then defaults. Diagnostics for ignored or
-    /// clamped values are routed through `ext_diag!`.
+    /// Load the limits the way a host does: profile-selected defaults, then
+    /// the global settings file, then the process environment. Diagnostics
+    /// for ignored or clamped values are routed through `ext_diag!`.
     pub fn load() -> Self {
-        let (limits, settings_diags) = Self::from_settings(&load_global_settings());
+        // `PIR_GC_PROFILE` selects the BASE default only: settings and
+        // `PI_EXT_*` are applied afterwards and win. An explicit injection
+        // (`Self::resolve(Some(..))`) bypasses this entirely.
+        let (profile, profile_diags) = gc_profile_from_env();
+        let base = Self::default().with_gc_profile(profile);
+        let (limits, settings_diags) = Self::from_settings_with_base(base, &load_global_settings());
         let (limits, env_diags) = limits.apply_process_env();
-        for diagnostic in settings_diags.into_iter().chain(env_diags) {
+        for diagnostic in profile_diags
+            .into_iter()
+            .chain(settings_diags)
+            .chain(env_diags)
+        {
             crate::ext_diag!("pir-ext: {diagnostic}");
         }
         limits
+    }
+
+    /// Apply a named GC profile as this value's BASE: it replaces the built-in
+    /// `None` default only, so a later [`Self::from_settings_with_base`] /
+    /// [`Self::apply_env`] override still wins.
+    pub fn with_gc_profile(mut self, profile: Option<GcProfile>) -> Self {
+        if let Some(profile) = profile {
+            self.gc_threshold_bytes = profile.gc_threshold_bytes();
+        }
+        self
     }
 
     /// Parse the `extensionLimits` object of a settings snapshot.
@@ -186,7 +331,12 @@ impl ExtensionLimits {
     /// itself is scope-agnostic and simply reads the typed field. Returns the
     /// limits plus one diagnostic per clamped/ignored value.
     pub fn from_settings(settings: &Settings) -> (Self, Vec<String>) {
-        let mut limits = Self::default();
+        Self::from_settings_with_base(Self::default(), settings)
+    }
+
+    /// [`Self::from_settings`] over an explicit base (the GC-profile seam):
+    /// every field the settings object does not mention keeps the base value.
+    pub fn from_settings_with_base(mut limits: Self, settings: &Settings) -> (Self, Vec<String>) {
         let mut diagnostics = Vec::new();
         let Some(section) = settings.extension_limits.as_ref() else {
             return (limits, diagnostics);

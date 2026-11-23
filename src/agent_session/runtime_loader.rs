@@ -184,7 +184,19 @@ fn extension_failure_cache_path() -> PathBuf {
 /// Cache key for an extension entry path: backslashes normalized to `/` for
 /// stable round-tripping (discovery paths mix separators on Windows).
 fn extension_failure_cache_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    // Strip the Windows verbatim prefix so a key is the same whether recorded
+    // from a canonical (\\?\\) path or looked up from the caller's spelling.
+    let text = path.to_string_lossy().replace('\\', "/");
+    text.strip_prefix("//?/").unwrap_or(&text).to_string()
+}
+
+/// Loose comparison form: unified separators, verbatim //?/ prefix and trailing
+/// slash dropped, ASCII lowercased, so a canonical vs as-given spelling of the
+/// same entry compares equal and a successful load drops its stale record.
+fn loose_cache_key(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    let trimmed = unified.strip_prefix("//?/").unwrap_or(&unified);
+    trimmed.trim_end_matches('/').to_ascii_lowercase()
 }
 
 /// Content fingerprint of an extension entry file: mtime + size. A hash of
@@ -313,11 +325,10 @@ fn update_extension_failure_cache(result: &crate::extensions::LoadResult) {
     let mut file = read_extension_failure_cache();
     let mut dirty = false;
     for extension in &result.loaded {
-        if file
-            .entries
-            .remove(&extension_failure_cache_key(&extension.path))
-            .is_some()
-        {
+        let target = loose_cache_key(&extension_failure_cache_key(&extension.path));
+        let before = file.entries.len();
+        file.entries.retain(|key, _| loose_cache_key(key) != target);
+        if file.entries.len() != before {
             dirty = true;
         }
     }

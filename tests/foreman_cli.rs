@@ -1,5 +1,12 @@
 //! `pir foreman` CLI surface and the public journal/sidecar bridge.
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,7 +84,7 @@ fn approval_decisions_update_the_journal_and_clear_pending() {
                 "call": "call-1",
                 "summary": "worker: write",
                 "state": "requested",
-                "createdAtMs": 0
+                "createdAtMs": now_ms()
             }],
             "allow_next_worker": false
         }))
@@ -119,7 +126,7 @@ fn approving_a_plan_switches_the_journal_to_normal() {
                 "state": "requested",
                 "plan": "1. do step one\n2. verify",
                 "kind": "plan",
-                "createdAtMs": 0
+                "createdAtMs": now_ms()
             }],
             "allow_next_worker": false,
             "submitted_plan": "1. do step one\n2. verify"
@@ -145,6 +152,52 @@ fn approving_a_plan_switches_the_journal_to_normal() {
         !status.allow_next_worker,
         "plan approval must not admit a worker"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn approving_a_plan_carries_its_verification_into_an_active_contract() {
+    let dir = temp_dir("plan-contract");
+    let session = dir.join("session.jsonl");
+    let mut journal_path = session.as_os_str().to_owned();
+    journal_path.push(".foreman.jsonl");
+    std::fs::write(
+        PathBuf::from(journal_path.clone()),
+        serde_json::to_string(&json!({
+            "v": 1,
+            "t": "snapshot",
+            "mode": "plan",
+            "phase": "PLANNING",
+            "generation": 0,
+            "reviewer": null,
+            "nudges": 0,
+            "settings": {"approvals": "auto", "router": "inline", "worktree": false},
+            "approvals": [{
+                "id": "p1",
+                "call": "call-plan",
+                "summary": "plan: step one",
+                "state": "requested",
+                "plan": "1. do step one",
+                "verification": "cargo test --all",
+                "kind": "plan",
+                "createdAtMs": now_ms()
+            }],
+            "allow_next_worker": false,
+            "submitted_plan": "1. do step one"
+        }))
+        .expect("snapshot JSON"),
+    )
+    .expect("write journal");
+
+    let decided = pir::foreman::decide_approval(&session, Some("p1"), true).expect("approve plan");
+    assert_eq!(decided[0].verification.as_deref(), Some("cargo test --all"));
+
+    // The authoritative snapshot now carries the execution contract, visible
+    // to the resumed Normal run and to the verification gate.
+    let text = std::fs::read_to_string(PathBuf::from(journal_path)).expect("journal after");
+    assert!(text.contains("active_contract"), "{text}");
+    assert!(text.contains("cargo test --all"), "{text}");
+    assert!(text.contains("\"normal\""), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -43,9 +43,9 @@ use pir::coding_agent::print::{
     partition_file_args, print_apply_max_turns, print_apply_retry, print_compaction_hook,
     print_loop_deps, print_plugin_host, print_retry_policy, print_tool_definitions,
     print_transport_hooks, print_transport_hooks_with_model, run_print_with_environment,
-    settings_compaction_config, text_with_background_reports, threshold_model_for,
-    try_extension_command, OutputMode, PrintBackground, PrintOptions, PrintSessionEventSink,
-    SharedSession,
+    settings_compaction_config, should_replay_background, text_with_background_reports,
+    threshold_model_for, try_extension_command, OutputMode, PrintBackground, PrintOptions,
+    PrintSessionEventSink, SharedSession,
 };
 use pir::coding_agent::resources::ResourcePathOptions;
 use pir::coding_agent::session_resolve::SessionPlan;
@@ -4971,4 +4971,32 @@ async fn print_prompt_request_resolves_the_upstream_zero_provider_budget() {
     assert_eq!(options.max_retries, Some(0));
     assert_eq!(options.max_retry_delay_ms, None);
     assert_eq!(options.timeout_ms, None);
+}
+
+/// The headless background-replay guard only asks the model to consume a late
+/// completion when the run is live, calls are in flight, and the settle cap is
+/// not exhausted. Every guard is independently testable.
+#[test]
+fn should_replay_background_guards() {
+    // Normal case: one in-flight call, live run, budget left.
+    assert!(should_replay_background(false, false, 1, 1));
+    // No background work: never wait.
+    assert!(!should_replay_background(false, false, 0, 1));
+    // An aborted run must not spawn another model turn.
+    assert!(!should_replay_background(true, false, 1, 1));
+    // A process termination signal settles immediately.
+    assert!(!should_replay_background(false, true, 1, 1));
+    // At the continuation cap the host settles rather than replaying.
+    assert!(!should_replay_background(
+        false,
+        false,
+        1,
+        pir::agent_session::AGENT_BEFORE_SETTLE_CONTINUATION_CAP
+    ));
+    assert!(!should_replay_background(
+        false,
+        false,
+        1,
+        pir::agent_session::AGENT_BEFORE_SETTLE_CONTINUATION_CAP + 1
+    ));
 }

@@ -249,7 +249,7 @@ required-features = ["sdk"]
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "fs", "process", "signal"] }
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
@@ -269,6 +269,12 @@ regex = "1.13.1"
 # rides the `session` feature. `--no-default-features` therefore drops it from
 # the graph; the `session` feature re-adds it.
 memmap2 = { version = "0.9", optional = true }
+# Optional process-wide allocator for allocator A/B runs (feature
+# `mimalloc-alloc`, OFF by default). `default-features = false` selects plain
+# mimalloc (the crate's default feature set is empty anyway); the `pir` bin
+# registers `mimalloc::MiMalloc` as its `#[global_allocator]`. A build without
+# the feature has exactly the previous allocator setup.
+mimalloc = { version = "0.1", optional = true, default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 # 0.23 shares the tree's single base64 (reqwest/rmcp/swc/hyper-util already
@@ -276,30 +282,36 @@ uuid = { version = "1", features = ["v4"] }
 # is unchanged between 0.22 and 0.23, so this dedupes one compiled crate.
 base64 = "0.23"
 sha2 = "0.10"
-# AWS SigV4 request signing for the Bedrock ConverseStream adapter; also the
-# HMAC backend for the node:crypto shim (hmac ops).
-hmac = { version = "0.12", optional = true }
-# Direct hash backends for the node:crypto shim's hash/hmac ops. md-5/sha1
-# already ride the lock as transitive deps (0.10.x); pinning the same minor
-# range reuses the existing lock entries instead of introducing duplicates.
-md-5 = { version = "0.10", optional = true }
+# Node/npm host ops (src/pir_node, previously the `pir-node` workspace crate).
+# Optional: only the `extensions` feature pulls the JS engine and these codecs.
+aes = { version = "0.8", optional = true }
 sha1 = { version = "0.10", optional = true }
-# Entropy for the node:crypto shim's randomBytes/randomUUID (0.3 lock line).
+sha3 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+pbkdf2 = { version = "0.12", features = ["hmac"], optional = true }
+scrypt = { version = "0.11", optional = true }
+url = { version = "2.5", optional = true }
+# AWS SigV4 request signing for the Bedrock ConverseStream adapter.
+hmac = { version = "0.12", optional = true }
+# Entropy for randomBytes/randomUUID and other core IDs.
 getrandom = "0.3"
-# PBKDF2 behind the node:crypto shim's pbkdf2Sync (default `hmac` feature
-# reuses the hmac/sha1/sha2 lock lines above; no new transitive deps).
-pbkdf2 = { version = "0.12", optional = true }
 # gzip/deflate codec behind the node:zlib shim (src/extensions/runtime/
-# host_functions/child_fns.rs). Default (miniz_oxide) backend keeps the tree
-# pure Rust; the 1.1 lock line already carries flate2's transitive deps.
-flate2 = { version = "1.1", optional = true }
+# host_functions/child_fns.rs) and the shim-deflate inflation in
+# `extensions::api::embedded`. The `zlib-rs` backend is pure Rust like
+# miniz_oxide but roughly 2x faster (it is a port of zlib's C, including the
+# longest-match deflate path), which is what a `zlib.deflateSync` benchmark
+# compares against Node's C zlib.
+flate2 = { version = "1.1", default-features = false, features = [
+    "zlib-rs",
+    "runtime_detection",
+], optional = true }
 # Brotli + Zstandard codecs behind the same node:zlib host op table: Node's
 # convenience-method surface (brotliCompress / zstdCompress + the *Sync and
 # stream-constructor forms) is what test-zlib-convenience-methods exercises,
 # and flate2 alone leaves it one throw away from green. `brotli` is pure Rust
 # (compressor + decompressor); `zstd` rides zstd-sys' bundled C source, built
 # by the `cc` crate with the MSVC toolset the tree already links against.
-brotli = { version = "8", optional = true }
+brotli = { version = "9", optional = true }
 zstd = { version = "0.13", optional = true }
 # The cm-memory engine behind the `memory` builtin. `default-features = false`
 # keeps the `cm` CLI out of pir's graph; only the library facade is linked.
@@ -329,7 +341,10 @@ similar = "2"
 memchr = "2"
 unicode-normalization = "0.1"
 # Extension runtime (feature `extensions`): QuickJS + the swc transpile stack.
-rquickjs = { version = "0.14.0", features = ["futures", "loader"], optional = true }
+# `disable-assertions` compiles quickjs.c with NDEBUG: the engine's internal
+# assertions are debug aids, and leaving them on costs a few percent on every
+# JS-heavy path (release builds of qjs ship without them too).
+rquickjs = { version = "0.14.0", features = ["futures", "loader", "parallel", "disable-assertions"], optional = true }
 swc_ecma_parser = { version = "46.0.0", optional = true }
 swc_ecma_codegen = { version = "32.0.3", optional = true }
 swc_ecma_ast = { version = "29.0.2", optional = true }
@@ -374,9 +389,8 @@ globset = "0.4"
 # `semver` semantics). Already in the lock as a transitive edge.
 semver = "1"
 # Text wrapping/indent helpers for the TUI. Pinned to the 0.15 line already in
-# the lock (rustpython-doc), not 0.16: 0.16's unicode-linebreak feature pulls
-# the icu_segmenter data tables (~1 MB of binary and a long compile), which the
-# tree deliberately avoids. 0.15 uses the light smawk/unicode-linebreak pair.
+# 0.15 avoids the icu_segmenter data tables that 0.16's unicode-linebreak
+# feature would pull (~1 MB of binary and a long compile).
 textwrap = { version = "0.15", default-features = false, features = ["unicode-width", "unicode-linebreak"] }
 # Official Model Context Protocol SDK (modelcontextprotocol/rust-sdk). The MCP
 # client layer is built on it: rmcp owns the JSON-RPC 2.0 framing, the
@@ -384,7 +398,6 @@ textwrap = { version = "0.15", default-features = false, features = ["unicode-wi
 # and both wire transports (child-process stdio and streamable HTTP with SSE).
 rmcp = { version = "3.5", default-features = false, optional = true, features = [
     "client",
-    "transport-child-process",
     "transport-streamable-http-client-reqwest",
     "reqwest-native-tls",
     # Server side: the built-in `sd` (search & replace) MCP server runs as a
@@ -392,30 +405,8 @@ rmcp = { version = "3.5", default-features = false, optional = true, features = 
     "server",
     "transport-io",
 ] }
-# Embedded RustPython 3 (pure-Rust Python) behind the `python` builtin tool
-# (src/plugins/builtin/python.rs). Component crates instead of the `rustpython`
-# meta-crate: the meta crate unconditionally pulls clap 2, env_logger 0.9,
-# rustyline 14 and dirs-next for its REPL binary. Feature posture:
-# threading/ssl/jit OFF (no native threads / TLS backends / cranelift);
-# `freeze-stdlib` compiles the pure-Python stdlib (rustpython-pylib Lib/) into
-# the binary so imports never touch a system Python (binary-size trade-off
-# accepted by the user). NOTE for cargo-deny: the tree pulls malachite-bigint
-# (LGPL-3.0-only, RustPython's bigint backend) — see deny.toml follow-up.
-rustpython-vm = { version = "0.4.0", default-features = false, features = ["compiler", "freeze-stdlib"], optional = true }
-rustpython-stdlib = { version = "0.4.0", default-features = false, features = ["compiler"], optional = true }
-rustpython-pylib = { version = "0.4.0", features = ["freeze-stdlib"], optional = true }
 # node:crypto real backends (src/extensions/runtime/host_functions/node_fns.rs):
-# AES block primitives (CBC/CTR/GCM are implemented in that module on top of
-# `aes`) and scrypt (password-hash/salsa20/pbkdf2 lines).
-aes = { version = "0.8", optional = true }
-scrypt = { version = "0.11", optional = true }
-# SQLite backend for the node:sqlite (DatabaseSync) real shim and the
-# better-sqlite3 virtual package shim (src/extensions/runtime/host_functions/
-# sqlite_fns.rs). 0.32 rides the libsqlite3-sys 0.28 lock line rustpython-stdlib
-# already carries (one bundled amalgamation build for the tree); `bundled`
-# compiles SQLite in-process (FTS5/RTREE included) so the runtime needs no
-# system sqlite3.dll — the exact gap that kept context-mode on the
-# native-addon permanent boundary.
+# Rust-native SQLite remains a root feature for context-mode and durable storage.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # Embedded bash-compatible shell (`brush`) behind the `brush` feature: when no
 # external Git Bash / /bin/bash is installed, the bash tool can still run
@@ -606,28 +597,21 @@ tui = [
 ]
 # Embedded QuickJS extension runtime (rquickjs + the swc transpile stack).
 extensions = [
+    "dep:aes",
+    "dep:sha1",
+    "dep:sha3",
+    "dep:md-5",
+    "dep:pbkdf2",
+    "dep:scrypt",
+    "dep:url",
     "dep:rquickjs",
-    # The `fs.watch` shim uses the native watcher when available (it also runs
-    # under `tui`/`env`); without this an extensions-only build fell back to a
-    # full-tree stat sweep every 200 ms.
-    "dep:notify",
-    # node:zlib / node:crypto host-function backends: the only users are the
-    # engine's host fns and the node shims, so they ride this feature.
     "dep:flate2",
     "dep:brotli",
     "dep:zstd",
-    "dep:aes",
-    "dep:scrypt",
-    "dep:md-5",
-    "dep:sha1",
-    "dep:pbkdf2",
-    # node:crypto's RSA sign/verify and HMAC backends.
-    "dep:rsa",
-    "dep:hmac",
-    # rusqlite rides the engine: node:sqlite's host functions live in the
-    # runtime's host-fn table (see the `extensions` feature; there is no
-    # separate `sqlite` feature).
     "dep:rusqlite",
+    "dep:hmac",
+    "dep:rsa",
+    "dep:notify",
     "dep:swc_ecma_parser",
     "dep:swc_ecma_codegen",
     "dep:swc_ecma_ast",
@@ -635,8 +619,22 @@ extensions = [
     "dep:swc_ecma_transforms_typescript",
     "dep:swc_common",
 ]
+# Optional process-wide allocator for the `pir` bin (A/B measurement only).
+#
+# OFF by default and deliberately NOT a member of `full`: a normal (default)
+# build keeps the system allocator, and `--no-default-features` is unaffected.
+# Enabling it swaps the bin's instrumented `TracingAllocator`
+# (PIR-TUI-019/020) for `mimalloc::MiMalloc`, so `PIR_ALLOC_TRACE` is inactive
+# in that build — a binary can install exactly one `#[global_allocator]`. The
+# library never registers an allocator, so tests/SDK embedders are unchanged.
+# The feature is package-wide, so the `pir` bin (`required-features = ["cli"]`)
+# sees it whenever `cli` is on.
+#   cargo run --features mimalloc-alloc -- <args>
+mimalloc-alloc = ["dep:mimalloc"]
 # The `python` builtin tool (embedded RustPython 3).
-python = ["dep:rustpython-vm", "dep:rustpython-stdlib", "dep:rustpython-pylib"]
+# The `python` feature name is kept for Settings/tool-selection compatibility;
+# the tool now runs JavaScript on the embedded QuickJS runtime (js_vm.rs).
+python = []
 # Embedded bash-compatible shell for the bash tool (`pir __brush` + the shell
 # pool's brush member). Without it the tool spawns the external shell exactly
 # as before; `shellPath` in settings still wins over brush.
@@ -774,6 +772,9 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_IO",
     # Native Shift+Enter detection (GetAsyncKeyState) in src/tui/stdin_buffer.rs.
     "Win32_UI_Input_KeyboardAndMouse",
+    # FormatMessageW for locale-independent OS error text in
+    # src/coding_agent/tools/util.rs (english_os_message).
+    "Win32_System_Diagnostics_Debug",
 ] }
 # The upstream `enableWindowsVTInput` port (src/tui/stdin_buffer.rs) reaches
 # GetConsoleMode/SetConsoleMode through the safe wrappers crossterm already
@@ -797,7 +798,7 @@ proptest = "1"
 # hash/hmac backend), which cargo-machete cannot see as a package use.
 # `openssl-sys` is target-only: the musl release enables its `vendored` feature
 # for native-tls, with no Rust-side import.
-ignored = ["md-5", "openssl-sys"]
+ignored = ["openssl-sys"]
 
 # Criterion owns `main` (its own runner + report); without `harness = false`
 # cargo compiles the bench under libtest and runs 0 benchmarks.
@@ -858,27 +859,7 @@ opt-level = "s"
 [profile.release-size.package.pir-sdk]
 opt-level = 3
 
-[profile.release-size.package.rustpython-vm]
-opt-level = 3
-[profile.release-size.package.rustpython-stdlib]
-opt-level = 3
-[profile.release-size.package.rustpython-common]
-opt-level = 3
-[profile.release-size.package.rustpython-format]
-opt-level = 3
-[profile.release-size.package.rustpython-sre_engine]
-opt-level = 3
 
-[profile.release-size.package.malachite]
-opt-level = 3
-[profile.release-size.package.malachite-base]
-opt-level = 3
-[profile.release-size.package.malachite-bigint]
-opt-level = 3
-[profile.release-size.package.malachite-nz]
-opt-level = 3
-[profile.release-size.package.malachite-q]
-opt-level = 3
 
 [profile.release-size.package.rquickjs]
 opt-level = 3
@@ -919,6 +900,14 @@ opt-level = 3
 inherits = "release"
 opt-level = 2
 
+# Benchmark/iteration profile: release optimization without the serializing
+# fat-LTO link, so JS/perf measurements land in minutes instead of tens of
+# minutes. Not for shipment (the shipped profile is `release`).
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 # No debuginfo in dev: the crate links ~99 test binaries, and line tables
 # pushed each to ~80 MB — a lib edit (including any `.js.txt` include_str!)
 # meant re-linking ~8 GB, dominating the edit-test loop. Panic locations and
@@ -928,6 +917,132 @@ opt-level = 2
 [profile.dev]
 opt-level = 0
 debug = 0
+
+# The embedded engine must be optimized in dev/test builds too. Without this,
+# the default dev profile hands quickjs.c to the C compiler at -O0, so every
+# JS-heavy test and `pir js` debug run is several times slower than the shipped
+# release binary and benchmarks do not represent production. Only the three
+# engine packages are optimized; the rest of the crate stays at opt-level 0, so
+# the edit-test loop and backtraces are unaffected (the C build happens once).
+[profile.dev.package.rquickjs-sys]
+opt-level = 3
+
+[profile.dev.package.rquickjs-core]
+opt-level = 3
+
+[profile.dev.package.rquickjs]
+opt-level = 3
+
+# `cargo test` uses the test profile; keep the same engine optimization there
+# (profile inheritance does not reliably carry per-package overrides).
+[profile.test.package.rquickjs-sys]
+opt-level = 3
+
+[profile.test.package.rquickjs-core]
+opt-level = 3
+
+[profile.test.package.rquickjs]
+opt-level = 3
+
+# The Node host bridge itself: dev/test builds otherwise run every host op
+# (base64 codecs, hashing, zlib, JSON payload conversion) at -O0, which makes
+# `fs.readFileSync`/`writeFileSync`/`crypto` several times slower than the
+# release binary. These are the crates on the JS↔Rust boundary; the rest of the
+# workspace stays unoptimized so the edit-test loop is unchanged.
+[profile.dev.package.pir-sdk]
+opt-level = 3
+
+[profile.test.package.pir-sdk]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
+
+[profile.test.package.serde_json]
+opt-level = 3
+
+[profile.dev.package.base64]
+opt-level = 3
+
+[profile.test.package.base64]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.test.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3
+
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.test.package.sha3]
+opt-level = 3
+
+# `sha3` delegates the permutation to this crate; without the override the
+# SHA-3 family runs at -O0 even when `sha3` itself is optimized.
+[profile.dev.package.keccak]
+opt-level = 3
+
+[profile.test.package.keccak]
+opt-level = 3
+
+[profile.dev.package.md-5]
+opt-level = 3
+
+[profile.test.package.md-5]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.test.package.hmac]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.test.package.pbkdf2]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.test.package.aes]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.test.package.rsa]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.test.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.test.package.miniz_oxide]
+opt-level = 3
+
+# `flate2`'s active backend: the `zlib-rs` crate carries the real deflate
+# work, so leaving it at the dev profile's O0 made `zlib.deflateSync(4KB)`
+# ~145–176µs instead of ~19–35µs in every test and `pir js` run.
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.test.package.zlib-rs]
+opt-level = 3
 
 [workspace]
 members = ["crates/pi-phone-server"]
@@ -999,30 +1114,47 @@ path = "tests/print_native_session.rs"
 
 # END GENERATED MERGED TEST TARGETS
 
-# The RustPython 0.4.0 stack trips rustc 1.99's `hint::assert_unchecked`
-# precondition checker in test/debug builds (a RustPython-internal assertion,
-# not a pir invariant). Keep the check enabled for this crate while compiling
-# the embedded interpreter without it, so the full Python/context-mode test
-# surface can run on stable.
-[profile.test.package.rustpython-vm]
-debug-assertions = false
+# Standalone (not merged) on purpose: it is opt-in measurement scaffolding for
+# the allocator/GC spike (`PIR_GC_MEASURE=1` prints numbers, asserts nothing),
+# and the parsing/profile tests are pure. Keeping it out of the merged harness
+# means the harness stays byte-identical for the gate.
+[[test]]
+name = "alloc_gc_tuning"
+path = "tests/alloc_gc_tuning.rs"
+required-features = ["extensions"]
 
-[profile.test.package.rustpython-common]
-debug-assertions = false
+# Fixed-workload measurement; kept standalone to avoid linking the merged
+# integration suites with the optimized benchmark profile.
+[[test]]
+name = "native_workload_parity"
+path = "tests/native_workload_parity.rs"
+required-features = ["cli", "extensions"]
 
-[profile.test.package.rustpython-stdlib]
-debug-assertions = false
+# Multi-plugin hosting measurement (N synthesized extension packages in one
+# runtime). Standalone like the other opt-in measurement harnesses; the
+# driver is `_scratch/plugin-scale/run.ps1`.
+[[test]]
+name = "plugin_scale"
+path = "tests/plugin_scale.rs"
+required-features = ["extensions"]
 
-[profile.test.package.rustpython-pylib]
-debug-assertions = false
+[[test]]
+name = "v8_diagnostics"
+path = "tests/v8_diagnostics.rs"
+required-features = ["cli", "extensions"]
 
-[profile.test.package.rustpython-sre_engine]
-debug-assertions = false
+[[test]]
+name = "node_core"
+path = "tests/node_core.rs"
+required-features = ["extensions"]
 
-# RustPython 0.4.0 can allocate a zero-sized layout; rustc 1.99's
-# `GlobalAlloc for GlobalAllocator` wrapper checks that precondition in debug
-# test builds and aborts the process. The embedded interpreter is third-party
-# code, so keep debug assertions off for the test profile; release builds are
-# unaffected.
+# One-shot AOT bytecode generator for the embedded JS shims. Run with
+# `cargo run --bin pir-gen-bytecode --features extensions` after editing any
+# `src/extensions/api/js/*.js.txt` source. Not part of the product binary.
+[[bin]]
+name = "pir-gen-bytecode"
+path = "src/bin/pir_gen_bytecode.rs"
+required-features = ["extensions"]
+
 [profile.test]
 debug-assertions = false

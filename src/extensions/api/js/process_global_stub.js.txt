@@ -126,7 +126,30 @@ if (globalThis.process === undefined) {
   // v24.19.0 (a split 22-vs-24 story makes version-gated package code and
   // plain diagnostics disagree with `node --version`).
   proc.version = "v24.19.0";
-  proc.versions = { node: "24.19.0" };
+  // Node compatibility baseline for ecosystem version checks. `node` is the
+  // pinned compatibility level; fields this runtime can observe truthfully
+  // are real (sqlite is the linked SQLite library, probed with
+  // `select sqlite_version()`); the rest are the compatible library labels
+  // downstream feature-detection parses as semver. QuickJS is the actual
+  // engine and there is no V8: reporting the Node-compatible V8 label keeps
+  // code that splits/compares `versions.v8` working, while every capability
+  // surface (`process.features`, `process.config.variables`) stays truthful.
+  proc.versions = {
+    node: "24.19.0",
+    v8: "13.6.233.17-node.58",
+    uv: "1.51.0",
+    zlib: "1.3.1",
+    brotli: "1.1.0",
+    ares: "1.34.5",
+    modules: "137",
+    napi: "10",
+    openssl: "3.5.1",
+    sqlite: "3.45.0",
+    // Probed engine property data: Unicode 15.0 (Kawi/Nag_Mundari property
+    // escapes work, the Unicode 16.0 additions do not).
+    unicode: "15.0",
+    icu: "77.1",
+  };
   proc.release = { name: "node", sourceUrl: "", headersUrl: "" };
   proc.env = {};
   proc.argv = [];
@@ -140,7 +163,61 @@ if (globalThis.process === undefined) {
   proc.exitCode = 0;
   proc.title = "pir";
   proc.debugPort = 0;
-  proc.config = {}; // minimal: the real build-time config object is not reachable
+  // Build-time configuration surface. `test/common` reads
+  // `variables.v8_enable_i18n_support` (hasIntl), `variables.asan` and
+  // `target_defaults.default_configuration` at load time; native-package
+  // feature detection reads the node-gyp-style keys. Values describe this
+  // runtime, not a V8 build:
+  //   * v8_enable_i18n_support: 0 — an Intl object exists (NumberFormat,
+  //     DateTimeFormat, Segmenter, ListFormat), but it carries no locale
+  //     data (no Collator), so Intl-dependent tests skip truthfully;
+  //   * v8_enable_webassembly: 0 — QuickJS exposes no WebAssembly;
+  //   * node_use_openssl: true — crypto is implemented (hash/hmac/random/
+  //     uuid over the host), and `versions.openssl` makes common.hasCrypto
+  //     true; there is no native addon support (all node_shared* false).
+  proc.config = {
+    variables: {
+      v8_enable_i18n_support: 0,
+      v8_enable_webassembly: 0,
+      node_shared: false,
+      node_use_openssl: true,
+      node_shared_openssl: false,
+      openssl_is_fips: false,
+      openssl_is_boringssl: false,
+      napi_build_version: "10",
+      node_module_version: 137,
+      asan: 0,
+      ubsan: 0,
+      debug: 0,
+      debug_node: false,
+      debug_symbols: false,
+      enable_lto: false,
+      node_target_type: "executable",
+      node_use_node_snapshot: false,
+      node_use_node_code_cache: false,
+      node_use_sqlite: true,
+      node_shared_sqlite: false,
+      node_shared_zlib: false,
+      node_shared_brotli: false,
+      node_shared_cares: false,
+      node_shared_libuv: false,
+      node_install_npm: false,
+      node_install_corepack: false,
+      node_no_browser_globals: false,
+      node_enable_experimentals: false,
+      host_arch: proc.arch,
+      target_arch: proc.arch,
+      node_byteorder: "little",
+    },
+    target_defaults: {
+      include_dirs: [],
+      libraries: [],
+      defines: [],
+      cflags: [],
+      default_configuration: "Release",
+      configurations: { Release: {} },
+    },
+  };
   proc.sourceMapsEnabled = false;
   proc._eval = undefined; // set by real Node only under `node -e`
   proc._preload_modules = undefined;
@@ -189,8 +266,34 @@ if (globalThis.process === undefined) {
   proc.openStdin = () => proc.stdin;
 
   // --- timing ---------------------------------------------------------------
-  proc.cwd = () => globalThis.__pirNodeCall("process", "cwd");
-  proc.chdir = () => { throw new Error("process.chdir is not supported"); };
+  // `process.chdir` is unsupported here and the runtime's cwd is fixed at
+  // construction, so the answer is memoized: the hot path is a property read
+  // instead of a host round trip. The typed entry avoids the JSON envelope on
+  // the first (cache-filling) call.
+  let pirCwdCache;
+  proc.cwd = () => {
+    if (pirCwdCache !== undefined) return pirCwdCache;
+    const nativeCwd = globalThis.__pirProcessCwd;
+    const native = typeof nativeCwd === "function" ? nativeCwd() : undefined;
+    if (typeof native === "string") {
+      pirCwdCache = native;
+      return native;
+    }
+    return globalThis.__pirNodeCall("process", "cwd");
+  };
+  proc.chdir = (directory) => {
+    if (typeof directory !== "string") {
+      const error = new TypeError(
+        "The \"directory\" argument must be of type string. Received " +
+        (directory === null ? "null" : typeof directory),
+      );
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    globalThis.__pirNodeCall("process", "chdir", { path: directory });
+    // The host stores the new cwd; drop the memo so cwd() reflects it.
+    pirCwdCache = undefined;
+  };
   proc.uptime = () => (Date.now() - startedAt) / 1000;
   proc.memoryUsage = throws("memoryUsage"); // host RSS is not reachable without a new op
   proc.constrainedMemory = throws("constrainedMemory");
@@ -320,7 +423,47 @@ if (globalThis.process === undefined) {
   proc.setUncaughtExceptionCaptureCallback = throws("setUncaughtExceptionCaptureCallback");
   proc.hasUncaughtExceptionCaptureCallback = () => false;
   proc.setSourceMapsEnabled = throws("setSourceMapsEnabled");
-  proc.report = throws("report");
+  // `process.report` is an OBJECT in Node, not a function (its own keys are
+  // the report options plus getReport/writeReport). The JavaScript API report
+  // is built from data this runtime really has; writeReport needs a file
+  // writer host op that does not exist behind this sandbox, so it throws the
+  // standard unsupported error while keeping the key surface.
+  proc.report = {
+    getReport: () => ({
+      header: {
+        reportVersion: 2,
+        event: "JavaScript API",
+        trigger: "GetReport",
+        nodejsVersion: proc.version,
+        v8Version: proc.versions.v8,
+        platform: proc.platform,
+        arch: proc.arch,
+        pid: proc.pid,
+        cwd: proc.cwd(),
+        commandLine: [],
+        execArgv: proc.execArgv.slice(),
+        wordSize: 64,
+      },
+      javascriptHeap: {
+        totalMemory: 0,
+        totalCommittedMemory: 0,
+        usedMemory: 0,
+        availableMemory: 0,
+        memoryLimit: 0,
+      },
+      resourceUsage: {},
+    }),
+    writeReport: throws("report.writeReport"),
+    directory: "",
+    filename: "",
+    compact: false,
+    excludeNetwork: false,
+    excludeEnv: false,
+    signal: "SIGUSR2",
+    reportOnFatalError: false,
+    reportOnSignal: false,
+    reportOnUncaughtException: false,
+  };
   proc.loadEnvFile = throws("loadEnvFile");
   proc.finalization = {
     register: throws("finalization.register"),
@@ -339,9 +482,63 @@ if (globalThis.process === undefined) {
     tls_sni: false,
     tls_ocsp: false,
     tls: false,
+    // QUIC needs TLS + the host's QUIC stack, neither of which exists here
+    // (common.hasQuic gates on this).
+    quic: false,
   };
-  // Windows Node reports 0; there is no host umask op.
-  proc.umask = () => 0;
+  // Node's umask get/set pair. There is no host op (the sandbox has no
+  // POSIX mode semantics), so the mask is process-local state like Node's.
+  // win32 reports 0 (the OS has no umask), everywhere else 0o022, which is
+  // also what `test/common` assumes before setting its own. Validation
+  // mirrors Node (number = 32-bit unsigned integer; octal strings accepted;
+  // the previous mask is returned).
+  let pirUmask = proc.platform === "win32" ? 0 : 0o022;
+  proc.umask = (mask) => {
+    if (mask === undefined) return pirUmask;
+    let next;
+    if (typeof mask === "string") {
+      if (!/^[0-7]+$/.test(mask)) {
+        const error = new TypeError(
+          "The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received '" +
+            mask + "'",
+        );
+        error.code = "ERR_INVALID_ARG_VALUE";
+        throw error;
+      }
+      next = parseInt(mask, 8);
+    } else if (typeof mask === "number") {
+      if (!Number.isInteger(mask)) {
+        const error = new RangeError(
+          'The value of "mask" is out of range. It must be an integer. Received ' + mask,
+        );
+        error.code = "ERR_OUT_OF_RANGE";
+        throw error;
+      }
+      if (mask < 0 || mask > 0xffffffff) {
+        const error = new RangeError(
+          'The value of "mask" is out of range. It must be >= 0 && <= 4294967295. Received ' +
+            mask,
+        );
+        error.code = "ERR_OUT_OF_RANGE";
+        throw error;
+      }
+      next = mask;
+    } else {
+      const error = new TypeError(
+        'The "mask" argument must be of type number. Received ' +
+          (mask === null ? "null" : typeof mask),
+      );
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    // The Windows CRT umask only retains the user read/write bits; `umask()`
+    // reports what the CRT would apply, so other bits are dropped instead of
+    // being stored verbatim (test/common sets 0o022 and expects 0o644 files).
+    if (proc.platform === "win32") next &= 0o600;
+    const previous = pirUmask;
+    pirUmask = next;
+    return previous;
+  };
   proc.noDeprecation = false;
   proc.throwDeprecation = false;
   // Node `process.emitWarning` (internal/process/warning.js): the 'warning'
@@ -384,7 +581,11 @@ if (globalThis.process === undefined) {
   // Real: resolves through the preloaded builtin registry (same table the
   // CJS require path consults).
   proc.getBuiltinModule = (name) => {
-    const mod = globalThis.__pirNodeModules ? globalThis.__pirNodeModules[String(name)] : undefined;
+    // Node accepts both the bare and `node:`-prefixed spelling; the builtin
+    // table is keyed bare.
+    let key = String(name);
+    if (key.startsWith("node:")) key = key.slice(5);
+    const mod = globalThis.__pirNodeModules ? globalThis.__pirNodeModules[key] : undefined;
     if (mod === undefined) {
       const error = new Error(
         "No such builtin module: " + String(name),
@@ -417,27 +618,53 @@ if (globalThis.process === undefined) {
     try { return globalThis.__pirNodeCall("process", "env"); } catch { return {}; }
   })();
   const envSymbolTypeError = () => new TypeError("Cannot convert a Symbol value to a string");
+  // Windows environment names are case-insensitive (`process.env.SystemRoot`
+  // and `SYSTEMROOT` are the same variable); the host snapshot keeps the OS
+  // spelling. Resolve through a lowercase index so reads/writes/deletes land on
+  // the existing entry while ownKeys still reports OS spelling.
+  const envWin32 = proc.platform === "win32";
+  const envCanonical = new Map();
+  if (envWin32) {
+    for (const name of Object.keys(envData)) envCanonical.set(name.toLowerCase(), name);
+  }
+  const envResolve = (key) => {
+    const text = String(key);
+    if (!envWin32) return text;
+    const actual = envCanonical.get(text.toLowerCase());
+    return actual === undefined ? text : actual;
+  };
+  const envRemember = (key) => {
+    if (envWin32) envCanonical.set(String(key).toLowerCase(), String(key));
+  };
   proc.env = new Proxy(envData, {
-    get(target, key) { return typeof key === "symbol" ? undefined : target[key]; },
+    get(target, key) {
+      return typeof key === "symbol" ? undefined : target[envResolve(key)];
+    },
     set(target, key, value) {
       // Node stringifies both the key and the value (V8's ToString), which is
       // what turns a symbol into that TypeError.
       if (typeof key === "symbol" || typeof value === "symbol") throw envSymbolTypeError();
-      Object.defineProperty(target, String(key), {
+      const name = envResolve(key);
+      Object.defineProperty(target, name, {
         value: String(value), writable: true, enumerable: true, configurable: true,
       });
+      envRemember(name);
       return true;
     },
-    has(target, key) { return typeof key === "symbol" ? false : key in target; },
+    has(target, key) { return typeof key === "symbol" ? false : envResolve(key) in target; },
     deleteProperty(target, key) {
-      if (typeof key !== "symbol") delete target[key];
+      if (typeof key !== "symbol") {
+        const name = envResolve(key);
+        delete target[name];
+        if (envWin32) envCanonical.delete(String(key).toLowerCase());
+      }
       return true;
     },
     ownKeys(target) {
       return Reflect.ownKeys(target).filter((key) => typeof key !== "symbol");
     },
     getOwnPropertyDescriptor(target, key) {
-      return typeof key === "symbol" ? undefined : Object.getOwnPropertyDescriptor(target, key);
+      return typeof key === "symbol" ? undefined : Object.getOwnPropertyDescriptor(target, envResolve(key));
     },
     // Node accepts only a full configurable/writable/enumerable data
     // descriptor (Object.defineProperty(process.env, k, {value: v}) throws).
@@ -454,9 +681,11 @@ if (globalThis.process === undefined) {
         error.code = "ERR_INVALID_OBJECT_DEFINE_PROPERTY";
         throw error;
       }
-      Object.defineProperty(target, key, {
+      const name = envResolve(key);
+      Object.defineProperty(target, name, {
         value: descriptor.value, writable: true, enumerable: true, configurable: true,
       });
+      envRemember(name);
       return true;
     },
   });
@@ -554,7 +783,8 @@ if (globalThis.process === undefined) {
     beforeExitProbeArmed = true;
     const id = globalThis.setTimeout(beforeExitProbe, delay);
     beforeExitSelfArms += 1;
-    if (typeof id === "number") beforeExitProbeIds.add(id);
+    const probeId = typeof id === "number" ? id : (id && id.__pirTimerId);
+    if (typeof probeId === "number") beforeExitProbeIds.add(probeId);
   };
   const beforeExitProbe = () => {
     const pending = beforeExitPending(); // still counts the running probe
@@ -574,21 +804,35 @@ if (globalThis.process === undefined) {
     }
     beforeExitWaits = 0;
     if (beforeExitEmitted) return; // one emission per idle period
+    // Exact Node rule: only work scheduled *synchronously by the handlers*
+    // makes the loop alive again. Timers armed earlier (while the probe was
+    // waiting) must not re-open the latch — test-fs-truncate's beforeExit
+    // closers would then run twice against an already-closed fd.
     beforeExitEmitted = true;
+    const seqBeforeEmit = beforeExitTimerSeq();
     try {
       proc.emit(
         "beforeExit",
         proc.exitCode === undefined || proc.exitCode === null ? 0 : proc.exitCode,
       );
     } finally {
-      // Work the handlers armed synchronously is visible here and the loop is
-      // alive again; a bare nextTick (and anything it may arm) is not — the
-      // follow-up probe re-judges that against the sequence window. A
-      // handler that scheduled nothing keeps the latch set and the process
-      // exits, which is what stops a second emission.
-      if (beforeExitPending() > 0) beforeExitEmitted = false;
-      beforeExitRebase();
-      if (proc.listenerCount("beforeExit") > 0) armBeforeExitProbe(0);
+      // Node emits again only when the handlers themselves made the loop
+      // alive again (a timer scheduled synchronously during the emission).
+      // Our idle probes are the only other timer source; re-arming after a
+      // clean emission just re-opened the latch and re-ran the handlers on an
+      // idle loop (test-fs-truncate's closers double-closed their fd).
+      if (beforeExitTimerSeq() > seqBeforeEmit) {
+        beforeExitEmitted = false;
+        beforeExitRebase();
+        armBeforeExitProbe(0);
+      } else {
+        // Nothing was armed synchronously, but a nextTick/microtask queued by
+        // the handler may arm a timer after this emit returns; Node re-checks
+        // liveness after that drain. Keep one probe armed to observe it (it
+        // stops immediately when nothing was armed).
+        beforeExitRebase();
+        armBeforeExitProbe(1);
+      }
     }
   };
   return proc;

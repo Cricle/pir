@@ -42,10 +42,78 @@ use std::path::{Path, PathBuf};
 
 use super::source::{builtin_name, is_builtin_path, BUILTIN_PATH_PREFIX};
 
-/// The JS `pi-tool-repair` package's directory name — the path component
-/// that identifies its extension entry (the npm package directory under
-/// `node_modules`, or a checkout of it).
-const JS_TOOL_REPAIR_DIR: &str = "pi-tool-repair";
+/// Native-first precedence pairs: `(builtin name, JS package path component)`.
+/// When the native builtin is on the effective plan the matching JS package
+/// entry is dropped so only the native face runs (the CLR analogy: if the
+/// native runtime can serve it, don't load the scripted copy).
+///
+/// All pairs are on by default: the Rust ports run with no plugin source
+/// change and no user flag, which is the whole point of the native surface
+/// (a scripted copy of the same package would just cost interpreted-JS
+/// throughput). `PIR_PREFER_NATIVE=0` restores upstream first-wins for the
+/// full-port pairs; the `tool-repair`/`phone` single-face rules stay always-on
+/// because two copies running the same repair pipeline or phone server would
+/// double-apply.
+const NATIVE_PRECEDENCE: &[(&str, &str)] = &[
+    ("tool-repair", "pi-tool-repair"),
+    ("phone", "@malinamnam/pi-phone"),
+    ("subagent", "pi-subagents"),
+    ("mcp", "pi-mcp"),
+    ("codemode", "pi-codemode"),
+    ("tool-search", "pi-tool-search"),
+    ("todo", "rpiv-todo"),
+    ("context-mode", "context-mode"),
+];
+
+/// Whether the native-first set is active (default ON). The Rust ports replace
+/// their unmodified JS packages automatically; `PIR_PREFER_NATIVE=0` (also
+/// `false`/`off`) opts out and keeps upstream's first-wins behavior.
+fn prefer_native_enabled() -> bool {
+    !matches!(
+        std::env::var("PIR_PREFER_NATIVE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the precedence table entry at `index` applies. The always-on
+/// single-face rules (tool-repair, phone) ignore the preference switch.
+/// single-face rules (tool-repair, phone) ignore the opt-in flag; the extra
+/// full-port pairs need `PIR_PREFER_NATIVE`.
+fn native_precedence_applies(index: usize, prefer_native: bool) -> bool {
+    index < 2 || prefer_native
+}
+
+/// Whether `path` names JS package `package` (any normalized path component,
+/// ASCII case-insensitive — npm `node_modules` layout or a checkout).
+fn is_js_package_path(path: &Path, package: &str) -> bool {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .any(|component| component.eq_ignore_ascii_case(package))
+}
+
+/// Apply the native-first table to an effective path list in place.
+fn apply_native_precedence(paths: &mut Vec<PathBuf>) {
+    for (index, (builtin, package)) in NATIVE_PRECEDENCE.iter().enumerate() {
+        // Indices 0/1 are the always-on single-face rules; the rest need opt-in.
+        if !native_precedence_applies(index, prefer_native_enabled()) {
+            continue;
+        }
+        let builtin_on_plan = paths
+            .iter()
+            .any(|path| builtin_name(&path.to_string_lossy()) == Some(*builtin));
+        if builtin_on_plan {
+            if *builtin == "phone" {
+                // The phone package resolves through `package.json` names and
+                // the `npm:` install shape, not just path components (see
+                // `default_disabled_package_name`). Keep that resolution.
+                paths.retain(|path| default_disabled_package_name(path) != Some(*package));
+            } else {
+                paths.retain(|path| !is_js_package_path(path, package));
+            }
+        }
+    }
+}
 
 /// Which `tool-repair` face an extension plan settles on — see
 /// [`tool_repair_precedence`] for the rule and why the native builtin wins.
@@ -89,49 +157,6 @@ pub fn tool_repair_precedence(
     }
 }
 
-/// Whether `path` is the JS `pi-tool-repair` package's extension entry: any
-/// path component named `pi-tool-repair` (npm install under `node_modules`,
-/// or a checkout directory). Backslashes are normalized first; the component
-/// compare is ASCII case-insensitive (Windows paths may be spelled either
-/// way).
-fn is_js_tool_repair_path(path: &Path) -> bool {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .split('/')
-        .any(|component| component.eq_ignore_ascii_case(JS_TOOL_REPAIR_DIR))
-}
-
-/// Apply [`tool_repair_precedence`] to an effective extension path list in
-/// place: with `builtin:tool-repair` on it the JS `pi-tool-repair` entry is
-/// removed; with the builtin disabled/absent the JS entry is left alone.
-fn apply_tool_repair_precedence(paths: &mut Vec<PathBuf>) {
-    let builtin_on_plan = paths
-        .iter()
-        .any(|path| builtin_name(&path.to_string_lossy()) == Some("tool-repair"));
-    let js_package_on_plan = paths.iter().any(|path| is_js_tool_repair_path(path));
-    if tool_repair_precedence(builtin_on_plan, js_package_on_plan)
-        == ToolRepairPrecedence::NativeBuiltin
-    {
-        paths.retain(|path| !is_js_tool_repair_path(path));
-    }
-}
-
-/// Native pi-phone wins over the JS `@malinamnam/pi-phone` package: with
-/// `builtin:phone` on the plan, the on-disk JS copy is dropped so two servers
-/// never start for the same phone UI (the same precedence shape as
-/// `tool-repair`). The JS package remains the face when the native builtin is
-/// absent/disabled, and the default-disabled policy separately keeps it off
-/// the plan unless the user opts in.
-fn apply_phone_precedence(paths: &mut Vec<PathBuf>) {
-    const PHONE_PACKAGE: &str = "@malinamnam/pi-phone";
-    let builtin_on_plan = paths
-        .iter()
-        .any(|path| builtin_name(&path.to_string_lossy()) == Some("phone"));
-    if builtin_on_plan {
-        paths.retain(|path| default_disabled_package_name(path) != Some(PHONE_PACKAGE));
-    }
-}
-
 /// Split the resolved extension path list into builtin names (in order) and
 /// on-disk file paths (in order, builtins removed so directory discovery
 /// never sees a `builtin:` pseudo-path). The `tool-repair` precedence is
@@ -140,8 +165,7 @@ fn apply_phone_precedence(paths: &mut Vec<PathBuf>) {
 /// load funnels through, `load_extension_runtime` included).
 pub fn partition_paths(paths: &[PathBuf]) -> (Vec<String>, Vec<PathBuf>) {
     let mut effective = paths.to_vec();
-    apply_tool_repair_precedence(&mut effective);
-    apply_phone_precedence(&mut effective);
+    apply_native_precedence(&mut effective);
     let mut builtins = Vec::new();
     let mut files = Vec::new();
     for path in &effective {
@@ -174,8 +198,7 @@ pub fn filter_disabled_builtins(paths: &[PathBuf], disabled: &BTreeSet<String>) 
         })
         .cloned()
         .collect();
-    apply_tool_repair_precedence(&mut retained);
-    apply_phone_precedence(&mut retained);
+    apply_native_precedence(&mut retained);
     retained
 }
 
@@ -564,4 +587,23 @@ pub fn unknown_builtin_errors(
             });
         }
     }
+}
+
+/// Test seam: the native-precedence rules (integration tests live in
+/// `tests/`; inline test modules are forbidden in `src/`).
+#[doc(hidden)]
+pub fn native_precedence_for_tests(index: usize, prefer_native: bool) -> bool {
+    native_precedence_applies(index, prefer_native)
+}
+
+/// Test seam: number of native/JS package pairs in the precedence table.
+#[doc(hidden)]
+pub fn native_precedence_len_for_tests() -> usize {
+    NATIVE_PRECEDENCE.len()
+}
+
+/// Test seam: package-path matching used by the precedence rule.
+#[doc(hidden)]
+pub fn is_js_package_path_for_tests(path: &Path, package: &str) -> bool {
+    is_js_package_path(path, package)
 }

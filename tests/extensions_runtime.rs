@@ -227,11 +227,10 @@ async fn spike_ts_extension_registers_session_start_hook() {
 // `pi.on` fail-closed event-name validation
 // ---------------------------------------------------------------------------
 
-/// A typo in `pi.on` is a LOAD error, not a handler that can never fire.
-/// The known set is the central registry (`src/plugins/coverage.rs`), exposed
-/// to the prelude through the `isKnownEvent` host function.
+/// Unknown/newer SDK events are accepted at load and warned once; the host
+/// simply has no dispatch route for an event it does not know yet.
 #[tokio::test(flavor = "current_thread")]
-async fn pi_on_rejects_unknown_event_names_at_load() {
+async fn pi_on_accepts_unknown_event_names_at_load() {
     let rt = new_runtime().await;
     rt.seed_module(
         "pir-ext:unknown-event.ts",
@@ -242,15 +241,11 @@ async fn pi_on_rejects_unknown_event_names_at_load() {
         "#,
     )
     .expect("seed");
-    let error = rt
+    let loaded = rt
         .seeded_load("pir-ext:unknown-event.ts")
         .await
-        .expect_err("an unknown event name must fail the extension load");
-    let error = format!("{:#}", error);
-    assert!(
-        error.contains("unknown event") && error.contains("compaction_ends"),
-        "clear TypeError expected, got: {error}"
-    );
+        .expect("unknown future event must not block extension loading");
+    assert_eq!(loaded, 1);
 }
 
 /// Every documented family stays accepted: upstream names, the session-event
@@ -822,11 +817,12 @@ async fn typebox_shim_produces_valid_json_schema() {
         import { Type } from "typebox";
 
         export default (pi) => {
-            globalThis.__schema = Type.Object({
+                globalThis.__schema = Type.Object({
                 required: Type.String({ description: "a required string" }),
                 optional: Type.Optional(Type.Number({ description: "an optional number" })),
                 tags: Type.Array(Type.String(), { description: "tags" }),
                 enabled: Type.Boolean({ default: false }),
+                undefinedValue: Type.Undefined(),
             });
         };
         "#,
@@ -845,9 +841,13 @@ async fn typebox_shim_produces_valid_json_schema() {
     assert_eq!(schema["properties"]["optional"]["type"], "number");
     assert_eq!(schema["properties"]["tags"]["type"], "array");
     assert_eq!(schema["properties"]["enabled"]["default"], false);
+    assert_eq!(schema["properties"]["undefinedValue"]["type"], "undefined");
     // Optional properties are excluded from `required`; the shim marker is
     // stripped.
-    assert_eq!(schema["required"], json!(["required", "tags", "enabled"]));
+    assert_eq!(
+        schema["required"],
+        json!(["required", "tags", "enabled", "undefinedValue"])
+    );
     assert!(
         serde_json::to_string(&schema).unwrap().is_ascii(),
         "schema must be JSON-serializable"
@@ -1776,4 +1776,358 @@ fn js_modules_are_not_transpiled_even_with_ts_syntax() {
     assert_eq!(pir::extensions::transpile("module.mjs", mjs).unwrap(), mjs);
     let cjs = "module.exports = { z: 3 };\n";
     assert_eq!(pir::extensions::transpile("module.cjs", cjs).unwrap(), cjs);
+}
+
+// ---------------------------------------------------------------------------
+// Disk-module bytecode cache
+// ---------------------------------------------------------------------------
+
+/// The key must be a function of the module name and the raw source only: a
+/// stable key lets a later `pir` start reuse the blob, and any edit or rename
+/// must produce a different key.
+#[test]
+fn bytecode_cache_keys_are_content_and_name_specific() {
+    use pir::extensions::bytecode_cache;
+    let base = bytecode_cache::key("pir-ext:/tmp/a.ts", b"export default 1;\n");
+    assert_eq!(
+        base,
+        bytecode_cache::key("pir-ext:/tmp/a.ts", b"export default 1;\n"),
+        "the same name and source must map to the same key"
+    );
+    assert_ne!(
+        base,
+        bytecode_cache::key("pir-ext:/tmp/a.ts", b"export default 2;\n"),
+        "an edited source must miss"
+    );
+    assert_ne!(
+        base,
+        bytecode_cache::key("pir-ext:/tmp/b.ts", b"export default 1;\n"),
+        "a renamed module must miss (bytecode is compiled per module name)"
+    );
+    assert_eq!(base.len(), 64);
+    assert!(base.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+/// `put` → `get` → `evict` round trip. The key is unique per test process so a
+/// developer's warm cache can never make this pass without going through the
+/// store.
+#[test]
+fn bytecode_cache_round_trips_and_evicts() {
+    use pir::extensions::bytecode_cache;
+    let unique = format!(
+        "pir-ext:bytecode-cache-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
+    let key = bytecode_cache::key(&unique, b"export default 0;\n");
+    bytecode_cache::evict(&key);
+    assert!(bytecode_cache::get(&key).is_none(), "a fresh key is empty");
+
+    let payload: Vec<u8> = (0..=255u8).cycle().take(2048).collect();
+    bytecode_cache::put(&key, &payload);
+    assert_eq!(
+        bytecode_cache::get(&key).as_deref(),
+        Some(&payload),
+        "the stored payload comes back byte-identically"
+    );
+
+    bytecode_cache::evict(&key);
+    assert!(bytecode_cache::get(&key).is_none(), "evict drops the entry");
+}
+
+/// A disk extension loaded through a fresh runtime twice (the second runtime
+/// models a worker/reload within one process, and the persisted blob models
+/// the next `pir` start) must load, run, and leave a compiled blob behind.
+#[tokio::test(flavor = "current_thread")]
+async fn disk_extension_loads_and_populates_the_bytecode_cache() {
+    use pir::extensions::{bytecode_cache, loader::module_name_for};
+
+    let entry_src = r#"
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { helper } from "./helper.ts";
+
+export default function (pi: ExtensionAPI) {
+  pi.on("session_start", () => {
+    globalThis.__bytecode_cache_probe = helper(20);
+  });
+}
+"#;
+    let helper_src = r#"
+export function helper(value: number): number {
+  const parts: string[] = [];
+  for (let i = 0; i < 4; i++) parts.push(`p-${value + i}`);
+  return value + parts.length;
+}
+"#;
+    let dir = write_temp_fixture(
+        "bytecode-cache",
+        &[("index.ts", entry_src), ("helper.ts", helper_src)],
+    );
+    let entry = dir.join("index.ts");
+    let name = module_name_for(&entry);
+    let key = bytecode_cache::key(&name, entry_src.as_bytes());
+    // Cold start for this exact source revision.
+    bytecode_cache::evict(&key);
+
+    let first = ExtensionRuntime::new(test_config_at(&dir))
+        .await
+        .expect("runtime construction");
+    first.allow_root(dir.clone());
+    let outcome = first.load(&[entry.clone()]).await.expect("first load");
+    assert_eq!(outcome.loaded.len(), 1, "{:?}", outcome.errors);
+    let mut payload = json!({ "reason": "startup" });
+    first
+        .emit("session_start", &mut payload)
+        .await
+        .expect("first emit");
+    assert!(
+        bytecode_cache::get(&key).is_some(),
+        "the entry blob is stored"
+    );
+
+    // Second runtime: the same modules must load again (memory/disk hit or a
+    // transparent miss-and-recompile) and still execute the imported helper.
+    let second = ExtensionRuntime::new(test_config_at(&dir))
+        .await
+        .expect("runtime construction");
+    second.allow_root(dir.clone());
+    let outcome = second.load(&[entry]).await.expect("second load");
+    assert_eq!(outcome.loaded.len(), 1, "{:?}", outcome.errors);
+    second
+        .emit("session_start", &mut payload)
+        .await
+        .expect("second emit");
+    let probe: serde_json::Value = second
+        .eval_json("JSON.stringify(globalThis.__bytecode_cache_probe)")
+        .await
+        .expect("eval");
+    assert_eq!(probe, json!(24), "the module ran through helper.ts");
+
+    bytecode_cache::evict(&key);
+}
+
+// ---------------------------------------------------------------------------
+// AOT boot-path pin
+// ---------------------------------------------------------------------------
+
+/// The same probe runs in-process (AOT available) and in a child with
+/// `PIR_EXT_BYTECODE=0` (source path), so both boots must agree. It covers the
+/// three things the AOT'd bundles install: the builtin sweep (`require("fs")`
+/// works synchronously), `process.platform` (dynamic constants eval) and the
+/// global `Buffer`/TextEncoder surface (static globals bundle).
+async fn boot_probe(runtime: &ExtensionRuntime) -> serde_json::Value {
+    runtime
+        .eval_json(
+            r#"JSON.stringify((function () {
+              const fs = require("fs");
+              return {
+                platform: process.platform,
+                platformGlobal: globalThis.__pirPlatform,
+                fsRead: typeof fs.readFileSync,
+                fsSync: typeof fs.statSync,
+                buffer: typeof globalThis.Buffer.from,
+                textEncoder: typeof TextEncoder,
+                requireFn: typeof require,
+              };
+            })())"#,
+        )
+        .await
+        .expect("boot probe")
+}
+
+fn expected_boot_probe() -> serde_json::Value {
+    json!({
+        "platform": pir::extensions::api::node_shims::NODE_PLATFORM,
+        "platformGlobal": pir::extensions::api::node_shims::NODE_PLATFORM,
+        "fsRead": "function",
+        "fsSync": "function",
+        "buffer": "function",
+        "textEncoder": "function",
+        "requireFn": "function",
+    })
+}
+
+/// Child-process body: inherited by the parent test with `PIR_EXT_BYTECODE=0`
+/// and the skip toggles cleared, so it exercises the source fallback for every
+/// boot shim.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "spawned by boot_bundles_are_aot_compiled_and_toggle_boots_identically"]
+async fn boot_bundle_probe_child() {
+    let expected_enabled = !matches!(
+        std::env::var("PIR_EXT_BYTECODE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    );
+    assert_eq!(
+        pir::extensions::api::shims::bytecode_enabled(),
+        expected_enabled,
+        "the child must boot with the requested bytecode mode"
+    );
+    let runtime = new_runtime().await;
+    assert_eq!(boot_probe(&runtime).await, expected_boot_probe());
+}
+
+/// Pins the boot bundles to the AOT registry and proves the `PIR_EXT_BYTECODE=0`
+/// escape hatch still boots them from source with identical installed globals.
+#[tokio::test(flavor = "current_thread")]
+async fn boot_bundles_are_aot_compiled_and_toggle_boots_identically() {
+    use pir::extensions::api::{bytecode, node_shims};
+
+    // Registry pin: both assembled bundles must have a guard-valid blob.
+    for name in [
+        node_shims::GLOBALS_BUNDLE,
+        node_shims::NODE_MODULES_BOOTSTRAP_BUNDLE,
+    ] {
+        let blob = bytecode::bytecode_for(name)
+            .unwrap_or_else(|| panic!("{name} must be embedded as AOT bytecode"));
+        assert!(
+            bytecode::payload(blob).is_some(),
+            "{name} guard header must validate (regenerate with pir-gen-bytecode)"
+        );
+    }
+
+    let before = bytecode::aot_loads();
+    let runtime = new_runtime().await;
+    let probed = boot_probe(&runtime).await;
+    assert_eq!(probed, expected_boot_probe());
+
+    if pir::extensions::api::shims::bytecode_enabled() {
+        // prelude + globals + builtin bootstrap all take the AOT path.
+        assert!(
+            bytecode::aot_loads() >= before + 3,
+            "a boot must evaluate the prelude, globals and builtin bootstrap from bytecode \
+             (aot_loads: before={before} after={})",
+            bytecode::aot_loads()
+        );
+        // The emitted globals blob is the assembled bundle minus the dynamic
+        // constants: pin that it is non-trivial and covers the whole text.
+        let globals_payload = bytecode::payload(
+            bytecode::bytecode_for(node_shims::GLOBALS_BUNDLE).expect("globals blob"),
+        )
+        .expect("globals payload");
+        assert!(
+            globals_payload.len() > 64 * 1024,
+            "globals bundle bytecode should be substantial, got {} bytes",
+            globals_payload.len()
+        );
+    }
+
+    // Force the source path in a fresh process (the mode is cached per
+    // process, so it must be a child) and compare the exact probe.
+    let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "boot_bundle_probe_child",
+            "--include-ignored",
+            "--nocapture",
+        ])
+        .env("PIR_EXT_BYTECODE", "0")
+        .env_remove("PIR_EXT_SKIP_PRELUDE")
+        .env_remove("PIR_EXT_SKIP_NODE_BUILTINS")
+        .status()
+        .expect("spawn source-path boot probe");
+    assert!(status.success(), "source-path boot probe failed: {status}");
+}
+
+// ---------------------------------------------------------------------------
+// Boot-cost measurement (manual, `--ignored`)
+// ---------------------------------------------------------------------------
+
+/// Mean warm `ExtensionRuntime` construction cost, with the boot-stage skip
+/// toggles to attribute the source-parse work. Run alone:
+///
+/// ```text
+/// cargo test --features extensions --test <group> \
+///   extensions_runtime::boot_cost_measurement -- --include-ignored --nocapture
+/// ```
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual boot-cost measurement"]
+async fn boot_cost_measurement() {
+    use pir::extensions::api::node_shims;
+    use std::time::{Duration, Instant};
+
+    const WARMUP: usize = 3;
+    const ITERS: usize = 20;
+
+    println!(
+        "bundle bytes: globals={} bootstrap={} prelude={} builtins={}",
+        node_shims::globals_source().len(),
+        node_shims::node_modules_bootstrap_source().len(),
+        pir::extensions::api::HOST_PRELUDE.source().len(),
+        node_shims::builtin_short_names().len(),
+    );
+
+    // Direct parse+eval cost of the globals bundle in a bare engine (no host
+    // registration, no sweep): upper bound for what AOT can remove.
+    {
+        let rt = rquickjs::Runtime::new().expect("quickjs runtime");
+        let ctx = rquickjs::Context::full(&rt).expect("quickjs context");
+        for _ in 0..WARMUP {
+            ctx.with(|ctx| {
+                ctx.eval::<(), _>(node_shims::globals_source())
+                    .expect("globals eval");
+            });
+        }
+        let mut samples = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let started = Instant::now();
+            ctx.with(|ctx| {
+                ctx.eval::<(), _>(node_shims::globals_source())
+                    .expect("globals eval");
+            });
+            samples.push(started.elapsed());
+        }
+        println!(
+            "raw globals_source eval: mean={:.3}ms min={:.3}ms",
+            mean(&samples).as_secs_f64() * 1e3,
+            samples.iter().min().copied().unwrap().as_secs_f64() * 1e3,
+        );
+    }
+
+    let scenarios: &[(&str, bool, bool)] = &[
+        ("full", false, false),
+        ("skip prelude", true, false),
+        ("skip builtins", false, true),
+        ("skip prelude+builtins", true, true),
+    ];
+    for (label, skip_prelude, skip_builtins) in scenarios {
+        if *skip_prelude {
+            std::env::set_var("PIR_EXT_SKIP_PRELUDE", "1");
+        } else {
+            std::env::remove_var("PIR_EXT_SKIP_PRELUDE");
+        }
+        if *skip_builtins {
+            std::env::set_var("PIR_EXT_SKIP_NODE_BUILTINS", "1");
+        } else {
+            std::env::remove_var("PIR_EXT_SKIP_NODE_BUILTINS");
+        }
+        for _ in 0..WARMUP {
+            let runtime = ExtensionRuntime::new(test_config())
+                .await
+                .expect("runtime construction");
+            drop(runtime);
+        }
+        let mut samples = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let started = Instant::now();
+            let runtime = ExtensionRuntime::new(test_config())
+                .await
+                .expect("runtime construction");
+            samples.push(started.elapsed());
+            drop(runtime);
+        }
+        println!(
+            "{label}: mean={:.3}ms min={:.3}ms",
+            mean(&samples).as_secs_f64() * 1e3,
+            samples.iter().min().copied().unwrap().as_secs_f64() * 1e3,
+        );
+    }
+    std::env::remove_var("PIR_EXT_SKIP_PRELUDE");
+    std::env::remove_var("PIR_EXT_SKIP_NODE_BUILTINS");
+
+    fn mean(samples: &[Duration]) -> Duration {
+        let total: Duration = samples.iter().sum();
+        total / u32::try_from(samples.len()).expect("sample count fits u32")
+    }
 }

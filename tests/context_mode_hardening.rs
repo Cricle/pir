@@ -40,7 +40,7 @@ use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 /// The embedded RustPython VM serializes user code behind a process-wide
-/// execution lock (`src/plugins/builtin/python_vm.rs`), and cargo runs this
+/// execution lock (`src/plugins/builtin/js_vm.rs`), and cargo runs this
 /// binary's tests concurrently. A call that has to queue behind another test's
 /// long script burns its own deadline there (default 30s for `ctx_execute`),
 /// which is what made the write-cap tests flaky under load. Hold this gate for
@@ -665,6 +665,7 @@ fn database_path_prefers_the_pushed_session_cwd() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "tests the removed Python worker exec lock"]
 fn python_exec_lock_starvation_valve_allows_two_deadline_ceiling() {
     let threshold = ContextModePlugin::python_exec_lock_wedged_after();
     assert_eq!(
@@ -686,7 +687,7 @@ async fn execute_print_loop_is_capped_at_write_time() {
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "for _ in range(500000):\n    print(\"x\" * 100)",
+                "code": "for (var i = 0; i < 500000; i++) { print(\"x\".repeat(100)); }",
                 "timeout": 120
             }),
         )
@@ -726,7 +727,7 @@ async fn execute_single_huge_write_is_capped() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('y' * 1_500_000)" }),
+            json!({ "code": "print('y'.repeat(1500000))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -747,7 +748,7 @@ async fn execute_stderr_is_capped_at_write_time() {
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "import sys\nsys.stderr.write('z' * 1_500_000)\n1 / 0"
+                "code": "console.error('z'.repeat(1500000))\nthrow new Error('boom')"
             }),
         )
         .await;

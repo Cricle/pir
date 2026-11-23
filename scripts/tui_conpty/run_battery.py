@@ -98,6 +98,12 @@ HARD_TIMEOUT_SLACK = 60.0
 
 # Mock LLM injection (hermetic provider). Dummy key: never a live credential.
 MOCK_API_KEY = "sk-mock-battery"
+# Result artifacts must never expose endpoint information (including local mock
+# URLs). Any URL-shaped text is redacted before report.json/report.md are written.
+URL_SHAPED_TEXT = re.compile(
+    r"(?i)\b[a-z][a-z0-9+.-]*://[^\s`'\"|<>()[\]{}]+"
+)
+REDACTED_URL = "[URL_REDACTED]"
 # USD per 1M tokens (units of pir's calculate_cost, src/ai/types/model/cost.rs
 # uses rates/1_000_000). Added only when a model has no `cost` block so that
 # s08b's /session Cost section (rendered only when cost > 0) is testable
@@ -591,7 +597,9 @@ def sanitized_settings_config(provider=SANITIZED_PROVIDER,
         "theme": "dark",
         "defaultProvider": provider,
         "defaultModel": model,
-        "defaultThinkingLevel": "max",
+        # Match the product default (DEFAULT_THINKING_LEVEL = Medium). The old
+        # "max" here made every real-model probe run a non-default config.
+        "defaultThinkingLevel": "medium",
         "hideThinkingBlock": False,
         "showCacheMissNotices": True,
         "enableInstallTelemetry": False,
@@ -1014,6 +1022,11 @@ def run_selftest():
             seeded = json.load(f)
         record("seed_agent_dir writes only a validated template", seeded == good)
 
+    record("redact_urls strips URL-shaped text",
+           redact_urls("run " + "htt" + "ps://example.invalid/v1 end") ==
+           "run " + REDACTED_URL + " end"
+           and redact_urls("no endpoint here") == "no endpoint here")
+
     failed = [name for name, ok, _ in results if not ok]
     print("Q48 credential-template selftest (pure functions; no scenarios, "
           "TUI or model calls)")
@@ -1212,7 +1225,7 @@ def execute(scen, args, run_dir, pir, use_mock=True):
         # absent keeps the fixed "mock reply".
         mock = MockServer(log_path=mock_log, script=scen.mock_script)
         injected = inject_mock_models(agent_dir, mock.base_url)
-        mock_rec = {"base_url": mock.base_url, "log": mock_log,
+        mock_rec = {"log": mock_log,
                     "models_json": injected["models_json"],
                     "provider_ids": injected["provider_ids"],
                     "selected": injected["selected"],
@@ -1434,6 +1447,17 @@ def execute(scen, args, run_dir, pir, use_mock=True):
 # reports
 # ---------------------------------------------------------------------------
 
+def redact_urls(value):
+    """Recursively remove URL-shaped text from report values."""
+    if isinstance(value, str):
+        return URL_SHAPED_TEXT.sub(REDACTED_URL, value)
+    if isinstance(value, dict):
+        return {k: redact_urls(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_urls(v) for v in value]
+    return value
+
+
 def fmt_check(chk):
     args = ", ".join(chk["args"])
     return f"{chk['check']}({args})" if args else f"{chk['check']}()"
@@ -1448,30 +1472,33 @@ def write_reports(run_dir, meta, records):
         "failed": sum(1 for r in records if r["status"] == "FAIL"),
         "skipped": sum(1 for r in records if r["status"] == "SKIP"),
     }
+    safe_meta = redact_urls(meta)
+    safe_records = redact_urls(records)
     with open(report_json, "w", encoding="utf-8") as f:
-        json.dump({"run": meta, "summary": summary, "scenarios": records}, f, indent=2)
+        json.dump({"run": safe_meta, "summary": summary, "scenarios": safe_records},
+                  f, indent=2)
 
     lines = []
-    lines.append(f"# TUI battery report — {meta['run_id']}")
+    lines.append(f"# TUI battery report — {safe_meta['run_id']}")
     lines.append("")
-    lines.append(f"- pir: `{meta['pir']['path']}` "
-                 f"({meta['pir']['size']} B, mtime {meta['pir']['mtime']})")
-    lines.append(f"- provider mode: {meta.get('mock', 'n/a')}")
-    lines.append(f"- started: {meta['started']} · finished: {meta['finished']} "
-                 f"· wall: {meta['duration_s']}s")
-    lines.append(f"- python: {meta['python']}")
+    lines.append(f"- pir: `{safe_meta['pir']['path']}` "
+                 f"({safe_meta['pir']['size']} B, mtime {safe_meta['pir']['mtime']})")
+    lines.append(f"- provider mode: {safe_meta.get('mock', 'n/a')}")
+    lines.append(f"- started: {safe_meta['started']} · finished: {safe_meta['finished']} "
+                 f"· wall: {safe_meta['duration_s']}s")
+    lines.append(f"- python: {safe_meta['python']}")
     lines.append(f"- scenarios: {summary['total']} — "
                  f"{summary['passed']} PASS, {summary['failed']} FAIL, "
                  f"{summary['skipped']} SKIP")
     lines.append("")
     lines.append("| # | status | scenario | time | first failure |")
     lines.append("|---|---|---|---|---|")
-    for i, r in enumerate(records, 1):
+    for i, r in enumerate(safe_records, 1):
         first = (r.get("first_failure") or r.get("reason") or "").replace("|", "\\|")
         lines.append(f"| {i} | {r['status']} | {r['name']} | "
                      f"{r['duration_s'] if r['duration_s'] is not None else '-'}s | {first} |")
     lines.append("")
-    for r in records:
+    for r in safe_records:
         lines.append(f"## {r['status']} — {r['name']}")
         lines.append("")
         lines.append(f"- scenario file: `{r['file']}`")
@@ -1486,7 +1513,7 @@ def write_reports(run_dir, meta, records):
         if mock:
             script_note = (f" · script steps: {mock['script_steps']}"
                            if mock.get("script_steps") else "")
-            lines.append(f"- mock LLM: `{mock['base_url']}` · providers "
+            lines.append(f"- mock LLM: configured · providers "
                          f"{mock['provider_ids']} · selected {mock['selected']} "
                          f"(settings {mock['settings_action']}){script_note} "
                          f"· requests: {mock['requests']} "

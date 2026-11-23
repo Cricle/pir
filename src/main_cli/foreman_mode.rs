@@ -253,8 +253,25 @@ async fn run_decision(
     }
     let session_path = match session {
         Some(target) => resolve_session_path(session_dir, &target)?,
-        None => last_session(agent_dir)
-            .ok_or_else(|| anyhow::anyhow!("no recent foreman session; pass --session"))?,
+        None => {
+            let active = active_foreman_sessions(jobs);
+            if active.len() > 1 {
+                let listing = active
+                    .iter()
+                    .map(|path| format!("  {}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    );
+                anyhow::bail!(
+                    "multiple foreman sessions have running jobs; pass --session to choose one:
+{listing}"
+                );
+            }
+            last_session(agent_dir)
+                .ok_or_else(|| anyhow::anyhow!("no recent foreman session; pass --session"))?
+        }
     };
     if let Some(meta) = find_job_for_session(jobs, &session_path) {
         if !meta.status.is_terminal() {
@@ -274,12 +291,24 @@ async fn run_decision(
     manager.ensure_exclusive_writer()?;
     for record in &decisions {
         let text = if record.kind == "plan" && approved {
-            format!(
+            let mut text = format!(
                 "PLAN APPROVED: `{}` ({}).\n\n{}\n\nImplement this plan now and verify the result.",
                 record.id,
                 record.summary,
                 record.plan.as_deref().unwrap_or("(see session transcript)")
-            )
+            );
+            if let Some(verification) = record
+                .verification
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                text.push_str(
+                    "\n\nExecution verification criteria (a real tool result must show success):\n",
+                );
+                text.push_str(verification);
+            }
+            text
         } else if record.kind == "plan" {
             format!(
                 "PLAN DENIED: `{}` ({}). Revise the plan and submit it again, or ask a clarifying question.",
@@ -483,6 +512,21 @@ fn open_session(session_dir: &Path, target: &str) -> pir::Result<SessionManager>
 
 fn is_job_id(jobs: &pir::jobs::JobStore, target: &str) -> bool {
     jobs.status(target).is_some()
+}
+
+/// Distinct session paths that currently have a non-terminal foreman job.
+/// Used to refuse an ambiguous implicit target when several foreman sessions
+/// are running in parallel.
+fn active_foreman_sessions(jobs: &pir::jobs::JobStore) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = jobs
+        .list()
+        .into_iter()
+        .filter(|meta| !meta.status.is_terminal())
+        .filter_map(|meta| session_from_job(&meta))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn find_job_for_session(

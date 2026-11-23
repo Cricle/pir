@@ -2928,15 +2928,52 @@ export const streamSimpleOpenAICompletions = pirLegacyAlias("openai-completions"
 export const streamOpenAIResponses = pirLegacyAlias("openai-responses", "stream");
 export const streamSimpleOpenAIResponses = pirLegacyAlias("openai-responses", "streamSimple");
 
+// The host owns model execution, but catalog reads are safe and real: expose
+// the current preloaded catalog to plugins that only discover model/provider
+// metadata (`getModels`, `getProviders`, and provider lookup helpers).
+function pirHostModelCatalog() {
+  try {
+    if (typeof globalThis.__pir_native?.getModels === "function") {
+      return globalThis.__pir_native.getModels();
+    }
+    if (typeof globalThis.__pir_host?.getModelsJson === "function") {
+      const value = JSON.parse(globalThis.__pir_host.getModelsJson());
+      return value && typeof value === "object" ? value : {};
+    }
+  } catch { /* catalog reads are best-effort */ }
+  return { models: [], providers: [] };
+}
+
+function pirProviderModels(provider) {
+  const catalog = pirHostModelCatalog();
+  const models = Array.isArray(catalog.models) ? catalog.models : [];
+  return provider === undefined ? models : models.filter((model) => model?.provider === provider);
+}
+
+function pirProviderList() {
+  const catalog = pirHostModelCatalog();
+  return Array.isArray(catalog.providers) ? catalog.providers : [];
+}
+
+function pirCatalogUnavailable(name) {
+  return function () {
+    throw new Error(name + " is not available in the pir extension runtime (the builtin model catalog is host-side)");
+  };
+}
+
 // The upstream lazy api factories (`anthropicMessagesApi()` etc.) hand out
-// the raw builtin implementations; those are host-side here.
+// the raw builtin implementations. Provider execution remains host-side, but
+// these aliases let plugins register/inspect the host-backed transport.
 function pirApiFactoryUnavailable(name) {
   return function () {
     throw new Error(name + "() is not available in the pir extension runtime (provider execution is host-side)");
   };
 }
 
-export const anthropicMessagesApi = pirApiFactoryUnavailable("anthropicMessagesApi");
+export const anthropicMessagesApi = () => ({
+  stream: streamAnthropic,
+  streamSimple: streamSimpleAnthropic,
+});
 export const azureOpenAIResponsesApi = pirApiFactoryUnavailable("azureOpenAIResponsesApi");
 export const bedrockConverseStreamApi = pirApiFactoryUnavailable("bedrockConverseStreamApi");
 export const googleGenerativeAIApi = pirApiFactoryUnavailable("googleGenerativeAIApi");
@@ -2947,17 +2984,14 @@ export const openAICompletionsApi = pirApiFactoryUnavailable("openAICompletionsA
 export const openAIResponsesApi = pirApiFactoryUnavailable("openAIResponsesApi");
 export const piMessagesApi = pirApiFactoryUnavailable("piMessagesApi");
 
-// --- builtin model/image catalogs (generated upstream; not shipped here) ----
+// --- builtin model/image catalogs (generated upstream; host snapshot reads) ---
 
-function pirCatalogUnavailable(name) {
-  return function () {
-    throw new Error(name + " is not available in the pir extension runtime (the builtin model catalog is host-side)");
-  };
+export function getModel(provider, id) {
+  return pirProviderModels(provider).find((model) => model?.id === id);
 }
-
-export const getModel = pirCatalogUnavailable("getModel");
-export const getModels = pirCatalogUnavailable("getModels");
-export const getProviders = pirCatalogUnavailable("getProviders");
+export function getModels(provider) { return pirProviderModels(provider); }
+export function getBuiltinModels(provider) { return pirProviderModels(provider); }
+export function getProviders() { return pirProviderList(); }
 
 // --- images (images.ts / image-models.ts / images-api-registry.ts) ----------
 
@@ -3016,6 +3050,59 @@ export function registerBunOAuthFlows() {}
 // Historical pir exports (phase before phase 4f)
 // ---------------------------------------------------------------------------
 
+// Upstream `utils/version.ts`: the package version plugins read for
+// compatibility checks.
+export const PI_AI_VERSION = "1.6.0";
+
+// Upstream `cache-warming.ts`: providers suppress cache warming after this
+// idle window. Plugins import the constant for their own timers.
+export const CACHE_WARMING_MAX_IDLE_AGE_MS = 30 * 60_000;
+
+// Upstream `utils/streaming-json.ts` (`ToolCallArgumentsStream`): incremental
+// tool-call argument accumulation. The parser is not ported; this keeps the
+// public shape and returns the best partial object that JSON.parse can recover
+// (complete prefix + closing braces), and the exact final parse in finish().
+export class ToolCallArgumentsStream {
+  constructor() {
+    this._text = "";
+    this._arguments = {};
+  }
+  get text() {
+    return this._text;
+  }
+  append(delta) {
+    this._text += String(delta);
+    return this._partial();
+  }
+  replace(text) {
+    text = String(text);
+    if (text.startsWith(this._text)) {
+      const delta = text.slice(this._text.length);
+      return { delta, arguments: delta === "" ? this._partial() : this.append(delta) };
+    }
+    this._text = "";
+    this._arguments = {};
+    return { delta: undefined, arguments: this.append(text) };
+  }
+  finish() {
+    return JSON.parse(this._text);
+  }
+  _partial() {
+    const text = this._text.trim();
+    if (text === "") return (this._arguments = {});
+    for (let closers = 0; closers <= 8; closers++) {
+      try {
+        const value = JSON.parse(text + "}".repeat(closers));
+        if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+          this._arguments = value;
+          return this._arguments;
+        }
+      } catch { /* keep trying */ }
+    }
+    return this._arguments;
+  }
+}
+
 export function StringEnum(values, opts) {
   return { type: "string", enum: values, ...(opts ?? {}) };
 }
@@ -3045,6 +3132,9 @@ export default {
   Type,
   StringEnum,
   uuidv7,
+  ToolCallArgumentsStream,
+  CACHE_WARMING_MAX_IDLE_AGE_MS,
+  PI_AI_VERSION,
   ANTHROPIC_API_KEY_ENV,
   ANTHROPIC_AUTH_TOKEN_ENV,
   ANTHROPIC_FEDERATION_RULE_ID_ENV,
@@ -3080,6 +3170,7 @@ export default {
   getImagesApiProvider,
   getModel,
   getModels,
+  getBuiltinModels,
   getProviderEnvValue,
   getProviders,
   registerApiProvider,

@@ -7,16 +7,25 @@ globalThis.__pirNodePrimaryOps ?? (globalThis.__pirNodePrimaryOps = {
 });
 
 globalThis.__pirNodeCall ?? (globalThis.__pirNodeCall = function (module, op, payload) {
-  const body = JSON.stringify(payload === undefined ? {} : payload);
-  const primary = globalThis.__pirNodePrimaryOps;
-  const onLegacy = (module === "child" || module === "zlib") &&
-    !(primary[module] && primary[module][op]);
-  const raw = onLegacy
-    ? __pir_host.nodeExt(module, op, body)
-    : __pir_host.node(module, op, body);
-  const res = JSON.parse(raw);
+  const arg = payload === undefined ? {} : payload;
+  // The C-ABI tier passes a live JS object in and reads a live object back —
+  // no JSON.stringify / JSON.parse at the JS↔Rust boundary. The error
+  // reconstruction below is shared with the legacy string path.
+  let res;
+  if (globalThis.__pirNode && typeof globalThis.__pirNode.invoke === "function") {
+    res = globalThis.__pirNode.invoke(module, op, arg);
+  } else {
+    const body = JSON.stringify(arg);
+    const primary = globalThis.__pirNodePrimaryOps;
+    const onLegacy = (module === "child" || module === "zlib") &&
+      !(primary[module] && primary[module][op]);
+    const raw = onLegacy
+      ? __pir_host.nodeExt(module, op, body)
+      : __pir_host.node(module, op, body);
+    res = JSON.parse(raw);
+  }
   if (!res || res.ok !== true) {
-    const err = new Error((res && res.message) || ("__pir_host.node failed: " + module + "." + op));
+    const err = new Error((res && res.message) || ("node call failed: " + module + "." + op));
     if (res) {
       if (res.code !== undefined) err.code = res.code;
       if (res.syscall !== undefined) err.syscall = res.syscall;

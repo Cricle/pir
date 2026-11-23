@@ -37,9 +37,10 @@
 //! the existing single/parallel/chain subagent execution.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Map, Value};
@@ -63,7 +64,7 @@ mod submit_plan;
 
 pub(crate) use approvals::ApprovalKind as ModeApprovalKind;
 use approvals::{now_ms, ApprovalKind, ApprovalRecord, ApprovalState};
-use journal::{JournalEvent, JournalState};
+use journal::{ExecutionContract, JournalEvent, JournalState};
 pub(crate) use settings::{ApprovalMode, ModeSettings, RouterMode};
 
 pub(crate) use journal::decide_approval_for_session;
@@ -143,6 +144,14 @@ pub const GATE_MESSAGE: &str = "FOREMAN GATE: the latest worker has not passed a
 /// The gate-cap warning: the run may settle, but it is no longer described as
 /// verified.
 pub const UNVERIFIED_MESSAGE: &str = "FOREMAN UNVERIFIED: the reviewer gate reached its 3-nudge limit. The run may finish, but the result has not been independently verified.";
+
+/// Custom-message type for the plan execution-contract verification gate.
+pub const VERIFICATION_GATE_CUSTOM_TYPE: &str = "verification_gate";
+/// Model-facing nudge when an approved plan has no successful verification tool
+/// result yet. Domain-neutral: it asks for a real command, not a specific check.
+pub const VERIFICATION_GATE_MESSAGE: &str = "EXECUTION CONTRACT: the approved plan is not verified yet. Run a real verification command with the available tools and confirm it succeeded (zero exit status) before reporting done. Reasoning or claiming 'verified' does not count; a successful tool result is required. Fix any failure and run it again.";
+/// Cap-warning for the contract verification gate.
+pub const VERIFICATION_UNVERIFIED_MESSAGE: &str = "EXECUTION CONTRACT UNVERIFIED: the verification gate reached its 3-nudge limit. The run may finish, but the approved plan's verification criteria were not confirmed by a tool result.";
 
 /// Direct tools a foreman/plan session may call. Everything else is blocked at
 /// the `tool_call` seam and removed from the model-facing declarations.
@@ -330,13 +339,22 @@ struct ModeState {
     last_reviewer_call_id: RwLock<Option<String>>,
     /// Settle-gate continuations already injected for this worker generation.
     gate_nudges: AtomicU32,
+    /// The worker generation whose reviewer already returned PASS. Persisted
+    /// so a resumed session does not re-gate an already verified worker.
+    review_passed_generation: RwLock<Option<u32>>,
     settings: RwLock<ModeSettings>,
     approvals: RwLock<Vec<ApprovalRecord>>,
-    /// One approved delegation may pass without prompting again. Persisted so
-    /// a detached approval round-trip survives a process restart.
-    allow_next_worker: AtomicBool,
+    /// Approval ids whose worker delegation was approved and may pass once
+    /// without prompting again. Bound to specific requests so approving A can
+    /// never admit a different task B; approve-all can grant several at once.
+    /// Persisted for detached round-trips.
+    allow_next_worker_ids: RwLock<HashSet<String>>,
     /// The plan text submitted by `submit_plan` in plan mode.
     submitted_plan: RwLock<Option<String>>,
+    /// The approved plan's execution contract, carried into Normal mode.
+    active_contract: RwLock<Option<ExecutionContract>>,
+    /// Approval id whose verification evidence has passed for the active contract.
+    verification_passed_id: RwLock<Option<String>>,
     journal: RwLock<Option<journal::ForemanJournal>>,
 }
 
@@ -351,10 +369,13 @@ impl ModeState {
             worker_generation: AtomicU32::new(0),
             last_reviewer_call_id: RwLock::new(None),
             gate_nudges: AtomicU32::new(0),
+            review_passed_generation: RwLock::new(None),
             settings: RwLock::new(ModeSettings::default()),
             approvals: RwLock::new(Vec::new()),
-            allow_next_worker: AtomicBool::new(false),
+            allow_next_worker_ids: RwLock::new(HashSet::new()),
             submitted_plan: RwLock::new(None),
+            active_contract: RwLock::new(None),
+            verification_passed_id: RwLock::new(None),
             journal: RwLock::new(None),
         }
     }
@@ -411,7 +432,10 @@ impl ModeState {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        self.allow_next_worker.store(false, Ordering::SeqCst);
+        *self
+            .allow_next_worker_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = HashSet::new();
         self.refresh_approval_status();
     }
 
@@ -423,10 +447,43 @@ impl ModeState {
             .approvals
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = approvals.iter().find(|record| record.id == id) {
-            return (existing.id.clone(), false);
-        }
         let summary = approval_summary(input);
+        if let Some(existing) = approvals.iter_mut().find(|record| record.id == id) {
+            if existing.is_pending() {
+                return (existing.id.clone(), false);
+            }
+            // A terminal (denied/approved/expired) request with the same stable
+            // id is REOPENED, not deduped: otherwise a denied worker could never
+            // be re-requested and the delegation was permanently blocked.
+            existing.state = ApprovalState::Requested;
+            existing.created_at_ms = now_ms();
+            existing.call = call.to_owned();
+            existing.summary = summary.clone();
+            existing.plan = None;
+            existing.kind = ApprovalKind::Worker;
+            drop(approvals);
+            // Reopening is a fresh authority: the allowance for THIS id must
+            // not carry over (other still-valid approvals are untouched).
+            self.allow_next_worker_ids
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            self.journal_append(
+                JournalEvent::Approval {
+                    id: id.clone(),
+                    call: call.to_owned(),
+                    state: ApprovalState::Requested.label().to_owned(),
+                    summary,
+                    kind: ApprovalKind::Worker,
+                    plan: None,
+                    verification: None,
+                },
+                true,
+            );
+            self.journal_snapshot(true);
+            self.refresh_approval_status();
+            return (id, true);
+        }
         approvals.push(ApprovalRecord::requested(
             id.clone(),
             call.to_owned(),
@@ -445,6 +502,7 @@ impl ModeState {
                 summary,
                 kind: ApprovalKind::Worker,
                 plan: None,
+                verification: None,
             },
             true,
         );
@@ -453,6 +511,9 @@ impl ModeState {
     }
 
     fn decide_approval(&self, id: &str, approved: bool) -> Option<ApprovalRecord> {
+        // A stale pending request is not decidable. Expire first so TUI and
+        // CLI decisions share the same authority check.
+        self.expire_stale_approvals();
         let mut approvals = self
             .approvals
             .write()
@@ -468,12 +529,19 @@ impl ModeState {
         record.state = state;
         let record = record.clone();
         drop(approvals);
-        // A decision is the latest authority: approve admits the next worker,
-        // deny must also clear an earlier unused approval so a different
-        // delegation cannot slip through on a stale flag. Plan approvals never
-        // touch the worker allowance.
+        // A decision is the latest authority for THIS id: approve admits that
+        // worker once, deny revokes any earlier allowance for it. Other ids
+        // already approved stay valid (approve-all can grant several). Plan
+        // approvals never touch the worker allowance.
         if record.kind == ApprovalKind::Worker {
-            self.allow_next_worker.store(approved, Ordering::SeqCst);
+            let mut allowance = self
+                .allow_next_worker_ids
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            allowance.remove(&record.id);
+            if approved {
+                allowance.insert(record.id.clone());
+            }
         }
         self.journal_append(
             JournalEvent::Approval {
@@ -483,6 +551,7 @@ impl ModeState {
                 summary: record.summary.clone(),
                 kind: record.kind,
                 plan: record.plan.clone(),
+                verification: record.verification.clone(),
             },
             true,
         );
@@ -494,8 +563,12 @@ impl ModeState {
     /// Submit a plan for approval in plan mode. Returns the stable request id
     /// and whether this is a new request (a re-submission of the same text is
     /// deduped). The full plan is journaled so it survives resume.
-    fn submit_plan(&self, call: &str, plan: &str) -> (String, bool) {
-        let id = plan_approval_id(plan);
+    fn submit_plan(&self, call: &str, plan: &str, verification: Option<&str>) -> (String, bool) {
+        let id = plan_approval_id(plan, verification);
+        let verification = verification
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
         *self
             .submitted_plan
             .write()
@@ -511,11 +584,12 @@ impl ModeState {
             return (id, false);
         }
         let summary = plan_summary(plan);
-        approvals.push(ApprovalRecord::plan(
+        approvals.push(ApprovalRecord::plan_with_verification(
             id.clone(),
             call.to_owned(),
             summary.clone(),
             plan.to_owned(),
+            verification.clone(),
         ));
         if approvals.len() > 64 {
             let excess = approvals.len() - 64;
@@ -526,6 +600,7 @@ impl ModeState {
             JournalEvent::PlanSubmitted {
                 id: id.clone(),
                 plan: plan.to_owned(),
+                verification: verification.clone(),
             },
             true,
         );
@@ -537,6 +612,7 @@ impl ModeState {
                 summary: summary.clone(),
                 kind: ApprovalKind::Plan,
                 plan: Some(plan.to_owned()),
+                verification: verification.clone(),
             },
             true,
         );
@@ -554,11 +630,46 @@ impl ModeState {
             .submitted_plan
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .active_contract
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .verification_passed_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.journal_append(JournalEvent::PlanRevision, true);
     }
 
+    /// Install the approved plan as the active execution contract in memory.
+    /// Callers persist it via the next journal snapshot (`apply_mode` to Normal
+    /// snapshots after this, and detached approval snapshots at decision end).
+    fn set_active_contract(&self, contract: ExecutionContract) {
+        *self
+            .verification_passed_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .active_contract
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(contract);
+    }
+
+    fn active_contract(&self) -> Option<ExecutionContract> {
+        self.active_contract
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn verification_passed_id(&self) -> Option<String> {
+        self.verification_passed_id
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn expire_stale_approvals(&self) {
-        const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
         let now = now_ms();
         let mut expired = Vec::new();
         {
@@ -567,7 +678,7 @@ impl ModeState {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for record in approvals.iter_mut() {
-                if record.is_pending() && now.saturating_sub(record.created_at_ms) > MAX_AGE_MS {
+                if record.is_expired_at(now) {
                     record.state = ApprovalState::Expired;
                     expired.push(record.clone());
                 }
@@ -582,6 +693,7 @@ impl ModeState {
                     summary: record.summary,
                     kind: record.kind,
                     plan: record.plan,
+                    verification: record.verification,
                 },
                 true,
             );
@@ -589,8 +701,14 @@ impl ModeState {
         self.refresh_approval_status();
     }
 
-    fn take_allow_next_worker(&self) -> bool {
-        self.allow_next_worker.swap(false, Ordering::SeqCst)
+    /// Consume the bound allowance only when the current delegation's approval
+    /// id is one that was approved. A mismatched task never consumes another
+    /// task's authorization; each approved id is consumed exactly once.
+    fn take_allow_for(&self, id: &str) -> bool {
+        self.allow_next_worker_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
     }
 
     fn journal_state(&self) -> JournalState {
@@ -606,12 +724,45 @@ impl ModeState {
             nudges: self.gate_nudges.load(Ordering::SeqCst),
             settings: self.settings(),
             approvals: self.approvals(),
-            allow_next_worker: self.allow_next_worker.load(Ordering::SeqCst),
+            review_passed_generation: *self
+                .review_passed_generation
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            allow_next_worker: !self
+                .allow_next_worker_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            // Both allowance fields must be deterministic: HashSet iteration
+            // order is random, so take the first of the SORTED ids for the
+            // legacy single-id mirror too.
+            allow_next_worker_id: {
+                let guard = self
+                    .allow_next_worker_ids
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut ids: Vec<&String> = guard.iter().collect();
+                ids.sort();
+                ids.first().map(|id| (*id).clone())
+            },
+            allow_next_worker_ids: {
+                let mut ids: Vec<String> = self
+                    .allow_next_worker_ids
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .cloned()
+                    .collect();
+                ids.sort();
+                ids
+            },
             submitted_plan: self
                 .submitted_plan
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            active_contract: self.active_contract(),
+            verification_passed_id: self.verification_passed_id(),
         }
     }
 
@@ -663,15 +814,30 @@ impl ModeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.reviewer;
         self.gate_nudges.store(state.nudges, Ordering::SeqCst);
         *self
+            .review_passed_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.review_passed_generation;
+        *self
             .approvals
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.approvals;
-        self.allow_next_worker
-            .store(state.allow_next_worker, Ordering::SeqCst);
+        *self
+            .allow_next_worker_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            state.allow_next_worker_ids.iter().cloned().collect();
         *self
             .submitted_plan
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = state.submitted_plan;
+        *self
+            .active_contract
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.active_contract;
+        *self
+            .verification_passed_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.verification_passed_id;
     }
 
     fn refresh_approval_status(&self) {
@@ -710,6 +876,10 @@ impl ModeState {
         self.worker_generation.store(0, Ordering::SeqCst);
         self.gate_nudges.store(0, Ordering::SeqCst);
         *self
+            .review_passed_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
             .last_reviewer_call_id
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -724,12 +894,24 @@ impl ModeState {
             self.worker_generation.fetch_add(1, Ordering::SeqCst);
             self.gate_nudges.store(0, Ordering::SeqCst);
             *self
+                .review_passed_generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
                 .last_reviewer_call_id
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             self.set_phase(Phase::Delegating);
         }
         if has_reviewer {
+            // A fresh reviewer delegation supersedes any earlier PASS for the
+            // current generation: the new verdict (which may be FAIL/errored)
+            // must be authoritative at the settle gate. Without this, a second
+            // reviewer that fails is masked by the first one's PASS.
+            *self
+                .review_passed_generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             if let Some(call_id) = call_id.filter(|call_id| !call_id.is_empty()) {
                 *self
                     .last_reviewer_call_id
@@ -751,13 +933,38 @@ impl ModeState {
         self.journal_maybe_compact();
     }
 
-    /// Ask for one more turn when a worker exists but the latest reviewer
-    /// result is missing, errored, or did not say PASS.
+    /// Ask for one more turn when a settled run has not met its completion
+    /// contract. Two independent gates share the same 3-nudge budget:
+    ///   - Foreman: a worker exists but the reviewer result is missing/FAIL.
+    ///   - Plan contract: an approved plan with verification criteria but no
+    ///     successful verification tool result.
+    ///
+    /// A plain Normal run with no contract is never gated.
     fn gate_continuation(&self, payload: &Value) -> Option<Value> {
-        if self.mode() != Mode::Foreman {
+        let mode = self.mode();
+        if mode == Mode::Foreman {
+            return self.foreman_gate_continuation(payload);
+        }
+        if mode == Mode::Normal {
+            return self.contract_gate_continuation(payload);
+        }
+        None
+    }
+
+    /// Foreman reviewer gate (unchanged semantics).
+    fn foreman_gate_continuation(&self, payload: &Value) -> Option<Value> {
+        if self.worker_generation.load(Ordering::SeqCst) == 0 {
             return None;
         }
-        if self.worker_generation.load(Ordering::SeqCst) == 0 {
+        let generation = self.worker_generation.load(Ordering::SeqCst);
+        if self
+            .review_passed_generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(&generation)
+        {
+            self.set_phase(Phase::Verified);
             return None;
         }
         let reviewer_call_id = self
@@ -770,6 +977,10 @@ impl ModeState {
             .is_some_and(|call_id| reviewer_passed(payload, call_id))
         {
             self.set_phase(Phase::Verified);
+            *self
+                .review_passed_generation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(generation);
             if let Some(call_id) = reviewer_call_id {
                 self.journal_append(
                     JournalEvent::Review {
@@ -788,6 +999,68 @@ impl ModeState {
             self.journal_snapshot(false);
             return None;
         }
+        self.gate_nudge(GATE_MESSAGE, GATE_CUSTOM_TYPE, UNVERIFIED_MESSAGE)
+    }
+
+    /// Execution-contract verification gate for Normal runs carrying an
+    /// approved plan. Only contracts that actually declare verification
+    /// criteria require tool evidence; a plan without a verification clause
+    /// keeps the previous "visible but ungated" behavior.
+    fn contract_gate_continuation(&self, payload: &Value) -> Option<Value> {
+        let contract = self.active_contract()?;
+        let requires_evidence = contract
+            .verification
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|text| !text.is_empty());
+        if !requires_evidence {
+            return None;
+        }
+        let approval_id = contract
+            .approval_id
+            .clone()
+            .unwrap_or_else(|| "plan".to_owned());
+        if self.verification_passed_id().as_deref() == Some(approval_id.as_str()) {
+            self.set_phase(Phase::Verified);
+            return None;
+        }
+        if verification_evidence_passed(payload) {
+            self.set_phase(Phase::Verified);
+            *self
+                .verification_passed_id
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(approval_id.clone());
+            self.journal_append(
+                JournalEvent::Verification {
+                    approval_id,
+                    pass: true,
+                },
+                false,
+            );
+            self.journal_append(
+                JournalEvent::Phase {
+                    phase: Phase::Verified.label().to_owned(),
+                },
+                false,
+            );
+            self.journal_snapshot(false);
+            return None;
+        }
+        self.gate_nudge(
+            VERIFICATION_GATE_MESSAGE,
+            VERIFICATION_GATE_CUSTOM_TYPE,
+            VERIFICATION_UNVERIFIED_MESSAGE,
+        )
+    }
+
+    /// Shared bounded nudge: one budget, one custom-message draft per boundary,
+    /// capped below the host's continuation cap.
+    fn gate_nudge(
+        &self,
+        message: &str,
+        custom_type: &str,
+        unverified_message: &str,
+    ) -> Option<Value> {
         if self.gate_nudges.load(Ordering::SeqCst) >= MAX_GATE_NUDGES {
             if self.phase() != Phase::Unverified {
                 self.set_phase(Phase::Unverified);
@@ -797,15 +1070,12 @@ impl ModeState {
                     },
                     true,
                 );
-                self.notify_level(NotifyLevel::Warning, UNVERIFIED_MESSAGE);
+                self.notify_level(NotifyLevel::Warning, unverified_message);
             }
             return None;
         }
         if self.gate_nudges.fetch_add(1, Ordering::SeqCst) == 0 {
-            // Boundary drafts do not emit a live TUI bubble; the notice is
-            // the user-visible half of the gate (the custom message carries
-            // the model-facing half).
-            self.notify_level(NotifyLevel::Warning, GATE_MESSAGE);
+            self.notify_level(NotifyLevel::Warning, message);
         }
         self.set_phase(Phase::Rework);
         let nudges = self.gate_nudges.load(Ordering::SeqCst);
@@ -821,8 +1091,8 @@ impl ModeState {
             "continue": true,
             "entries": [{
                 "type": "custom_message",
-                "customType": GATE_CUSTOM_TYPE,
-                "content": GATE_MESSAGE,
+                "customType": custom_type,
+                "content": message,
                 "display": true,
             }],
         }))
@@ -920,7 +1190,7 @@ impl ModeState {
                 Mode::Foreman => self.reconstruct_gate(context),
             }
         }
-        if self.mode() != Mode::Normal {
+        if self.mode() != Mode::Normal || self.active_contract().is_some() {
             self.open_journal(context);
         } else {
             self.clear_approvals();
@@ -1048,7 +1318,9 @@ impl AgentPlugin for ModePlugin {
         });
         ctx.register_command(
             COMMAND_NAME,
-            Some("Switch session mode: /mode foreman | /mode normal | /mode plan"),
+            Some(
+                "Switch session mode: /mode foreman | /mode plan | /mode normal [--force].                  Foreman routes mutations to workers and requires a reviewer; plan is read-only                  until a submitted plan is approved. Run /approvals to decide pending approvals,                  /foreman to tune settings. Use --force to leave a busy session in an emergency.",
+            ),
             Some(CommandBackend::Rust(handler)),
         );
         let settings_state = Arc::clone(&self.state);
@@ -1090,9 +1362,12 @@ impl AgentPlugin for ModePlugin {
 
     fn handles_event_now(&self, event: &str) -> bool {
         // The settle boundary serializes the whole transcript before the
-        // handlers run. Only foreman has a settle handler, so normal and plan
+        // handlers run. Only foreman and Normal runs carrying an approved
+        // execution contract have a settle handler; ordinary normal/plan
         // sessions keep the no-handler fast path.
-        event != "agent_before_settle" || self.state.mode() == Mode::Foreman
+        event != "agent_before_settle"
+            || self.state.mode() == Mode::Foreman
+            || (self.state.mode() == Mode::Normal && self.state.active_contract().is_some())
     }
 
     fn hidden_tool_declarations(&self) -> Vec<String> {
@@ -1170,7 +1445,24 @@ impl AgentPlugin for ModePlugin {
                         mode_prompt(event, FOREMAN_SECTION, &prompt)
                     }
                     Mode::Plan => mode_prompt(event, PLAN_SECTION, PLAN_PROMPT),
-                    Mode::Normal => PluginEventOutcome::None,
+                    Mode::Normal => match self.state.active_contract() {
+                        Some(contract) if !contract.plan.trim().is_empty() => {
+                            let mut prompt = String::from(EXECUTION_CONTRACT_PROMPT_HEAD);
+                            prompt.push_str(contract.plan.trim());
+                            if let Some(verification) = contract
+                                .verification
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|text| !text.is_empty())
+                            {
+                                prompt.push_str("\n\nVerification criteria: ");
+                                prompt.push_str(verification);
+                            }
+                            prompt.push_str(EXECUTION_CONTRACT_PROMPT_TAIL);
+                            mode_prompt(event, EXECUTION_CONTRACT_SECTION, &prompt)
+                        }
+                        _ => PluginEventOutcome::None,
+                    },
                 },
                 "tool_call" => {
                     let mode = self.state.mode();
@@ -1219,7 +1511,13 @@ impl AgentPlugin for ModePlugin {
                                 terminate: false,
                             };
                         }
-                        let (id, created) = self.state.submit_plan(&call_id, &plan);
+                        let verification = event
+                            .payload
+                            .get("input")
+                            .and_then(|input| input.get("verification"))
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.trim().is_empty());
+                        let (id, created) = self.state.submit_plan(&call_id, &plan, verification);
                         if created {
                             self.state.notify_level(
                                 NotifyLevel::Warning,
@@ -1292,14 +1590,13 @@ impl AgentPlugin for ModePlugin {
                         let has_worker = agents.iter().any(|agent| agent != "reviewer");
                         let settings = self.state.settings();
                         let call_id = event.str_field("toolCallId").unwrap_or_default().to_owned();
+                        let worker_input = event.payload.get("input").unwrap_or(&Value::Null);
+                        let worker_approval_id = approval_id(worker_input);
                         if has_worker
                             && settings.approvals == ApprovalMode::Manual
-                            && !self.state.take_allow_next_worker()
+                            && !self.state.take_allow_for(&worker_approval_id)
                         {
-                            let (id, created) = self.state.request_approval(
-                                &call_id,
-                                event.payload.get("input").unwrap_or(&Value::Null),
-                            );
+                            let (id, created) = self.state.request_approval(&call_id, worker_input);
                             if created {
                                 self.state.notify_level(
                                     NotifyLevel::Warning,
@@ -1406,14 +1703,21 @@ pub fn new_mode_plugin() -> Arc<dyn AgentPlugin> {
 }
 
 fn handle_mode_command(state: &ModeState, args: &str) -> CommandOutcome {
-    match args.trim().to_ascii_lowercase().as_str() {
+    let trimmed = args.trim().to_ascii_lowercase();
+    let force = trimmed.ends_with(" --force");
+    let base = if force {
+        trimmed.trim_end_matches(" --force").trim()
+    } else {
+        trimmed.as_str()
+    };
+    match base {
         "" => CommandOutcome {
             ok: true,
             error: Some(format!("Current mode: {}.", state.mode().label())),
         },
-        "foreman" => switch_mode(state, Mode::Foreman),
-        "normal" => switch_mode(state, Mode::Normal),
-        "plan" => switch_mode(state, Mode::Plan),
+        "foreman" => switch_mode(state, Mode::Foreman, false),
+        "normal" => switch_mode(state, Mode::Normal, force),
+        "plan" => switch_mode(state, Mode::Plan, false),
         _ => CommandOutcome {
             ok: false,
             error: Some(USAGE_MESSAGE.to_owned()),
@@ -1421,7 +1725,7 @@ fn handle_mode_command(state: &ModeState, args: &str) -> CommandOutcome {
     }
 }
 
-fn switch_mode(state: &ModeState, target: Mode) -> CommandOutcome {
+fn switch_mode(state: &ModeState, target: Mode, force: bool) -> CommandOutcome {
     if state.mode() == target {
         return CommandOutcome {
             ok: true,
@@ -1437,7 +1741,7 @@ fn switch_mode(state: &ModeState, target: Mode) -> CommandOutcome {
             };
         }
         if let Some(session) = context.session() {
-            if !session.is_idle() {
+            if !session.is_idle() && !(force && target == Mode::Normal) {
                 return CommandOutcome {
                     ok: false,
                     error: Some(BUSY_MESSAGE.to_owned()),
@@ -1494,6 +1798,11 @@ fn apply_mode(state: &ModeState, target: Mode) {
                     },
                     true,
                 );
+                state.journal_snapshot(true);
+            } else if state.active_contract().is_some() {
+                // An approved plan keeps a verification contract alive in
+                // Normal mode. Keep the journal open so the verification /
+                // gate-nudge events persist across interrupts and resume.
                 state.journal_snapshot(true);
             } else {
                 state.journal_snapshot(true);
@@ -1626,14 +1935,24 @@ fn force_readonly_subagent_tools(input: &mut Value) {
             .map(|name| Value::String((*name).to_owned()))
             .collect(),
     );
+    let force_one = |object: &mut serde_json::Map<String, Value>| {
+        object.insert("tools".to_owned(), tools.clone());
+        // A worktree is created by `git worktree add` on the HOST before the
+        // child runs, and `worktreeMerge:auto` runs `git add/commit/merge` on
+        // the HOST after it — both mutate the real workspace regardless of the
+        // child's tool allowlist. Force them off so a plan-mode subagent can
+        // never write through the isolation/merge path.
+        object.insert("isolation".to_owned(), Value::String("none".to_owned()));
+        object.insert("worktreeMerge".to_owned(), Value::String("none".to_owned()));
+    };
     // Top-level override (single mode and a default for tasks/chain).
     if let Some(object) = input.as_object_mut() {
-        object.insert("tools".to_owned(), tools.clone());
+        force_one(object);
         for key in ["tasks", "chain"] {
             if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
                 for item in items {
                     if let Some(item) = item.as_object_mut() {
-                        item.insert("tools".to_owned(), tools.clone());
+                        force_one(item);
                     }
                 }
             }
@@ -1685,6 +2004,80 @@ fn scan_subagent_calls(message: &Value, generation: &mut u32, last_reviewer: &mu
             }
         }
     }
+}
+
+/// Whether the payload carries at least one successful, generic shell-command
+/// tool result. This is deliberately domain-neutral: it checks tool facts only
+/// (call/result pairing, tool name, error flag, exit code), never the command's
+/// meaning or any artifact format. It mirrors `compaction::evidence`'s rules.
+fn verification_evidence_passed(payload: &Value) -> bool {
+    let Some(messages) = payload
+        .pointer("/context/llmMessages")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    // Map tool call id -> shell tool name.
+    let mut shell_calls: HashSet<String> = HashSet::new();
+    for message in messages {
+        let Some(assistant) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in assistant {
+            if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            let name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if matches!(name, "bash" | "shell" | "powershell" | "sh") {
+                if let Some(id) = block.get("id").and_then(Value::as_str) {
+                    shell_calls.insert(id.to_owned());
+                }
+            }
+        }
+    }
+    messages.iter().any(|result| {
+        let call_id = result
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let tool_name = result
+            .get("toolName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_shell = shell_calls.contains(call_id)
+            || matches!(tool_name, "bash" | "shell" | "powershell" | "sh");
+        if !is_shell || result.get("isError").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        // Explicit non-zero exit code anywhere in details -> fail.
+        if result
+            .pointer("/details/exitCode")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+        {
+            return false;
+        }
+        let text = text_content(result.get("content"));
+        let lower = text.to_ascii_lowercase();
+        for marker in ["command failed", "command aborted", "command timed out"] {
+            if lower.contains(marker) {
+                return false;
+            }
+        }
+        // pir's bash tool appends "Command exited with code N"; accept only 0
+        // when such a status line is present, and require no status line to be
+        // flagged as a failure. A result with no command output at all is not
+        // evidence.
+        let has_status = lower.contains("command exited with code ");
+        if has_status {
+            lower.contains("command exited with code 0")
+        } else {
+            !text.trim().is_empty()
+        }
+    })
 }
 
 /// Whether the reviewer tool result matching `call_id` is a non-error PASS.
@@ -1782,7 +2175,22 @@ fn verdict_is_pass(text: &str) -> bool {
     let first = first.trim_start_matches(|character: char| {
         character.is_whitespace() || matches!(character, '*' | '#' | '`' | '_' | '>' | '-')
     });
-    first.starts_with("PASS") || (upper.contains("PASS") && !upper.contains("FAIL"))
+    // Only a leading PASS token counts. A whole-text "contains PASS" fallback
+    // made "the review would not pass" read as a successful verification.
+    if !matches!(
+        first.split(|c: char| !c.is_ascii_alphanumeric()).next(),
+        Some("PASS")
+    ) {
+        return false;
+    }
+    // The first line must be a CLEAN PASS verdict. Text like
+    // "PASS criteria not met, verdict FAIL" starts with PASS but is a failure —
+    // checking only whole-text "NOT PASS" missed it. Reject explicit verdict
+    // reversals on the same line. Keep the markers narrow: an evidence clause
+    // like "PASS {not valid json" or "evidence: no failure found" must still
+    // count as PASS, so generic words ("NOT", "BUT", "?") are NOT reversals.
+    const REVERSALS: &[&str] = &["NOT PASS", "PASS?", "FAIL", "VERDICT", "CRITERIA"];
+    !REVERSALS.iter().any(|marker| first.contains(marker))
 }
 
 /// Parse `{"verdict":"PASS"|"FAIL", ...}` (optionally inside a Markdown fence)
@@ -1808,10 +2216,17 @@ fn structured_verdict(text: &str) -> Option<bool> {
     }
 }
 
-fn plan_approval_id(plan: &str) -> String {
+fn plan_approval_id(plan: &str, verification: Option<&str>) -> String {
     let mut hasher = DefaultHasher::new();
     "plan".hash(&mut hasher);
     plan.hash(&mut hasher);
+    // Changing the verification contract is a material change to the plan, so
+    // it must produce a fresh approval id. Omitting it keeps the legacy id for
+    // old callers.
+    if let Some(verification) = verification {
+        "verification".hash(&mut hasher);
+        verification.hash(&mut hasher);
+    }
     format!("p{:016x}", hasher.finish())
 }
 
@@ -2227,6 +2642,17 @@ async fn run_approval_ui(
     "Approval was already decided.".to_owned()
 }
 
+const EXECUTION_CONTRACT_SECTION: &str = "execution_contract";
+const EXECUTION_CONTRACT_PROMPT_HEAD: &str = r#"<execution_contract>
+An approved plan is active for this run. Keep it as the acceptance contract:
+"#;
+const EXECUTION_CONTRACT_PROMPT_TAIL: &str = r#"
+Before reporting done you MUST actually run a verification command with the
+available tools and observe a successful result. Saying "verified" or reasoning
+about correctness is not verification: a real tool result with a zero exit
+status is required. If verification fails, fix the cause and run it again.
+</execution_contract>"#;
+
 /// Apply an approval decision's side effects: send the follow-up message and,
 /// for an approved plan, switch the session to normal mode so the follow-up
 /// executes with the full tool surface. A denied plan stays in plan mode with
@@ -2239,6 +2665,16 @@ fn apply_decision(
 ) {
     if record.kind == ApprovalKind::Plan {
         if approved {
+            // Install the contract in memory BEFORE the mode switch: apply_mode
+            // snapshots the journal, so the contract is persisted with the
+            // switch to Normal and survives resume.
+            if let Some(plan) = record.plan.as_deref() {
+                state.set_active_contract(journal::ExecutionContract {
+                    plan: plan.to_owned(),
+                    verification: record.verification.clone(),
+                    approval_id: Some(record.id.clone()),
+                });
+            }
             // Persist + announce the mode switch before the follow-up message
             // is pumped, so the execution run starts in Normal mode. Bypass
             // the busy guard (the submit-plan run is still active here).
@@ -2262,11 +2698,23 @@ fn send_approval_message(
     let content = if record.kind == ApprovalKind::Plan {
         if approved {
             let plan = record.plan.as_deref().unwrap_or("(see submitted plan)");
-            format!(
+            let mut content = format!(
                 "PLAN APPROVED: the user approved your plan `{}`.\n\n{}\n\nImplement this plan \
                  now. Use the appropriate tools and verify the result before reporting done.",
                 record.id, plan
-            )
+            );
+            if let Some(verification) = record
+                .verification
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                content.push_str(
+                    "\n\nExecution verification criteria (a real tool result must show success):\n",
+                );
+                content.push_str(verification);
+            }
+            content
         } else {
             format!(
                 "PLAN DENIED: the user did not approve plan `{}`. Revise the plan based on their \

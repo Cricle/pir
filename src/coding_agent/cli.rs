@@ -811,8 +811,15 @@ pub struct Cli {
     #[arg(long = "model", value_name = "PATTERN", global = true)]
     pub model: Option<String>,
 
-    /// API key for the selected provider (upstream `--api-key`)
-    #[arg(long = "api-key", value_name = "KEY", global = true)]
+    /// API key for the selected provider (upstream `--api-key`).
+    /// `PIR_SUBAGENT_API_KEY` lets a process-mode parent pass a provider-scoped
+    /// key without putting the secret in argv (visible in process listings).
+    #[arg(
+        long = "api-key",
+        value_name = "KEY",
+        global = true,
+        env = "PIR_SUBAGENT_API_KEY"
+    )]
     pub api_key: Option<String>,
 
     /// Replace the system prompt (upstream `--system-prompt`)
@@ -1400,7 +1407,9 @@ pub enum ForemanCommand {
         /// Working directory (defaults to the current directory)
         #[arg(long = "cwd", value_name = "DIR")]
         cwd: Option<String>,
-        /// Existing session file/id to resume
+        /// Reuse an existing session file/id. This RESETS that session's
+        /// foreman journal/sidecar to a fresh run (pending approvals, phase and
+        /// worker generation are cleared); it does not resume prior state.
         #[arg(long = "session", value_name = "ID_OR_PATH")]
         session: Option<String>,
         /// Isolate each worker in a git worktree

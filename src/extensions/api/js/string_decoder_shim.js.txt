@@ -32,7 +32,16 @@
 function pirDescribeValue(value) {
   if (typeof value === "string") return value;
   if (value === null) return "null";
-  if (typeof value === "object" || typeof value === "function") {
+  if (typeof value === "bigint") return String(value) + "n";
+  // Node's internal formatter: a custom toString wins (`new
+  // StringDecoder({ toString: () => "hex" })` reports "Unknown encoding:
+  // hex"), arrays and plain objects are inspected, functions stringify.
+  if (typeof value === "object" && !Array.isArray(value) &&
+      typeof value.toString === "function" &&
+      value.toString !== Object.prototype.toString) {
+    return String(value);
+  }
+  if (typeof value === "object") {
     const modules = globalThis.__pirNodeModules;
     const util = modules && modules.util;
     const inspect = util && ((util.default && util.default.inspect) || util.inspect);
@@ -203,6 +212,37 @@ function pirViewToBytes(view) {
 const pirNativeCodec =
   typeof globalThis.__pirBufferCodec === "function" ? globalThis.__pirBufferCodec : null;
 
+// Common utf8 chunk: with nothing held and a strictly valid body, the plain
+// kernel is provably identical to the V8 state machine (valid UTF-8 has
+// exactly one decode), so only the walk-back/hold bookkeeping remains.
+// `utf8DecodeStrict` answers `undefined` for any ill-formed byte (overlong,
+// surrogate, out-of-range, bad/truncated continuation), which sends the chunk
+// through the authoritative `stringDecodeChunk` machine — no separate guard
+// scan over the decoded output is needed.
+function pirNativeUtf8Chunk(decoder, bytes) {
+  if (pirNativeCodec === null) return undefined;
+  try {
+    if (decoder._pirNeed !== 0 || decoder._pirPending.length !== 0) return undefined;
+    const length = bytes.length;
+    const last = length > 0 ? bytes[length - 1] : 0;
+    // An ASCII tail can never be an incomplete sequence: skip the walk-back
+    // call on the overwhelmingly common chunk shape.
+    const hold = last < 0x80 ? 0 : pirUtf8HoldCount(bytes);
+    const bodyEnd = length - hold;
+    const body = hold > 0 ? bytes.subarray(0, bodyEnd) : bytes;
+    const text = body.length === 0 ? "" : pirNativeCodec("utf8DecodeStrict", body);
+    if (typeof text !== "string") return undefined;
+    if (hold > 0) pirSetPending(decoder, bytes.slice(bodyEnd), pirUtf8NeedFor(bytes));
+    else {
+      decoder._pirPending = [];
+      decoder._pirNeed = 0;
+    }
+    return text;
+  } catch (error) {
+    return undefined;
+  }
+}
+
 function pirNativeChunk(decoder, view) {
   try {
     const result = pirNativeCodec("stringDecodeChunk", view, false, false, decoder);
@@ -309,6 +349,10 @@ function pirUtf8HoldCount(bytes) {
     start = length - 1;
   }
   const lead = bytes[start];
+  // Node's `StringDecoder` uses the plain `DecodeData` walk-back: only the
+  // byte count and continuation-ness matter, so `E0 80` IS held as an
+  // incomplete 3-byte prefix (unlike WHATWG `TextDecoder`, whose hold logic
+  // validates the lead-specific second-byte window — see textcodec_global).
   let expected;
   if ((lead & 0xe0) === 0xc0) expected = 2;
   else if ((lead & 0xf0) === 0xe0) expected = 3;
@@ -411,7 +455,9 @@ function pirWriteWindow(decoder, bytes, offset) {
 }
 
 function pirSetPending(decoder, bytes, need) {
-  decoder._pirPending = bytes.slice();
+  // Always a plain array (the native state triple and `concat` below assume
+  // one); `bytes` may be a Buffer view from the stateless fast path.
+  decoder._pirPending = Array.prototype.slice.call(bytes);
   decoder._pirNeed = need;
   pirWriteWindow(decoder, bytes, 0);
 }
@@ -608,6 +654,12 @@ StringDecoder.prototype.write = function write(buf) {
   // (node raises this from String::NewFromUtf8 for the same input).
   if (pirViewLength(buf) > 0x1fffffe8) throw pirStringTooLong();
   if (pirNativeCodec !== null) {
+    if (this.encoding === "utf8" && this._pirNeed === 0 && buf instanceof Uint8Array) {
+      // Stateless fast path first: the plain decode kernel plus the
+      // hold bookkeeping, without the state-triple marshalling.
+      const fast = pirNativeUtf8Chunk(this, buf);
+      if (fast !== undefined) return fast;
+    }
     const text = pirNativeChunk(this, buf);
     if (text !== undefined) return text;
   }

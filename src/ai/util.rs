@@ -317,6 +317,14 @@ fn retryable_provider_error_pattern() -> &'static StaticRegex {
             "connection.?refused",
             "connection.?lost",
             "other side closed",
+            // Windows WSAECONNRESET: the local socket was force-closed by the
+            // remote host (e.g. a provider dropping an idle/streaming
+            // connection). Reqwest surfaces it as `os error 10054` with a
+            // locale-specific reason; match both the stable code and the
+            // common Chinese wording so retries work under zh-CN Windows.
+            r"os error 10054",
+            r"WSAECONNRESET",
+            "远程主机强迫关闭了一个现有的连接",
             "fetch failed",
             // node-fetch system errors, e.g. the Google ADC OAuth token
             // refresh used by google-vertex; the reason is often empty

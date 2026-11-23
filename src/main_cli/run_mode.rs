@@ -78,6 +78,17 @@ pub(super) async fn run() -> Result<()> {
             std::process::exit(1);
         }
     }
+    // `pir [node flags] <script>` / `pir <script>`: the same script runner
+    // reached through Node's respawn shape (`spawn(process.execPath, …)`),
+    // which test harnesses and worker pools use. `node_style_invocation` returns
+    // `Some` only when every leading option is a V8-only no-op here and the
+    // first positional is an existing JS/TS file, so prompts and the pi
+    // subcommand grammar are untouched.
+    #[cfg(feature = "extensions")]
+    if let Some((exec_argv, argv)) = crate::js_mode::node_style_invocation(&raw_args) {
+        let code = crate::js_mode::run_with_exec_argv(&argv, &exec_argv);
+        std::process::exit(code);
+    }
     // `pir env-daemon serve --token <hex>`: the built-in pi-env protocol-v1
     // daemon (upstream `packages/env/daemon`, argv shape preserved). The env
     // SDK shim spawns `<current_exe> env-daemon …` and speaks the framed v1
@@ -273,16 +284,15 @@ pub(super) async fn run() -> Result<()> {
         cli.entry_plan(stdin_tty, stdout_tty).app_mode
             == pir::coding_agent::cli::AppMode::Interactive
     };
-    // `rustpython_vm=warn`: the embedded interpreter logs every caught
+    // The embedded JS runtime logs through the host tracing destination.
     // exception at INFO (`Exception raised: PyBaseException`) — normal
     // control flow inside the frozen stdlib, and pure noise on the CLI's
     // stderr. `rmcp=warn` likewise keeps the MCP client's expected lifecycle
     // ("Service initialized as client", "task cancelled") off every
     // `mcp list` / prompt invocation unless the user opts into RUST_LOG.
     // Warnings and errors still surface in both cases.
-    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,rustpython_vm=warn,rmcp=warn")
-    });
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rmcp=warn"));
     if app_mode_tui {
         let log_path = pir::coding_agent::context::agent_dir().join("pir.log");
         rotate_tui_trace_log(&log_path, TUI_TRACE_LOG_MAX_BYTES);
@@ -1091,6 +1101,16 @@ pub(super) async fn run() -> Result<()> {
                 None => match pir::coding_agent::cli::read_piped_input(stdin_tty, std::io::stdin())
                 {
                     Some(prompt) => prompt,
+                    None if (cli.continue_session || cli.resume)
+                        && pir::coding_agent::print::resume_on_error_enabled() =>
+                    {
+                        // Opt-in breakpoint continuation: an explicit resume
+                        // with no prompt is valid; run_print injects the
+                        // synthetic continuation turn (error-aware wording).
+                        // Ordinary resume still requires a prompt and keeps
+                        // the upstream error above.
+                        String::new()
+                    }
                     None => {
                         return Err(anyhow::anyhow!(
                             "pir print requires a prompt (pass an argument or pipe stdin)"

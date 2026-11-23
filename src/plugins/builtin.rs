@@ -338,7 +338,7 @@ pub use super::codemode::{namespace_matches, script_reach, CODEMODE_TOOL_NAME};
 pub(crate) mod python;
 
 #[cfg(feature = "python")]
-pub(crate) mod python_vm;
+pub mod js_vm;
 
 #[cfg(feature = "context-mode")]
 pub(crate) mod context_mode;
@@ -407,6 +407,8 @@ fn new_memory_plugin() -> Arc<dyn AgentPlugin> {
     memory::new_memory_plugin()
 }
 
+#[cfg(feature = "python")]
+pub use js_vm::{ExecOutcome, PythonJob, PythonSession};
 /// Public re-exports of the `python` builtin's integration surface (tests,
 /// embedders that resolve the `pythonTool` setting, and the tool-selection
 /// layer).

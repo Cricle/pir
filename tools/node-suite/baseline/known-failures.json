@@ -1,0 +1,3590 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-20T09:23:05.114012+00:00",
+  "pir": {
+    "path": "C:\\wp\\empty\\_pir_node_wt\\target\\debug\\pir.exe",
+    "sha256": "ed86f49a3386c63557a9d7cea65f899d993b06e2874526f400568284dde360ee",
+    "size": 328803840,
+    "mtime": "2026-11-20T15:08:39.512208+08:00",
+    "reported_version": "v24.19.0"
+  },
+  "shims": null,
+  "suite": {
+    "corpus": "C:\\wp\\empty\\_scratch\\node-suite-probe\\node",
+    "tag": "v24.22.1",
+    "commit": "ce7aaf1cee78b8cf0ce17364260535c418d3ed26"
+  },
+  "selection": {
+    "list": "C:\\wp\\empty\\_pir_node_wt\\tools\\node-suite\\baseline\\tier-b-api.txt",
+    "prefixes": [],
+    "count": 438
+  },
+  "harness": {
+    "timeout_s": 8.0,
+    "jobs": 5,
+    "cwd": "repo-shaped work root (contains test/)",
+    "shim_mode": "embedded bytecode",
+    "env": {
+      "PIR_EXT_BYTECODE": "1",
+      "PIR_EXT_SHIM_SRC": "0",
+      "PIR_AGENT_DIR": "<agent-root>/agent-<run>-<per-test id>",
+      "NODE_TEST_KNOWN_GLOBALS": "0",
+      "TEST_SERIAL_ID": "<per-test id>",
+      "TEST_THREAD_ID": "<per-test id>",
+      "NODE_TEST_DIR": "<out>/testtmp/<per-test id>",
+      "NODE_COMMON_PORT": "12346+<slot>"
+    }
+  },
+  "stability": {
+    "runs": 6,
+    "run_ids": [
+      "bytecode",
+      "bytecode2",
+      "bytecode3",
+      "final",
+      "final2",
+      "final3"
+    ],
+    "counts": {
+      "PASS": 178,
+      "ASSERT": 112,
+      "ERROR": 124,
+      "UNSUPPORTED": 8,
+      "SKIP": 6,
+      "TIMEOUT": 10
+    },
+    "flaky": {
+      "test-fs-watch-recursive-add-file-to-existing-subfolder.js": [
+        "PASS",
+        "ERROR",
+        "PASS",
+        "PASS",
+        "PASS",
+        "PASS"
+      ],
+      "test-fs-watch-recursive-add-file-to-new-folder.js": [
+        "PASS",
+        "PASS",
+        "PASS",
+        "PASS",
+        "ERROR",
+        "PASS"
+      ],
+      "test-fs-watch-recursive-add-file.js": [
+        "PASS",
+        "ERROR",
+        "PASS",
+        "PASS",
+        "PASS",
+        "PASS"
+      ]
+    },
+    "note": "Six embedded-bytecode runs. Every test matched the majority except the three listed fs.watch tests. Source-shim runs were discarded because src/extensions/api/js was being edited during execution."
+  },
+  "results": {
+    "test-assert-async.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "assert",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-assert-calltracker-calls.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "assert",
+      "first_error": "test/parallel/test-assert-calltracker-calls.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-assert-calltracker-report.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "assert",
+      "first_error": "TypeError: test/parallel/test-assert-calltracker-report.js: not a function",
+      "skip_reason": ""
+    },
+    "test-assert-calltracker-verify.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 110,
+      "module": "assert",
+      "first_error": "TypeError: test/parallel/test-assert-calltracker-verify.js: not a function",
+      "skip_reason": ""
+    },
+    "test-buffer-arraybuffer.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 110,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-arraybuffer.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-ascii.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-ascii.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-badhex.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-bigint64.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-bytelength.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-compare-offset.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-compare.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-concat.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 77,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-constants.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 1375,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-constants.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-buffer-constructor-deprecation-error.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-buffer-constructor-outside-node-modules.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-buffer-equals.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-failed-alloc-typed-arrays.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-fakes.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-from.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 77,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-generic-methods.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 92,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-generic-methods.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-inheritance.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-inspect.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-inspect.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-isascii.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-isascii.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-isencoding.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-isutf8.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-isutf8.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-iterator.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-new.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-new.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-buffer-no-negative-allocation.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-no-negative-allocation.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-of-no-deprecation.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-over-max-length.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-over-max-length.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-prototype-inspect.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-read.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-readdouble.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-readdouble.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-readfloat.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-readfloat.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-readint.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-readint.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-readuint.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-readuint.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-safe-unsafe.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-set-inspect-max-bytes.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-set-inspect-max-bytes.js: Missing expected exception (RangeError).",
+      "skip_reason": ""
+    },
+    "test-buffer-sharedarraybuffer.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-slow.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "buffer",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-buffer-swap.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 77,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-tojson.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-tostring-4gb.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "RangeError: test/parallel/test-buffer-tostring-4gb.js: invalid array buffer length",
+      "skip_reason": ""
+    },
+    "test-buffer-tostring-range.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "buffer",
+      "first_error": "TypeError: test/parallel/test-buffer-tostring-range.js: Unknown encoding: ascii",
+      "skip_reason": ""
+    },
+    "test-buffer-tostring.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-writedouble.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-writedouble.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-writefloat.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-writefloat.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-writeint.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-writeint.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-writeuint.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "buffer",
+      "first_error": "test/parallel/test-buffer-writeuint.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-buffer-zero-fill-reset.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-buffer-zero-fill.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "buffer",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-events-getmaxlisteners.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "events",
+      "first_error": "TypeError: test/parallel/test-events-getmaxlisteners.js: The \"emitter\" argument must be an instance of EventEmitter or EventTarget. Received an instance of EventTarget",
+      "skip_reason": ""
+    },
+    "test-events-list.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "events",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-events-listener-count-with-listener.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 92,
+      "module": "events",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-events-once.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 92,
+      "module": "events",
+      "first_error": "Unhandled promise rejection: The operation was aborted",
+      "skip_reason": ""
+    },
+    "test-events-uncaught-exception-stack.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "events",
+      "first_error": "Error: test/parallel/test-events-uncaught-exception-stack.js:",
+      "skip_reason": ""
+    },
+    "test-fs-append-file-sync.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-append-file-sync.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-append-file.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-append-file.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-assert-encoding-error.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-assert-encoding-error.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-buffer.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-buffertype-writesync.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-buffertype-writesync.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-chmod-mask.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-chmod.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-chown-negative-one.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-chown-negative-one.js: fs.chown is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-fs-chown-type-check.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-chown-type-check.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-close-errors.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-close-errors.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-close.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-constants.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-empty-readStream.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 108,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-fchmod.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-fchmod.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-fchown-negative-one.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-fchown-negative-one.js: fs.fchown is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-fs-fchown.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-fchown.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-fmap.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-fsync.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-fsync.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-internal-assertencoding.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-internal-assertencoding.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-lchmod.js": {
+      "result": "SKIP",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "1..0 # Skipped: lchmod is only available on macOS",
+      "skip_reason": "lchmod is only available on macOS"
+    },
+    "test-fs-lchown-negative-one.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-lchown-negative-one.js: EPERM: operation not permitted, symlink '<testtmp>'",
+      "skip_reason": ""
+    },
+    "test-fs-lchown.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-lchown.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-link.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-link.js: fs.link is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-fs-make-callback.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-makeStatsCallback.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-makeStatsCallback.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-mkdir-mode-mask.js": {
+      "result": "SKIP",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "1..0 # Skipped: mode is not supported in mkdir on Windows",
+      "skip_reason": "mode is not supported in mkdir on Windows"
+    },
+    "test-fs-mkdir-rmdir.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-mkdtemp-prefix-check.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-non-number-arguments-throw.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-null-bytes.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-null-bytes.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-open-mode-mask.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-open-mode-mask.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-open-numeric-flags.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-opendir.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-promises-appendfile.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 109,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected rejection (AbortError).",
+      "skip_reason": ""
+    },
+    "test-fs-promises-exists.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-promises-exists.js: Expected \"actual\" to be reference-equal to \"expected\":",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-append-file.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-chmod.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-dispose.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-read.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-stat.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-stream.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-sync.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected rejection.",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-truncate.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-write.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-promises-file-handle-writeFile.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected rejection (AbortError).",
+      "skip_reason": ""
+    },
+    "test-fs-promises-readfile-empty.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-promises-readfile-with-fd.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-promises-statfs-validate-path.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-promises-write-optional-params.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected rejection.",
+      "skip_reason": ""
+    },
+    "test-fs-promises-writefile.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected rejection (AbortError).",
+      "skip_reason": ""
+    },
+    "test-fs-promisified.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-read-empty-buffer.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-read-empty-buffer.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-read-file-assert-encoding.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-read-file-assert-encoding.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-read-file-sync.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-read-offset-null.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-read-optional-params.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-read-promises-optional-params.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-autoClose.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-double-close.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "fs",
+      "first_error": "Mismatched noop function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-encoding.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: false == true",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-err.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-fd-leak.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 8953,
+      "module": "fs",
+      "first_error": "testing for leaks from fs.createReadStream().close()...",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-fd.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-read-stream-fd.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-file-handle.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-patch-open.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-read-stream-patch-open.js: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-resume.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-read-stream-resume.js: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-read-stream-throw-type-error.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-read-stream-throw-type-error.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-read-type.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-read-type.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-read-zero-length.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-read.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-read.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-readSync-optional-params.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-readSync-optional-params.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-readdir-buffer.js": {
+      "result": "SKIP",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "1..0 # Skipped: this tests works only on MacOS",
+      "skip_reason": "this tests works only on MacOS"
+    },
+    "test-fs-readdir-stack-overflow.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 453,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-readdir-ucs2.js": {
+      "result": "SKIP",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "1..0 # Skipped: Test is linux specific.",
+      "skip_reason": "Test is linux specific."
+    },
+    "test-fs-readfile-empty.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-readfile-fd.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-readfile-fd.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-readfile-flags.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-readfile-unlink.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-readfile-zero-byte-liar.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-readfile.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 3077,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-readfile.js: fs.statfsSync is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-fs-readfilesync-utf8-sizes.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "AssertionError [ERR_ASSERTION]: size 1 by fd at EOF",
+      "skip_reason": ""
+    },
+    "test-fs-readlink-type-check.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-readlink-type-check.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-readv-promises.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-readv-promisify.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-readv-sync.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-readv-sync.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-readv.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-readv.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-ready-event-stream.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-fs-realpath-buffer-encoding.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-realpath-buffer-encoding.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-realpath-native.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-realpath-native.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-rename-type-check.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-rename-type-check.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-rmSync-special-char.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-rmSync-special-char.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-recursive-sync-warns-not-found.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-recursive-sync-warns-on-file.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-rmdir-recursive-sync-warns-on-file.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-recursive-throws-not-found.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-recursive-throws-on-file.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-rmdir-recursive-throws-on-file.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-recursive-warns-not-found.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-recursive-warns-on-file.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-rmdir-type-check.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-rmdir-type-check.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-sir-writes-alot.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 391,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-stat-bigint.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "AssertionError [ERR_ASSERTION]: Number version atimeMs = <n>.<n>, BigInt version atimeMs = <n>n, Allowable delta = 0",
+      "skip_reason": ""
+    },
+    "test-fs-statfs.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-statfs.js: fs.statfs is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-fs-stream-construct-compat-error-read.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-stream-construct-compat-error-read.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-fs-stream-construct-compat-error-write.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-fs-stream-construct-compat-graceful-fs.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-stream-construct-compat-graceful-fs.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-fs-stream-construct-compat-old-node.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-stream-construct-compat-old-node.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-fs-stream-destroy-emit-error.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-stream-double-close.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-stream-fs-options.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-stream-fs-options.js: Missing expected exception (TypeError): createWriteStream options.fs.open should throw if isn't a function",
+      "skip_reason": ""
+    },
+    "test-fs-stream-options.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-stream-options.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-symlink-dir-junction-relative.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-symlink-dir-junction-relative.js: EPERM: operation not permitted, symlink '<testtmp>'",
+      "skip_reason": ""
+    },
+    "test-fs-symlink-dir-junction.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: ifError got unwanted exception: EPERM: operation not permitted, symlink '<testtmp>'",
+      "skip_reason": ""
+    },
+    "test-fs-symlink-longpath.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: ifError got unwanted exception: EPERM: operation not permitted, symlink '<testtmp>'",
+      "skip_reason": ""
+    },
+    "test-fs-symlink.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-symlink.js: The \"path\" argument must be of type string. Received undefined",
+      "skip_reason": ""
+    },
+    "test-fs-timestamp-parsing-error.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-timestamp-parsing-error.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-truncate-sync.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-truncate.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-truncate.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-unlink-type-check.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-unlink-type-check.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-utimes.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "Error: test/parallel/test-fs-utimes.js: EPERM: operation not permitted, symlink '<testtmp>'",
+      "skip_reason": ""
+    },
+    "test-fs-watch-close-when-destroyed.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 9296,
+      "module": "fs",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-fs-watch-encoding.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 9282,
+      "module": "fs",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-fs-watch-ignore-invalid.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-watch-ignore-invalid.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-add-file-to-existing-subfolder.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 296,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-add-file-to-new-folder.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 312,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-add-file-with-url.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 9140,
+      "module": "fs",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-add-file.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 344,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-add-folder.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 233,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-assert-leaks.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 483,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-delete.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 641,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-linux-directory-watchers.js": {
+      "result": "SKIP",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "1..0 # Skipped: the recursive watcher is native on this platform",
+      "skip_reason": "the recursive watcher is native on this platform"
+    },
+    "test-fs-watch-recursive-promise.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 8875,
+      "module": "fs",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-update-file.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 312,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-validate.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-recursive-watch-file.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 110,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watch-ref-unref.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 9030,
+      "module": "fs",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-fs-watch-stop-async.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 5062,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-watch-stop-sync.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 5062,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-watchfile-ref-unref.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 5046,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-buffer-large.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "RangeError: test/parallel/test-fs-write-buffer-large.js: invalid array buffer length",
+      "skip_reason": ""
+    },
+    "test-fs-write-buffer.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected exception (RangeError).",
+      "skip_reason": ""
+    },
+    "test-fs-write-file-buffer.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-file-typedarrays.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 125,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-file.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 93,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: cannot read property 'name' of null",
+      "skip_reason": ""
+    },
+    "test-fs-write-negativeoffset.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-write-no-fd.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-write-no-fd.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-write-optional-params.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: function should not have been called at @node/assert:20",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-autoclose-option.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-write-stream-autoclose-option.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-change-open.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-write-stream-change-open.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-close-without-callback.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-double-close.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-encoding.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-end.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-err.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-file-handle-2.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-file-handle.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-fs.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream-throw-type-error.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-write-stream-throw-type-error.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-fs-write-stream.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-write-stream.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-fs-write-sync-optional-params.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-write-sync-optional-params.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-fs-write-sync.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-writefile-with-fd.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "fs",
+      "first_error": "TypeError: test/parallel/test-fs-writefile-with-fd.js: The \"path\" argument must be of type string or an instance of Buffer or URL. Received type number (3)",
+      "skip_reason": ""
+    },
+    "test-fs-writesync-crash.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-fs-writev-promises.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-fs-writev-sync.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 93,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-writev-sync.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-fs-writev.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "fs",
+      "first_error": "test/parallel/test-fs-writev.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-path-dirname.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "path",
+      "first_error": "test/parallel/test-path-dirname.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-path-extname.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-path-glob.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "path",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-path-isabsolute.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-path-join.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-path-makelong.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-path-normalize.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-path-posix-exists.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "test/parallel/test-path-posix-exists.js: Expected \"actual\" to be reference-equal to \"expected\":",
+      "skip_reason": ""
+    },
+    "test-path-relative.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "path",
+      "first_error": "AssertionError [ERR_ASSERTION]:",
+      "skip_reason": ""
+    },
+    "test-path-win32-exists.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "path",
+      "first_error": "test/parallel/test-path-win32-exists.js: Expected \"actual\" to be reference-equal to \"expected\":",
+      "skip_reason": ""
+    },
+    "test-path-win32-normalize-device-names.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "path",
+      "first_error": "AssertionError [ERR_ASSERTION]: path.win32.normalize(\"COM9.\") === \".\\\\COM9.\", but got \"COM9.\"",
+      "skip_reason": ""
+    },
+    "test-querystring-escape.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "querystring",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-querystring-multichar-separator.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "querystring",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-aliases-legacy.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-aliases-legacy.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-auto-destroy.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-await-drain-writers-in-synchronously-recursion-write.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-backpressure.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 5796,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-big-packet.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-big-push.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-catch-rejections.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: kaboom",
+      "skip_reason": ""
+    },
+    "test-stream-compose.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Error: test/parallel/test-stream-compose.js: stream.compose is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-stream-consumers.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-decoder-objectmode.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-destroy-event-order.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-drop-take.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 10592,
+      "module": "stream",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-stream-duplex-destroy.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-duplex-destroy.js: no setter for property",
+      "skip_reason": ""
+    },
+    "test-stream-duplex-end.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: function should not have been called at node_globals.js.txt:37",
+      "skip_reason": ""
+    },
+    "test-stream-duplex-props.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-duplex-readable-writable.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "AssertionError [ERR_ASSERTION]: function should not have been called at node_globals.js.txt:23",
+      "skip_reason": ""
+    },
+    "test-stream-duplex-writable-finished.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-duplex.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-duplexpair.js": {
+      "result": "UNSUPPORTED",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Error: test/parallel/test-stream-duplexpair.js: stream.duplexPair is not supported by the pir extension runtime",
+      "skip_reason": ""
+    },
+    "test-stream-end-of-streams.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-end-of-streams.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-end-paused.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-err-multiple-callback-construction.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Mismatched noop function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-error-once.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "Mismatched noop function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-event-names.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-event-names.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-events-prepend.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Mismatched noop function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-filter.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-filter.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-flatMap.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-flatMap.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-forEach.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-forEach.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-inheritance.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-ispaused.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-map.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-map.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-objectmode-undefined.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-once-readable-pipe.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-passthrough-drain.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-after-end.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-await-drain-manual-resume.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected awaitDrainWriters to be a Writable but instead got null",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-await-drain-push-while-write.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-cleanup.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-pipe-cleanup.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-error-handling.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-error-unhandled.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-event.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-pipe-event.js: class constructors must be invoked with 'new'",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-flow-after-unpipe.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected at least 20, actual 2.",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-flow.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 266,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-manual-resume.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 11203,
+      "module": "stream",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-multiple-pipes.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-needDrain.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Mismatched noop function calls. Expected exactly 2, actual 1.",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-objectmode-to-non-objectmode.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: The input did not match the regular expression /ERR_INVALID_ARG_TYPE/. Input:",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-unpipe-streams.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "AssertionError [ERR_ASSERTION]: destination{1}'s 'close' event listeners not removed",
+      "skip_reason": ""
+    },
+    "test-stream-pipe-without-listenerCount.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Mismatched noop function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-pipeline-async-iterator.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected \"actual\" to be reference-equal to \"expected\":",
+      "skip_reason": ""
+    },
+    "test-stream-pipeline-duplex.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: cannot read property 'code' of null",
+      "skip_reason": ""
+    },
+    "test-stream-pipeline-listeners.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-pipeline-listeners.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-pipeline-uncaught.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-pipeline-uncaught.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-pipeline-with-empty-string.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-preprocess.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-promises.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "AssertionError [ERR_ASSERTION]: Expected \"actual\" to be reference-equal to \"expected\":",
+      "skip_reason": ""
+    },
+    "test-stream-push-order.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 77,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-push-strings.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 156,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-aborted.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-add-chunk-during-data.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-async-iter-half-open-duplex.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-compose.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-readable-compose.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-readable-constructor-set-methods.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-data.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-default-encoding.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-readable-default-encoding.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-stream-readable-destroy.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-readable-destroy.js: no setter for property",
+      "skip_reason": ""
+    },
+    "test-stream-readable-didRead.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-dispose.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-readable-dispose.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-readable-emit-readable-short-stream.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-emittedReadable.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-end-destroyed.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-ended.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-error-end.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Mismatched noop function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-readable-event.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-flow-recursion.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-from-web-termination.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-readable-from-web-termination.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-readable-hwm-0-async.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-hwm-0-no-flow-data.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-hwm-0.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-infinite-read.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 10937,
+      "module": "stream",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-stream-readable-invalid-chunk.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-readable-needReadable.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-next-no-null.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Missing expected rejection (TypeError).",
+      "skip_reason": ""
+    },
+    "test-stream-readable-no-unneeded-readable.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-object-multi-push-async.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 125,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-pause-and-resume.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 312,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-readable-then-resume.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "AssertionError [ERR_ASSERTION]: Expected \"actual\" to be reference-equal to \"expected\":",
+      "skip_reason": ""
+    },
+    "test-stream-readable-readable.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-readable-readable.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-readable-reading-readingMore.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-resume-hwm.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-resumeScheduled.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-setEncoding-existing-buffers.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 110,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-readable-setEncoding-null.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 92,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-readable-strategy-option.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "ReferenceError: test/parallel/test-stream-readable-strategy-option.js: ByteLengthQueuingStrategy is not defined",
+      "skip_reason": ""
+    },
+    "test-stream-readable-to-web-byob.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-readable-to-web-byob.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-readable-to-web-termination-byob.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-readable-to-web-termination-byob.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-readable-unobserved-eof-readable.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-readable-with-unimplemented-_read.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-readableListening-state.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-reduce.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-reduce.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-set-default-hwm.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-set-default-hwm.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-toArray.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-toArray.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-transform-callback-twice.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-transform-constructor-set-methods.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-stream-transform-destroy.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "TypeError: test/parallel/test-stream-transform-destroy.js: not a function",
+      "skip_reason": ""
+    },
+    "test-stream-transform-final-sync.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-transform-final.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 156,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-transform-flush-data.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-transform-hwm0.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-transform-objectmode-falsey-value.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 296,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-transform-split-highwatermark.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-transform-split-highwatermark.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-transform-split-objectmode.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-typedarray.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "AssertionError [ERR_ASSERTION]: false == true",
+      "skip_reason": ""
+    },
+    "test-stream-uint8array.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-uint8array.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-unpipe-event.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-unshift-empty-chunk.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 187,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-unshift-read-race.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 250,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Missing expected exception (Error).",
+      "skip_reason": ""
+    },
+    "test-stream-writable-aborted.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-aborted.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-writable-change-default-encoding.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-change-default-encoding.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-stream-writable-constructor-set-methods.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-constructor-set-methods.js: Missing expected exception (Error).",
+      "skip_reason": ""
+    },
+    "test-stream-writable-decoded-encoding.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-decoded-encoding.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-stream-writable-end-cb-error.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-writable-end-cb-uncaught.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-end-multiple.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-ended-state.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-ended-state.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-writable-final-async.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-final-destroy.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-final-throw.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-finish-destroyed.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-finished-state.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-finished.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-invalid-chunk.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-needdrain-state.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-null.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 30,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-properties.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 32,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-writable.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-writable.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-writable-write-cb-error.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-write-cb-twice.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writable-write-error.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writable-write-error.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-stream-writableState-ending.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 31,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writableState-uncorked-bufferedRequestCount.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "test/parallel/test-stream-writableState-uncorked-bufferedRequestCount.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-stream-write-destroy.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-write-drain.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 47,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-write-final.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 156,
+      "module": "stream",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-stream-writev.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "stream",
+      "first_error": "Unhandled promise rejection: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-string-decoder-end.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "string_decoder",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-string-decoder-fuzz.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "string_decoder",
+      "first_error": "AssertionError [ERR_ASSERTION]: Mismatch:",
+      "skip_reason": ""
+    },
+    "test-url-invalid-file-url-path-input.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "url",
+      "first_error": "test/parallel/test-url-invalid-file-url-path-input.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-url-revokeobjecturl.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "url",
+      "first_error": "test/parallel/test-url-revokeobjecturl.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-util-deprecate-invalid-code.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "util",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-util-exception-with-host-port.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "util",
+      "first_error": "test/parallel/test-util-exception-with-host-port.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-util-getcallsites-preparestacktrace.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "util",
+      "first_error": "test/parallel/test-util-getcallsites-preparestacktrace.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-util-inherits.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "util",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-util-inspect-long-running.js": {
+      "result": "TIMEOUT",
+      "exit_code": 1,
+      "duration_ms": 9546,
+      "module": "util",
+      "first_error": "exit code 1 with no output",
+      "skip_reason": ""
+    },
+    "test-util-parse-env.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 47,
+      "module": "util",
+      "first_error": "test/parallel/test-util-parse-env.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-util-primordial-monkeypatching.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 125,
+      "module": "util",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-util-types-exists.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "util",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-brotli-16GB.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 171,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-brotli-16GB.js: cannot read property 'buffer' of undefined",
+      "skip_reason": ""
+    },
+    "test-zlib-brotli-dictionary.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 92,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-brotli-dictionary.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-zlib-brotli-flush.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-brotli-from-brotli.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-brotli-from-string.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-brotli.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 171,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-brotli.js: Missing expected exception (RangeError).",
+      "skip_reason": ""
+    },
+    "test-zlib-close-after-write.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-close-in-ondata.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 141,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-const.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 108,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-convenience-methods.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 437,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-create-raw.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 46,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-deflate-constructors.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-deflate-raw-inherits.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-deflate-raw-inherits.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-destroy-pipe.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 1500,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-destroy.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 265,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-destroy.js: Expected values to be strictly equal:",
+      "skip_reason": ""
+    },
+    "test-zlib-dictionary-fail.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "Mismatched <anonymous> function calls. Expected exactly 1, actual 0.",
+      "skip_reason": ""
+    },
+    "test-zlib-dictionary.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-dictionary.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-empty-buffer.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-failed-init.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-failed-init.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-zlib-flush-drain.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-flush-drain.js: cannot read property 'needDrain' of undefined",
+      "skip_reason": ""
+    },
+    "test-zlib-flush-flags.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-flush-flags.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-zlib-from-concatenated-gzip.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 296,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-from-gzip-with-trailing-garbage.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 46,
+      "module": "zlib",
+      "first_error": "Error: test/parallel/test-zlib-from-gzip-with-trailing-garbage.js: invalid gzip header",
+      "skip_reason": ""
+    },
+    "test-zlib-from-gzip.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-from-string.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 77,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-invalid-arg-value-brotli-compress.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-invalid-arg-value-brotli-compress.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-zlib-invalid-input.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-invalid-input.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-zlib-maxOutputLength.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-negative-zero.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-not-string-or-buffer.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-not-string-or-buffer.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-zlib-object-write.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-params.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 155,
+      "module": "zlib",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-premature-end.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-premature-end.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-random-byte-pipes.js": {
+      "result": "SKIP",
+      "exit_code": 0,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "1..0 # Skipped: missing crypto",
+      "skip_reason": "missing crypto"
+    },
+    "test-zlib-reset-before-write.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 62,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-reset-before-write.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-reset-during-write.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-reset-during-write.js: Expected values to be strictly deep-equal:",
+      "skip_reason": ""
+    },
+    "test-zlib-sync-no-event.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-sync-no-event.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-truncated.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 156,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-truncated.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-unzip-one-byte-chunks.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 125,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-write-after-close.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "Unhandled promise rejection: cannot read property 'code' of undefined",
+      "skip_reason": ""
+    },
+    "test-zlib-write-after-flush.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 77,
+      "module": "zlib",
+      "first_error": "TypeError: test/parallel/test-zlib-write-after-flush.js: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-zero-byte.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 92,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-zstd-dictionary.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 78,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-zstd-dictionary.js: Missing expected exception (TypeError).",
+      "skip_reason": ""
+    },
+    "test-zlib-zstd-flush.js": {
+      "result": "ERROR",
+      "exit_code": 1,
+      "duration_ms": 94,
+      "module": "zlib",
+      "first_error": "Unhandled promise rejection: not a function",
+      "skip_reason": ""
+    },
+    "test-zlib-zstd-from-string.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 94,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-zstd-from-zstd.js": {
+      "result": "PASS",
+      "exit_code": 0,
+      "duration_ms": 109,
+      "module": "zlib",
+      "first_error": "",
+      "skip_reason": ""
+    },
+    "test-zlib-zstd-pledged-src-size.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 155,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-zstd-pledged-src-size.js: Missing expected exception.",
+      "skip_reason": ""
+    },
+    "test-zlib-zstd.js": {
+      "result": "ASSERT",
+      "exit_code": 1,
+      "duration_ms": 2015,
+      "module": "zlib",
+      "first_error": "test/parallel/test-zlib-zstd.js: Missing expected exception (RangeError).",
+      "skip_reason": ""
+    }
+  }
+}

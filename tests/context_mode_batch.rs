@@ -27,7 +27,7 @@ use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 /// The embedded RustPython VM serializes user code behind a process-wide
-/// execution lock (`src/plugins/builtin/python_vm.rs`), and cargo runs this
+/// execution lock (`src/plugins/builtin/js_vm.rs`), and cargo runs this
 /// binary's tests concurrently. Without this gate a script can spend its whole
 /// per-script deadline queued behind another test's script (the batch then
 /// reports "timed out while queued" instead of the behavior under test). Hold
@@ -309,7 +309,7 @@ async fn failing_script_does_not_prevent_the_next_and_is_summarized() {
             "scripts": [
                 {
                     "label": "boom",
-                    "code": "print('partial_marker')\n1 / 0"
+                    "code": "print('partial_marker')\nthrow new Error('boom')"
                 },
                 { "label": "after", "code": "print('after_marker')" }
             ],
@@ -330,7 +330,7 @@ async fn failing_script_does_not_prevent_the_next_and_is_summarized() {
         .as_str()
         .unwrap_or_else(|| panic!("failing script gets a preview: {value}"));
     assert!(
-        preview.contains("ZeroDivisionError"),
+        preview.contains("boom"),
         "the preview names the failure: {preview}"
     );
     assert!(
@@ -364,7 +364,7 @@ async fn each_script_gets_a_fresh_namespace() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "code": "leaked = 41" },
+                { "code": "var leaked = 41" },
                 { "code": "print(leaked)" }
             ],
             "source": "fresh"
@@ -383,7 +383,7 @@ async fn each_script_gets_a_fresh_namespace() {
         summaries[1]["errorPreview"]
             .as_str()
             .unwrap_or_default()
-            .contains("NameError"),
+            .contains("is not defined"),
         "the second script starts from a fresh namespace: {value}"
     );
     assert_eq!(
@@ -471,7 +471,7 @@ async fn timeout_applies_per_script_and_the_batch_continues() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "label": "runaway", "code": "while True:\n    pass" },
+                { "label": "runaway", "code": "while (true) {}" },
                 { "label": "next", "code": "print('survived_marker')" }
             ],
             "queries": ["survived_marker"],
@@ -518,7 +518,7 @@ async fn per_script_output_cap_is_respected_and_bodies_stay_out_of_context() {
     let harness = Harness::new("cap");
     let result = harness
         .batch(json!({
-            "scripts": [{ "label": "big", "code": "print('x' * 1_100_000)" }]
+            "scripts": [{ "label": "big", "code": "print('x'.repeat(1100000))" }]
         }))
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -556,7 +556,7 @@ async fn query_sections_are_snippets_not_full_chunks() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "code": "print('needle_body ' + 'Z' * 6000)" }
+                { "code": "print('needle_body ' + 'Z'.repeat(6000))" }
             ],
             "queries": ["needle_body"],
             "source": "bodybatch"

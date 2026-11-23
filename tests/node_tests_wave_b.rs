@@ -899,3 +899,185 @@ async fn events_unhandled_error_and_async_resource_contract() {
         "a direct EventEmitterAsyncResource needs options.name: {v}"
     );
 }
+
+/// Ignored profiling probe (run with `--include-ignored`): reports ns/op for the
+/// Buffer hot path and each layer underneath it, so before/after comparisons use
+/// the same dev profile. Prints one JSON line per op.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn buffer_perf_probe() {
+    let dir = write_temp_fixture("perf-probe", &[]);
+    let rt = new_runtime_at(&dir).await;
+    let script = r#"
+      (() => {
+        const results = {};
+        const measure = (name, fn, iters) => {
+          for (let i = 0; i < 200; i++) fn();
+          let best = Infinity;
+          for (let round = 0; round < 5; round++) {
+            const t0 = Date.now();
+            for (let i = 0; i < iters; i++) fn();
+            const ms = Date.now() - t0;
+            if (ms < best) best = ms;
+          }
+          results[name] = Math.round(best * 1e6 / iters); // ns/op
+        };
+        const buf = Buffer.alloc(1240);
+        for (let i = 0; i < buf.length; i++) buf[i] = (i * 7) & 0xff;
+        const ascii = Buffer.from("The quick brown fox jumps over the lazy dog. ".repeat(28));
+        const text = Buffer.from("héllo wörld — 你好世界 ".repeat(40), "utf8");
+        const codec = globalThis.__pirBufferCodec;
+        const view = buf.subarray(0, buf.length);
+        const td = new TextDecoder();
+        let sdMod = null;
+        try {
+          if (typeof globalThis.__pirRequireFrom === "function") {
+            sdMod = globalThis.__pirRequireFrom("", "string_decoder");
+          }
+        } catch (error) { sdMod = null; }
+        const sd = sdMod ? new sdMod.StringDecoder("utf8") : null;
+        measure("textdecoder.decode", () => td.decode(text), 20000);
+        measure("textdecoder.decode.u8", () => td.decode(new Uint8Array(text.buffer, text.byteOffset, text.byteLength)), 20000);
+        if (sd) measure("stringdecoder.write", () => sd.write(text), 20000);
+        measure("buffer.tostring.utf8", () => text.toString("utf8"), 20000);
+        measure("toString.latin1", () => buf.toString("latin1"), 20000);
+        measure("toString.hex", () => buf.toString("hex"), 20000);
+        measure("toString.base64", () => buf.toString("base64"), 20000);
+        measure("toString.utf8", () => buf.toString("utf8"), 20000);
+        measure("toString.ascii.latin1", () => ascii.toString("latin1"), 20000);
+        measure("toString.ascii.hex", () => ascii.toString("hex"), 20000);
+        measure("toString.ascii.base64", () => ascii.toString("base64"), 20000);
+        measure("toString.ascii.utf8", () => ascii.toString("utf8"), 20000);
+        measure("toString.text.utf8", () => text.toString("utf8"), 20000);
+        measure("toString.text.latin1", () => text.toString("latin1"), 20000);
+        measure("toString.utf16le", () => buf.toString("utf16le"), 2000);
+        measure("toString.base64url", () => buf.toString("base64url"), 20000);
+        measure("codec.base64urlEncode", () => codec("base64urlEncode", buf), 20000);
+        measure("toString.ranged.hex", () => buf.toString("hex", 10, 1230), 20000);
+        measure("codec.latin1Decode", () => codec("latin1Decode", buf), 20000);
+        measure("codec.latin1Decode.ascii", () => codec("latin1Decode", ascii), 20000);
+        measure("codec.latin1Decode.text", () => codec("latin1Decode", text), 20000);
+        measure("codec.hexEncode.ascii", () => codec("hexEncode", ascii), 20000);
+        measure("codec.utf8Decode.ascii", () => codec("utf8Decode", ascii), 20000);
+        measure("codec.utf8Decode.text", () => codec("utf8Decode", text), 20000);
+        measure("codec.hexEncode", () => codec("hexEncode", buf), 20000);
+        measure("codec.base64Encode", () => codec("base64Encode", buf), 20000);
+        measure("codec.utf8Decode", () => codec("utf8Decode", buf), 20000);
+        measure("codec.latin1Decode.range", () => codec("latin1Decode", buf, false, false, 1230, 10), 20000);
+        measure("subarray", () => buf.subarray(0, buf.length), 50000);
+        measure("slice", () => buf.slice(0, buf.length), 50000);
+        measure("raw.typedview", () => new Uint8Array(buf.buffer, 0, 16), 50000);
+        measure("setproto16", () => Object.setPrototypeOf(new Uint8Array(16), Buffer.prototype), 50000);
+        measure("newplain16", () => new Uint8Array(16), 50000);
+        measure("reflect16", () => Reflect.construct(Uint8Array, [buf.buffer, 0, 16], Buffer), 50000);
+        measure("allocUnsafe16", () => Buffer.allocUnsafe(16), 50000);
+        measure("legacyNew16", () => Buffer(16), 50000);
+        measure("lowercase", () => "base64".toLowerCase(), 50000);
+        const str = "a".repeat(1240);
+        measure("from.string", () => Buffer.from(str, "utf8"), 20000);
+        measure("from.string.hex", () => Buffer.from("6162636465666768", "hex"), 20000);
+        measure("codec.utf8Bytes", () => codec("utf8Bytes", str), 20000);
+        const b64 = buf.toString("base64");
+        measure("from.base64", () => Buffer.from(b64, "base64"), 20000);
+        const parts = [Buffer.alloc(500), Buffer.alloc(400), Buffer.alloc(340)];
+        measure("concat3", () => Buffer.concat(parts), 20000);
+        measure("from.uint8", () => Buffer.from(new Uint8Array(1240)), 20000);
+        const dst = Buffer.alloc(2048);
+        const src = "x".repeat(1000);
+        measure("write", () => dst.write(src), 20000);
+        const fmt = Buffer.alloc(2048);
+        measure("fill", () => fmt.fill(7), 20000);
+        measure("indexOf", () => buf.indexOf(0x55), 50000);
+        results["probe.base64Type"] = typeof codec("base64Encode", buf);
+        results["probe.base64Len"] = codec("base64Encode", buf).length;
+        results["probe.base64urlType"] = typeof codec("base64urlEncode", buf);
+        results["probe.base64urlLen"] = codec("base64urlEncode", buf).length;
+        results["probe.base64urlSample"] = codec("base64urlEncode", Buffer.from([0xfb, 0xff])).slice(0, 4);
+        // Semantic spot-checks for the allocation/prototype fast paths.
+        const rc = Reflect.construct(Uint8Array, [8], Buffer);
+        results["probe.reflectIsBuffer"] = Buffer.isBuffer(rc);
+        results["probe.reflectLen"] = rc.length;
+        const fromStr = Buffer.from("abc");
+        results["probe.fromStringIsBuffer"] = Buffer.isBuffer(fromStr);
+        results["probe.fromStringByteOffset"] = fromStr.byteOffset;
+        results["probe.fromStringLen"] = fromStr.length;
+        results["probe.subarrayIsBuffer"] = Buffer.isBuffer(Buffer.alloc(8).subarray(1, 3));
+        results["probe.sliceIsBuffer"] = Buffer.isBuffer(Buffer.alloc(8).slice(1, 3));
+        const ab = new ArrayBuffer(16);
+        const zero = Buffer.from(ab, 4, 4);
+        zero[0] = 9;
+        results["probe.zeroCopy"] = new Uint8Array(ab)[4] === 9 && zero.byteOffset === 4;
+        const concatParts = [Buffer.from("ab"), Buffer.from("cd")];
+        results["probe.concat"] = Buffer.concat(concatParts).toString();
+        const tout = Buffer.alloc(8);
+        tout.write("hello", 1);
+        results["probe.write"] = tout.toString("latin1");
+        const roundtrip = Buffer.from("héllo 你好", "utf8");
+        results["probe.roundtrip"] = roundtrip.toString("utf8");
+        results["probe.roundtripHex"] = roundtrip.toString("hex");
+        results["probe.roundtripB64"] = Buffer.from(roundtrip.toString("base64"), "base64").equals(roundtrip);
+        results["probe.invalidUtf8"] = Buffer.from([0xff, 0xfe, 0x61]).toString("utf8");
+        results["probe.latin1High"] = Buffer.from([0xe9, 0xff]).toString("latin1").charCodeAt(0);
+        results["probe.latin1Roundtrip"] = (() => {
+          const b = Buffer.from([0x00, 0x7f, 0x80, 0xe9, 0xff]);
+          const s = b.toString("latin1");
+          const back = Buffer.from(s, "latin1");
+          return [s.length, s.charCodeAt(2), back.equals(b)];
+        })();
+        const lone = Buffer.from([0x00, 0xd8, 0x61, 0x00]).toString("utf16le");
+        results["probe.utf16Lone"] = [lone.length, lone.charCodeAt(0), lone.charCodeAt(1), lone.charCodeAt(2)];
+        results["probe.utf16Plain"] = Buffer.from([0x61, 0x00, 0x62, 0x00]).toString("utf16le");
+        results["probe.utf16Emoji"] = Buffer.from("😀x", "utf16le").toString("utf16le");
+        results["probe.strictValid"] = codec("utf8DecodeStrict", Buffer.from("héllo 你好"));
+        results["probe.strictInvalid"] = typeof codec("utf8DecodeStrict", Buffer.from([0xe0, 0x80, 0x80]));
+        results["probe.maximalSubpart"] = [
+          [0xe0,0x80,0x80],
+          [0xed,0xa0,0x80],
+          [0xf4,0x90,0x80,0x80],
+          [0xe1,0x80,0x41],
+          [0xf1,0xcc,0xb8],
+        ].map((list) => {
+          const s = Buffer.from(list).toString("utf8");
+          const cps = [];
+          for (const ch of s) cps.push(ch.codePointAt(0));
+          return cps;
+        });
+        const cpsOf = (s) => { const a = []; for (const ch of s) a.push(ch.codePointAt(0)); return a; };
+        results["probe.tdStream"] = (() => {
+          const d = new TextDecoder();
+          return [
+            cpsOf(d.decode(Uint8Array.from([0xe0]), { stream: true })),
+            cpsOf(d.decode(Uint8Array.from([0x80]), { stream: true })),
+            cpsOf(d.decode(Uint8Array.from([0x80]))),
+          ];
+        })();
+        if (sd) {
+          results["probe.sdStream"] = (() => {
+            const d = new sdMod.StringDecoder("utf8");
+            return [
+              cpsOf(d.write(Buffer.from([0xe0]))),
+              cpsOf(d.write(Buffer.from([0x80]))),
+              cpsOf(d.write(Buffer.from([0x80]))),
+            ];
+          })();
+          results["probe.sdHold"] = (() => {
+            const d = new sdMod.StringDecoder("utf8");
+            return [cpsOf(d.write(Buffer.from([0xe0, 0x80]))), cpsOf(d.end())];
+          })();
+        }
+        results["probe.writeWide"] = (() => {
+          const b = Buffer.alloc(16);
+          const n = b.write("你好");
+          return [n, b.toString("utf8", 0, n)];
+        })();
+        results["probe.writeTruncated"] = (() => {
+          const b = Buffer.alloc(4, 0x2e);
+          const n = b.write("aé", 0, 2);
+          return [n, b.toString("hex")];
+        })();
+        return JSON.stringify(results);
+      })()
+    "#;
+    let value = rt.eval_json(script).await.expect("perf probe ran");
+    println!("PERF {}", serde_json::to_string_pretty(&value).unwrap());
+}

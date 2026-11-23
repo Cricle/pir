@@ -1065,6 +1065,13 @@ pub(crate) enum NativeActionKind {
 /// normal path.
 pub(crate) const NATIVE_ACTION_QUEUE_CAP: usize = 64;
 
+/// Hard cap on `agent_before_settle` continuation iterations per run, shared by
+/// the live session loop and the print host. A plugin that requests
+/// continuations (e.g. the foreman review gate) should keep its own nudge
+/// budget below this so the run settles with a well-defined state before the
+/// host truncation.
+pub const AGENT_BEFORE_SETTLE_CONTINUATION_CAP: usize = 8;
+
 /// Mirrored pending texts of the steering/follow-up queues (upstream keeps
 /// the message arrays directly; pir's [`Inbox`] owns them in its consumer
 /// task, so every mutation site mirrors the change here).

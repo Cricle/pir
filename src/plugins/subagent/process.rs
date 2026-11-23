@@ -19,6 +19,9 @@ use super::*;
 static PROMPT_SEQ: AtomicU64 = AtomicU64::new(0);
 const MAX_PROCESS_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROCESS_STDERR_BYTES: u64 = 1024 * 1024;
+/// Internal marker envs for process-mode children (never secrets in argv).
+pub(crate) const SUBAGENT_DEPTH_ENV: &str = "PIR_SUBAGENT_DEPTH";
+pub(crate) const SUBAGENT_API_KEY_ENV: &str = "PIR_SUBAGENT_API_KEY";
 
 pub(super) struct ProcessChildInputs {
     pub env: Arc<ToolSessionEnv>,
@@ -31,6 +34,8 @@ pub(super) struct ProcessChildInputs {
     pub budget: SubagentBudget,
     pub isolation: Isolation,
     pub worktree_merge: WorktreeMerge,
+    /// Current child depth computed by the parent (1-based).
+    pub child_depth: usize,
 }
 
 pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResult {
@@ -45,6 +50,7 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
         budget,
         isolation,
         worktree_merge,
+        child_depth,
     } = inputs;
 
     let worktree = if isolation == Isolation::Worktree {
@@ -127,6 +133,18 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
     if env.project_trusted {
         command.arg("--approve");
     }
+    // Pass the parent-computed depth so the child's own `session_depth` starts
+    // at the right value instead of resetting to 0 across the process boundary.
+    command.env(SUBAGENT_DEPTH_ENV, child_depth.to_string());
+    // Inherit the parent's explicit credential only for the child's provider
+    // (mirrors the inline path in child.rs). Never place the key in argv.
+    if let Some(key) = env
+        .credential
+        .as_ref()
+        .and_then(|credential| credential.key_for(&model.provider))
+    {
+        command.env(SUBAGENT_API_KEY_ENV, key);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -160,7 +178,8 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
     let stderr = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
             // Drain the pipe so a chatty child never blocks on a full stderr
-            // buffer, but retain only the diagnostic head.
+            // buffer. Retain the TAIL: a process's actual error is usually
+            // printed last, so keeping the head hid the useful diagnostic.
             let mut reader = BufReader::new(stderr);
             let cap = MAX_PROCESS_STDERR_BYTES as usize;
             let mut kept = Vec::new();
@@ -169,9 +188,12 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
                 match reader.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        if kept.len() < cap {
-                            let take = count.min(cap - kept.len());
-                            kept.extend_from_slice(&buf[..take]);
+                        kept.extend_from_slice(&buf[..count]);
+                        if kept.len() > cap {
+                            // Drop the oldest bytes, keeping the most recent
+                            // `cap` bytes. drain is amortized O(n) per overflow.
+                            let excess = kept.len() - cap;
+                            kept.drain(..excess);
                         }
                     }
                 }
@@ -375,7 +397,18 @@ pub(super) async fn run_child_process(inputs: ProcessChildInputs) -> SingleResul
     if let Some(lease) = worktree {
         let mut merge_result = super::worktree::WorktreeResult::default();
         if is_failed(&result) {
-            merge_result.cleaned = lease.cleanup().await.is_ok();
+            // Retain the worktree on failure so the worker's partial changes
+            // remain inspectable (matches the conflict-retention policy).
+            merge_result.cleaned = false;
+            let retained = format!(
+                "Worktree retained after failed run at {} (branch {})",
+                lease.path.display(),
+                lease.branch
+            );
+            result.error_message = Some(match result.error_message.take() {
+                Some(existing) => format!("{existing} — {retained}"),
+                None => retained,
+            });
         } else if worktree_merge == WorktreeMerge::Auto {
             merge_result = lease.merge().await;
             if let Some(error) = &merge_result.error {

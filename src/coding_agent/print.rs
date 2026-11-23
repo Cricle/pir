@@ -48,7 +48,8 @@ use crate::agent_session::background::{
     BackgroundRegistry, BACKGROUND_TOOL_RESULT_TYPE, DEFAULT_BACKGROUND_CALL_LIMIT,
 };
 use crate::agent_session::{
-    BackgroundCallStatus, SessionEvent, SessionEventHandler, SESSION_IDLE, SESSION_RUNNING,
+    BackgroundCallStatus, SessionEvent, SessionEventHandler, AGENT_BEFORE_SETTLE_CONTINUATION_CAP,
+    SESSION_IDLE, SESSION_RUNNING,
 };
 use crate::ai::provider::ProviderRegistry;
 use crate::ai::types::{
@@ -3045,6 +3046,55 @@ pub fn truncation_notice(stop_reason: crate::ai::types::StopReason) -> Option<&'
     (stop_reason == crate::ai::types::StopReason::Length).then_some(TRUNCATION_WARNING)
 }
 
+/// Whether a resumed session's leaf ends at a failed assistant request
+/// (`stopReason: error`, e.g. an HTTP 10054 connection reset). This is the
+/// recovery signal for opt-in "resume and continue from the breakpoint":
+/// the branch path is already persisted entry-by-entry, so the interrupted
+/// turn's context survives even though that request produced no answer.
+///
+/// Only the LAST message entry on the projected branch counts: a mid-run
+/// `error` followed by later user/toolResult entries is not a breakpoint.
+pub fn session_tail_is_error(session: &crate::session_manager::SessionManager) -> bool {
+    use crate::session_manager::{FileEntry, StoredMessage};
+    session
+        .projected_branch_path(None)
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            FileEntry::Message(m) => match &m.message {
+                StoredMessage::Assistant(a) => {
+                    Some(a.stop_reason == crate::ai::types::StopReason::Error)
+                }
+                // Skip non-assistant message entries while scanning back, but
+                // do not let an assistant buried under a later user turn count.
+                StoredMessage::User(_) | StoredMessage::Custom(_) => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// The synthetic continuation prompt injected when `PIR_RESUME_ON_ERROR=1`
+/// and a resumed session's leaf is a failed request. The approved plan (if
+/// any) is already in the replayed transcript as a `PLAN APPROVED` user turn,
+/// so the model sees it; this prompt only tells it to resume rather than
+/// re-planning or re-asking.
+pub const RESUME_ON_ERROR_PROMPT: &str = "The previous request ended in an error. Continue from where you left off: resume the approved plan using the work already done (files and progress are on disk), do not restart or re-plan, and verify the final result before reporting done.";
+
+/// Fallback continuation text when an explicit resume has no prompt but the
+/// leaf is not a failed request (e.g. a clean stop). Keeps a bare `--resume`
+/// from issuing an empty-string turn.
+pub const RESUME_CONTINUATION_PROMPT: &str = "Continue the previous task from where it left off using the work already done, without restarting, and verify the final result before reporting done.";
+
+/// Env switch for opt-in breakpoint continuation on resume. Off by default so
+/// ordinary `--resume` semantics are unchanged.
+pub fn resume_on_error_enabled() -> bool {
+    std::env::var("PIR_RESUME_ON_ERROR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// What a print run produced: the text to write on stdout plus the process
 /// exit code (upstream `runPrintMode` returns an exit code alongside the
 /// output it already wrote).
@@ -3507,7 +3557,26 @@ pub async fn run_print_with_environment(
 
     let mut registry = ToolRegistry::new();
     crate::coding_agent::tools::register_core_tools(&mut registry);
-    let prompt_text = options.prompt.clone();
+    let mut prompt_text = options.prompt.clone();
+    // Opt-in breakpoint continuation (A1+A2): on an explicit resume with no
+    // new prompt, inject a synthetic "continue" turn so the existing loop
+    // re-runs with the full replayed history (including any approved plan).
+    // The leaf's stop reason only selects the wording; either way a bare
+    // `--resume` with no prompt must never run an empty-string turn. This must
+    // stay in lockstep with run_mode.rs, which relaxes the "prompt required"
+    // check under the same (is_continuing && switch) condition.
+    if options.is_continuing && prompt_text.trim().is_empty() && resume_on_error_enabled() {
+        let tail_is_error = session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(session_tail_is_error);
+        prompt_text = if tail_is_error {
+            RESUME_ON_ERROR_PROMPT.to_owned()
+        } else {
+            RESUME_CONTINUATION_PROMPT.to_owned()
+        };
+    }
     // The unified plugin host is built BEFORE `session_start`: the event is
     // dispatched through the host's ordered list, so its native plugins
     // observe the same startup event the JS face does (the JS adapter is
@@ -5018,7 +5087,10 @@ pub async fn run_print_with_environment(
             // continuation iteration would only spin to the cap. Extension
             // aborts settle here and the next positional prompt gets a fresh
             // signal.
-            if continue_requested && !result.aborted && settle_iterations < 8 {
+            if continue_requested
+                && !result.aborted
+                && settle_iterations < AGENT_BEFORE_SETTLE_CONTINUATION_CAP
+            {
                 settle_iterations += 1;
                 // A continuation MUST observe the transcript the boundary just
                 // wrote: `custom_message` drafts project as user messages,
@@ -5062,6 +5134,42 @@ pub async fn run_print_with_environment(
                 );
             } else if continue_requested {
                 crate::ext_diag!("[ext] agent_before_settle continuation cap reached; settling");
+            }
+            // Headless background completion: a `background: true` call that
+            // finished after the terminal model turn has no live loop to inject
+            // into. Before settling, wait for in-flight calls and, if a
+            // completion arrived, run one more turn so the model consumes it.
+            if should_replay_background(
+                result.aborted,
+                termination.requested(),
+                background.call_count(),
+                settle_iterations,
+            ) && background.wait_for_idle(DEFAULT_BACKGROUND_EXIT_WAIT).await
+                && background.has_pending_follow_up().await
+            {
+                settle_iterations += 1;
+                if paged_prompt_context_used || streamed_prompt_source.is_some() {
+                    let mut guard = session.lock().await;
+                    if let Some(manager) = guard.as_mut() {
+                        manager.widen_to_full()?;
+                    }
+                }
+                let projected_messages =
+                    match crate::agent_session::project_optional_session_messages_off_thread(
+                        &session,
+                    )
+                    .await
+                    {
+                        Ok(Some(messages)) => messages,
+                        Ok(None) => result.context.messages.clone(),
+                        Err(error) => return Err(error),
+                    };
+                run_context = Context {
+                    system_prompt: result.context.system_prompt.clone(),
+                    messages: projected_messages,
+                    tools: result.context.tools.clone(),
+                };
+                continue;
             }
             break result;
         };
@@ -5884,6 +5992,22 @@ pub async fn generate_navigation_summary_with_retry_events(
 // ---------------------------------------------------------------------------
 // Automatic compaction (upstream AgentSession threshold compaction)
 // ---------------------------------------------------------------------------
+
+/// Whether a settling print run should wait for in-flight background calls and
+/// give the model one more turn to consume a late completion. Extracted as a
+/// pure function so every guard is unit-testable without driving the run loop.
+#[doc(hidden)]
+pub fn should_replay_background(
+    aborted: bool,
+    termination_requested: bool,
+    in_flight: usize,
+    settle_iterations: usize,
+) -> bool {
+    !aborted
+        && !termination_requested
+        && in_flight > 0
+        && settle_iterations < AGENT_BEFORE_SETTLE_CONTINUATION_CAP
+}
 
 /// The model compaction thresholds are checked against (agent_session
 /// `threshold_model_for`): a virtual selection checks the ROUTED physical

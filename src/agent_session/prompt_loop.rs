@@ -3264,7 +3264,7 @@ impl AgentSession {
                     _ => false,
                 }
             };
-            if continue_requested && settle_iterations < 8 {
+            if continue_requested && settle_iterations < AGENT_BEFORE_SETTLE_CONTINUATION_CAP {
                 continue;
             }
             if continue_requested {

@@ -15,15 +15,23 @@ globalThis.__pirCjsLoad ?? (globalThis.__pirCjsLoad = function (absPath) {
   // every derived name (`__filename`, `require.cache`, `module.id`) — to
   // forward slashes. The host read op accepts both spellings on Windows.
   const key = String(absPath).replace(/\\/g, "/");
+  // Node spells a module path natively: on win32 `path.resolve` (and therefore
+  // `__filename`, `__dirname`, `module.id`, `require.resolve`) uses
+  // backslashes. The loader names modules with forward slashes, so rebuild the
+  // native spelling here; the registry key stays slash-normalized so one file
+  // is still exactly one module instance (cycles reached from both spellings).
+  const filename = globalThis.__pirPlatform === "win32"
+    ? key.replace(/\//g, "\\")
+    : key;
   const registry = globalThis.__pirCjsRegistry;
   const cached = registry.get(key);
   if (cached !== undefined) return cached;
   // Register before running the body so a cyclic require observes the
   // partially filled exports object (Node semantics).
-  const module = { exports: {}, loaded: false, id: key };
+  const module = { exports: {}, loaded: false, id: filename };
   registry.set(key, module);
-  const slash = Math.max(key.lastIndexOf("/"), key.lastIndexOf("\\"));
-  const dir = slash === -1 ? "" : key.slice(0, slash);
+  const slash = Math.max(filename.lastIndexOf("/"), filename.lastIndexOf("\\"));
+  const dir = slash === -1 ? "" : filename.slice(0, slash);
   try {
     // `asCjs` asks the host to rewrite ESM sources to a CommonJS body
     // (require(esm), Node 22+): the returned `kind` stays "esm" so the
@@ -31,6 +39,26 @@ globalThis.__pirCjsLoad ?? (globalThis.__pirCjsLoad = function (absPath) {
     const source = globalThis.__pirNodeCall("npm", "readSource", { path: key, asCjs: true });
     if (source.kind === "json") {
       module.exports = JSON.parse(source.source);
+    } else if (source.kind === "esm") {
+      // Node compiles a required ES module as a module, not as a CJS
+      // function body: `require`/`module`/`exports` are NOT in scope (a
+      // module may declare `const require = createRequire(...)` — that is
+      // exactly `test/common/index.mjs`), and `import.meta` is populated.
+      // The host transform emits `require(…)`/`exports[…]` for the module's
+      // imports/exports, so those two generated identifiers are rewritten to
+      // wrapper-private names; everything else keeps ES module scope.
+      const body = globalThis.__pirEsmRequirableBody(source.source, key, dir);
+      const fn = (0, eval)(
+        "(function (__pirCjsRequire, __pirCjsExports, __pirCjsFilename, __pirCjsDirname) {" +
+        body + "\n})"
+      );
+      fn(globalThis.__pirMakeRequire(dir), module.exports, filename, dir);
+      // Mark the namespace for the interop helpers and Node's default-unwrap
+      // rule at the require boundary. Non-enumerable so `export *`
+      // re-exports and Object.keys never leak it.
+      Object.defineProperty(module.exports, "__pirEsmNamespace", {
+        value: true, enumerable: false, configurable: true, writable: true,
+      });
     } else {
       // The wrapper head stays on the source's first line (Node's own
       // `Module.wrap` shape) so every eval'd position — line and column —
@@ -39,15 +67,7 @@ globalThis.__pirCjsLoad ?? (globalThis.__pirCjsLoad = function (absPath) {
         "(function (module, exports, require, __filename, __dirname) {" +
         source.source + "\n})"
       );
-      fn(module, module.exports, globalThis.__pirMakeRequire(dir), key, dir);
-      if (source.kind === "esm") {
-        // Mark the namespace for the interop helpers and Node's
-        // default-unwrap rule at the require boundary. Non-enumerable so
-        // `export *` re-exports and Object.keys never leak it.
-        Object.defineProperty(module.exports, "__pirEsmNamespace", {
-          value: true, enumerable: false, configurable: true, writable: true,
-        });
-      }
+      fn(module, module.exports, globalThis.__pirMakeRequire(dir), filename, dir);
     }
     module.loaded = true;
     return module;
@@ -166,3 +186,224 @@ globalThis.__pirMakeRequire ?? (globalThis.__pirMakeRequire = function (fromDir)
   require.cache = globalThis.__pirCjsRegistry;
   return require;
 });
+
+// ---------------------------------------------------------------------------
+// require(esm) body preparation
+//
+// `esm_to_cjs` (host transform) emits `require("…")` for the module's
+// imports and `exports[…]` for its exports. Evaluated with a CJS wrapper's
+// ordinary `require`/`exports` parameters, a module that DECLARES those
+// names (`const require = createRequire(import.meta.url)` — Node's own
+// `test/common/index.mjs`) is a syntax error ("invalid redefinition of
+// parameter name"), and `import.meta` is not valid script code at all. Node
+// compiles a required ES module with ES module scope, so:
+//   - the generated identifiers are renamed to wrapper-private ones,
+//   - `import.meta` is replaced with a populated module object,
+//   - `require`/`module`/`exports` are NOT provided (Node exposes none of
+//     them in ES module scope; a module's own declarations win).
+// The CJS wrapper above is unchanged — `const require` in a CJS file is a
+// SyntaxError in Node too.
+// ---------------------------------------------------------------------------
+
+globalThis.__pirEsmRequirableBody ?? (function () {
+const __pirIdentChar = /[A-Za-z0-9_$]/;
+
+/// Native-separator spelling of a module path for `import.meta.filename` /
+/// `import.meta.dirname` (Node hands out platform paths, not URLs).
+function __pirEsmNativePath(path) {
+  const text = String(path);
+  const platform =
+    typeof globalThis.__pirPlatform === "string"
+      ? globalThis.__pirPlatform
+      : typeof process === "object" && process !== null
+        ? String(process.platform || "")
+        : "";
+  return platform === "win32" ? text.replace(/\//g, "\\") : text;
+}
+
+/// `file:` URL of a module path, percent-encoded per path segment (UTF-8),
+/// with the Windows drive colon left literal (`file:///C:/x`).
+function __pirEsmFileUrl(path) {
+  let text = String(path).replace(/\\/g, "/");
+  if (text.charAt(0) !== "/") text = "/" + text;
+  try {
+    return (
+      "file://" +
+      text
+        .split("/")
+        .map((segment) => encodeURIComponent(segment).replace(/%3A/gi, ":"))
+        .join("/")
+    );
+  } catch (_error) {
+    return "file://" + text;
+  }
+}
+
+/// Copy of `source` with the contents of strings, template literals and
+/// comments blanked out (positions and newlines preserved), so a token search
+/// never matches inside a literal. `${ … }` template expressions stay code.
+/// Regex literals are treated as division (a `/` inside one can be seen as a
+/// comment start); generated import/export code never carries one.
+function __pirMaskCode(source) {
+  const out = source.split("");
+  const templateStack = [];
+  let mode = "code";
+  let quote = "";
+  let depth = 0;
+  let i = 0;
+  const n = source.length;
+  const hide = (index) => {
+    const c = source[index];
+    if (c !== "\n" && c !== "\r") out[index] = " ";
+  };
+  while (i < n) {
+    const c = source[i];
+    if (mode === "line") {
+      if (c === "\n" || c === "\r") mode = "code";
+      else out[i] = " ";
+      i += 1;
+      continue;
+    }
+    if (mode === "block") {
+      if (c === "*" && source[i + 1] === "/") {
+        out[i] = " ";
+        out[i + 1] = " ";
+        i += 2;
+        mode = "code";
+      } else {
+        hide(i);
+        i += 1;
+      }
+      continue;
+    }
+    if (mode === "string") {
+      if (c === "\\") {
+        out[i] = " ";
+        if (i + 1 < n) out[i + 1] = " ";
+        i += 2;
+        continue;
+      }
+      if (c === quote) {
+        mode = "code";
+        i += 1;
+        continue;
+      }
+      hide(i);
+      i += 1;
+      continue;
+    }
+    if (mode === "template") {
+      if (c === "\\") {
+        out[i] = " ";
+        if (i + 1 < n) out[i + 1] = " ";
+        i += 2;
+        continue;
+      }
+      if (c === "`") {
+        mode = "code";
+        i += 1;
+        continue;
+      }
+      if (c === "$" && source[i + 1] === "{") {
+        out[i] = " ";
+        out[i + 1] = " ";
+        templateStack.push(depth);
+        depth = 0;
+        mode = "code";
+        i += 2;
+        continue;
+      }
+      hide(i);
+      i += 1;
+      continue;
+    }
+    // code
+    if (c === "/" && source[i + 1] === "/") {
+      mode = "line";
+      i += 2;
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "*") {
+      mode = "block";
+      i += 2;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      mode = "string";
+      quote = c;
+      i += 1;
+      continue;
+    }
+    if (c === "`") {
+      mode = "template";
+      i += 1;
+      continue;
+    }
+    if (c === "{") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (c === "}") {
+      if (depth === 0 && templateStack.length > 0) {
+        depth = templateStack.pop();
+        mode = "template";
+      } else if (depth > 0) {
+        depth -= 1;
+      }
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return out.join("");
+}
+
+/// Replace whole-identifier occurrences of `token` that are outside string /
+/// comment literals.
+function __pirReplaceCodeToken(source, token, replacement) {
+  const masked = __pirMaskCode(source);
+  let out = "";
+  let last = 0;
+  let replaced = false;
+  let index = masked.indexOf(token);
+  while (index !== -1) {
+    const before = index === 0 ? "" : masked.charAt(index - 1);
+    const after = masked.charAt(index + token.length);
+    if (!__pirIdentChar.test(before) && !__pirIdentChar.test(after)) {
+      out += source.slice(last, index) + replacement;
+      last = index + token.length;
+      replaced = true;
+    }
+    index = masked.indexOf(token, index + 1);
+  }
+  return replaced ? out + source.slice(last) : source;
+}
+
+/// Make an `esm_to_cjs` body evaluable with ES module scope: populate
+/// `import.meta` and rename the transform's generated `require`/`exports`
+/// references to the wrapper-private names, leaving user declarations (and
+/// user uses of `require`) alone.
+function __pirEsmRequirableBody(source, key, dir) {
+  const meta =
+    "{ url: " + JSON.stringify(__pirEsmFileUrl(key)) +
+    ", filename: " + JSON.stringify(__pirEsmNativePath(key)) +
+    ", dirname: " + JSON.stringify(__pirEsmNativePath(dir)) +
+    " }";
+  let body = __pirReplaceCodeToken(source, "import.meta", "__pirEsmImportMeta");
+  body = "const __pirEsmImportMeta = " + meta + ";\n" + body;
+  // Generated import statements (the transform's exact shapes).
+  body = body.replace(
+    /__pirInteropNamespace\(require\(/g,
+    "__pirInteropNamespace(__pirCjsRequire("
+  );
+  body = body.replace(/(^|\n)require\(/g, "$1__pirCjsRequire(");
+  // Generated export assignments.
+  body = body.replace(/(^|\n)exports\./g, "$1__pirCjsExports.");
+  body = body.replace(/(^|\n)exports\[/g, "$1__pirCjsExports[");
+  body = body.replace(/ exports\[/g, " __pirCjsExports[");
+  return body;
+}
+
+globalThis.__pirEsmRequirableBody = __pirEsmRequirableBody;
+})();

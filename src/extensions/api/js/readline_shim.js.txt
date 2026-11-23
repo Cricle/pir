@@ -1,17 +1,29 @@
 import { EventEmitter } from "@node/events";
+import { StringDecoder } from "@node/string_decoder";
 
-// node:readline load-compatible surface: the Interface skeleton moves
-// whole-line writes through the event surface; the cursor helpers write the
-// real ANSI sequences to the stream; no raw keypress decoding happens (the
-// runtime has no terminal input host).
+// node:readline surface. A non-terminal Interface has the real Node consumer
+// path: it decodes the input's `data` chunks and splits them into `line`
+// events (CRLF pairs kept together across chunk boundaries), flushing the
+// last unterminated line on `end` before emitting `close`
+// (test-stream-preprocess reads a file through createReadStream + readline).
+// The cursor helpers write the real ANSI sequences to the stream; no raw
+// keypress decoding happens (the runtime has no terminal input host).
 
 class Interface extends EventEmitter {
   constructor(input, output, options) {
     super();
+    let opts = options === undefined || options === null ? {} : options;
+    // Modern form: createInterface({ input, output, terminal, ... }). Node
+    // unwraps the options object before validating the real stream.
+    if (input !== undefined && input !== null && typeof input === "object" &&
+        typeof input.on !== "function" && input.input !== undefined) {
+      opts = input;
+      output = input.output;
+      input = input.input;
+    }
     if (input !== undefined && input !== null && typeof input !== "object") {
       throw new TypeError("The \"input\" argument must be a readable stream");
     }
-    const opts = options === undefined || options === null ? {} : options;
     this.input = input;
     this.output = output !== undefined && output !== null ? output : input;
     this.terminal = Boolean(opts.terminal);
@@ -19,10 +31,61 @@ class Interface extends EventEmitter {
     // name (`this.prompt` must remain the callable method).
     this._prompt = opts.prompt !== undefined ? String(opts.prompt) : "> ";
     this.historySize = typeof opts.historySize === "number" ? opts.historySize : 30;
-    this.history = [];
+    this.history = Array.isArray(opts.history) ? opts.history.slice() : [];
     this.line = "";
     this.cursor = 0;
     this.closed = false;
+    // Non-terminal input consumption (Node: 'data' + 'end' listeners, utf8
+    // StringDecoder, line-ending split with a CRLF pair spanning chunks).
+    this._decoder = new StringDecoder("utf8");
+    this._lineBuffer = "";
+    this._sawCR = false;
+    this._input = undefined;
+    if (this.terminal || input === undefined || input === null ||
+        typeof input.on !== "function") {
+      return;
+    }
+    const self = this;
+    this._onData = function (chunk) { self._normalWrite(chunk); };
+    this._onEnd = function () {
+      if (self._lineBuffer.length > 0) {
+        const line = self._lineBuffer;
+        self._lineBuffer = "";
+        self.emit("line", line);
+      }
+      self.close();
+    };
+    this._input = input;
+    input.on("data", this._onData);
+    input.on("end", this._onEnd);
+    this.once("close", function () {
+      if (typeof input.removeListener === "function") {
+        input.removeListener("data", self._onData);
+        input.removeListener("end", self._onEnd);
+      }
+    });
+  }
+  /// Split one input chunk into complete lines (Node's kNormalWrite).
+  _normalWrite(chunk) {
+    if (chunk === undefined) return;
+    let string = typeof chunk === "string" ? chunk : this._decoder.write(chunk);
+    if (this._sawCR) {
+      this._sawCR = false;
+      if (string.charCodeAt(0) === 10) string = string.slice(1);
+    }
+    if (!string) return;
+    const lines = string.split(/\r\n|\r|\n|\u2028|\u2029/);
+    if (lines.length === 1) {
+      this._lineBuffer += string;
+      return;
+    }
+    if (string.charCodeAt(string.length - 1) === 13) this._sawCR = true;
+    let first = lines[0];
+    if (this._lineBuffer) first = this._lineBuffer + first;
+    const last = lines.length - 1;
+    this._lineBuffer = lines[last];
+    this.emit("line", first);
+    for (let i = 1; i < last; i++) this.emit("line", lines[i]);
   }
   getPrompt() {
     return this._prompt;
@@ -45,12 +108,23 @@ class Interface extends EventEmitter {
     }
   }
   pause() {
+    if (this._input && typeof this._input.pause === "function") this._input.pause();
     return this;
   }
   resume() {
+    if (this._input && typeof this._input.resume === "function") this._input.resume();
     return this;
   }
-  write(_data, _key) {}
+  write(data, _key) {
+    if (this.closed) {
+      const error = new Error("Cannot write to a closed readline interface");
+      error.code = "ERR_USE_AFTER_CLOSE";
+      throw error;
+    }
+    if (data === undefined) return;
+    // Non-terminal: the line is fed through the same splitting path as input.
+    if (!this.terminal) this._normalWrite(data);
+  }
   close() {
     if (this.closed) return;
     this.closed = true;
@@ -63,9 +137,10 @@ class Interface extends EventEmitter {
 }
 
 function createInterface(input, output, options) {
-  if (input !== undefined && input !== null && typeof input === "object" && typeof input.read !== "function") {
-    // (options) single-argument shape.
-    return new Interface(undefined, undefined, input);
+  if (input !== undefined && input !== null && typeof input === "object" &&
+      typeof input.on !== "function" && input.input !== undefined) {
+    // `createInterface({ input, output, terminal, ... })` options object.
+    return new Interface(input);
   }
   if (input !== undefined && input !== null && typeof input === "object" && options === undefined && output !== undefined && output !== null && typeof output === "object" && typeof output.read !== "function") {
     // (input, options) shape.

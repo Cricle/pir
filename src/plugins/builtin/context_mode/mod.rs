@@ -82,7 +82,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value as JsonValue;
 
 use crate::extensions::SessionContextSnapshot;
-use crate::plugins::builtin::python_vm::{PythonSession, MAX_OUTPUT_CHARS};
+use crate::plugins::builtin::js_vm::{PythonSession, MAX_OUTPUT_CHARS};
 use crate::plugins::plugin::{
     AgentPlugin, EventInterest, PluginEvent, PluginEventOutcome, PluginFuture, RegistrationContext,
 };
@@ -1006,10 +1006,10 @@ impl ContextModePlugin {
 
     /// How long the process-wide Python execution lock may be held before
     /// waiting jobs fail fast (the starvation safety valve documented in
-    /// `python_vm`). Hidden test seam for that policy.
+    /// `js_vm`). Hidden test seam for that policy.
     #[doc(hidden)]
     pub fn python_exec_lock_wedged_after() -> std::time::Duration {
-        crate::plugins::builtin::python_vm::exec_lock_wedged_after()
+        crate::plugins::builtin::js_vm::exec_lock_wedged_after()
     }
 
     /// Whether the Python worker thread/VM currently exists. Hidden test

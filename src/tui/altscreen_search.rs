@@ -2072,7 +2072,10 @@ pub fn finish_search_walk_check(
     let matches = {
         let frame = core.last_frame_lines();
         let dock = dock_height.min(frame.len());
-        find_search_matches(&frame[..frame.len() - dock], &state.search.query)
+        find_search_matches(
+            &frame[..frame.len().saturating_sub(dock)],
+            &state.search.query,
+        )
     };
     if matches.is_empty() {
         // The probe's page did not survive the band render (the probes are a
@@ -4302,7 +4305,7 @@ fn retarget_search(
         // windowed band can shift when the reveal scrolls, and a full pass is
         // O(band) per keystroke).
         match state.search.cache.prepare_with_hint(
-            &frame[..frame.len() - dock],
+            &frame[..frame.len().saturating_sub(dock)],
             &state.search.query,
             hint,
         ) {

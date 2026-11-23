@@ -15,6 +15,17 @@ mod cli_commands;
 // crate, never in the library — see `main_alloc.rs`.
 #[path = "main_cli/cli_preprocess.rs"]
 mod cli_preprocess;
+
+// Allocator A/B switch (`--features mimalloc-alloc`, OFF by default). A
+// binary can declare exactly one `#[global_allocator]`, so enabling mimalloc
+// replaces `main_alloc.rs`'s tracing allocator for this build; the default
+// build is unchanged. Registering the allocator is safe code — only the
+// `GlobalAlloc` implementation lives in the crate.
+#[cfg(feature = "mimalloc-alloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(feature = "tui", not(feature = "mimalloc-alloc")))]
 #[path = "main_alloc.rs"]
 mod main_alloc;
 // `pir js` runs scripts on the embedded QuickJS runtime, so the whole module

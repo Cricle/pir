@@ -22,7 +22,7 @@
 //!   cooperatively. Captured output is capped at 1 MiB.
 //!
 //! The worker/interpreter machinery itself lives in
-//! [`super::python_vm`] and is shared with the `context-mode` builtin (whose
+//! [`super::js_vm`] and is shared with the `context-mode` builtin (whose
 //! executor runs each job in a fresh namespace over the same interpreter).
 //!
 //! ## Execution semantics
@@ -66,7 +66,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::python_vm::{ExecOutcome, PythonJob, PythonSession};
+use super::js_vm::{ExecOutcome, PythonJob, PythonSession};
 
 use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
@@ -83,7 +83,7 @@ pub const PYTHON_TOOL_NAME: &str = "python";
 
 /// Default per-call deadline (30s; `timeout_ms` may raise it up to
 /// [`MAX_TIMEOUT_MS`]).
-pub use super::python_vm::{DEFAULT_TIMEOUT_MS, MAX_OUTPUT_CHARS, MAX_TIMEOUT_MS};
+pub use super::js_vm::{DEFAULT_TIMEOUT_MS, MAX_OUTPUT_CHARS, MAX_TIMEOUT_MS};
 
 // ---------------------------------------------------------------------------
 // The `python` AgentTool
@@ -125,7 +125,7 @@ impl AgentTool for PythonTool {
 
     fn description(&self) -> &'static str {
         "Embedded RustPython 3 —pure-Python stdlib subset; C extensions (numpy/pandas) not available; state persists across calls in this session. \
-Executes Python `code` in a persistent interpreter: variables, functions and imports defined in one call remain available in later calls. \
+Executes JavaScript `code` in a persistent interpreter: variables, functions and imports defined in one call remain available in later calls. \
 A single expression's repr is returned after captured output; print/stdout and stderr are captured, and uncaught exceptions return the Python traceback as an error. \
 The default 30s deadline can be raised with timeout_ms (max 120000); a timed-out or aborted call resets the session (globals are lost). \
 Imports resolve against the frozen stdlib and the working directory; no network, no native threads, no SSL, and no memory cap (output is capped at 1 MiB per call)."

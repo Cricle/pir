@@ -1,5 +1,6 @@
 
 import { EventEmitter } from "@node/events";
+import { StringDecoder } from "@node/string_decoder";
 
 const Buffer = globalThis.Buffer;
 const call = globalThis.__pirNodeCall;
@@ -18,7 +19,7 @@ function pirTypeTail(value) {
   if (type === "string") return "type string ('" + value + "')";
   if (type === "number") return "type number (" + String(value) + ")";
   if (type === "boolean") return "type boolean (" + String(value) + ")";
-  if (type === "bigint") return "type bigint (" + String(value) + ")";
+  if (type === "bigint") return "type bigint (" + String(value) + "n)";
   if (type === "symbol") return "type symbol (" + String(value) + ")";
   if (type === "function") return "function " + (value.name === undefined ? "" : value.name);
   if (Buffer.isBuffer(value)) return "an instance of Buffer";
@@ -46,20 +47,158 @@ function pirUnknownEncoding(encoding) {
   return error;
 }
 
-function pushData(chunks, data, encoding) {
-  if (typeof data === "string") chunks.push(Buffer.from(data, encoding === undefined ? "utf8" : encoding));
-  else if (data instanceof Uint8Array) chunks.push(Buffer.from(data));
-  else if (data instanceof ArrayBuffer) chunks.push(Buffer.from(new Uint8Array(data)));
-  else chunks.push(Buffer.from(data));
+const PIR_INPUT_EXPECTED = "of type string or an instance of Buffer, TypedArray, or DataView";
+
+// Node's `addNumericalSeparator`: groups the integer part in threes.
+function pirAddNumericalSeparator(value) {
+  let result = "";
+  let index = value.length;
+  const start = value[0] === "-" ? 1 : 0;
+  for (; index >= start + 4; index -= 3) {
+    result = "_" + value.slice(index - 3, index) + result;
+  }
+  return value.slice(0, index) + result;
 }
 
-// Node key-material coercion: string keys hash as UTF-8, views/ArrayBuffers
-// pass through, everything else is the Node argument TypeError.
-function toKeyBytes(value, name) {
+// ERR_OUT_OF_RANGE's Received rendering: integers above 2^32 are grouped,
+// everything else uses inspect's number spelling.
+function pirOutOfRange(name, range, value) {
+  let received;
+  if (Number.isInteger(value) && Math.abs(value) > 4294967296) {
+    received = pirAddNumericalSeparator(String(value));
+  } else if (typeof value === "bigint") {
+    received = String(value);
+    if (value > 4294967296n || value < -4294967296n) received = pirAddNumericalSeparator(received);
+    received += "n";
+  } else if (typeof value === "number" && Object.is(value, -0)) {
+    received = "-0";
+  } else {
+    received = String(value);
+  }
+  const error = new RangeError("The value of \"" + name + "\" is out of range. It must be " + range + ". Received " + received);
+  error.code = "ERR_OUT_OF_RANGE";
+  return error;
+}
+
+function pirInvalidArgValue(name, value, reason) {
+  const type = name.indexOf(".") === -1 ? "argument" : "property";
+  const inspected = typeof value === "string" ? "'" + value + "'" : String(value);
+  const error = new TypeError("The " + type + " '" + name + "' " + (reason === undefined ? "is invalid" : reason) + ". Received " + inspected);
+  error.code = "ERR_INVALID_ARG_VALUE";
+  return error;
+}
+
+// internal/validators validateNumber: only a non-number or an explicit
+// min/max violation throws (NaN included only when a bound is given).
+function pirValidateNumber(value, name, min, max) {
+  if (typeof value !== "number") throw pirInvalidArgType(name, "of type number", value);
+  if ((min !== undefined && value < min) || (max !== undefined && value > max) ||
+      ((min !== undefined || max !== undefined) && Number.isNaN(value))) {
+    const range = (min !== undefined ? ">= " + min : "") +
+      (min !== undefined && max !== undefined ? " && " : "") +
+      (max !== undefined ? "<= " + max : "");
+    throw pirOutOfRange(name, range, value);
+  }
+}
+
+function pirValidateFunction(value, name) {
+  if (typeof value !== "function") throw pirInvalidArgType(name, "of type function", value);
+}
+
+function pirValidateObject(value, name) {
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    throw pirInvalidArgType(name, "of type object", value);
+  }
+}
+
+// Hash.update()/Sign.update() encoding validation (internal/validators
+// validateEncoding): only an odd-length hex payload is rejected up front; the
+// decoder itself accepts a bad digit run and stops there, exactly like
+// Buffer.from.
+function pirValidateEncoding(data, encoding) {
+  if (typeof encoding === "string" && encoding.length === 3 &&
+      encoding.toLowerCase() === "hex" && data.length % 2 !== 0) {
+    throw pirInvalidArgValue("encoding", encoding, "is invalid for data of length " + data.length);
+  }
+}
+
+// Node's Hash.update decodes strings through the C++ StringBytes decoder,
+// which falls back to UTF-8 for an unknown/non-string encoding (unlike
+// Buffer.from, which throws ERR_UNKNOWN_ENCODING).
+function pirDecodeString(data, encoding) {
+  if (typeof encoding === "string" && Buffer.isEncoding(encoding)) {
+    return Buffer.from(data, encoding);
+  }
+  return Buffer.from(data, "utf8");
+}
+
+// One conversion for every hash/sign input: strings decode per the encoding
+// rules above, any ArrayBufferView (TypedArray or DataView, Buffer included)
+// passes through as a zero-copy view of its own byte range, and everything
+// else (ArrayBuffer, SharedArrayBuffer, numbers, null, ...) is Node's
+// ERR_INVALID_ARG_TYPE.
+/// A zero-copy Buffer over a typed-array view using the backing store's real
+/// extent. Node's C++ reads the internal typed-array length, not the JS
+/// `byteLength` getter (test-crypto-hkdf defines a lying `byteLength` getter
+/// on a 2048-byte info array); a view whose offset/length falls outside its
+/// buffer is Node's ERR_OUT_OF_RANGE.
+function pirViewBytes(value) {
+  const elementSize = value.BYTES_PER_ELEMENT || 1;
+  const length = value.length;
+  const offset = value.byteOffset;
+  const total = typeof length === "number" ? length * elementSize : value.byteLength;
+  const capacity = value.buffer === undefined || value.buffer === null ? 0 : value.buffer.byteLength;
+  if (!(offset >= 0) || !(total >= 0) || offset + total > capacity) {
+    const error = new RangeError("input buffer is out of bounds");
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  return Buffer.from(value.buffer, offset, total);
+}
+
+function pirHashInputBytes(data, encoding) {
+  if (typeof data === "string") {
+    pirValidateEncoding(data, encoding);
+    return pirDecodeString(data, encoding);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return pirViewBytes(data);
+  }
+  throw pirInvalidArgType("data", PIR_INPUT_EXPECTED, data);
+}
+
+// A view of any ArrayBuffer family member (ArrayBuffer or SharedArrayBuffer),
+// or Buffer.from-able bytes, for key material.
+function pirArrayBufferBytes(value) {
+  if (ArrayBuffer.isView(value)) {
+    return pirViewBytes(value);
+  }
+  if (value instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)) {
+    return Buffer.from(new Uint8Array(value));
+  }
+  return undefined;
+}
+
+// Sign/Verify buffer their chunks and concatenate later, so the view must be
+// copied at update() time (Node's C++ side ingests it immediately).
+function pushData(chunks, data, encoding) {
+  const bytes = pirHashInputBytes(data, encoding);
+  chunks.push(typeof data === "string" ? bytes : Buffer.from(bytes));
+}
+
+// Key material coercion shared by the KDF entry points. Node's message lists
+// `ArrayBuffer` (the older helper omitted it); each caller passes its exact
+// expected-noun phrase because `ikm` also accepts a SecretKeyObject.
+const PIR_KEY_EXPECTED = "of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView";
+const PIR_IKM_EXPECTED = "of type string or an instance of SecretKeyObject, ArrayBuffer, TypedArray, DataView, or Buffer";
+const PIR_HKDF_BYTES_EXPECTED = "of type string or an instance of ArrayBuffer, TypedArray, DataView, or Buffer";
+
+function toKeyBytes(value, name, expected) {
   if (typeof value === "string") return Buffer.from(value, "utf8");
-  if (value instanceof Uint8Array) return Buffer.from(value);
-  if (value instanceof ArrayBuffer) return Buffer.from(new Uint8Array(value));
-  throw new TypeError("The \"" + name + "\" argument must be of type string or an instance of Buffer, TypedArray, or DataView");
+  const bytes = pirArrayBufferBytes(value);
+  if (bytes !== undefined) return bytes;
+  throw pirInvalidArgType(name, expected === undefined ? PIR_KEY_EXPECTED : expected, value);
 }
 
 // The wider key surface HMAC/cipher accept: string / bytes / KeyObject (with
@@ -75,8 +214,8 @@ function pirKeyBytes(value, name) {
     return Buffer.from(value._raw);
   }
   if (typeof value === "string") return Buffer.from(value, "utf8");
-  if (value instanceof Uint8Array) return Buffer.from(value);
-  if (value instanceof ArrayBuffer) return Buffer.from(new Uint8Array(value));
+  const bytes = pirArrayBufferBytes(value);
+  if (bytes !== undefined) return bytes;
   throw pirInvalidArgType(
     name,
     "of type string or an instance of ArrayBuffer, Buffer, TypedArray, DataView, KeyObject, or CryptoKey",
@@ -91,20 +230,20 @@ function pirKeyBytes(value, name) {
 const PIR_DIGEST_ALIASES = { dss1: "sha1" };
 
 function normalizeDigest(algo) {
-  const name = String(algo === undefined || algo === null ? "" : algo).toLowerCase().replace(/-/g, "");
+  let name = String(algo === undefined || algo === null ? "" : algo).toLowerCase();
+  // Skip the regex on the common unhyphenated spelling.
+  if (name.indexOf("-") !== -1) name = name.replace(/-/g, "");
   return PIR_DIGEST_ALIASES[name] === undefined ? name : PIR_DIGEST_ALIASES[name];
 }
 
 // ---------------------------------------------------------------------------
-// Digests the host backend does not cover, implemented in JS
+// JS digest fallback (every algorithm below is host-backed by default)
 // ---------------------------------------------------------------------------
-// The host `crypto` op exposes md5/sha1/sha256/sha512 (RustCrypto). Node's
-// `crypto.createHash`/`createHmac` additionally accept sha224 and sha384, and
-// every OpenSSL build also offers the SHA-3 family, so these are computed here
-// (real implementations — RFC 6234 for SHA-2, FIPS 202 for SHA-3 — verified
-// against Node's OpenSSL digests) instead of surfacing an unsupported-algorithm
-// error. SHA-256/224 use 32-bit lanes; the 512-bit family and Keccak-F[1600]
-// use BigInt lanes (input sizes in this runtime are small).
+// These implementations predate the RustCrypto SHA-2/SHA-3 coverage in
+// `pir-node` and are kept as the tier for a host whose `crypto` op does not
+// know an algorithm (`PIR_HOST_DIGESTS` above marks the ones it does). The
+// SHA-3 family is pure BigInt Keccak and costs seconds per MiB, so it must
+// never be the path taken by this host.
 const PIR_SHA256_K = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -340,8 +479,106 @@ const PIR_JS_DIGESTS = {
   sha3384: { hash: (bytes) => pirSha3(bytes, 104, 48), blockSize: 104 },
 };
 
-// The digests the host op serves directly (RustCrypto).
-const PIR_HOST_DIGESTS = { md5: true, sha1: true, sha256: true, sha512: true };
+// Digests the host op serves directly (RustCrypto: SHA-2, SHA-3, SHA-1,
+// MD5). The JS implementations below stay as the fallback tier, but the host
+// path is what runs: the SHA-3 family used to take seconds per MiB as BigInt
+// Keccak and is now ~1-3 ms/MiB in Rust.
+const PIR_HOST_DIGESTS = {
+  md5: true,
+  sha1: true,
+  sha224: true,
+  sha256: true,
+  sha384: true,
+  sha512: true,
+  sha3224: true,
+  sha3256: true,
+  sha3384: true,
+  sha3512: true,
+  shake128: true,
+  shake256: true,
+};
+
+// HMAC rejects the SHAKE XOF pair (Node: OpenSSL "xof digests not allowed");
+// everything else the digest table serves works as an HMAC PRF.
+const PIR_HOST_HMACS = {
+  md5: true,
+  sha1: true,
+  sha224: true,
+  sha256: true,
+  sha384: true,
+  sha512: true,
+  sha3224: true,
+  sha3256: true,
+  sha3384: true,
+  sha3512: true,
+};
+
+// Fixed digest output sizes (bytes) and the SHAKE default lengths. Node's
+// `options.outputLength` is only free-form for the XOF pair; for a fixed
+// digest it must equal the digest size (and OpenSSL rejects any other value).
+const PIR_DIGEST_SIZES = {
+  md5: 16,
+  sha1: 20,
+  sha224: 28,
+  sha256: 32,
+  sha384: 48,
+  sha512: 64,
+  sha3224: 28,
+  sha3256: 32,
+  sha3384: 48,
+  sha3512: 64,
+};
+const PIR_SHAKE_DEFAULTS = { shake128: 16, shake256: 32 };
+
+function pirDigestUnsupported() {
+  // Node's `Hash` constructor reports an unknown/unsupported digest as a
+  // plain Error with no `code` (unlike `createHmac`, which raises
+  // ERR_CRYPTO_INVALID_DIGEST).
+  return new Error("Digest method not supported");
+}
+
+function pirNotXof(algo, length) {
+  const error = new Error(
+    "error:030000B2:digital envelope routines::not XOF or invalid length");
+  error.code = "ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH";
+  return error;
+}
+
+/// Node's `validateInteger(options.outputLength, …)` window (0..2^32-1). The
+/// non-integer spelling covers NaN/Infinity/fractions exactly like
+/// internal/validators.
+function pirHashOutputRange(value) {
+  if (!Number.isInteger(value)) {
+    return pirOutOfRange("options.outputLength", "an integer", value);
+  }
+  return pirOutOfRange("options.outputLength", ">= 0 && <= 4294967295", value);
+}
+
+/// Read `options.outputLength` for `createHash`/`Hash.copy`. `options` is
+/// deliberately not type-checked (Node accepts a string/number and ignores
+/// it); only a present `outputLength` property is validated.
+function pirParseHashOutputLength(options) {
+  if (options === null || typeof options !== "object") return undefined;
+  const value = options.outputLength;
+  if (value === undefined) return undefined;
+  if (typeof value !== "number") {
+    throw pirInvalidArgType("options.outputLength", "of type number", value);
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 4294967295) {
+    throw pirHashOutputRange(value);
+  }
+  return value;
+}
+
+/// Apply the digest-specific rule once the algorithm is known: SHAKE accepts
+/// any validated length; a fixed digest only its own size.
+function pirHashOutputLength(algo, value) {
+  if (value === undefined) return undefined;
+  if (PIR_SHAKE_DEFAULTS[algo] !== undefined) return value;
+  const size = PIR_DIGEST_SIZES[algo];
+  if (size !== undefined && value !== size) throw pirNotXof(algo, value);
+  return value;
+}
 
 function pirInvalidDigest(algo) {
   const error = new TypeError("Invalid digest: " + algo);
@@ -353,12 +590,23 @@ function pirDigestKnown(algo) {
   return PIR_HOST_DIGESTS[algo] === true || PIR_JS_DIGESTS[algo] !== undefined;
 }
 
-function pirDigestBytes(algo, bytes) {
+function pirDigestBytes(algo, bytes, outputLength) {
   if (PIR_HOST_DIGESTS[algo] === true) {
-    return Buffer.from(call("crypto", "hash", { algo: algo, data: bytes.toString("base64") }), "base64");
+    // Typed C-ABI entry: the bytes cross as a Uint8Array view, so a multi-MB
+    // `update()` does not pay a base64 encode/decode round trip on both legs.
+    const native = globalThis.__pirCryptoDigest;
+    if (typeof native === "function") {
+      const digest = outputLength === undefined ? native(algo, bytes) : native(algo, bytes, outputLength);
+      if (digest !== undefined) {
+        return Buffer.from(digest.buffer, digest.byteOffset, digest.byteLength);
+      }
+    }
+    const payload = { algo: algo, data: Buffer.from(bytes).toString("base64") };
+    if (outputLength !== undefined) payload.outputLength = outputLength;
+    return Buffer.from(call("crypto", "hash", payload), "base64");
   }
   const impl = PIR_JS_DIGESTS[algo];
-  if (impl === undefined) throw pirInvalidDigest(algo);
+  if (impl === undefined) throw pirDigestUnsupported();
   return impl.hash(bytes);
 }
 
@@ -366,6 +614,13 @@ function pirDigestBytes(algo, bytes) {
 /// raw byte arrays.
 function pirHmacBytes(algo, key, data) {
   if (PIR_HOST_DIGESTS[algo] === true) {
+    const native = globalThis.__pirCryptoHmac;
+    if (typeof native === "function") {
+      const digest = native(algo, key, data);
+      if (digest !== undefined) {
+        return Buffer.from(digest.buffer, digest.byteOffset, digest.byteLength);
+      }
+    }
     return Buffer.from(call("crypto", "hmac", {
       algo: algo,
       key: Buffer.from(key).toString("base64"),
@@ -389,11 +644,92 @@ function pirHmacBytes(algo, key, data) {
 }
 
 
-// Node's `hash.digest(encoding)`: `undefined` and "buffer" give the raw bytes,
-// anything else is a string encoding.
+// Native digest entries answer a bare Uint8Array for the output; Node's
+// digest() is a Buffer. Re-tag the view (no copy) and leave fast-path strings
+// alone.
+function pirDigestValue(value) {
+  if (typeof value === "string") return value;
+  return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+// Node's `hash.digest(encoding)`: a falsy encoding (and the "buffer" spelling)
+// gives the raw bytes; a Buffer encoding decodes the digest bytes exactly the
+// way Buffer.toString does; anything else (the C++ decoder treats it as an
+// unknown name) still hands back the raw bytes.
 function pirDigestResult(bytes, encoding) {
-  if (encoding === undefined || encoding === null || encoding === "buffer") return bytes;
-  return bytes.toString(encoding);
+  if (!encoding) return bytes;
+  const name = typeof encoding === "string" ? encoding : String(encoding);
+  if (name.toLowerCase() === "buffer") return bytes;
+  if (Buffer.isEncoding(name)) return bytes.toString(name);
+  return bytes;
+}
+
+// Hash.update()'s normalization. Unlike `pushData` (used by Sign/Verify, whose
+// chunks are concatenated later and therefore need their own copy), a view is
+// handed to the native state as-is: Rust copies it into the digest before the
+// call returns, matching Node's immediate-update semantics and removing the
+// per-chunk `Buffer.from` copy.
+function pirUpdateBytes(data, encoding) {
+  return pirHashInputBytes(data, encoding);
+}
+
+// Snapshot for the buffered tier: Node's update() ingests the bytes
+// immediately, so the caller's view must not be retained. `new
+// Uint8Array(view)` is the engine's memcpy (0.3 µs for 4 KiB), far cheaper
+// than the old `Buffer.from` wrapper path.
+function pirSnapshotBytes(data, encoding) {
+  return new Uint8Array(pirUpdateBytes(data, encoding));
+}
+
+// Digest encodings the native finalizer renders itself (`digest("hex")` was
+// dominated by the JS per-byte hex loop). Everything else stays on the raw
+// bytes + `Buffer.toString(encoding)` path, which keeps object-valued
+// encodings (`{toString}`) and Node's encoding errors intact.
+const PIR_HASH_TEXT_ENCODINGS = { hex: true, base64: true, base64url: true };
+
+// GC release for a hash the caller dropped without calling digest(). The
+// registry itself is per-runtime (context userdata), so this only covers the
+// live-runtime case; runtime teardown drops every session anyway. Handles are
+// never reused, so a late callback cannot free a different hash.
+const pirHashFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((handle) => {
+      if (PIR_HASH_RELEASE !== null) PIR_HASH_RELEASE(handle);
+    })
+  : null;
+
+// All three entries must exist before a hash commits to the streaming path;
+// a host without them keeps the old buffered copy + one-shot digest. Cached at
+// module load (the host installs them before any shim runs): the property
+// lookups otherwise sit on `createHash()`/`update()`'s hot path.
+const PIR_HASH_NEW = typeof globalThis.__pirCryptoHashNew === "function"
+  ? globalThis.__pirCryptoHashNew : null;
+const PIR_HMAC_NEW = typeof globalThis.__pirCryptoHmacNew === "function"
+  ? globalThis.__pirCryptoHmacNew : null;
+const PIR_HASH_UPDATE = typeof globalThis.__pirCryptoHashUpdate === "function"
+  ? globalThis.__pirCryptoHashUpdate : null;
+const PIR_HASH_COPY = typeof globalThis.__pirCryptoHashCopy === "function"
+  ? globalThis.__pirCryptoHashCopy : null;
+const PIR_HASH_FINAL = typeof globalThis.__pirCryptoHashFinal === "function"
+  ? globalThis.__pirCryptoHashFinal : null;
+const PIR_HASH_RELEASE = typeof globalThis.__pirCryptoHashRelease === "function"
+  ? globalThis.__pirCryptoHashRelease : null;
+const PIR_DIGEST_ENC = typeof globalThis.__pirCryptoDigestEnc === "function"
+  ? globalThis.__pirCryptoDigestEnc : null;
+const PIR_HMAC_ENC = typeof globalThis.__pirCryptoHmacEnc === "function"
+  ? globalThis.__pirCryptoHmacEnc : null;
+const PIR_RANDOM_UUID = typeof globalThis.__pirCryptoRandomUUID === "function"
+  ? globalThis.__pirCryptoRandomUUID : null;
+const PIR_CAN_STREAM_HASH = PIR_HASH_NEW !== null && PIR_HASH_UPDATE !== null && PIR_HASH_FINAL !== null;
+const PIR_CAN_STREAM_HMAC = PIR_HMAC_NEW !== null && PIR_HASH_UPDATE !== null && PIR_HASH_FINAL !== null;
+const PIR_EMPTY_BYTES = new Uint8Array(0);
+// A single chunk at least this large goes straight into the Rust state (no JS
+// copy); smaller chunks take the cheap snapshot + one-call digest path.
+const PIR_STREAM_UPDATE_BYTES = 64 * 1024;
+
+function pirHashFinalizedError() {
+  const error = new Error("Digest already called");
+  error.code = "ERR_CRYPTO_HASH_FINALIZED";
+  return error;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,21 +737,87 @@ function pirDigestResult(bytes, encoding) {
 // ---------------------------------------------------------------------------
 // Both carry Node's HashBase surface: `update()…digest()` plus the
 // Writable+Readable transform sides (`write`/`end` on the way in, `data`/`end`
-// on the way out, `read()`/`setEncoding()` for consumers). The input is
-// buffered and the digest computed once at `end()`, the same posture as the
-// zlib transform pad — real digests, one host/JS call per stream.
-class PirHashBase extends EventEmitter {
+// on the way out, `read()`/`setEncoding()` for consumers).
+//
+// The digest state itself lives in Rust behind an integer handle when this
+// host exposes the streaming entries: `update()` feeds each chunk straight to
+// the Rust state (no per-chunk copy, no `Buffer.concat` at the end), and
+// `digest()` is still exactly one host call. Without those entries the old
+// buffered path stays as the fallback tier.
+class PirHashBase {
   constructor() {
-    super();
-    this._chunks = [];
+    // Lazy: the streaming path never allocates the chunk array, and the
+    // stream/readable flags only matter if those methods are used.
+    this._chunks = null;
+    this._handle = null;
+    this._canStream = false;
     this._digestBytes = null;
-    this._ended = false;
-    this._digestCalled = false;
-    this._encoding = undefined;
-    this._readConsumed = false;
+  }
+  // Subclasses open a state over their algorithm (and key, for HMAC).
+  _openState() { return undefined; }
+  // Drops a live native session without finalizing it (destroy()/abandonment).
+  _releaseHandle() {
+    const handle = this._handle;
+    if (handle === null) return;
+    this._handle = null;
+    if (pirHashFinalizer !== null) pirHashFinalizer.unregister(this);
+    if (PIR_HASH_RELEASE !== null) PIR_HASH_RELEASE(handle);
+  }
+  // Open the Rust state on the first update (Node's Hash ingests each
+  // update() immediately, so a later caller mutation must not be observable).
+  _openHandle() {
+    if (this._handle !== null) return this._handle;
+    if (!this._canStream) return null;
+    const handle = this._openState();
+    if (handle === undefined || handle === null) {
+      // The host does not serve this algorithm; stay on the buffered tier.
+      this._canStream = false;
+      return null;
+    }
+    this._handle = handle;
+    if (pirHashFinalizer !== null) pirHashFinalizer.register(this, handle, this);
+    return handle;
+  }
+  // Feed every buffered chunk into a freshly opened state.
+  _drainChunks(handle) {
+    const chunks = this._chunks;
+    this._chunks = null;
+    for (let index = 0; index < chunks.length; index++) PIR_HASH_UPDATE(handle, chunks[index]);
+  }
+  _push(data, encoding) {
+    if (this._handle !== null) {
+      PIR_HASH_UPDATE(this._handle, pirUpdateBytes(data, encoding));
+      return;
+    }
+    if (this._canStream) {
+      const view = pirUpdateBytes(data, encoding);
+      if (view.byteLength >= PIR_STREAM_UPDATE_BYTES) {
+        // Large chunk: let Rust snapshot it directly (after any earlier small
+        // chunks that are still buffered).
+        const handle = this._openHandle();
+        if (handle !== null) {
+          if (this._chunks !== null) this._drainChunks(handle);
+          PIR_HASH_UPDATE(handle, view);
+          return;
+        }
+      }
+      // Small (or host-fallback) chunk: keep a copy, which is what Node's
+      // update() effectively does, and switch to streaming on the second one.
+      if (this._chunks === null) this._chunks = [];
+      this._chunks.push(typeof data === "string" ? view : new Uint8Array(view));
+      if (this._chunks.length > 1) {
+        const handle = this._openHandle();
+        if (handle !== null) this._drainChunks(handle);
+      }
+      return;
+    }
+    if (this._chunks === null) this._chunks = [];
+    this._chunks.push(pirSnapshotBytes(data, encoding));
   }
   update(data, encoding) {
-    pushData(this._chunks, data, encoding);
+    // Node checks the finalized state before it looks at the data argument.
+    if (this._digestCalled) throw pirHashFinalizedError();
+    this._push(data, encoding);
     return this;
   }
   // --- Writable side ------------------------------------------------------
@@ -427,14 +829,14 @@ class PirHashBase extends EventEmitter {
       if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return false; }
       throw error;
     }
-    pushData(this._chunks, chunk, encoding);
+    this._push(chunk, encoding);
     if (typeof callback === "function") globalThis.__pirMicrotask(callback);
     return true;
   }
   end(chunk, encoding, callback) {
     if (typeof chunk === "function") { callback = chunk; chunk = undefined; encoding = undefined; }
     else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
-    if (chunk !== undefined && chunk !== null) pushData(this._chunks, chunk, encoding);
+    if (chunk !== undefined && chunk !== null) this._push(chunk, encoding);
     if (!this._ended) {
       this._ended = true;
       this._digestBytes = this._computeDigest();
@@ -469,51 +871,129 @@ class PirHashBase extends EventEmitter {
   }
   destroy(error) {
     this._ended = true;
+    this._releaseHandle();
     if (error) this.emit("error", error);
     this.emit("close");
     return this;
   }
+  // One-shot digest over a single byte view, implemented by Hash/Hmac.
+  _computeOneShot(_bytes, _encoding) { return Buffer.alloc(0); }
+  _finishHandle(encoding) {
+    const handle = this._handle;
+    this._handle = null;
+    if (pirHashFinalizer !== null) pirHashFinalizer.unregister(this);
+    // `hex`/`base64`/`base64url` are rendered host-side. Any other encoding
+    // (including an object with toString) takes the raw-bytes contract.
+    const fast = typeof encoding === "string" && PIR_HASH_TEXT_ENCODINGS[encoding] === true;
+    // Never pass an explicit `undefined` in an optional position: the host
+    // entry converts its arguments by value, and an undefined where a number
+    // or string is expected fails conversion instead of meaning "absent".
+    // `outputLength` only exists for SHAKE, so the fixed-digest path keeps the
+    // shorter call, and the raw-bytes spelling ("buffer") is passed when SHAKE
+    // needs a length without a text encoding: the host returns the same
+    // Uint8Array for it as for an absent encoding.
+    let value;
+    if (this._outputLength === undefined) {
+      value = fast ? PIR_HASH_FINAL(handle, encoding) : PIR_HASH_FINAL(handle);
+    } else {
+      value = PIR_HASH_FINAL(handle, fast ? encoding : "buffer", this._outputLength);
+    }
+    if (value !== undefined) return pirDigestValue(value);
+    throw new Error("crypto hash state lost");
+  }
+  _computeDigest(encoding) {
+    if (this._handle !== null) return this._finishHandle(encoding);
+    const chunks = this._chunks;
+    const bytes = chunks === null || chunks.length === 0
+      ? PIR_EMPTY_BYTES
+      : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+    return this._computeOneShot(bytes, encoding);
+  }
+  // After the stream path finalized, Node's Hash hands back the digest the
+  // stream produced; Hmac instead returns an empty value (test-crypto-hmac
+  // pins `streamHmac.digest()` === Buffer.alloc(0)).
+  _streamDigest(encoding) { return pirDigestResult(this._digestBytes, encoding); }
   // --- digest() -----------------------------------------------------------
   digest(encoding) {
-    // After the stream path finalized, Node hands back the digest the stream
-    // produced instead of hashing a now-empty state
-    // (test-crypto-hash-stream-pipe: `h.digest('hex')` inside the 'data'
-    // handler must still return the stream's digest).
-    if (this._ended) return pirDigestResult(this._digestBytes, encoding);
+    if (this._ended) return this._streamDigest(encoding);
     if (this._digestCalled) return this._repeatDigest(encoding);
     this._digestCalled = true;
-    const value = this._computeDigest();
-    this._chunks = [];
+    const value = this._computeDigest(encoding);
+    this._chunks = null;
+    // The host already rendered hex/base64/base64url; a primitive string's
+    // toString ignores the encoding argument, so skip the second dispatch.
+    if (typeof value === "string") return value;
     return pirDigestResult(value, encoding);
   }
   _repeatDigest(encoding) {
-    return pirDigestResult(Buffer.alloc(0), encoding);
+    // Hmac's second digest: an empty Buffer, rendered as a string only for a
+    // truthy non-"buffer" encoding (node's own branch).
+    if (encoding && encoding !== "buffer") return Buffer.alloc(0).toString(encoding);
+    return Buffer.alloc(0);
   }
 }
 
+// Node's Hash/Hmac are Transform streams, hence EventEmitters. Linking the
+// prototype directly (instead of `extends`) skips EventEmitter's constructor
+// and the derived-constructor prologue on every hash; the events shim already
+// lazily creates `_events` for util.inherits-style instances, and
+// `instanceof EventEmitter` still holds through the prototype chain.
+Object.setPrototypeOf(PirHashBase.prototype, EventEmitter.prototype);
+
 class Hash extends PirHashBase {
-  constructor(algo) {
+  constructor(algo, options) {
     super();
     if (typeof algo !== "string") {
       throw pirInvalidArgType("algorithm", "of type string", algo);
     }
     // WebCrypto spells algorithms "SHA-256"; Node digests use "sha256".
     this._algo = normalizeDigest(algo);
+    // Node validates `options.outputLength` before it resolves the digest.
+    const requested = pirParseHashOutputLength(options);
     // Node reports an unknown digest at construction, not at digest().
-    if (!pirDigestKnown(this._algo)) throw pirInvalidDigest(this._algo);
+    if (!pirDigestKnown(this._algo)) throw pirDigestUnsupported();
+    this._outputLength = pirHashOutputLength(this._algo, requested);
+    this._canStream = PIR_HOST_DIGESTS[this._algo] === true && PIR_CAN_STREAM_HASH;
   }
-  _computeDigest() {
-    return pirDigestBytes(this._algo, Buffer.concat(this._chunks));
+  _openState() { return PIR_HASH_NEW(this._algo); }
+  _computeOneShot(bytes, encoding) {
+    if (PIR_HOST_DIGESTS[this._algo] === true && PIR_DIGEST_ENC !== null) {
+      const fast = typeof encoding === "string" && PIR_HASH_TEXT_ENCODINGS[encoding] === true;
+      // Same arity rule as `_finishHandle`: never pass an explicit undefined
+      // into an optional host position, and spell the raw-bytes choice as
+      // "buffer" when a SHAKE length has to be supplied without an encoding.
+      let value;
+      if (this._outputLength === undefined) {
+        value = fast
+          ? PIR_DIGEST_ENC(this._algo, bytes, encoding)
+          : PIR_DIGEST_ENC(this._algo, bytes);
+      } else {
+        value = PIR_DIGEST_ENC(this._algo, bytes, fast ? encoding : "buffer", this._outputLength);
+      }
+      if (value !== undefined) return pirDigestValue(value);
+    }
+    return pirDigestBytes(this._algo, bytes, this._outputLength);
   }
   // Node's Hash throws on a second digest(); Hmac (below) returns empty.
-  _repeatDigest() {
-    const error = new Error("Digest already called");
-    error.code = "ERR_CRYPTO_HASH_FINALIZED";
-    throw error;
+  _repeatDigest(encoding) {
+    throw pirHashFinalizedError();
   }
-  copy() {
-    const clone = new Hash(this._algo);
-    clone._chunks = this._chunks.slice();
+  copy(options) {
+    // Node's Hash.copy() refuses a finalized state, unlike the Hmac wrapper.
+    if (this._digestCalled) throw pirHashFinalizedError();
+    // Node resets to the digest's default outputLength when copy() gets no
+    // options (`createHash('shake256', { outputLength: 0 }).copy()` hashes 32
+    // bytes), and honours an explicit `{ outputLength }` otherwise.
+    const clone = new Hash(this._algo, options);
+    if (this._handle !== null) {
+      const handle = PIR_HASH_COPY(this._handle);
+      if (handle !== undefined) {
+        clone._handle = handle;
+        if (pirHashFinalizer !== null) pirHashFinalizer.register(clone, handle, clone);
+        return clone;
+      }
+    }
+    if (this._chunks !== null) clone._chunks = this._chunks.slice();
     return clone;
   }
 }
@@ -523,13 +1003,23 @@ class Hmac extends PirHashBase {
     super();
     this._algo = normalizeDigest(algo);
     this._key = pirKeyBytes(key, "key");
+    this._canStream = PIR_HOST_HMACS[this._algo] === true && PIR_CAN_STREAM_HMAC;
   }
-  _computeDigest() {
-    return pirHmacBytes(this._algo, this._key, Buffer.concat(this._chunks));
+  _openState() { return PIR_HMAC_NEW(this._algo, this._key); }
+  _streamDigest(encoding) { return this._repeatDigest(encoding); }
+  _computeOneShot(bytes, encoding) {
+    if (PIR_HOST_HMACS[this._algo] === true && PIR_HMAC_ENC !== null) {
+      const fast = typeof encoding === "string" && PIR_HASH_TEXT_ENCODINGS[encoding] === true;
+      const value = fast
+        ? PIR_HMAC_ENC(this._algo, this._key, bytes, encoding)
+        : PIR_HMAC_ENC(this._algo, this._key, bytes);
+      if (value !== undefined) return pirDigestValue(value);
+    }
+    return pirHmacBytes(this._algo, this._key, bytes);
   }
 }
 
-function createHash(algo) { return new Hash(algo); }
+function createHash(algo, options) { return new Hash(algo, options); }
 
 // Node's createHmac validates the algorithm *name* as a string first, then the
 // key, then the digest name (ERR_CRYPTO_INVALID_DIGEST for an unknown one).
@@ -538,7 +1028,9 @@ function createHmac(algo, key) {
     throw pirInvalidArgType("hmac", "of type string", algo);
   }
   const hmac = new Hmac(algo, key);
-  if (!pirDigestKnown(hmac._algo)) throw pirInvalidDigest(hmac._algo);
+  if (!pirDigestKnown(hmac._algo) || PIR_HOST_HMACS[hmac._algo] !== true) {
+    throw pirInvalidDigest(hmac._algo);
+  }
   return hmac;
 }
 
@@ -579,19 +1071,86 @@ function pirCallableCtor(impl, before) {
 }
 
 // One-shot `crypto.hash(algorithm, data, outputEncoding)` (Node 21+).
-function hash(algorithm, data, outputEncoding) {
-  const hasher = new Hash(algorithm).update(data);
-  return hasher.digest(outputEncoding);
+// Semantics from lib/internal/crypto/hash.js `hash()`: the third argument is
+// either an encoding string or an options object (`{ outputEncoding,
+// outputLength }`), the output defaults to **hex**, and "buffer" returns the
+// raw bytes.
+function hash(algorithm, input, options) {
+  if (typeof algorithm !== "string") throw pirInvalidArgType("algorithm", "of type string", algorithm);
+  if (typeof input !== "string" && !ArrayBuffer.isView(input)) {
+    throw pirInvalidArgType("input", PIR_INPUT_EXPECTED, input);
+  }
+  let outputEncoding;
+  let outputLength;
+  if (options === undefined) {
+    outputEncoding = "hex";
+  } else if (typeof options === "string") {
+    outputEncoding = options;
+  } else {
+    pirValidateObject(options, "options");
+    outputEncoding = options.outputEncoding;
+    outputLength = pirOneShotOutputLength(options.outputLength);
+  }
+  if (outputEncoding === undefined || outputEncoding === null) outputEncoding = "hex";
+
+  let encoding = outputEncoding;
+  if (encoding !== "hex") {
+    if (typeof encoding !== "string") throw pirInvalidArgType("outputEncoding", "of type string", encoding);
+    if (!Buffer.isEncoding(encoding) && encoding.toLowerCase() !== "buffer") {
+      throw pirInvalidArgValue("outputEncoding", encoding);
+    }
+  }
+
+  const algo = normalizeDigest(algorithm);
+  if (!pirDigestKnown(algo)) {
+    // oneShotDigest's own error, distinct from createHash's.
+    throw new Error("Digest method " + algorithm + " is not supported");
+  }
+  // oneShotDigest's non-XOF message differs from the createHash constructor's
+  // ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH.
+  if (outputLength !== undefined && PIR_SHAKE_DEFAULTS[algo] === undefined) {
+    const size = PIR_DIGEST_SIZES[algo];
+    if (size !== undefined && outputLength !== size) {
+      throw new Error("Output length " + outputLength + " is invalid for " +
+        algorithm + ", which does not support XOF");
+    }
+  }
+  const hashOptions = outputLength === undefined ? undefined : { outputLength: outputLength };
+  const bytes = new Hash(algorithm, hashOptions).update(input).digest();
+  if (encoding.toLowerCase() === "buffer") return bytes;
+  return bytes.toString(encoding);
+}
+
+/// One-shot `crypto.hash` spells its XOF length as a *positional option*, so
+/// Node's validator names it `outputLength` (not `options.outputLength`).
+function pirOneShotOutputLength(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number") {
+    throw pirInvalidArgType("outputLength", "of type number", value);
+  }
+  if (!Number.isInteger(value)) throw pirOutOfRange("outputLength", "an integer", value);
+  if (value < 0 || value > 4294967295) {
+    throw pirOutOfRange("outputLength", ">= 0 && <= 4294967295", value);
+  }
+  return value;
 }
 
 function randomBytes(size, callback) {
-  const count = Math.trunc(Number(size));
-  if (!Number.isFinite(count) || count < 0) {
-    throw new TypeError("The value of \"size\" is out of range. It must be >= 0");
-  }
-  if (typeof callback === "function") {
-    microtaskRandom(count, callback);
-    return;
+  // Node's assertSize(size, 1, 0, Infinity): a non-number is
+  // ERR_INVALID_ARG_TYPE, then the range check covers NaN/negative/Infinity
+  // and the 2^31-1 allocation cap.
+  const count = pirAssertSize(size, 1, 0, Infinity);
+  if (callback !== undefined) pirValidateFunction(callback, "callback");
+  if (callback === undefined) return pirRandomBytes(count);
+  microtaskRandom(count, callback);
+}
+
+/// OS entropy as a Buffer. The typed entry hands the bytes over directly; the
+/// base64 JSON op stays as the fallback for boot paths without it.
+function pirRandomBytes(count) {
+  if (typeof globalThis.__pirCryptoRandom === "function") {
+    const bytes = globalThis.__pirCryptoRandom(count);
+    if (bytes !== undefined) return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
   return Buffer.from(call("crypto", "randomBytes", { n: count }), "base64");
 }
@@ -600,7 +1159,7 @@ function microtaskRandom(count, callback) {
   globalThis.__pirMicrotask(() => {
     let value;
     try {
-      value = Buffer.from(call("crypto", "randomBytes", { n: count }), "base64");
+      value = pirRandomBytes(count);
     } catch (error) {
       callback(error);
       return;
@@ -609,33 +1168,90 @@ function microtaskRandom(count, callback) {
   });
 }
 
-function randomFillSync(buffer, offset, size) {
-  if (!(buffer instanceof Uint8Array)) {
-    throw new TypeError("The \"buf\" argument must be an instance of Buffer, TypedArray, or DataView");
+// Node's random.js `assertOffset`/`assertSize`: element-size aware bounds with
+// ERR_OUT_OF_RANGE. `>>> 0` is Node's uint32 truncation (a fractional offset
+// or size is accepted and truncated).
+function pirAssertOffset(offset, elementSize, length) {
+  pirValidateNumber(offset, "offset");
+  offset *= elementSize;
+  const maxLength = Math.min(length, 2147483647);
+  if (Number.isNaN(offset) || offset > maxLength || offset < 0) {
+    throw pirOutOfRange("offset", ">= 0 && <= " + maxLength, offset);
   }
-  const start = offset === undefined ? 0 : Math.trunc(offset);
-  const length = size === undefined ? buffer.length - start : Math.trunc(size);
-  if (length === 0) return buffer;
-  const bytes = Buffer.from(call("crypto", "randomBytes", { n: length }), "base64");
-  buffer.set(bytes, start);
+  return offset >>> 0;
+}
+
+function pirAssertSize(size, elementSize, offset, length) {
+  pirValidateNumber(size, "size");
+  size *= elementSize;
+  if (Number.isNaN(size) || size > 2147483647 || size < 0) {
+    throw pirOutOfRange("size", ">= 0 && <= 2147483647", size);
+  }
+  if (size + offset > length) {
+    throw pirOutOfRange("size + offset", "<= " + length, size + offset);
+  }
+  return size >>> 0;
+}
+
+function pirIsAnyArrayBuffer(value) {
+  return value instanceof ArrayBuffer ||
+    (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer);
+}
+
+// The destination window for a fill. ArrayBuffer/SharedArrayBuffer address
+// bytes directly; a view offsets from its own byteOffset.
+function pirFillWindow(buffer, offset, size) {
+  if (pirIsAnyArrayBuffer(buffer)) return new Uint8Array(buffer, offset, size);
+  return new Uint8Array(buffer.buffer, buffer.byteOffset + offset, size);
+}
+
+function randomFillSync(buffer, offset, size) {
+  if (!pirIsAnyArrayBuffer(buffer) && !ArrayBuffer.isView(buffer)) {
+    throw pirInvalidArgType("buf", "an instance of ArrayBuffer or ArrayBufferView", buffer);
+  }
+  const elementSize = buffer.BYTES_PER_ELEMENT || 1;
+  const length = buffer.byteLength;
+  offset = pirAssertOffset(offset === undefined ? 0 : offset, elementSize, length);
+  size = size === undefined
+    ? length - offset
+    : pirAssertSize(size, elementSize, offset, length);
+  if (size === 0) return buffer;
+  pirFillWindow(buffer, offset, size).set(pirRandomBytes(size));
   return buffer;
 }
 
 function randomFill(buffer, offset, size, callback) {
-  if (typeof offset === "function") { callback = offset; offset = undefined; size = undefined; }
-  else if (typeof size === "function") { callback = size; size = undefined; }
-  const start = offset === undefined ? 0 : Math.trunc(offset);
-  const length = size === undefined ? buffer.length - start : Math.trunc(size);
+  if (!pirIsAnyArrayBuffer(buffer) && !ArrayBuffer.isView(buffer)) {
+    throw pirInvalidArgType("buf", "an instance of ArrayBuffer or ArrayBufferView", buffer);
+  }
+  const elementSize = buffer.BYTES_PER_ELEMENT || 1;
+  const length = buffer.byteLength;
+  if (typeof offset === "function") {
+    callback = offset;
+    offset = 0;
+    size = buffer.length;
+  } else if (typeof size === "function") {
+    callback = size;
+    size = (buffer.length !== undefined ? buffer.length : length) - offset;
+  } else {
+    pirValidateFunction(callback, "callback");
+  }
+  offset = pirAssertOffset(offset === undefined ? 0 : offset, elementSize, length);
+  size = size === undefined
+    ? length - offset
+    : pirAssertSize(size, elementSize, offset, length);
+  if (size === 0) {
+    callback(null, buffer);
+    return;
+  }
   globalThis.__pirMicrotask(() => {
     try {
-      randomFillSync(buffer, start, length);
-      if (typeof callback === "function") callback(null, buffer);
+      pirFillWindow(buffer, offset, size).set(pirRandomBytes(size));
+      callback(null, buffer);
     } catch (error) {
-      if (typeof callback === "function") callback(error);
-      else throw error;
+      callback(error);
     }
   });
-  if (typeof callback !== "function") return undefined;
 }
 
 // Unbiased `randomInt` via rejection sampling over the host entropy source.
@@ -645,7 +1261,7 @@ function pirRandomIntValue(lo, hi) {
   const pow = bytes === 6 ? 281474976710656 : Math.pow(2, bytes * 8);
   const limit = pow - (pow % range);
   for (;;) {
-    const buf = Buffer.from(call("crypto", "randomBytes", { n: bytes }), "base64");
+    const buf = pirRandomBytes(bytes);
     let value = 0;
     for (let i = 0; i < bytes; i++) value = value * 256 + buf[i];
     if (value < limit) return lo + (value % range);
@@ -653,32 +1269,61 @@ function pirRandomIntValue(lo, hi) {
 }
 
 function randomInt(min, max, callback) {
-  if (typeof max === "function") { callback = max; max = min; min = 0; }
-  let lo = Math.trunc(Number(min));
-  let hi = Math.trunc(Number(max));
-  if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
-    throw new TypeError("The \"max\" argument must be an integer");
+  // randomInt(max) / randomInt(max, callback): the second argument is the
+  // callback, so `max` (above) becomes the bound and `min` is 0.
+  const minNotSpecified = typeof max === "undefined" || typeof max === "function";
+  if (minNotSpecified) {
+    callback = max;
+    max = min;
+    min = 0;
   }
-  if (hi <= lo) {
-    throw new RangeError("The value of \"max\" is out of range. It must be greater than \"min\". Received " + hi);
+  const isSync = typeof callback === "undefined";
+  if (!isSync) pirValidateFunction(callback, "callback");
+  if (!Number.isSafeInteger(min)) throw pirInvalidArgType("min", "a safe integer", min);
+  if (!Number.isSafeInteger(max)) throw pirInvalidArgType("max", "a safe integer", max);
+  if (max <= min) {
+    throw pirOutOfRange("max", "greater than the value of \"min\" (" + min + ")", max);
   }
-  if (hi - lo > 281474976710656) {
-    throw new RangeError("The value of \"max\" is out of range. It must be <= 2^48 - 1. Received " + hi);
+  const range = max - min;
+  // Node's RAND_MAX is 2^48 - 1.
+  if (!(range <= 281474976710655)) {
+    throw pirOutOfRange(minNotSpecified ? "max" : "max - min", "<= 281474976710655", range);
   }
-  if (typeof callback === "function") {
-    globalThis.__pirMicrotask(() => callback(null, pirRandomIntValue(lo, hi)));
-    return;
-  }
-  return pirRandomIntValue(lo, hi);
+  const value = pirRandomIntValue(min, max);
+  if (isSync) return value;
+  const deliver = () => callback(undefined, value);
+  if (typeof globalThis.__pirNextTick === "function") globalThis.__pirNextTick(deliver);
+  else globalThis.__pirMicrotask(deliver);
+  return undefined;
 }
 
-function randomUUID() { return String(call("crypto", "randomUUID")); }
+function pirRandomUuidOptions(options) {
+  if (options !== undefined) pirValidateObject(options, "options");
+  const disable = options === undefined || options.disableEntropyCache === undefined
+    ? false
+    : options.disableEntropyCache;
+  if (typeof disable !== "boolean") {
+    throw pirInvalidArgType("options.disableEntropyCache", "of type boolean", disable);
+  }
+}
+
+function randomUUID(options) {
+  pirRandomUuidOptions(options);
+  // The typed entry builds the hyphenated string in Rust: one host call and
+  // no Buffer/per-byte hex table on the JS side.
+  if (PIR_RANDOM_UUID !== null) {
+    const value = PIR_RANDOM_UUID();
+    if (value !== undefined) return value;
+  }
+  return String(call("crypto", "randomUUID"));
+}
 
 // UUID v7: 48-bit big-endian millisecond timestamp + version/variant + random
 // tail (RFC 9562 layout; time-based ordering is best-effort, no monotonic
 // counter is kept).
-function randomUUIDv7() {
-  const bytes = Buffer.from(call("crypto", "randomBytes", { n: 16 }), "base64");
+function randomUUIDv7(options) {
+  pirRandomUuidOptions(options);
+  const bytes = pirRandomBytes(16);
   const ms = BigInt(Date.now());
   for (let i = 0; i < 6; i++) {
     bytes[i] = Number((ms >> BigInt(8 * (5 - i))) & 0xffn);
@@ -690,24 +1335,40 @@ function randomUUIDv7() {
   return hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
 }
 
-// The digests this runtime advertises. It stays the host op's four on purpose:
-// tests/node_shims.rs pins this exact list (`getHashes mismatch`), and that
-// file is not owned by this wave — the JS digests above (sha224/sha384/
-// sha3-*) are served by createHash/createHmac but not listed here until that
-// pin is updated (see scripts/node_tests/REPORT.md).
-function getHashes() { return ["md5", "sha1", "sha256", "sha512"]; }
+// Every digest this runtime can actually compute: the host `crypto` op serves
+// the whole set (`PIR_HOST_DIGESTS`), so advertising only the original four
+// would make plugins feature-detect SHA-3 as missing and take a slow path.
+// tests/node_shims.rs and tests/zlib_crypto_shims.rs pin this exact list.
+function getHashes() {
+  // The real host-backed set: the Rust `hash`/`HashState` table serves all of
+  // these (SHAKE through the extendable-output path). Node also lists RSA-*
+  // and other provider aliases, which this runtime has no engine for.
+  return [
+    "md5", "sha1", "sha224", "sha256", "sha384", "sha512",
+    "sha3-224", "sha3-256", "sha3-384", "sha3-512",
+    "shake128", "shake256",
+  ];
+}
 
 function toBytes(value, name) {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  throw new TypeError("The \"" + name + "\" argument must be an instance of Buffer, TypedArray, or DataView");
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)) {
+    return new Uint8Array(value);
+  }
+  const error = new TypeError(
+    "The \"" + name + "\" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.");
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
 }
 
 function timingSafeEqual(a, b) {
   const left = toBytes(a, "buf1");
   const right = toBytes(b, "buf2");
   if (left.length !== right.length) {
-    throw new RangeError("Input buffers must have the same byte length");
+    const error = new RangeError("Input buffers must have the same byte length");
+    error.code = "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH";
+    throw error;
   }
   let diff = 0;
   for (let i = 0; i < left.length; i++) diff |= left[i] ^ right[i];
@@ -718,13 +1379,33 @@ function timingSafeEqual(a, b) {
 // createCipheriv / createDecipheriv (real AES-128/192/256 CBC/CTR/GCM)
 // ---------------------------------------------------------------------------
 
-/// WebCrypto `getRandomValues` shape (also the standalone module export).
+function pirDomException(message, name) {
+  if (typeof DOMException === "function") return new DOMException(message, name);
+  const error = new Error(message);
+  error.name = name;
+  error.code = name === "QuotaExceededError" ? 22 : name === "TypeMismatchError" ? 17 : 0;
+  return error;
+}
+
+function pirIsFloatTypedArray(value) {
+  const name = value.constructor && value.constructor.name;
+  return name === "Float16Array" || name === "Float32Array" || name === "Float64Array";
+}
+
+/// WebCrypto `getRandomValues` (internal/crypto/random.js `getRandomValues`):
+/// only integer-type TypedArrays are accepted (DataView, ArrayBuffer, plain
+/// arrays and the float arrays are a TypeMismatchError), and the byte length
+/// is capped at 64 KiB with a QuotaExceededError.
 const webcryptoGetRandomValues = (array) => {
-  if (!array || !ArrayBuffer.isView(array) || array instanceof DataView) {
-    throw new TypeError("The provided value is not of type '(ArrayBuffer or ArrayBufferView)'");
+  if (!ArrayBuffer.isView(array) || array instanceof DataView || pirIsFloatTypedArray(array)) {
+    throw pirDomException("The data argument must be an integer-type TypedArray", "TypeMismatchError");
   }
-  const bytes = Buffer.from(call("crypto", "randomBytes", { n: array.byteLength }), "base64");
-  new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(bytes);
+  if (array.byteLength > 65536) {
+    throw pirDomException("The requested length exceeds 65,536 bytes", "QuotaExceededError");
+  }
+  if (array.byteLength > 0) {
+    new Uint8Array(array.buffer, array.byteOffset, array.byteLength).set(pirRandomBytes(array.byteLength));
+  }
   return array;
 };
 
@@ -754,6 +1435,26 @@ function getCiphers() {
   return out;
 }
 
+// Node's public cipher errors (lib/internal/crypto/cipher.js). Key/IV length
+// checks happen in the constructor, exactly like Node's `Cipher` setup.
+function pirUnknownCipher() {
+  const error = new Error("Unknown cipher");
+  error.code = "ERR_CRYPTO_UNKNOWN_CIPHER";
+  return error;
+}
+
+function pirInvalidKeyLength() {
+  const error = new RangeError("Invalid key length");
+  error.code = "ERR_CRYPTO_INVALID_KEYLEN";
+  return error;
+}
+
+function pirInvalidIv() {
+  const error = new TypeError("Invalid initialization vector");
+  error.code = "ERR_CRYPTO_INVALID_IV";
+  return error;
+}
+
 function getCipherInfo(nameOrNid, options) {
   if (typeof nameOrNid === "string") return pirCipherInfo(nameOrNid);
   // Numeric NID lookups need OpenSSL tables the runtime does not host.
@@ -767,10 +1468,25 @@ function getCurves() { return []; }
 
 class PirCipher {
   constructor(algorithm, key, iv, encrypt) {
-    this._alg = String(algorithm).toLowerCase();
+    if (typeof algorithm !== "string") {
+      throw pirInvalidArgType("cipher", "of type string", algorithm);
+    }
+    const info = pirCipherInfo(algorithm);
+    if (info === undefined) throw pirUnknownCipher();
+    this._alg = info.name;
+    this._info = info;
     this._encrypt = encrypt;
-    this._keyB64 = toKeyBytes(key, "key").toString("base64");
-    this._ivB64 = iv === undefined || iv === null ? null : toKeyBytes(iv, "iv").toString("base64");
+    const keyBytes = pirKeyBytes(key, "key");
+    if (keyBytes.length !== info.keyLength) throw pirInvalidKeyLength();
+    // CBC/CTR need a full block; GCM accepts any non-empty IV (Node's
+    // `AES-128-GCM` setup rejects only a zero-length one).
+    if (iv === undefined || iv === null) throw pirInvalidIv();
+    const ivBytes = toKeyBytes(iv, "iv");
+    if (ivBytes.length === 0 || (info.mode !== "gcm" && ivBytes.length !== info.blockSize)) {
+      throw pirInvalidIv();
+    }
+    this._keyB64 = keyBytes.toString("base64");
+    this._ivB64 = ivBytes.toString("base64");
     this._state = null;
     this._autoPadding = true;
     this._aadB64 = null;
@@ -781,15 +1497,19 @@ class PirCipher {
   }
   _dataBytes(data, encoding) {
     if (typeof data === "string") return Buffer.from(data, encoding === undefined ? "utf8" : encoding);
-    if (data instanceof Uint8Array) return Buffer.from(data);
-    if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
-    throw new TypeError("The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView");
+    if (ArrayBuffer.isView(data)) {
+      return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    }
+    if (data instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer === "function" && data instanceof SharedArrayBuffer)) {
+      return Buffer.from(new Uint8Array(data));
+    }
+    throw pirInvalidArgType("data", PIR_INPUT_EXPECTED, data);
   }
   _run(data, isFinal) {
     if (this._ended) {
-      const error = new Error("Invalid state: Cipher is already finalized");
-      error.code = "ERR_CRYPTO_INVALID_STATE";
-      throw error;
+      // Node's C++ layer: update()/final() after final().
+      throw new Error("Trying to add data in unsupported state");
     }
     const payload = {
       alg: this._alg,
@@ -803,7 +1523,17 @@ class PirCipher {
     };
     if (this._aadB64 !== null) payload.aad = this._aadB64;
     if (!this._encrypt && this._authTagB64 !== null) payload.authTag = this._authTagB64;
-    const result = call("crypto", "cipheriv", payload);
+    let result;
+    try {
+      result = call("crypto", "cipheriv", payload);
+    } catch (error) {
+      // Node surfaces a failed GCM tag comparison as this plain Error (no
+      // code); the host's openssl-style spelling is remapped here.
+      if (error !== null && typeof error === "object" && error.code === "ERR_OSSL_EVP_BAD_DECRYPT") {
+        throw new Error("Unsupported state or unable to authenticate data");
+      }
+      throw error;
+    }
     this._state = result.state === null || result.state === undefined ? null : result.state;
     if (result.authTag) this._finalTag = Buffer.from(result.authTag, "base64");
     if (isFinal) this._ended = true;
@@ -820,19 +1550,24 @@ class PirCipher {
     return encoding === undefined ? out : out.toString(encoding);
   }
   // Node's CipherBase pins one output encoding per cipher: a later update()/
-  // final() with a different one raises `Cannot change encoding`, and an
-  // unknown name raises ERR_UNKNOWN_ENCODING (the unknown-encoding check runs
-  // first — test-crypto-encoding-validation-error covers both orders).
+  // final() with a different one raises ERR_INVALID_ARG_VALUE, and an unknown
+  // name raises ERR_UNKNOWN_ENCODING (the unknown-encoding check runs first —
+  // test-crypto-encoding-validation-error covers both orders).
   _checkOutputEncoding(outputEncoding) {
     if (outputEncoding === undefined || outputEncoding === null) return undefined;
     if (typeof outputEncoding !== "string" || !Buffer.isEncoding(outputEncoding)) {
       throw pirUnknownEncoding(outputEncoding);
     }
+    // Node compares the StringDecoder's normalized label and reports that same
+    // label in the error (`cannot be changed from 'utf8'`, not 'utf-8').
+    const normalized = new StringDecoder(outputEncoding).encoding;
     if (this._outputEncoding === undefined) {
-      this._outputEncoding = outputEncoding;
-    } else if (this._outputEncoding !== outputEncoding) {
-      const error = new Error("Cannot change encoding");
-      error.code = "ERR_INTERNAL_ASSERTION";
+      this._outputEncoding = normalized;
+    } else if (this._outputEncoding !== normalized) {
+      const error = new TypeError(
+        "The argument 'outputEncoding' cannot be changed from '" +
+        this._outputEncoding + "'. Received '" + outputEncoding + "'");
+      error.code = "ERR_INVALID_ARG_VALUE";
       throw error;
     }
     return outputEncoding;
@@ -847,7 +1582,9 @@ class PirCipher {
   }
   getAuthTag() {
     if (this._finalTag === null) {
-      throw new Error("The authentication tag has not been computed; call final() first");
+      const error = new Error("Invalid state for operation getAuthTag");
+      error.code = "ERR_CRYPTO_INVALID_STATE";
+      throw error;
     }
     return this._finalTag;
   }
@@ -933,6 +1670,7 @@ function normalizeSignAlgo(algorithm) {
 class Sign {
   constructor(algorithm) {
     this._algo = normalizeSignAlgo(algorithm);
+    if (PIR_HOST_HMACS[this._algo] !== true) throw pirInvalidDigest(String(algorithm));
     this._chunks = [];
   }
   update(data, encoding) { pushData(this._chunks, data, encoding); return this; }
@@ -952,6 +1690,7 @@ class Sign {
 class Verify {
   constructor(algorithm) {
     this._algo = normalizeSignAlgo(algorithm);
+    if (PIR_HOST_HMACS[this._algo] !== true) throw pirInvalidDigest(String(algorithm));
     this._chunks = [];
   }
   update(data, encoding) { pushData(this._chunks, data, encoding); return this; }
@@ -999,63 +1738,80 @@ function verify(algorithm, data, key, signature) {
 // PBKDF2 / scrypt / HKDF key derivation
 // ---------------------------------------------------------------------------
 
-// Real PBKDF2 (RFC 2898) over the host's Hmac<sha1|sha256|sha512>; Node
-// argument shapes and error ordering (iterations/keylen validated first).
+// internal/validators validateInteger: type, then integrality, then the
+// inclusive window. Node prints the range with "&&" (not "and").
+function pirValidateInteger(value, name, min, max) {
+  if (typeof value !== "number") throw pirInvalidArgType(name, "of type number", value);
+  if (!Number.isInteger(value)) throw pirOutOfRange(name, "an integer", value);
+  if (value < min || value > max) {
+    throw pirOutOfRange(name, ">= " + min + " && <= " + max, value);
+  }
+  return value;
+}
+
+function pirScryptParamsError(reason) {
+  const error = new RangeError(reason === undefined ? "Invalid scrypt params" : reason);
+  error.code = "ERR_CRYPTO_INVALID_SCRYPT_PARAMS";
+  return error;
+}
+
+// Real PBKDF2 (RFC 2898) over the host's HMAC backends (SHA-1, SHA-2, SHA-3
+// and MD5). Node validates password/salt, then iterations, keylen and digest.
 function pbkdf2Sync(password, salt, iterations, keylen, digest) {
   const passwordBytes = toKeyBytes(password, "password");
   const saltBytes = toKeyBytes(salt, "salt");
-  const rounds = Number(iterations);
-  if (!Number.isFinite(rounds) || rounds < 1) {
-    throw new TypeError("The \"iterations\" argument must be a positive number");
-  }
-  const length = Number(keylen);
-  if (!Number.isFinite(length) || length < 0) {
-    throw new TypeError("The \"keylen\" argument must be a non-negative number");
+  const rounds = pirValidateInteger(iterations, "iterations", 1, 2147483647);
+  const length = pirValidateInteger(keylen, "keylen", 0, 2147483647);
+  if (typeof digest !== "string") {
+    throw pirInvalidArgType("digest", "of type string", digest);
   }
   const algo = normalizeDigest(digest);
-  if (algo !== "sha1" && algo !== "sha256" && algo !== "sha512") {
-    throw new Error("Digest method not supported: " + digest);
+  if (PIR_SHAKE_DEFAULTS[algo] !== undefined) {
+    // OpenSSL's provider rejects XOF digests as PBKDF2 PRFs.
+    throw new Error("error:1C8000B7:Provider routines::xof digests not allowed");
   }
+  if (PIR_HOST_HMACS[algo] !== true) throw pirInvalidDigest(digest);
   return Buffer.from(call("crypto", "pbkdf2", {
     algo: algo,
     password: passwordBytes.toString("base64"),
     salt: saltBytes.toString("base64"),
-    iterations: Math.floor(rounds),
-    keylen: Math.floor(length),
+    iterations: rounds,
+    keylen: length,
   }), "base64");
 }
 
 function pbkdf2(password, salt, iterations, keylen, digest, callback) {
   // Node's overloads: pbkdf2(pw, salt, iterations, keylen, digest, cb) and
-  // the digest-less form with the callback in the digest slot.
+  // the digest-less form with the callback in the digest slot. Node validates
+  // every argument synchronously (a bad digest throws even with a callback),
+  // so the derivation runs before the callback check here as well.
   if (typeof digest === "function") { callback = digest; digest = undefined; }
-  globalThis.__pirMicrotask(() => {
-    let value;
-    try {
-      value = pbkdf2Sync(password, salt, iterations, keylen, digest);
-    } catch (error) {
-      if (typeof callback === "function") { callback(error); return; }
-      throw error;
-    }
-    if (typeof callback === "function") callback(null, value);
-  });
+  const value = pbkdf2Sync(password, salt, iterations, keylen, digest);
+  if (typeof callback !== "function") throw pirInvalidArgType("callback", "of type function", callback);
+  globalThis.__pirMicrotask(() => callback(null, value));
 }
 
-// Node's scryptSync defaults: N=16384, r=8, p=1, maxmem=32 MiB.
+// Node's scrypt defaults: N=16384, r=8, p=1, maxmem=32 MiB. The option object
+// itself is not type-checked (Node accepts a string and reads nothing).
 function scryptOptions(options) {
   const opts = options === undefined || options === null ? {} : options;
-  const n = opts.N === undefined ? 16384 : Number(opts.N);
-  const r = opts.r === undefined ? 8 : Number(opts.r);
-  const p = opts.p === undefined ? 1 : Number(opts.p);
-  const maxmem = opts.maxmem === undefined ? 32 * 1024 * 1024 : Number(opts.maxmem);
+  const n = opts.N === undefined ? 16384 : pirValidateInteger(opts.N, "N", 0, 4294967295);
+  const r = opts.r === undefined ? 8 : pirValidateInteger(opts.r, "r", 0, 4294967295);
+  const p = opts.p === undefined ? 1 : pirValidateInteger(opts.p, "p", 0, 4294967295);
+  const maxmem = opts.maxmem === undefined
+    ? 32 * 1024 * 1024
+    : pirValidateInteger(opts.maxmem, "maxmem", 0, 9007199254740991);
   const logN = Math.log2(n);
-  if (!Number.isInteger(n) || n < 2 || !Number.isInteger(logN)) {
-    throw new RangeError("The value of \"options.N\" is out of range. It must be a power of two > 1. Received " + n);
-  }
-  for (const [name, value, min] of [["r", r, 1], ["p", p, 1], ["maxmem", maxmem, 1]]) {
-    if (!Number.isInteger(value) || value < min) {
-      throw new RangeError("The value of \"options." + name + "\" is out of range. It must be an integer >= " + min + ". Received " + value);
-    }
+  if (n < 2 || !Number.isInteger(logN)) throw pirScryptParamsError();
+  // OpenSSL accepts r=0/p=0 but the Rust `scrypt` crate does not; report the
+  // same error class/code as the other invalid parameter shapes.
+  if (r === 0 || p === 0) throw pirScryptParamsError();
+  // OpenSSL's guard: 128 * r * (N + p + 2) bytes.
+  const memory = 128 * r * (n + p + 2);
+  if (memory > maxmem) {
+    throw pirScryptParamsError(
+      "Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded",
+    );
   }
   return { logN: logN, r: r, p: p, maxmem: maxmem };
 }
@@ -1063,10 +1819,7 @@ function scryptOptions(options) {
 function scryptSync(password, salt, keylen, options) {
   const passwordBytes = toKeyBytes(password, "password");
   const saltBytes = toKeyBytes(salt, "salt");
-  const length = Number(keylen);
-  if (!Number.isFinite(length) || length < 0) {
-    throw new TypeError("The \"keylen\" argument must be a non-negative number");
-  }
+  const length = pirValidateInteger(keylen, "keylen", 0, 2147483647);
   const opts = scryptOptions(options);
   return Buffer.from(call("crypto", "scrypt", {
     password: passwordBytes.toString("base64"),
@@ -1075,43 +1828,55 @@ function scryptSync(password, salt, keylen, options) {
     r: opts.r,
     p: opts.p,
     maxmem: opts.maxmem,
-    keylen: Math.floor(length),
+    keylen: length,
   }), "base64");
 }
 
 function scrypt(password, salt, keylen, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
-  globalThis.__pirMicrotask(() => {
-    let value;
-    try {
-      value = scryptSync(password, salt, keylen, options);
-    } catch (error) {
-      if (typeof callback === "function") { callback(error); return; }
-      throw error;
-    }
-    if (typeof callback === "function") callback(null, value);
-  });
+  // Node validates and starts the derivation synchronously; bad arguments
+  // throw even when a callback is supplied (test-crypto-scrypt's `bad` loop).
+  const value = scryptSync(password, salt, keylen, options);
+  if (typeof callback !== "function") throw pirInvalidArgType("callback", "of type function", callback);
+  globalThis.__pirMicrotask(() => callback(null, value));
 }
 
 // Real HKDF (RFC 5869) composed from the real HMAC chain. Node returns an
-// ArrayBuffer from hkdfSync.
+// ArrayBuffer from hkdfSync and requires both salt and info.
 function pirHkdf(digest, ikm, salt, info, keylen) {
-  const algo = normalizeDigest(digest);
-  if (algo !== "sha1" && algo !== "sha256" && algo !== "sha384" && algo !== "sha512") {
-    throw new Error("Digest method not supported: " + digest);
+  if (typeof digest !== "string") {
+    throw pirInvalidArgType("digest", "of type string", digest);
   }
-  const ikmBytes = toKeyBytes(ikm, "ikm");
-  const saltBytes = salt === undefined || salt === null ? Buffer.alloc(0) : toKeyBytes(salt, "salt");
-  const infoBytes = info === undefined || info === null ? Buffer.alloc(0) : toKeyBytes(info, "info");
-  const length = Number(keylen);
-  if (!Number.isFinite(length) || length < 0) {
-    throw new TypeError("The \"keylen\" argument must be a non-negative number");
+  // Node accepts a secret KeyObject as `ikm` (not for salt/info).
+  let ikmBytes;
+  if (KeyObject !== undefined && ikm instanceof KeyObject) {
+    if (ikm.type !== "secret" || typeof ikm._secretB64 !== "string") {
+      throw pirInvalidArgType("ikm", PIR_IKM_EXPECTED, ikm);
+    }
+    ikmBytes = Buffer.from(ikm._secretB64, "base64");
+  } else {
+    ikmBytes = toKeyBytes(ikm, "ikm", PIR_IKM_EXPECTED);
+  }
+  // Node's HKDF requires explicit salt/info byte strings (undefined and null
+  // are ERR_INVALID_ARG_TYPE, unlike older Node releases), and caps info at
+  // 1024 bytes.
+  const saltBytes = toKeyBytes(salt, "salt", PIR_HKDF_BYTES_EXPECTED);
+  const infoBytes = toKeyBytes(info, "info", PIR_HKDF_BYTES_EXPECTED);
+  if (infoBytes.length > 1024) {
+    throw pirOutOfRange("info", "must not contain more than 1024 bytes", infoBytes.length);
+  }
+  const length = pirValidateInteger(keylen, "length", 0, 9007199254740991);
+  const algo = normalizeDigest(digest);
+  if (PIR_SHAKE_DEFAULTS[algo] !== undefined || PIR_HOST_HMACS[algo] !== true) {
+    throw pirInvalidDigest(digest);
   }
   const prk = createHmac(algo, saltBytes).update(ikmBytes).digest();
   const hashLen = prk.length;
   const blocks = Math.ceil(length / hashLen);
   if (blocks > 255) {
-    throw new RangeError("Invalid key length");
+    const error = new RangeError("Invalid key length");
+    error.code = "ERR_CRYPTO_INVALID_KEYLEN";
+    throw error;
   }
   const out = [];
   let previous = Buffer.alloc(0);
@@ -1133,16 +1898,11 @@ function hkdfSync(digest, ikm, salt, info, keylen) {
 }
 
 function hkdf(digest, ikm, salt, info, keylen, callback) {
-  globalThis.__pirMicrotask(() => {
-    let value;
-    try {
-      value = pirHkdf(digest, ikm, salt, info, keylen);
-    } catch (error) {
-      if (typeof callback === "function") { callback(error); return; }
-      throw error;
-    }
-    if (typeof callback === "function") callback(null, value);
-  });
+  // Argument validation is synchronous in Node: a bad digest throws even when
+  // a callback is supplied (test-crypto-hkdf's `assert.throws` cases).
+  const value = pirHkdf(digest, ikm, salt, info, keylen);
+  if (typeof callback !== "function") throw pirInvalidArgType("callback", "of type function", callback);
+  globalThis.__pirMicrotask(() => callback(null, value));
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,7 +2021,7 @@ const webcrypto = {
         throw pirWebcryptoHmacOnly("subtle.generateKey", normalized.name);
       }
       const bits = normalized.length === undefined ? 512 : Number(normalized.length);
-      const raw = Buffer.from(call("crypto", "randomBytes", { n: Math.ceil(bits / 8) }), "base64");
+      const raw = pirRandomBytes(Math.ceil(bits / 8));
       return pirWebcryptoSecretKey(normalized, raw, extractable, usages, bits);
     },
   },
@@ -1365,6 +2125,58 @@ function pirCryptoClass(api) {
   };
 }
 
+// Node's supported asymmetric key types. The runtime cannot generate any of
+// them, but the *argument* validation still has to match Node before the
+// unsupported-surface error is raised.
+const PIR_KEY_TYPES = [
+  "rsa", "rsa-pss", "dsa", "ec", "ed25519", "ed448", "x25519", "x448", "dh",
+];
+
+function pirValidateKeyType(type) {
+  if (typeof type !== "string") {
+    throw pirInvalidArgType("type", "of type string", type);
+  }
+  if (PIR_KEY_TYPES.indexOf(type) === -1) {
+    throw pirInvalidArgValue("type", type, "must be a supported key type");
+  }
+  return type;
+}
+
+function generateKeyPairSync(type, _options) {
+  pirValidateKeyType(type);
+  throw pirCryptoUnsupported("crypto.generateKeyPairSync");
+}
+
+function generateKeyPair(type, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  // Node checks the callback before the key type (generateKeyPair(42, {})
+  // reports the missing callback, not the bad type).
+  if (typeof callback !== "function") {
+    throw pirInvalidArgType("callback", "of type function", callback);
+  }
+  pirValidateKeyType(type);
+  throw pirCryptoUnsupported("crypto.generateKeyPair");
+}
+
+function generateKeySync(type, _options) {
+  pirValidateKeyType(type);
+  throw pirCryptoUnsupported("crypto.generateKeySync");
+}
+
+function createECDH(curve) {
+  if (typeof curve !== "string") {
+    throw pirInvalidArgType("curve", "of type string", curve);
+  }
+  throw pirCryptoUnsupported("crypto.createECDH");
+}
+
+function getDiffieHellman(group) {
+  if (typeof group !== "string") {
+    throw pirInvalidArgType("group", "of type string", group);
+  }
+  throw pirCryptoUnsupported("crypto.getDiffieHellman");
+}
+
 const Certificate = pirCryptoClass("crypto.Certificate");
 const DiffieHellman = pirCryptoClass("crypto.DiffieHellman");
 const DiffieHellmanGroup = pirCryptoClass("crypto.DiffieHellmanGroup");
@@ -1377,17 +2189,12 @@ const checkPrime = pirCryptoThrower("crypto.checkPrime");
 const checkPrimeSync = pirCryptoThrower("crypto.checkPrimeSync");
 const createDiffieHellman = pirCryptoThrower("crypto.createDiffieHellman");
 const createDiffieHellmanGroup = pirCryptoThrower("crypto.createDiffieHellmanGroup");
-const createECDH = pirCryptoThrower("crypto.createECDH");
 const decapsulate = pirCryptoThrower("crypto.decapsulate");
 const diffieHellman = pirCryptoThrower("crypto.diffieHellman");
 const encapsulate = pirCryptoThrower("crypto.encapsulate");
 const generateKey = pirCryptoThrower("crypto.generateKey");
-const generateKeyPair = pirCryptoThrower("crypto.generateKeyPair");
-const generateKeyPairSync = pirCryptoThrower("crypto.generateKeyPairSync");
-const generateKeySync = pirCryptoThrower("crypto.generateKeySync");
 const generatePrime = pirCryptoThrower("crypto.generatePrime");
 const generatePrimeSync = pirCryptoThrower("crypto.generatePrimeSync");
-const getDiffieHellman = pirCryptoThrower("crypto.getDiffieHellman");
 const privateDecrypt = pirCryptoThrower("crypto.privateDecrypt");
 const privateEncrypt = pirCryptoThrower("crypto.privateEncrypt");
 const publicDecrypt = pirCryptoThrower("crypto.publicDecrypt");

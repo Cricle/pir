@@ -39,7 +39,12 @@
     if (typeof exitCode !== "number" || Number.isNaN(exitCode)) exitCode = 0;
     exitCode = Math.trunc(exitCode);
     proc.exitCode = exitCode;
-    try { proc.emit("exit", exitCode); } catch { /* listener errors die with us */ }
+    // A `process.exit` from inside an exit listener terminates without a
+    // second `exit` emit (Node's `_exiting` guard).
+    if (proc._exiting !== true) {
+      proc._exiting = true;
+      try { proc.emit("exit", exitCode); } catch { /* listener errors die with us */ }
+    }
     try { __pir_host.worker("workerExit", JSON.stringify({ id: workerId, code: exitCode })); } catch { /* best-effort */ }
     throw workerExitSignal;
   };

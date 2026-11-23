@@ -36,3 +36,11 @@ export const glob = promises.glob;
 export const mkdtempDisposable = promises.mkdtempDisposable;
 export const statfs = promises.statfs;
 export const watch = promises.watch;
+
+// Node's `require("fs/promises") === require("fs").promises` (the same object,
+// with no extra own `default`). The CJS require path hands out a plain copy of
+// this module namespace by default; pre-seeding the builtin cache with the
+// live `fs.promises` object keeps Node's reference identity and property set.
+if (globalThis.__pirBuiltinRequireCache instanceof Map) {
+  globalThis.__pirBuiltinRequireCache.set("fs/promises", promises);
+}

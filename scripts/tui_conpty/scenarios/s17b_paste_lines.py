@@ -46,17 +46,17 @@ OPS = [
     ("snap", "s17b_cleared"),
 ]
 CHECKS = [
-    # The last pasted line must be its own editor row (pre-fix the whole
-    # payload is a single wrapped line, so this row holds
-    # `10fold-line-11fold-line-12`).
-    ("screen_regex", "s17b_after", r"(?m)^\s*fold-line-12\s*$"),
-    # Discriminating check for the lost newlines: never concatenated.
+    # The editor folds a >3-line paste into a `[paste #N +L lines]` chip
+    # (editor.rs PASTE_FOLD_MAX_LINES); `expanded_text` restores all L lines on
+    # submit. `+12 lines` therefore proves all 12 line breaks survived. Older
+    # builds displayed the literal rows and asserted `fold-line-12` here.
+    ("screen_contains", "s17b_after", "[paste #1 +12 lines]"),
+    # The raw newline bytes must never be typed as a concatenated line, nor
+    # must the bracketed-paste markers leak into the editor.
     ("screen_not_contains", "s17b_after", "fold-line-01fold-line-02"),
-    # Nothing was submitted: the payload is still the editor's content.
-    ("editor_contains", "s17b_after", "fold-line-12"),
-    # The paste markers must never be typed or decoded.
+    ("editor_contains", "s17b_after", "[paste #1 +12 lines]"),
     ("screen_not_contains", "s17b_after", "[200~"),
     ("screen_not_contains", "s17b_after", "[201~"),
-    ("editor_not_contains", "s17b_cleared", "fold-line-"),
+    ("editor_not_contains", "s17b_cleared", "[paste #"),
     ("restore_markers",),
 ]

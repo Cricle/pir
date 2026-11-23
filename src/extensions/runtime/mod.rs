@@ -2,13 +2,21 @@
 //!
 //! [`ExtensionRuntime`] owns the QuickJS runtime/context, injects the host
 //! function table (`__pir_host.*`) and the JS prelude, and exposes the
-//! load/dispatch APIs the pir session loop calls. All JS values stay inside
-//! QuickJS; the Rust/JS boundary is JSON strings.
+//! load/dispatch APIs the pir session loop calls. Most of the legacy
+//! `__pir_host.*` table still crosses the boundary as JSON strings; the newer
+//! `__pir_native.*` tier passes live QuickJS values through C-ABI calls with
+//! no string round-trip (see `native_bridge`).
 
 #[cfg(feature = "extensions")]
 mod exec;
 #[cfg(feature = "extensions")]
 mod host_functions;
+
+/// Native (rquickjs C-ABI) value bridge — `__pir_native`, the JSON-free
+/// counterpart to the `__pir_host` string envelope.
+#[cfg(feature = "extensions")]
+pub mod native_bridge;
+
 #[cfg(feature = "extensions")]
 pub(crate) mod host_op_stats;
 
@@ -31,7 +39,7 @@ use serde_json::Value as JsonValue;
 #[cfg(feature = "extensions")]
 use self::host_functions::register_host_functions;
 #[cfg(feature = "extensions")]
-use super::api::{HOST_PRELUDE, HOST_PRELUDE_MODULE};
+use super::api::HOST_PRELUDE;
 // The configurable QuickJS resource limits (always compiled; the engine
 // applies them, `RuntimeState` carries the resolved value).
 use super::limits::ExtensionLimits;
@@ -167,6 +175,9 @@ mod ext_stdio;
 mod hooks;
 #[cfg(feature = "extensions")]
 mod ops;
+// Allocator/runtime-construction seam (`PIR_QJS_ALLOC`); see the module docs.
+#[cfg(feature = "extensions")]
+mod qjs_alloc;
 mod state;
 
 // The engine and the crate's unit tests are the callers; keep the
@@ -191,6 +202,12 @@ pub use ext_stdio::{ext_stdio_route, ExtStdioRoute, MAX_ROUTED_WRITE_BYTES};
 // a standalone script entry that `load` seeds for extension entries. The
 // bounded rejection log is public so its eviction invariant is testable
 // without a live QuickJS runtime.
+/// A child wait's condvar park probe (blocking-host wakeup regression).
+#[doc(hidden)]
+#[cfg(feature = "extensions")]
+pub use crate::pir_node::modules::child::{
+    activity_park_probe_for_tests, append_base64_chunk_for_tests, sync_drain_wait_slice_for_tests,
+};
 /// Test seams for the idle drain backoff (integration tests live in
 /// `tests/`; inline test modules are forbidden in `src/`).
 #[doc(hidden)]
@@ -198,12 +215,6 @@ pub use ext_stdio::{ext_stdio_route, ExtStdioRoute, MAX_ROUTED_WRITE_BYTES};
 pub use engine::{next_park_slice_for_tests, park_slice_bounds_for_tests};
 #[cfg(feature = "extensions")]
 pub use engine::{package_entry_root, RejectionLog};
-/// A child wait's condvar park probe (blocking-host wakeup regression).
-#[doc(hidden)]
-#[cfg(feature = "extensions")]
-pub use host_functions::child_fns::{
-    activity_park_probe_for_tests, append_base64_chunk_for_tests, sync_drain_wait_slice_for_tests,
-};
 /// Test seams for the adaptive `workerRecvPoll` fallback and its idle-wait
 /// probe (the worker registry/runtime stay private).
 #[doc(hidden)]
@@ -370,6 +381,9 @@ pub(crate) struct RuntimeState {
     /// the memo validates against the data itself and can never serve a stale
     /// array.
     pub(crate) all_tools_json: Option<(u64, String)>,
+    /// Native-tier companion to `all_tools_json`: the same memoized array as a
+    /// JSON tree, so `__pir_native.getAllTools` never materializes a string.
+    pub(crate) all_tools_value: Option<(u64, JsonValue)>,
     pub(crate) command_defs: Vec<CommandDef>,
     pub(crate) shortcut_defs: Vec<ShortcutDef>,
     /// Registered handler count per event name, refreshed with the registry
@@ -553,11 +567,6 @@ pub(crate) struct RuntimeState {
     /// `options` object. Bound before a stream starts, unbound when it ends;
     /// `__pir_host.streamHookEvent` fires the matching observer.
     pub(crate) stream_hook_bridges: HashMap<String, StreamHookBridge>,
-    /// Open file descriptors of the fs v2 surface (`openSync` family): OS
-    /// handles plus host-tracked sequential offsets. The runtime clears the
-    /// table at teardown (`ExtensionRuntime::drop`) since the state itself
-    /// is shared into a reload's fresh runtime.
-    pub(crate) fd_table: state::FdTable,
     /// Budget for the `before_agent_start` lifecycle dispatch
     /// (`extensionLimits.beforeAgentStartTimeoutMs` /
     /// `PI_EXT_BEFORE_AGENT_START_TIMEOUT_MS`, default

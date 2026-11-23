@@ -185,7 +185,7 @@ fn registers_exactly_the_nine_context_mode_tools() {
     assert!(
         batch
             .description()
-            .contains("MULTIPLE Python analyses in one call"),
+            .contains("MULTIPLE JavaScript analyses in one call"),
         "description steers toward batching: {}",
         batch.description()
     );
@@ -306,7 +306,7 @@ async fn execute_prints_only_findings_not_reprs() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "values = [1, 2, 3, 4]\nprint(sum(values))\nvalues" }),
+            json!({ "code": "var values = [1, 2, 3, 4]\nprint(values.reduce((a, b) => a + b, 0))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -326,7 +326,7 @@ async fn execute_prints_only_findings_not_reprs() {
 async fn fresh_namespace_per_call_but_interpreter_reused() {
     let harness = Harness::new("fresh-scope");
     let first = harness
-        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "leaked = 41" }))
+        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "var leaked = 41" }))
         .await;
     assert!(!first.is_error, "{}", first.content);
     assert_eq!(first.content, "(no output)");
@@ -340,8 +340,8 @@ async fn fresh_namespace_per_call_but_interpreter_reused() {
         second.content
     );
     assert!(
-        second.content.contains("NameError"),
-        "traceback present, got: {}",
+        second.content.contains("leaked is not defined"),
+        "error present, got: {}",
         second.content
     );
     assert_eq!(
@@ -357,12 +357,12 @@ async fn uncaught_exception_returns_traceback() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('before')\n1 / 0" }),
+            json!({ "code": "print('before')\nthrow new Error('division by zero')" }),
         )
         .await;
     assert!(result.is_error);
     assert!(
-        result.content.contains("ZeroDivisionError"),
+        result.content.contains("division by zero"),
         "got: {}",
         result.content
     );
@@ -380,7 +380,7 @@ async fn timeout_interrupts_runaway_loop() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "while True:\n    pass", "timeout": 2 }),
+            json!({ "code": "while (true) {}", "timeout": 2 }),
         )
         .await;
     let elapsed = started.elapsed();
@@ -402,7 +402,7 @@ async fn oversized_output_is_capped() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('x' * 1_100_000)" }),
+            json!({ "code": "print('x'.repeat(1100000))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -433,10 +433,11 @@ async fn empty_code_is_rejected() {
 async fn intent_auto_indexes_large_stdout_instead_of_dumping_it() {
     let harness = Harness::new("intent");
     let code = r#"
-lines = []
-for i in range(200):
-    lines.append(f"entry {i:03d}: needle value {i} " + "x" * 24)
-print("\n".join(lines))
+var lines = [];
+for (var i = 0; i < 200; i++) {
+  lines.push("entry " + String(i).padStart(3, "0") + ": needle value " + i + " " + "x".repeat(24));
+}
+print(lines.join("\n"));
 "#;
     let result = harness
         .run(
@@ -497,7 +498,7 @@ async fn execute_file_injects_file_content_and_returns_only_prints() {
             CTX_EXECUTE_FILE_TOOL_NAME,
             json!({
                 "path": "data.txt",
-                "code": "print(FILE_CONTENT.count('\\n'))\nprint(FILE_PATH.endswith('data.txt'))\nprint(len(FILE_CONTENT))"
+                "code": "print(FILE_CONTENT.split('\\n').length - 1)\nprint(FILE_PATH.endsWith('data.txt'))\nprint(FILE_CONTENT.length)"
             }),
         )
         .await;
@@ -508,7 +509,7 @@ async fn execute_file_injects_file_content_and_returns_only_prints() {
         result.content
     );
     assert!(
-        result.content.contains("True"),
+        result.content.contains("true"),
         "FILE_PATH is the resolved absolute path: {}",
         result.content
     );
@@ -525,7 +526,7 @@ async fn execute_file_rejects_escapes_and_non_files() {
     let absolute = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": outside.to_string_lossy(), "code": "print(len(FILE_CONTENT))" }),
+            json!({ "path": outside.to_string_lossy(), "code": "print(FILE_CONTENT.length)" }),
         )
         .await;
     assert!(absolute.is_error, "absolute escape must be rejected");
@@ -538,7 +539,7 @@ async fn execute_file_rejects_escapes_and_non_files() {
     let relative = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": "../outside.txt", "code": "print(len(FILE_CONTENT))" }),
+            json!({ "path": "../outside.txt", "code": "print(FILE_CONTENT.length)" }),
         )
         .await;
     assert!(relative.is_error, "`..` escape must be rejected");
@@ -597,7 +598,7 @@ fn execute_file_rejects_symlink_escape_when_supported() {
         .unwrap_or_else(|error| panic!("runtime: {error}"));
     let result = runtime.block_on(harness.run(
         CTX_EXECUTE_FILE_TOOL_NAME,
-        json!({ "path": "link.txt", "code": "print(len(FILE_CONTENT))" }),
+        json!({ "path": "link.txt", "code": "print(FILE_CONTENT.length)" }),
     ));
     assert!(result.is_error, "symlink escape must be rejected");
     assert!(
@@ -617,7 +618,7 @@ async fn execute_file_rejects_files_over_32_mib() {
     let result = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": "huge.bin", "code": "print(len(FILE_CONTENT))" }),
+            json!({ "path": "huge.bin", "code": "print(FILE_CONTENT.length)" }),
         )
         .await;
     assert!(result.is_error);

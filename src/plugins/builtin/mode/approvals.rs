@@ -66,6 +66,10 @@ pub(crate) struct ApprovalRecord {
     /// The full submitted plan text, when `kind == Plan`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plan: Option<String>,
+    /// Optional execution-time verification contract, when `kind == Plan`.
+    /// Old journals/sidecars without it replay as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification: Option<String>,
     #[serde(default)]
     pub(crate) kind: ApprovalKind,
 }
@@ -79,6 +83,7 @@ impl ApprovalRecord {
             state: ApprovalState::Requested,
             created_at_ms: now_ms(),
             plan: None,
+            verification: None,
             kind: ApprovalKind::Worker,
         }
     }
@@ -91,12 +96,35 @@ impl ApprovalRecord {
             state: ApprovalState::Requested,
             created_at_ms: now_ms(),
             plan: Some(plan),
+            verification: None,
             kind: ApprovalKind::Plan,
         }
     }
 
+    pub(crate) fn plan_with_verification(
+        id: String,
+        call: String,
+        summary: String,
+        plan: String,
+        verification: Option<String>,
+    ) -> Self {
+        let mut record = Self::plan(id, call, summary, plan);
+        record.verification = verification;
+        record
+    }
+
     pub(crate) fn is_pending(&self) -> bool {
         self.state == ApprovalState::Requested
+    }
+
+    /// Approvals older than this are stale and must not be decidable. Shared by
+    /// the live plugin and the detached CLI so both compute expiry identically.
+    pub(crate) const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
+
+    /// Whether this record is a pending request that has aged past the expiry
+    /// window at `now`. Never expires a non-pending (decided) record.
+    pub(crate) fn is_expired_at(&self, now: u64) -> bool {
+        self.is_pending() && now.saturating_sub(self.created_at_ms) > Self::MAX_AGE_MS
     }
 }
 

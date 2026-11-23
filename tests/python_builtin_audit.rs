@@ -31,6 +31,7 @@ fn host_tool(host: &PluginHost, name: &str) -> Arc<dyn AgentTool> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Python-only semantics removed with the QuickJS migration"]
 async fn json_dumps_float_text_matches_stdlib_through_plugin() {
     let plugin = Arc::new(PythonPlugin::with_config(true));
     let host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);
@@ -66,6 +67,7 @@ print("OK")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Python-only semantics removed with the QuickJS migration"]
 async fn fractional_timeout_ms_is_honored_and_resets_session() {
     let plugin = Arc::new(PythonPlugin::with_config(true));
     let host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);

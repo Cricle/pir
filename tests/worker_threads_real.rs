@@ -355,6 +355,73 @@ async fn worker_clone_rejects_functions() {
 }
 
 // ---------------------------------------------------------------------------
+// Typed value wire: both directions carry nested values unchanged, and the
+// clone contract holds on the worker (`parentPort.postMessage`) side too.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_typed_wire_round_trips_nested_values() {
+    let result = run_worker_test(
+        "worker_typed_wire",
+        r#"
+        import { Worker } from "node:worker_threads";
+        const worker = new Worker(`
+          const { parentPort } = require("node:worker_threads");
+          const clone = (value) => {
+            try { parentPort.postMessage(value); return null; }
+            catch (error) { return { name: error.name, code: error.code }; }
+          };
+          class Box { constructor() { this.n = 1; } }
+          const cyclic = {}; cyclic.self = cyclic;
+          const nested = {
+            a: [1, "two", null, true, { b: 3.5 }],
+            empty: {},
+            list: [],
+            text: "plain",
+          };
+          // Echo whatever the parent sends, tagged, so both directions are
+          // exercised by one exchange.
+          parentPort.on("message", (message) => {
+            parentPort.postMessage({
+              typed: typeof globalThis.__pirWorkerSend,
+              nested,
+              cloneFn: clone({ fn: () => {} }),
+              cloneClass: clone(new Box()),
+              cloneCycle: clone(cyclic),
+              echo: message,
+            });
+          });
+        `, { eval: true });
+        const reply = await new Promise((resolve, reject) => {
+          worker.once("message", resolve);
+          worker.on("error", reject);
+          worker.postMessage({ from: "parent", values: [1, { x: "y" }, null] });
+        });
+        await worker.terminate();
+        globalThis.__testResult = { ...reply, parentTyped: typeof globalThis.__pirWorkerSendValue };
+        "#,
+    )
+    .await;
+    assert_eq!(
+        result,
+        json!({
+            "typed": "function",
+            "parentTyped": "function",
+            "nested": {
+                "a": [1, "two", null, true, { "b": 3.5 }],
+                "empty": {},
+                "list": [],
+                "text": "plain",
+            },
+            "cloneFn": { "name": "DataCloneError", "code": 25 },
+            "cloneClass": { "name": "DataCloneError", "code": 25 },
+            "cloneCycle": { "name": "DataCloneError", "code": 25 },
+            "echo": { "from": "parent", "values": [1, { "x": "y" }, null] },
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
 // scripted-workflow-isomorphic sequence: eval worker + workerData require of
 // an absolute CJS module + vm sandbox + call/response message protocol
 // ---------------------------------------------------------------------------

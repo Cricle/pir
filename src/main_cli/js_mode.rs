@@ -20,8 +20,8 @@
 //! any agent-session surface.
 //!
 //! Three node-CLI-shaped entry forms exist, because this subcommand is also
-//! the target of the node-executable shim (`host_functions::child_fns` routes
-//! `spawn("node", …)` / `exec("node …")` here):
+//! the target of the node-executable shim (`pir-node`'s child_process table
+//! routes `spawn("node", …)` / `exec("node …")` here):
 //!
 //! * `pir js <file> [args...]` — the file runner (item B; unchanged).
 //! * `pir js -e <code> [args...]` / `--eval <code>` / `--eval=<code>` —
@@ -35,6 +35,11 @@
 //!   translation target for `node --version`: it claims the node
 //!   compatibility baseline (see [`NODE_COMPAT_VERSION`]) instead of pir's
 //!   own version. Deliberate compatibility masquerade.
+//! * `pir [node-flags…] <file> [args...]` — the same runner reached through
+//!   Node's respawn shape (`spawn(process.execPath, [file, …])`), with the
+//!   V8-only flags in [`IGNORED_NODE_BOOL_FLAGS`] / [`IGNORED_NODE_VALUE_FLAGS`]
+//!   dropped. Only an existing JS/TS file can take this path, so a prompt is
+//!   never reinterpreted (see [`node_style_invocation`]).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -124,12 +129,22 @@ enum Entry {
 /// Entry point for `pir js <file|-> [args...]` (args exclude the `js`
 /// subcommand itself). Returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
+    run_with_exec_argv(args, &[])
+}
+
+/// [`run`] with the Node options the process was started with (the
+/// `pir [node-flags] <script>` respawn shape). They are not applied — this
+/// runtime has no V8 flag set — but they are reported through
+/// `process.execArgv`, which Node's own `test/common` uses to decide whether a
+/// script still has to re-exec itself with its `// Flags:`.
+pub fn run_with_exec_argv(args: &[String], exec_argv: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("--help")
         || args.first().map(String::as_str) == Some("-h")
     {
         println!("Usage: pir js <file|-> [args...]");
         println!("       pir js -e <code> [args...]");
         println!("       pir js --version");
+        println!("       pir [node flags] <file> [args...]");
         println!();
         println!("Run a JavaScript/TypeScript file on pir's built-in QuickJS runtime with the");
         println!("node compatibility layer, as a spawned child process: real stdio, real argv,");
@@ -142,7 +157,9 @@ pub fn run(args: &[String]) -> i32 {
         println!("  -e, --eval      evaluate <code> as a CJS script (require bound to the cwd);");
         println!("                  process.argv is [execPath, ...args]");
         println!("  -               read the script from stdin (same CJS eval path)");
-        println!("  -v, --version   print the claimed node compatibility version ({NODE_COMPAT_VERSION})");
+        println!(
+            "  -v, --version   print the claimed node compatibility version ({NODE_COMPAT_VERSION})"
+        );
         return 0;
     }
     // Node-version masquerade (see the module header): the shim routes
@@ -167,14 +184,16 @@ pub fn run(args: &[String]) -> i32 {
     // `process.execPath` points back at this binary, so
     // `child_process.spawn(process.execPath, ["js", other.js])` re-enters
     // the runner — the ecosystem pattern (mcp-cli, bridges) is built on it.
-    // The routed node shim (child_fns) relies on the same property: it spawns
-    // this binary with `js` prepended, never a real node.
+    // The routed node shim (the child_process table in `pir-node`) relies on
+    // the same property: it spawns this binary with `js` prepended, never a
+    // real node.
     let exec_path = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "pir".to_string());
     let mut full_argv: Vec<String> = Vec::with_capacity(argv.len() + 1);
     full_argv.push(exec_path.clone());
     full_argv.extend(argv);
+    let exec_argv = exec_argv.to_vec();
 
     // rquickjs futures are !Send: run the whole script on a dedicated thread
     // with a current-thread tokio runtime + LocalSet (the extension actor
@@ -201,9 +220,11 @@ pub fn run(args: &[String]) -> i32 {
                             eprintln!("Error: Cannot find module '{file}'");
                             return 1;
                         };
-                        run_script(script_path, full_argv, exec_path).await
+                        run_script(script_path, full_argv, exec_path, exec_argv).await
                     }
-                    Entry::Eval { code, .. } => run_eval(code, full_argv, exec_path).await,
+                    Entry::Eval { code, .. } => {
+                        run_eval(code, full_argv, exec_path, exec_argv).await
+                    }
                 }
             })
         });
@@ -271,6 +292,127 @@ fn parse_entry(args: &[String]) -> Result<Entry, String> {
     }
 }
 
+/// Node CLI flags `pir` accepts and ignores when they precede a script.
+///
+/// They only steer V8/Node internals this runtime does not implement, yet
+/// test harnesses and worker pools put them in front of the script whenever
+/// they respawn `process.execPath`. An option not listed here is not claimed:
+/// it falls back to the pi command line and keeps its existing error, so this
+/// list can never silently swallow a real typo.
+const IGNORED_NODE_BOOL_FLAGS: &[&str] = &[
+    "--no-warnings",
+    "--trace-warnings",
+    "--throw-deprecation",
+    "--trace-deprecation",
+    "--no-deprecation",
+    "--pending-deprecation",
+    "--enable-source-maps",
+    "--no-enable-source-maps",
+    "--preserve-symlinks",
+    "--preserve-symlinks-main",
+    "--frozen-intrinsics",
+    "--force-context-aware",
+    "--zero-fill-buffers",
+    "--abort-on-uncaught-exception",
+    "--openssl-legacy-provider",
+    "--use-openssl-ca",
+    "--no-use-openssl-ca",
+    "--interpreted-frames-native-stack",
+];
+
+/// Node flags above that consume the following argv token when no `=` value
+/// is attached.
+const IGNORED_NODE_VALUE_FLAGS: &[&str] = &[
+    "--max-old-space-size",
+    "--max-semi-space-size",
+    "--stack-size",
+    "--v8-pool-size",
+    "--inspect-port",
+    "--title",
+    "--icu-data-dir",
+    "--diagnostic-dir",
+    "--redirect-warnings",
+    "--env-file",
+    "--conditions",
+    "--disable-warning",
+    "--heapsnapshot-signal",
+    "--openssl-config",
+    "--tls-cipher-list",
+    "--unhandled-rejections",
+    "--dns-result-order",
+    "--report-directory",
+    "--report-filename",
+];
+
+/// Flag families whose individual members are all no-ops here.
+const IGNORED_NODE_FLAG_PREFIXES: &[&str] = &[
+    "--inspect",
+    "--experimental-",
+    "--no-experimental-",
+    "--trace-",
+    "--report-",
+];
+
+/// Recognize Node's `spawn(process.execPath, [node-flags…, script, …])` shape
+/// and rewrite it to the `pir js` argv shape (`[script, …args]`).
+///
+/// `None` unless every leading option is ignorable *and* the first positional
+/// is an existing JavaScript/TypeScript file. A prompt, a pi subcommand, or
+/// `--print`-style invocation therefore never turns into a script run.
+pub fn node_style_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    let mut index = 0;
+    let mut exec_argv: Vec<String> = Vec::new();
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            // Node's end-of-options marker: the next token is the script.
+            index += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        let name = arg.split_once('=').map_or(arg, |(name, _)| name);
+        if !ignored_node_flag(name) {
+            return None;
+        }
+        exec_argv.push(args[index].clone());
+        let inline_value = arg.len() > name.len();
+        index += 1;
+        if !inline_value && IGNORED_NODE_VALUE_FLAGS.contains(&name) {
+            if let Some(value) = args.get(index) {
+                exec_argv.push(value.clone());
+            }
+            index += 1;
+        }
+    }
+    let script = args.get(index)?;
+    if !is_script_path(script) {
+        return None;
+    }
+    Some((exec_argv, args[index..].to_vec()))
+}
+
+fn ignored_node_flag(name: &str) -> bool {
+    IGNORED_NODE_BOOL_FLAGS.contains(&name)
+        || IGNORED_NODE_VALUE_FLAGS.contains(&name)
+        || IGNORED_NODE_FLAG_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// `pir <path>` is a script run only when `<path>` exists and carries a
+/// JavaScript/TypeScript extension; every other positional stays a prompt.
+fn is_script_path(path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts"];
+    let candidate = Path::new(path);
+    candidate.is_file()
+        && candidate
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// The script's `process.argv` tail (argv[0], the pir executable, is added by
 /// the caller).
 ///
@@ -313,7 +455,12 @@ fn resolve_script_path(file: &str) -> Option<PathBuf> {
 /// loop, and return the exit code. The runtime's `Drop` (which emits the
 /// Node final `exit` event) runs before this returns on the success path —
 /// exit listeners observe the code the process will carry, like Node.
-async fn run_script(script_path: PathBuf, argv: Vec<String>, exec_path: String) -> i32 {
+async fn run_script(
+    script_path: PathBuf,
+    argv: Vec<String>,
+    exec_path: String,
+    exec_argv: Vec<String>,
+) -> i32 {
     let config = ExtensionConfig {
         cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         mode: "script".to_string(),
@@ -330,23 +477,23 @@ async fn run_script(script_path: PathBuf, argv: Vec<String>, exec_path: String) 
         }
     };
 
-    // fs roots: the script's directory plus its nearest package root (module
-    // loading and fs-write fencing). The runtime defaults already contribute
-    // cwd + `~/.pi` + system temp (`node_fns::effective_roots`); npm
-    // dependencies add their own package roots on bare imports. The user npm
-    // root is allowed as a module-load root too: bare-specifier resolution
-    // falls back to it (loader::bare_search_roots) and relative imports from
-    // npm packages reach into it, so its files must pass the on-disk load
-    // check even when no bare resolution pushed a package root first.
-    let script_dir = script_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    runtime.allow_root(script_dir);
+    // Keep the supplied script directory and its nearest package boundary as
+    // explicit module roots. Check the real file before reading the entry;
+    // the target directory of a symlinked script is not an implicit grant.
+    if let Some(dir) = script_path.parent() {
+        runtime.allow_root(dir.to_path_buf());
+    }
     runtime.allow_root(pir::extensions::runtime::package_entry_root(&script_path));
-    runtime.allow_root(pir::coding_agent::context::agent_dir().join("npm"));
+    let Some(script_path) = runtime.allowed_entry_path(&script_path) else {
+        eprintln!(
+            "Error: script entry is outside the allowed extension roots or not a real file: {}",
+            script_path.display()
+        );
+        return 1;
+    };
 
-    // Script-mode overlay: argv/execPath + real-stdio console + process.exit.
+    // Script-mode overlay: argv/execPath/execArgv + real-stdio console +
+    // process.exit.
     let boot = SCRIPT_BOOT
         .replace(
             "__PIR_SCRIPT_ARGV__",
@@ -355,6 +502,10 @@ async fn run_script(script_path: PathBuf, argv: Vec<String>, exec_path: String) 
         .replace(
             "__PIR_SCRIPT_EXEC_PATH__",
             &serde_json::to_string(&exec_path).unwrap_or_else(|_| "\"pir\"".to_string()),
+        )
+        .replace(
+            "__PIR_SCRIPT_EXEC_ARGV__",
+            &serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".to_string()),
         );
     if let Err(error) = runtime.eval_boot(&boot).await {
         eprintln!("Error: script runtime boot failed: {error}");
@@ -401,7 +552,12 @@ async fn run_script(script_path: PathBuf, argv: Vec<String>, exec_path: String) 
 /// `exports` / `__filename` ("[eval]") / `__dirname` (".") defined the way
 /// Node's eval scope defines them. `process.argv` is the injected
 /// `[execPath, ...args]`.
-async fn run_eval(code: String, argv: Vec<String>, exec_path: String) -> i32 {
+async fn run_eval(
+    code: String,
+    argv: Vec<String>,
+    exec_path: String,
+    exec_argv: Vec<String>,
+) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = ExtensionConfig {
         cwd: cwd.clone(),
@@ -418,14 +574,13 @@ async fn run_eval(code: String, argv: Vec<String>, exec_path: String) -> i32 {
             return 1;
         }
     };
-    // The runtime defaults already include the cwd; the user npm root is
-    // allowed as a module-load root for the same reason as in `run_script`
-    // (bare-specifier resolution falls back to it).
+    // Eval is explicitly cwd-scoped, unlike extension runtimes. Bare npm
+    // imports use the loader's separate, package-scoped resolution policy.
     runtime.allow_root(cwd.clone());
-    runtime.allow_root(pir::coding_agent::context::agent_dir().join("npm"));
 
-    // Script-mode overlay: argv/execPath + real-stdio console + process.exit
-    // (the overlay's `__pirScriptRun` module runner stays unused here).
+    // Script-mode overlay: argv/execPath/execArgv + real-stdio console +
+    // process.exit (the overlay's `__pirScriptRun` module runner stays unused
+    // here).
     let boot = SCRIPT_BOOT
         .replace(
             "__PIR_SCRIPT_ARGV__",
@@ -434,6 +589,10 @@ async fn run_eval(code: String, argv: Vec<String>, exec_path: String) -> i32 {
         .replace(
             "__PIR_SCRIPT_EXEC_PATH__",
             &serde_json::to_string(&exec_path).unwrap_or_else(|_| "\"pir\"".to_string()),
+        )
+        .replace(
+            "__PIR_SCRIPT_EXEC_ARGV__",
+            &serde_json::to_string(&exec_argv).unwrap_or_else(|_| "[]".to_string()),
         );
     if let Err(error) = runtime.eval_boot(&boot).await {
         eprintln!("Error: script runtime boot failed: {error}");

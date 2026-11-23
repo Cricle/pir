@@ -1336,8 +1336,14 @@ fn decode_base64_prefix(base64_data: &str) -> Option<Vec<u8>> {
         .nth(chars)
         .map(|(index, _)| index)
         .unwrap_or(base64_data.len());
-    // Whole 4-char groups only: a partial group is not valid base64.
-    let end = end - (end % 4);
+    // Whole 4-char groups only: a partial group is not valid base64. The
+    // alignment cut is a byte offset, so step back onto a char boundary: the
+    // payload is normally ASCII base64, but a non-ASCII attachment must not
+    // slice inside a code point.
+    let mut end = end - (end % 4);
+    while end > 0 && !base64_data.is_char_boundary(end) {
+        end -= 1;
+    }
     let prefix = &base64_data[..end];
     base64::engine::general_purpose::STANDARD
         .decode(prefix)

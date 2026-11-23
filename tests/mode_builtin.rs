@@ -608,7 +608,13 @@ async fn plan_mode_hides_mutations_and_blocks_execution_subagents() {
         "type": "tool_call",
         "toolCallId": "call-scout-2",
         "toolName": "subagent",
-        "input": { "agent": "scout", "task": "inspect" },
+        "input": {
+            "agent": "scout", "task": "inspect",
+            "isolation": "worktree", "worktreeMerge": "auto",
+            "tasks": [
+                { "agent": "reviewer", "task": "look", "isolation": "worktree", "worktreeMerge": "auto" }
+            ]
+        },
     });
     let outcome = host
         .emit("tool_call", &mut scout_payload)
@@ -623,6 +629,18 @@ async fn plan_mode_hides_mutations_and_blocks_execution_subagents() {
     assert!(
         !tool_names.contains(&"bash"),
         "bash must be removed: {tool_names:?}"
+    );
+    // Worktree isolation/merge mutate the HOST (git worktree add / commit /
+    // merge) regardless of the child's tool list. The plan fence must strip
+    // them at the top level AND in every task, or a plan-mode subagent can
+    // write through the isolation path.
+    assert_eq!(scout_payload["input"]["isolation"], "none");
+    assert_eq!(scout_payload["input"]["worktreeMerge"], "none");
+    assert_eq!(scout_payload["input"]["tasks"][0]["isolation"], "none");
+    assert_eq!(scout_payload["input"]["tasks"][0]["worktreeMerge"], "none");
+    assert_eq!(
+        scout_payload["input"]["tasks"][0]["tools"][0], "read",
+        "each task's tools are overridden too"
     );
 
     host.dispatch_command("mode", "normal")
@@ -658,6 +676,22 @@ async fn reviewer_structured_verdicts_win_over_text() {
     assert!(
         !gate_after_reviewer_text("PASS {not valid json").await,
         "malformed JSON must fall back to the text verdict"
+    );
+    assert!(
+        gate_after_reviewer_text("The review would not PASS; see issues").await,
+        "negated PASS must never be read as a successful verdict"
+    );
+    assert!(
+        gate_after_reviewer_text("not PASS").await,
+        "leading negation must be rejected"
+    );
+    assert!(
+        gate_after_reviewer_text("PASS criteria not met, verdict FAIL").await,
+        "a leading PASS token with reversal markers on the same line is a FAIL"
+    );
+    assert!(
+        gate_after_reviewer_text("PASS verdict FAIL after recheck").await,
+        "a PASS followed by an explicit FAIL verdict must not be read as success"
     );
 }
 
@@ -907,6 +941,231 @@ async fn denying_one_approval_clears_an_unused_approval_allowance() {
         outcome.result["block"], true,
         "a denied delegation must not inherit an unused approval: {:?}",
         outcome.result
+    );
+}
+
+/// A denied worker request must be re-requestable: the stable approval id is
+/// reopened instead of being deduped forever against a terminal record.
+#[tokio::test(flavor = "current_thread")]
+async fn denied_worker_can_be_requested_again_and_approved() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-reopen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let input = worker_input();
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-1", input.clone()).await["block"],
+        true,
+        "first request must block"
+    );
+    let journal_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".foreman.jsonl");
+        std::path::PathBuf::from(p)
+    };
+    let read_id = || -> String {
+        let journal = std::fs::read_to_string(&journal_path).expect("journal");
+        // Read the LAST pending approval from either an approval event or a
+        // compacted snapshot (decide_approval snapshots the journal).
+        journal
+            .lines()
+            .rev()
+            .find_map(|line| {
+                let v: Value = serde_json::from_str(line).ok()?;
+                let t = v.get("t")?.as_str()?;
+                if t == "approval" && v.get("state") == Some(&Value::String("requested".to_owned()))
+                {
+                    return v.get("id")?.as_str().map(str::to_owned);
+                }
+                if t == "snapshot" {
+                    if let Some(approvals) = v.get("approvals").and_then(Value::as_array) {
+                        for record in approvals.iter().rev() {
+                            if record.get("state") == Some(&Value::String("requested".to_owned())) {
+                                if let Some(id) = record.get("id")?.as_str() {
+                                    return Some(id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .expect("pending approval id")
+    };
+    let id = read_id();
+    pir::foreman::decide_approval(&path, Some(&id), false).expect("deny");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore after deny");
+
+    // Re-request the SAME task after the deny: it must become pending again.
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-2", input.clone()).await["block"],
+        true,
+        "reopened request must still block until approved"
+    );
+    let id2 = read_id();
+    assert_eq!(id2, id, "reopen reuses the stable approval id");
+    pir::foreman::decide_approval(&path, Some(&id2), true).expect("approve reopened");
+    let mut start2 = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start2)
+        .await
+        .expect("restore after approve");
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-3", input).await["block"],
+        true,
+        "approved reopened request must admit the worker"
+    );
+}
+
+/// Approving worker A must not authorize a different worker B.
+#[tokio::test(flavor = "current_thread")]
+async fn approving_worker_a_does_not_admit_worker_b() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-bound-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let a = worker_input();
+    let b = json!({ "agent": "worker", "task": "write the other file" });
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a", a.clone()).await["block"],
+        true
+    );
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-b", b.clone()).await["block"],
+        true
+    );
+
+    let journal_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".foreman.jsonl");
+        std::path::PathBuf::from(p)
+    };
+    let journal = std::fs::read_to_string(&journal_path).expect("journal");
+    let id_a = journal
+        .lines()
+        .find_map(|line| {
+            let v: Value = serde_json::from_str(line).ok()?;
+            let summary = v.get("summary")?.as_str()?;
+            (v.get("t") == Some(&Value::String("approval".to_owned()))
+                && v.get("state") == Some(&Value::String("requested".to_owned()))
+                && summary.contains("write the file"))
+            .then(|| v.get("id")?.as_str().map(str::to_owned))
+            .flatten()
+        })
+        .expect("id A");
+    pir::foreman::decide_approval(&path, Some(&id_a), true).expect("approve A");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore");
+
+    // A is approved -> allowed; B is a different task -> still blocked.
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-a2", a).await["block"],
+        true,
+        "A must pass"
+    );
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-b2", b).await["block"],
+        true,
+        "B must not pass on A's approval"
+    );
+}
+
+/// approve-all (a single CLI decision over all pending) must grant EVERY
+/// pending worker, not just the last one. Previously `allow_next_worker_id`
+/// was a single slot, so the second approval overwrote the first and the
+/// first worker was needlessly re-prompted.
+#[tokio::test(flavor = "current_thread")]
+async fn approving_all_pending_workers_grants_each_independently() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-approveall-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let a = worker_input();
+    let b = json!({ "agent": "worker", "task": "write the other file" });
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a", a.clone()).await["block"],
+        true
+    );
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-b", b.clone()).await["block"],
+        true
+    );
+
+    // One decision over ALL pending approvals (None = every pending id).
+    pir::foreman::decide_approval(&path, None, true).expect("approve all");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore");
+
+    // Both distinct workers pass, each consuming its OWN one-shot allowance.
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-a2", a.clone()).await["block"],
+        true,
+        "worker A must be admitted by approve-all"
+    );
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-b2", b).await["block"],
+        true,
+        "worker B must also be admitted by approve-all"
+    );
+    // The allowance is one-shot: a second delegation of A needs a new approval.
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a3", a).await["block"],
+        true,
+        "a consumed allowance must not admit the worker twice"
     );
 }
 
@@ -1288,6 +1547,32 @@ async fn a_new_worker_invalidates_an_earlier_reviewer_pass() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_fresh_reviewer_in_the_same_generation_clears_an_earlier_pass() {
+    let session = FakeSession::new(true, &["subagent", "read"]);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("enable foreman");
+
+    emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
+    emit_tool_input(&host, "subagent", "call-review-1", reviewer_input()).await;
+    let passed = completed_turn(vec![reviewer_tool_result("call-review-1", "PASS")]);
+    let result = emit_settle(&host, passed.clone()).await;
+    assert_ne!(result["continue"], true, "the first PASS settles: {result}");
+
+    // A second reviewer in the SAME worker generation re-opens the verdict:
+    // its FAIL must not be masked by the persisted PASS above.
+    emit_tool_input(&host, "subagent", "call-review-2", reviewer_input()).await;
+    let failed = completed_turn(vec![reviewer_tool_result("call-review-2", "FAIL")]);
+    let result = emit_settle(&host, failed).await;
+    assert_eq!(
+        result["continue"], true,
+        "a fresh reviewer's FAIL must re-open the gate: {result}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reviewer_before_any_worker_cannot_satisfy_a_later_worker_gate() {
     let session = FakeSession::new(true, &["subagent", "read"]);
     let status = Arc::new(FakeStatus::default());
@@ -1518,6 +1803,40 @@ fn submit_plan_input(plan: &str) -> Value {
     json!({ "plan": plan })
 }
 
+fn submit_plan_input_with_verification(plan: &str, verification: &str) -> Value {
+    json!({ "plan": plan, "verification": verification })
+}
+
+/// A successful shell command: assistant toolCall paired with a zero-exit
+/// toolResult, matching the generic evidence rules used by the contract gate.
+fn successful_verification_turn(call_id: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": call_id,
+                "name": "bash",
+                "arguments": { "command": "python -m unittest" }
+            }],
+            "stopReason": "toolUse"
+        }),
+        json!({
+            "role": "toolResult",
+            "toolCallId": call_id,
+            "toolName": "bash",
+            "isError": false,
+            "content": [{ "type": "text", "text": "Ran 3 tests OK\nCommand exited with code 0" }],
+            "details": { "exitCode": 0 }
+        }),
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "done" }],
+            "stopReason": "stop"
+        }),
+    ]
+}
+
 fn plan_approval_id_from_journal(path: &std::path::Path) -> String {
     let mut os = path.as_os_str().to_owned();
     os.push(".foreman.jsonl");
@@ -1668,5 +1987,232 @@ async fn submit_plan_is_hidden_outside_plan_mode_and_rejects_empty_plans() {
         .as_str()
         .unwrap_or_default()
         .contains("non-empty"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn submit_plan_with_verification_journals_it_and_changes_the_approval_id() {
+    let dir = plan_dir("verify-submit");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+
+    host.dispatch_command("mode", "plan")
+        .await
+        .expect("enter plan mode");
+    let plan = "1. implement\n2. check";
+    let plain_id = {
+        emit_tool_input(&host, "submit_plan", "call-plain", submit_plan_input(plan)).await;
+        plan_approval_id_from_journal(&path)
+    };
+    // A different verification clause is a materially different plan.
+    host.dispatch_command("mode", "plan").await.ok();
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-verify",
+        submit_plan_input_with_verification(plan, "run the test suite"),
+    )
+    .await;
+    assert_eq!(outcome["block"], true, "{outcome}");
+
+    let mut os = path.as_os_str().to_owned();
+    os.push(".foreman.jsonl");
+    let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
+    assert!(journal.contains("run the test suite"), "{journal}");
+    assert!(journal.contains("plan_submitted"), "{journal}");
+    // Both approvals are journaled and distinct (different verification).
+    let ids: Vec<String> = journal
+        .lines()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            if value.get("t") == Some(&Value::String("approval".to_owned()))
+                && value.get("state") == Some(&Value::String("requested".to_owned()))
+            {
+                value.get("id")?.as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .filter(|id| id.starts_with('p'))
+        .collect();
+    assert!(ids.contains(&plain_id), "{ids:?}");
+    assert!(ids.iter().any(|id| id != &plain_id), "{ids:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Helper: drive an approved plan (with verification) through /approvals.
+async fn approve_plan_with_contract(
+    dir: &std::path::Path,
+    plan: &str,
+    verification: &str,
+) -> (PluginHost, Arc<FakeStatus>) {
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
+    let status = Arc::new(FakeStatus::default());
+    let ui = FakeUi::selecting("approve");
+    let messages = Arc::new(FakeMessages::default());
+    let (host, _plugin) = host_with_plan(session, Arc::clone(&status), ui, messages);
+    host.dispatch_command("mode", "plan")
+        .await
+        .expect("enter plan mode");
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification(plan, verification),
+    )
+    .await;
+    assert_eq!(outcome["block"], true, "{outcome}");
+    let result = host
+        .dispatch_command("approvals", "")
+        .await
+        .expect("approvals command");
+    assert!(result.ok, "{result:?}");
+    (host, status)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn approving_a_plan_keeps_a_contract_and_injects_it_into_normal_prompts() {
+    let dir = plan_dir("contract-prompt");
+    let (host, status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing\n2. verify it",
+        "run the unit tests successfully",
+    )
+    .await;
+    assert_eq!(status.text("mode"), None, "normal mode restored");
+
+    let payload = emit_prompt(&host, true).await;
+    let sections = &payload["systemPromptOptions"]["sections"];
+    let contract = sections["execution_contract"].as_str().unwrap_or_default();
+    assert!(contract.contains("build the thing"), "{contract}");
+    assert!(
+        contract.contains("run the unit tests successfully"),
+        "{contract}"
+    );
+    assert!(
+        contract.contains("real tool result"),
+        "evidence requirement is explicit: {contract}"
+    );
+
+    let mut os = dir.join("session.jsonl").as_os_str().to_owned();
+    os.push(".foreman.jsonl");
+    let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
+    assert!(journal.contains("active_contract"), "{journal}");
+    assert!(
+        journal.contains("run the unit tests successfully"),
+        "{journal}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_plain_normal_run_without_a_contract_is_not_gated() {
+    let dir = plan_dir("no-contract");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["bash"], path);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    let result = emit_settle(&host, completed_turn(vec![])).await;
+    assert_ne!(result["continue"], true, "plain normal settles: {result}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn contract_gate_nudges_until_a_successful_verification_tool_result() {
+    let dir = plan_dir("contract-gate");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    // No verification tool result yet: the gate asks for one (custom message).
+    let gated = emit_settle(&host, completed_turn(vec![])).await;
+    assert_eq!(gated["continue"], true, "gate demands evidence: {gated}");
+    assert_eq!(gated["entries"][0]["customType"], "verification_gate");
+    let content = gated["entries"][0]["content"].as_str().unwrap_or_default();
+    assert!(content.contains("verification"), "{content}");
+
+    // A successful shell command satisfies the contract; settle proceeds.
+    let passed = emit_settle(&host, successful_verification_turn("call-verify-1")).await;
+    assert_ne!(
+        passed["continue"], true,
+        "successful evidence settles: {passed}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_shell_command_does_not_satisfy_the_contract_gate() {
+    let dir = plan_dir("contract-fail");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    let failed_turn = vec![
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call-fail",
+                "name": "bash",
+                "arguments": { "command": "python -m unittest" }
+            }],
+            "stopReason": "toolUse"
+        }),
+        json!({
+            "role": "toolResult",
+            "toolCallId": "call-fail",
+            "toolName": "bash",
+            "isError": false,
+            "content": [{ "type": "text", "text": "FAILED (failures=1)\nCommand exited with code 1" }],
+            "details": { "exitCode": 1 }
+        }),
+        json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "done" }],
+            "stopReason": "stop"
+        }),
+    ];
+    let gated = emit_settle(&host, failed_turn).await;
+    assert_eq!(
+        gated["continue"], true,
+        "failed evidence keeps gate: {gated}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn contract_gate_stops_after_three_nudges_and_marks_unverified() {
+    let dir = plan_dir("contract-cap");
+    let (host, status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing",
+        "run the unit tests successfully",
+    )
+    .await;
+
+    for _ in 0..3 {
+        let gated = emit_settle(&host, completed_turn(vec![])).await;
+        assert_eq!(gated["continue"], true, "nudge within cap: {gated}");
+    }
+    // Fourth boundary: cap reached, no more nudge, run settles as unverified.
+    let settled = emit_settle(&host, completed_turn(vec![])).await;
+    assert_ne!(settled["continue"], true, "cap allows settle: {settled}");
+    assert_eq!(status.text("mode"), None, "still in normal mode");
+    let mut os = dir.join("session.jsonl").as_os_str().to_owned();
+    os.push(".foreman.jsonl");
+    let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
+    assert!(
+        journal.to_ascii_lowercase().contains("unverified"),
+        "unverified phase persisted: {journal}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

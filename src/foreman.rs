@@ -31,6 +31,8 @@ pub struct ForemanApproval {
     pub kind: String,
     /// The submitted plan text when `kind == "plan"`.
     pub plan: Option<String>,
+    /// The execution verification contract when `kind == "plan"`.
+    pub verification: Option<String>,
     pub created_at_ms: u64,
 }
 
@@ -90,6 +92,7 @@ pub fn read_status(session_path: &Path) -> Option<ForemanStatus> {
                 state: record.state.label().to_owned(),
                 kind: record.kind.label().to_owned(),
                 plan: record.plan.clone(),
+                verification: record.verification.clone(),
                 created_at_ms: record.created_at_ms,
             })
             .collect(),
@@ -122,6 +125,7 @@ pub fn decide_approval(
                     state: record.state.label().to_owned(),
                     kind: record.kind.label().to_owned(),
                     plan: record.plan.clone(),
+                    verification: record.verification.clone(),
                     created_at_ms: record.created_at_ms,
                 })
                 .collect()
