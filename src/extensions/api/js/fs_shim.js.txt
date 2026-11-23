@@ -1,5 +1,6 @@
 import { EventEmitter } from "@node/events";
 import { fileURLToPath as pirFileUrlToPath } from "@node/url";
+import { StringDecoder } from "@node/string_decoder";
 
 const Buffer = globalThis.Buffer;
 const call = globalThis.__pirNodeCall;
@@ -81,33 +82,188 @@ function pirIsFileUrl(value) {
 /// everything else with ERR_INVALID_ARG_TYPE before any host call happens.
 function pirPathArg(value, name) {
   const argName = name === undefined ? "path" : name;
-  if (typeof value === "string") return value;
-  if (value instanceof Uint8Array) return Buffer.from(value).toString();
-  if (value instanceof globalThis.URL || pirIsFileUrl(value)) {
-    return String(pirFileUrlToPath(value));
+  let text;
+  if (typeof value === "string") text = value;
+  else if (value instanceof Uint8Array) text = Buffer.from(value).toString();
+  else if (value instanceof globalThis.URL || pirIsFileUrl(value)) {
+    text = String(pirFileUrlToPath(value));
+  } else {
+    throw pirInvalidArgType(argName, kPathExpectation, value);
   }
-  throw pirInvalidArgType(argName, kPathExpectation, value);
+  // `validatePath` rejects NUL bytes with ERR_INVALID_ARG_VALUE.
+  if (text.indexOf("\u0000") !== -1) {
+    throw pirInvalidArgValue(argName, text,
+      "must be a string, Uint8Array, or URL without null bytes");
+  }
+  return text;
 }
 
 /// `parseFileMode`: an octal string is accepted, the result must be a uint32.
-function pirParseMode(value, name) {
-  let mode = value;
-  if (typeof mode === "string") mode = parseInt(mode, 8);
-  if (typeof mode !== "number") throw pirInvalidArgType(name, "of type number", value);
-  if (!Number.isInteger(mode)) throw pirOutOfRange(name, "an integer", mode);
-  if (mode < 0 || mode > 4294967295) throw pirOutOfRange(name, ">= 0 && <= 4294967295", mode);
-  return mode;
-}
 
-function pirCheckCallback(callback) {
+function pirCheckCallback(callback, name) {
   if (typeof callback !== "function") {
-    throw pirInvalidArgType("callback", "of type function", callback);
+    throw pirInvalidArgType(name === undefined ? "callback" : name, "of type function", callback);
   }
   return callback;
 }
 
+/// Node's `ERR_INVALID_ARG_VALUE`: `The argument '<name>' <reason>. Received
+/// <inspected>`.
+function pirInvalidArgValue(name, value, reason) {
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
+    "The argument '" + name + "' " + reason + ". Received " + pirInspectReceived(value));
+}
+
+/// Node's `validateFunction` for the callback position. The fs callbacks are
+/// named `cb` in Node's messages (mkdtemp/opendir use `callback`).
+function pirValidateFunction(value, name) {
+  if (typeof value !== "function") {
+    throw pirInvalidArgType(name, "of type function", value);
+  }
+  return value;
+}
+
+/// `isArrayBufferView`: Buffer, every TypedArray and DataView.
+function pirIsArrayBufferView(value) {
+  return value !== null && typeof value === "object" &&
+    typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(value);
+}
+
+/// Node's `validateBuffer` (read/readv argument): "an instance of".
+function pirValidateBuffer(value, name) {
+  if (!pirIsArrayBufferView(value)) {
+    throw pirInvalidArgType(name, "an instance of Buffer, TypedArray, or DataView", value);
+  }
+  return value;
+}
+
+/// A read argument that is either a string (the string form) or a typed array.
+/// Node's `validateStringAfterArrayBufferView`.
+function pirValidateStringOrView(value, name) {
+  if (typeof value === "string") return value;
+  throw pirInvalidArgType(name, "of type string or an instance of Buffer, TypedArray, or DataView", value);
+}
+
+/// `getValidatedFd`: `-0` normalizes to 0, then an int32 in [0, 2^31-1].
+function pirValidateFd(fd, name) {
+  const argName = name === undefined ? "fd" : name;
+  if (Object.is(fd, -0)) return 0;
+  return pirValidateInteger(fd, argName, 0, 2147483647);
+}
+
+/// `getValidatedPath` also rejects NUL bytes; Node words that
+/// ERR_INVALID_ARG_VALUE ("must be a string, Uint8Array, or URL without null
+/// bytes").
+function pirCheckPathBytes(target, name) {
+  if (target.indexOf("\u0000") !== -1) {
+    throw pirInvalidArgValue(name === undefined ? "path" : name, target,
+      "must be a string, Uint8Array, or URL without null bytes");
+  }
+  return target;
+}
+
+/// Node's `assertEncoding` (fs `getOptions`): an empty encoding means "no
+/// encoding"; `buffer` is accepted here and rejected later by the Buffer
+/// conversion (ERR_UNKNOWN_ENCODING), exactly like Node.
+function pirValidateEncodingValue(encoding) {
+  if (encoding === undefined || encoding === null || encoding === "" || encoding === "buffer") return;
+  if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+    throw pirInvalidArgValue("encoding", encoding, "is invalid encoding");
+  }
+}
+
+/// `parseFileMode`: an octal string or a uint32; `def` covers
+/// undefined/null. `property` selects Node's "options.mode" wording.
+function pirParseModeStrict(value, name, def, property) {
+  let mode = value;
+  if (mode === undefined || mode === null) mode = def;
+  if (typeof mode === "string") {
+    if (!/^[0-7]+$/.test(mode)) {
+      const error = pirCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
+        "The " + (property ? "property" : "argument") + " '" + name + "' must be a 32-bit unsigned integer or an octal string. Received " +
+        pirPrimitiveText(mode));
+      throw error;
+    }
+    mode = parseInt(mode, 8);
+  }
+  if (typeof mode !== "number") {
+    throw (property ? pirInvalidArgTypeProperty : pirInvalidArgType)(name, "of type number", mode);
+  }
+  if (!Number.isInteger(mode)) throw pirOutOfRange(name, "an integer", mode);
+  if (mode < 0 || mode > 4294967295) {
+    throw pirOutOfRange(name, ">= 0 && <= 4294967295", mode);
+  }
+  return mode + 0;
+}
+
+/// `validateBoolean` (argument wording).
+function pirValidateBoolean(value, name) {
+  if (typeof value !== "boolean") {
+    throw pirInvalidArgType(name, "of type boolean", value);
+  }
+  return value;
+}
+
+function pirValidateBooleanProperty(value, name) {
+  if (typeof value !== "boolean") {
+    throw pirInvalidArgTypeProperty(name, "of type boolean", value);
+  }
+  return value;
+}
+
+/// `validateOffsetLengthRead`: the read side's offset/length window.
+function pirValidateOffsetLengthRead(offset, length, bufferLength) {
+  if (offset < 0) throw pirOutOfRange("offset", ">= 0", offset);
+  if (length < 0) throw pirOutOfRange("length", ">= 0", length);
+  if (offset + length > bufferLength) {
+    throw pirOutOfRange("length", "<= " + (bufferLength - offset), length);
+  }
+}
+
+/// `validateOffsetLengthWrite`: Node checks the windows in this order, then
+/// range-checks the (possibly coerced) length as an int32.
+function pirValidateOffsetLengthWrite(offset, length, byteLength) {
+  if (offset > byteLength) throw pirOutOfRange("offset", "<= " + byteLength, offset);
+  if (length > byteLength - offset) {
+    throw pirOutOfRange("length", "<= " + (byteLength - offset), length);
+  }
+  if (length < 0) throw pirOutOfRange("length", ">= 0", length);
+  pirValidateInteger(length, "length", 0, 2147483647);
+}
+
+/// Node's `validatePosition`: a number >= -1 (integer) or a BigInt in
+/// [-1, 2^63-1-length].
+function pirValidatePosition(position, length) {
+  if (typeof position === "number") {
+    return pirValidateInteger(position, "position", -1);
+  }
+  if (typeof position === "bigint") {
+    const max = (2n ** 63n) - 1n - BigInt(length);
+    if (position < -1n || position > max) {
+      throw pirOutOfRange("position", ">= -1 && <= " + String(max), position);
+    }
+    return position;
+  }
+  throw pirInvalidArgType("position", "of type bigint or integer", position);
+}
+
+/// AbortSignal helpers (`AbortError` shape).
+function pirAbortError(signal) {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  if (signal && signal.reason !== undefined) error.cause = signal.reason;
+  return error;
+}
+
+function pirCheckAborted(signal) {
+  if (signal && signal.aborted === true) throw pirAbortError(signal);
+}
+
 /// Node's `validateInteger` (argument wording).
 function pirValidateInteger(value, name, min, max) {
+  if (min === undefined) min = Number.MIN_SAFE_INTEGER;
+  if (max === undefined) max = Number.MAX_SAFE_INTEGER;
   if (typeof value !== "number") {
     throw pirInvalidArgType(name, "of type number", value);
   }
@@ -197,15 +353,30 @@ const constants = Object.assign(Object.create(null), {
 });
 
 function fileOptions(options) {
-  if (options === undefined || options === null) return {};
-  if (typeof options === "string") return { encoding: options };
-  if (typeof options === "object") {
-    return {
-      encoding: options.encoding === undefined || options.encoding === null ? undefined : options.encoding,
-      flag: options.flag,
-    };
+  // Node's `getOptions`: null/undefined and *functions* mean the defaults
+  // (the function form is the `readFile(path, cb)` overload).
+  if (options === undefined || options === null || typeof options === "function") return {};
+  let opts;
+  if (typeof options === "string") opts = { encoding: options };
+  else if (typeof options === "object") opts = options;
+  else {
+    // Node: `The "options" argument must be one of type string or object.`
+    throw pirInvalidArgType("options", "one of type string or object", options);
   }
-  return {};
+  const encoding = opts.encoding;
+  // Node validates the encoding up front; `buffer` is deliberately accepted
+  // here (it fails as ERR_UNKNOWN_ENCODING at the Buffer conversion).
+  pirValidateEncodingValue(encoding);
+  // `getOptions` also rejects a non-AbortSignal `options.signal` synchronously.
+  pirValidateSignal(opts.signal, "options.signal");
+  return {
+    encoding: encoding === undefined || encoding === null || encoding === "" ? undefined : encoding,
+    flag: opts.flag,
+    mode: opts.mode,
+    flush: opts.flush,
+    signal: opts.signal,
+    source: opts,
+  };
 }
 
 function dataToBase64(data, encoding) {
@@ -269,19 +440,119 @@ function pirWriteData(payload, data, encoding) {
   return payload;
 }
 
-class Stats {
-  constructor(raw) {
-    this._raw = raw;
-    this.size = raw.size;
-    // Node's `mode`: permission bits plus the file-type bits (0o100000 for a
-    // regular file, 0o40000 for a directory) as libuv reports them on the
-    // host platform (Windows: 0o444 read-only / 0o666 writable).
-    this.mode = Number(raw.mode) || 0;
-    this.mtimeMs = raw.mtimeMs;
-    this.birthtimeMs = raw.birthtimeMs;
-    this.mtime = new Date(raw.mtimeMs);
-    this.birthtime = new Date(raw.birthtimeMs);
+/// Bytes for the typed native write entry: a value that is already a byte view
+/// crosses the C-ABI without a base64 copy. Strings (the `dataText` channel),
+/// plain arrays and anything else keep the JSON path.
+function pirWriteBytes(data) {
+  if (typeof globalThis.__pirFsWrite !== "function") return undefined;
+  if (Buffer.isBuffer(data)) return data;
+  if (typeof data !== "object" || data === null) return undefined;
+  if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
   }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return undefined;
+}
+
+/// `true` when the typed entry owns this write. A host failure is thrown as the
+/// same Node-shaped `Error` the JSON call reconstructs — never retried, since a
+/// partially written append would then duplicate bytes.
+///
+/// `flag` is Node's normalized flag (string or int32 mask). The flag-aware
+/// entry (`__pirFsWriteFlags`) is preferred; a pre-flag binary only has
+/// `__pirFsWrite(path, bytes, append)`, which is still exact for the plain
+/// `w`/`a` cases.
+function pirTryNativeWrite(target, data, flag, mode) {
+  const bytes = pirWriteBytes(data);
+  if (bytes === undefined) return false;
+  const flagsEntry = globalThis.__pirFsWriteFlags;
+  if (typeof flagsEntry === "function") {
+    // `mode` must be *absent*, not an explicit `undefined`: the host signature
+    // declares it as `Opt<f64>`, and an explicit undefined fails f64 conversion
+    // ("Error converting from js 'undefined' into type 'f64'").
+    const answer =
+      mode === undefined ? flagsEntry(target, bytes, flag) : flagsEntry(target, bytes, flag, mode);
+    return answer !== undefined;
+  }
+  const legacyEntry = globalThis.__pirFsWrite;
+  if (typeof legacyEntry === "function") {
+    legacyEntry(target, bytes, pirFlagsAppend(flag));
+    return true;
+  }
+  return false;
+}
+
+// --- Stats ----------------------------------------------------------------
+
+/// Raw stat payload integer -> BigInt. Both host channels deliver the exact
+/// integer (typed: a BigInt; JSON: a decimal string), so nothing is lost for
+/// 64-bit `ino`/`dev`.
+function pirStatBigInt(value) {
+  if (typeof value === "bigint") return value;
+  return BigInt(typeof value === "string" ? value : Number(value));
+}
+
+/// Milliseconds for a Number `Stats` field. Node derives the Number fields
+/// from the same ns integers through `msFromTimeSpec` (`sec * 1000 +
+/// nsec / 1e6`, fractional), while `BigIntStats.atimeMs` is
+/// `atimeNs / 1e6n` (truncating). The host also ships the already-fractional
+/// f64, but both shapes must agree to sub-millisecond precision for
+/// `test-fs-stat-bigint` (its allowable delta is the time between the two stat
+/// calls, which is 0 here), so the ns integer is the single source of truth
+/// and the Number shape truncates exactly like `BigIntStats`.
+function pirStatMs(raw, key) {
+  const ns = raw[key + "Ns"];
+  if (ns !== undefined) return Number(pirStatBigInt(ns) / 1000000n);
+  const ms = raw[key + "Ms"];
+  if (typeof ms === "number") return ms;
+  return 0;
+}
+
+/// A raw integer field with the pre-Node-24 typed payload (which only carried
+/// `size`/`mode`) defaulting to Node's value for "host cannot supply it": 0.
+function pirRawBig(raw, key) {
+  const value = raw[key];
+  return value === undefined ? 0n : pirStatBigInt(value);
+}
+
+const kiniStatsOwnFields = [
+  "dev", "mode", "nlink", "uid", "gid", "rdev", "blksize", "ino", "size", "blocks",
+];
+
+/// Fill a `Stats` (numbers) or `BigIntStats` (BigInt) instance. Field order
+/// matches Node's constructor: dev, mode, nlink, uid, gid, rdev, blksize, ino,
+/// size, blocks, then the four `*Ms` values (and the four `*Ns` BigInts).
+function pirFillStats(target, raw, bigint) {
+  if (bigint) {
+    for (const key of kiniStatsOwnFields) target[key] = pirRawBig(raw, key);
+    target.atimeMs = pirRawBig(raw, "atimeNs") / 1000000n;
+    target.mtimeMs = pirRawBig(raw, "mtimeNs") / 1000000n;
+    target.ctimeMs = pirRawBig(raw, "ctimeNs") / 1000000n;
+    target.birthtimeMs = pirRawBig(raw, "birthtimeNs") / 1000000n;
+    target.atimeNs = pirRawBig(raw, "atimeNs");
+    target.mtimeNs = pirRawBig(raw, "mtimeNs");
+    target.ctimeNs = pirRawBig(raw, "ctimeNs");
+    target.birthtimeNs = pirRawBig(raw, "birthtimeNs");
+  } else {
+    for (const key of kiniStatsOwnFields) target[key] = Number(pirRawBig(raw, key));
+    target.atimeMs = pirStatMs(raw, "atime");
+    target.mtimeMs = pirStatMs(raw, "mtime");
+    target.ctimeMs = pirStatMs(raw, "ctime");
+    target.birthtimeMs = pirStatMs(raw, "birthtime");
+  }
+  // The booleans and the raw payload stay off the enumerable surface: Node's
+  // `Object.keys(stats)` is exactly the numeric fields.
+  Object.defineProperty(target, "_raw", {
+    value: raw, writable: false, enumerable: false, configurable: true,
+  });
+}
+
+/// Node puts the `is*()` predicates on an internal `StatsBase` prototype
+/// (they are not own properties of `Stats.prototype`) and the Date accessors
+/// on the concrete constructors.
+class StatsBase {
   isFile() { return !!this._raw.isFile; }
   isDirectory() { return !!this._raw.isDirectory; }
   isSymbolicLink() { return !!this._raw.isSymbolicLink; }
@@ -291,11 +562,85 @@ class Stats {
   isSocket() { return false; }
 }
 
+/// Node's Date accessors are lazy: the first read replaces the accessor with
+/// an own enumerable value property (`Object.keys(stats)` grows by `atime`
+/// once it has been read).
+function pirStatsDate(name) {
+  const materialize = (target, value) => {
+    Object.defineProperty(target, name, {
+      value, writable: true, enumerable: true, configurable: true,
+    });
+    return value;
+  };
+  return {
+    get() { return materialize(this, new Date(Math.round(Number(this[name + "Ms"])))); },
+    set(value) { materialize(this, value); },
+    enumerable: false,
+    configurable: true,
+  };
+}
+
+function pirInstallStats(ctor) {
+  for (const name of ["atime", "mtime", "ctime", "birthtime"]) {
+    Object.defineProperty(ctor.prototype, name, pirStatsDate(name));
+  }
+}
+
+/// The internal `Stats` shape. It stays a class because the host payload path
+/// constructs it with `new`; the public `Stats` below is Node's callable
+/// (deprecated direct-constructor) wrapper.
+class StatsImpl extends StatsBase {
+  constructor(raw) {
+    super();
+    pirFillStats(this, raw, false);
+  }
+}
+
+const kStatsFields = ["dev", "mode", "nlink", "uid", "gid", "rdev", "blksize", "ino", "size", "blocks"];
+
+/// Node's `fs.Stats` is still a plain function: `fs.Stats(...)` without `new`
+/// works (and warns DEP0180), while the internal result path calls it with the
+/// 14-value signature. `new Stats` is an alias for the internal shape the
+/// shim's stat calls need.
+function Stats(raw) {
+  if (new.target !== undefined) return new StatsImpl(raw);
+  // Deprecated direct construction: dev..blocks then the four ms values.
+  const args = arguments;
+  const stats = Object.create(StatsImpl.prototype);
+  for (let i = 0; i < kStatsFields.length; i++) stats[kStatsFields[i]] = args[i];
+  stats.atimeMs = args[10];
+  stats.mtimeMs = args[11];
+  stats.ctimeMs = args[12];
+  stats.birthtimeMs = args[13];
+  pirEmitWarningOnce("DEP0180", "fs.Stats constructor is deprecated.",
+    { type: "DeprecationWarning", code: "DEP0180" });
+  return stats;
+}
+Stats.prototype = StatsImpl.prototype;
+Stats.prototype.constructor = Stats;
+
+/// Node's `{ bigint: true }` result type. It is a separate constructor (not
+/// `instanceof Stats`) and, like Node, is not exported from the module.
+class BigIntStats extends StatsBase {
+  constructor(raw) {
+    super();
+    pirFillStats(this, raw, true);
+  }
+}
+
+pirInstallStats(Stats);
+pirInstallStats(BigIntStats);
+
 class Dirent {
-  constructor(raw, parentPath) {
-    this._raw = raw;
-    this.name = raw.name;
-    // Node stamps the directory the entry came from onto every dirent.
+  constructor(raw, parentPath, name) {
+    // Node's `Object.keys(dirent)` is exactly ["name", "parentPath"]; the raw
+    // kind bits behind the `is*()` methods stay hidden.
+    Object.defineProperty(this, "_raw", {
+      value: raw, writable: false, enumerable: false, configurable: true,
+    });
+    this.name = name === undefined ? raw.name : name;
+    // Node stamps the directory the entry came from onto every dirent,
+    // verbatim (a relative argument stays relative).
     this.parentPath = parentPath === undefined ? null : parentPath;
   }
   isFile() { return !!this._raw.isFile; }
@@ -307,13 +652,17 @@ class Dirent {
   isSocket() { return false; }
 }
 
-/// Read the whole descriptor; Node's `readFile` uses the same loop.
+/// Read a descriptor from its *current* position, the way Node's `readFile`
+/// does for a user fd: `fstat` decides the size and the reads are sequential
+/// (they advance the host-tracked offset). A regular file therefore returns
+/// `size` bytes; when the kernel lies about the size Node also does one extra
+/// 8 KiB read, which this loop reproduces.
 function pirReadFdFully(fd) {
   const total = fstatSync(fd).size;
-  const out = Buffer.alloc(total);
+  const out = Buffer.alloc(total === 0 ? 8192 : total);
   let done = 0;
-  while (done < total) {
-    const count = readSync(fd, out, done, total - done, done);
+  while (done < out.length) {
+    const count = readSync(fd, out, done, out.length - done);
     if (count <= 0) break;
     done += count;
   }
@@ -321,40 +670,154 @@ function pirReadFdFully(fd) {
 }
 
 function readFileSync(path, options) {
+  // Node validates the options (and their encoding) before the path.
   const opts = fileOptions(options);
-  let buffer;
-  if (typeof path === "number") {
-    // Node also accepts a descriptor instead of a path.
-    buffer = pirReadFdFully(path);
-  } else {
-    const target = pirPathArg(path, "path");
-    const flag = pirOpenFlags(opts.flag);
-    if (pirFlagsPureRead(flag)) {
-      buffer = Buffer.from(call("fs", "readFile", { path: target }), "base64");
+  pirValidateReadFileBufferOption(opts);
+  try {
+    let buffer;
+    if (typeof path === "number") {
+      // Node also accepts a descriptor instead of a path. `-0` is fd 0.
+      pirValidateFd(path);
+      buffer = pirReadFdFully(path);
     } else {
-      // Anything else can create the file (`a+`) or refuse to touch it when
-      // it exists (`ax+`), which the whole-file host read cannot express:
-      // route it through the fd family instead.
-      const fd = openSync(target, flag);
-      try {
-        buffer = pirReadFdFully(fd);
-      } finally {
-        closeSync(fd);
+      const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+      const flag = pirOpenFlags(opts.flag);
+      if (pirFlagsPureRead(flag)) {
+        // Typed entry first: the bytes cross as a Uint8Array instead of a
+        // base64 string (a multi-MB `readFileSync` would otherwise pay two
+        // base64 laps). `undefined` means "not mine" — the JSON op takes over,
+        // including its exact error reconstruction.
+        const nativeRead = globalThis.__pirFsRead;
+        const bytes = typeof nativeRead === "function" ? nativeRead(target) : undefined;
+        buffer = bytes === undefined
+          ? Buffer.from(call("fs", "readFile", { path: target }), "base64")
+          : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      } else {
+        // Anything else can create the file (`a+`) or refuse to touch it when
+        // it exists (`ax+`), which the whole-file host read cannot express:
+        // route it through the fd family instead.
+        const fd = openSync(target, flag);
+        try {
+          buffer = pirReadFdFully(fd);
+        } finally {
+          closeSync(fd);
+        }
       }
     }
+    // Node's `getOptions` lets `buffer` through; Buffer#toString then raises
+    // ERR_UNKNOWN_ENCODING("buffer"), which is the Node-visible behavior for
+    // `readFileSync(path, 'buffer')` on v24.
+    return opts.encoding === undefined ? buffer : buffer.toString(opts.encoding);
+  } catch (error) {
+    throw pirReadFileSizeError(path, error);
   }
-  return opts.encoding === undefined ? buffer : buffer.toString(opts.encoding);
+}
+
+/// The host refuses whole-file reads above its 32 MiB budget with `E2BIG`.
+/// Node's own ceiling is 2^31-1 bytes, reported as a RangeError
+/// (`ERR_FS_FILE_TOO_LARGE`) — map a genuinely oversized file onto that code.
+function pirReadFileSizeError(path, error) {
+  if (error && error.code === "E2BIG" && typeof path !== "number") {
+    let size;
+    try { size = statSync(path).size; } catch { return error; }
+    if (size > 2147483647) {
+      const tooLarge = new RangeError(
+        "Cannot create a Buffer larger than 0x7fffffff bytes");
+      tooLarge.code = "ERR_FS_FILE_TOO_LARGE";
+      return tooLarge;
+    }
+  }
+  return error;
+}
+
+/// Node's `validateReadFileBufferOptions` (the `options.buffer` extension).
+/// The shim does not implement the user-buffer fast path, but the argument
+/// contract is observable and tests assert it, so it is validated here.
+function pirValidateReadFileBufferOption(opts) {
+  const source = opts.source;
+  const buffer = source && source.buffer;
+  if (buffer !== undefined && typeof buffer !== "function" && !pirIsArrayBufferView(buffer)) {
+    throw pirInvalidArgType("options.buffer",
+      "of type Buffer, TypedArray, DataView, or function", buffer);
+  }
+}
+
+/// Normalize `data` for the write family: typed arrays ride the byte channel
+/// untouched; a string is UTF-8-encoded with the validated encoding (Node does
+/// the same through `Buffer.from(data, encoding || 'utf8')`).
+function pirWriteBytesFor(data, encoding, name) {
+  if (pirIsArrayBufferView(data)) {
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  pirValidateStringOrView(data, name === undefined ? "data" : name);
+  return Buffer.from(data, encoding === undefined ? "utf8" : encoding);
+}
+
+/// Node's `writeFileSync` flag selection: `options.flag || defaultFlag`, so
+/// `0`/`""`/`null`/`false` all fall back (a numeric `O_RDONLY` therefore means
+/// the default write, exactly like Node), and the result goes through
+/// `stringToFlags` validation.
+function pirWriteFlag(opts, defaultValue) {
+  return pirOpenFlags(opts.flag || defaultValue);
 }
 
 function writeFileSync(path, data, options) {
+  // Node validates options first, then `flush`, then the data, and only then
+  // opens (`getValidatedPath`) — so `writeFileSync()` reports the data error.
   const opts = fileOptions(options);
-  const append = pirFlagsAppend(opts.flag);
-  call("fs", "writeFile", pirWriteData({ path: String(path), append: append }, data, opts.encoding));
+  if (opts.flush !== undefined) pirValidateBooleanProperty(opts.flush, "options.flush");
+  const flag = pirWriteFlag(opts, "w");
+  const mode = pirParseModeStrict(opts.mode, "mode", 0o666, false);
+  const bytes = pirWriteBytesFor(data, opts.encoding, "data");
+  if (typeof path === "number") {
+    // Node's fd form writes at the current offset and never closes the fd.
+    const fd = pirValidateFd(path);
+    let done = 0;
+    while (done < bytes.length) {
+      done += writeSync(fd, bytes, done, bytes.length - done);
+    }
+    if (opts.flush) fsyncSync(fd);
+    return;
+  }
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (pirTryNativeWrite(target, bytes, flag, mode)) return;
+  const payload = pirWriteData({
+    path: target,
+    append: pirFlagsAppend(flag),
+    flag: flag,
+  }, bytes, undefined);
+  payload.mode = mode;
+  call("fs", "writeFile", payload);
+  if (opts.flush) {
+    const fd = openSync(target, "r+");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  }
 }
 
 function appendFileSync(path, data, options) {
   const opts = fileOptions(options);
-  call("fs", "writeFile", pirWriteData({ path: String(path), append: true }, data, opts.encoding));
+  if (opts.flush !== undefined) pirValidateBooleanProperty(opts.flush, "options.flush");
+  const flag = pirWriteFlag(opts, "a");
+  const mode = pirParseModeStrict(opts.mode, "mode", 0o666, false);
+  const bytes = pirWriteBytesFor(data, opts.encoding, "data");
+  if (typeof path === "number") {
+    const fd = pirValidateFd(path);
+    let done = 0;
+    while (done < bytes.length) {
+      done += writeSync(fd, bytes, done, bytes.length - done);
+    }
+    return;
+  }
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (pirTryNativeWrite(target, bytes, flag, mode)) return;
+  const payload = pirWriteData({
+    path: target,
+    append: pirFlagsAppend(flag),
+    flag: flag,
+  }, bytes, undefined);
+  payload.mode = mode;
+  call("fs", "writeFile", payload);
 }
 
 function existsSync(path) {
@@ -365,6 +828,14 @@ function existsSync(path) {
   } catch {
     return false;
   }
+  // Node passes "" to the OS (it does not resolve it to cwd), which makes the
+  // probe fail; `existsSync("")` is false.
+  if (target === "") return false;
+  const nativeExists = globalThis.__pirFsExists;
+  if (typeof nativeExists === "function") {
+    const answer = nativeExists(target);
+    if (answer !== undefined) return answer;
+  }
   try {
     return call("fs", "exists", { path: target }) === true;
   } catch {
@@ -372,29 +843,227 @@ function existsSync(path) {
   }
 }
 
-function statSync(path) {
-  return new Stats(call("fs", "stat", { path: pirPathArg(path, "path") }));
+/// Node's `statSync`/`lstatSync` options: only `bigint === true` selects the
+/// BigInt shape; `throwIfNoEntry: false` turns a missing target into
+/// `undefined` (Node does that for ENOENT/ENOTDIR only).
+function pirStatOptions(options) {
+  const opts = options !== null && typeof options === "object" ? options : {};
+  return {
+    bigint: opts.bigint === true,
+    throwIfNoEntry: opts.throwIfNoEntry !== false,
+  };
 }
 
-function lstatSync(path) {
-  return new Stats(call("fs", "lstat", { path: pirPathArg(path, "path") }));
+function pirStatRaw(target, lstat) {
+  // Typed entry: one string in, the raw Stats payload out. `undefined` means
+  // "not mine" (no runtime attached) — the envelope path takes over,
+  // including its error reconstruction.
+  const nativeStat = globalThis.__pirFsStat;
+  if (typeof nativeStat === "function") {
+    const raw = nativeStat(target, lstat);
+    if (raw !== undefined) return raw;
+  }
+  return call("fs", lstat ? "lstat" : "stat", { path: target });
+}
+
+function pirStatSync(path, options, lstat) {
+  const target = pirPathArg(path, "path");
+  const opts = pirStatOptions(options);
+  let raw;
+  try {
+    raw = pirStatRaw(target, lstat);
+  } catch (error) {
+    if (!opts.throwIfNoEntry && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+      return undefined;
+    }
+    throw error;
+  }
+  return opts.bigint ? new BigIntStats(raw) : new Stats(raw);
+}
+
+function statSync(path, options) {
+  // Node's stat family takes a path only; a raw descriptor is fstatSync's
+  // job (`fs.statSync(fd)` is ERR_INVALID_ARG_TYPE on Node v24).
+  return pirStatSync(path, options, false);
+}
+
+function lstatSync(path, options) {
+  return pirStatSync(path, options, true);
+}
+
+/// Node's readdir `getOptions`: string means `{encoding}`, null/undefined and
+/// functions mean the defaults, anything else non-object is invalid. The
+/// `buffer` pseudo-encoding is Node's fs-only "names as Buffers" mode.
+function pirReaddirOptions(options) {
+  if (options === undefined || options === null || typeof options === "function") return {};
+  if (typeof options === "string") {
+    // The string form is `{ encoding: options }`; getOptions validates it
+    // (except the fs-only `buffer` pseudo-encoding) before readdir runs.
+    if (options !== "buffer") pirValidateEncodingValue(options);
+    return { encoding: options === "" ? "utf8" : options };
+  }
+  if (typeof options !== "object") {
+    throw pirInvalidArgType("options", "one of type string or object", options);
+  }
+  const encoding = options.encoding;
+  if (encoding === undefined || encoding === null || encoding === "") {
+    return { encoding: "utf8", withFileTypes: options.withFileTypes, recursive: options.recursive };
+  }
+  if (encoding !== "buffer") {
+    // Every other value must be a Buffer encoding (`ERR_INVALID_ARG_VALUE`).
+    if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+      throw pirInvalidArgValue("encoding", encoding, "is invalid encoding");
+    }
+  }
+  return { encoding: encoding, withFileTypes: options.withFileTypes, recursive: options.recursive };
+}
+
+/// Node's directory names come from libuv as UTF-8 bytes, then get decoded
+/// with the requested encoding. `buffer` keeps the bytes, every other
+/// encoding is the Buffer view of those bytes.
+///
+/// `ascii` is decoded here rather than through `Buffer.toString("ascii")`:
+/// Node masks each byte with 0x7F (libuv's name bytes), and this Buffer shim's
+/// ascii decoder currently behaves like latin1.
+function pirEncodeReaddirName(name, encoding) {
+  if (encoding === undefined || encoding === "utf8") return name;
+  const bytes = Buffer.from(name, "utf8");
+  if (encoding === "buffer") return bytes;
+  if (encoding === "ascii") {
+    let text = "";
+    for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i] & 0x7f);
+    return text;
+  }
+  return bytes.toString(encoding);
+}
+
+/// `path.join`-shape join for the recursive readdir names. The result uses the
+/// active platform separator and never doubles it.
+function pirJoinDirPath(parent, name) {
+  if (parent === undefined || parent === null || parent === "") return name;
+  const isWin = globalThis.__pirPlatform === "win32";
+  const sep = isWin ? "\\" : "/";
+  let base = String(parent);
+  if (isWin) base = base.replace(/\//g, "\\");
+  if (base.endsWith(sep)) return base + name;
+  return base + sep + name;
+}
+
+/// One directory listing. The typed host entry is preferred; `undefined`
+/// falls back to the JSON op (including its error reconstruction).
+function pirReaddirLevel(target, dirents) {
+  const nativeReaddir = globalThis.__pirFsReaddir;
+  if (typeof nativeReaddir === "function") {
+    const native = nativeReaddir(target, dirents);
+    if (native !== undefined) return native;
+  }
+  return call("fs", "readdir", { path: target, dirents: dirents });
 }
 
 function readdirSync(path, options) {
-  const withFileTypes = !!(options && typeof options === "object" && options.withFileTypes);
-  const target = pirPathArg(path, "path");
-  const entries = call("fs", "readdir", { path: target, dirents: withFileTypes });
-  return withFileTypes ? entries.map((raw) => new Dirent(raw, target)) : entries;
+  // Node's order: options/encoding, path, then the recursive boolean.
+  const opts = pirReaddirOptions(options);
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (opts.recursive !== undefined && opts.recursive !== null) {
+    pirValidateBooleanProperty(opts.recursive, "options.recursive");
+  }
+  const encoding = opts.encoding === undefined ? "utf8" : opts.encoding;
+  const withFileTypes = !!opts.withFileTypes;
+  if (!opts.recursive) {
+    const entries = pirReaddirLevel(target, withFileTypes);
+    if (withFileTypes) {
+      return Array.prototype.map.call(entries, (raw) =>
+        new Dirent(raw, target, pirEncodeReaddirName(raw.name, encoding)));
+    }
+    if (encoding === "utf8") return entries;
+    const names = new Array(entries.length);
+    for (let i = 0; i < entries.length; i++) {
+      names[i] = pirEncodeReaddirName(entries[i], encoding);
+    }
+    return names;
+  }
+
+  // Node's recursive walk is breadth-first: append every entry of one
+  // directory, then descend into its subdirectories in listing order
+  // (`readdirSyncRecursive` + `readdirSyncRecursiveCallback`).
+  const results = [];
+  const queue = [{ path: target, prefix: undefined }];
+  for (let index = 0; index < queue.length; index++) {
+    const level = queue[index];
+    const entries = pirReaddirLevel(level.path, true);
+    const childDirs = [];
+    for (let i = 0; i < entries.length; i++) {
+      const raw = entries[i];
+      const joined = level.prefix === undefined
+        ? raw.name
+        : pirJoinDirPath(level.prefix, raw.name);
+      if (withFileTypes) {
+        results.push(new Dirent(raw, level.path, pirEncodeReaddirName(raw.name, encoding)));
+      } else {
+        results.push(pirEncodeReaddirName(joined, encoding));
+      }
+      if (raw.isDirectory) {
+        childDirs.push({ path: pirJoinDirPath(level.path, raw.name), prefix: joined });
+      }
+    }
+    // FIFO: the children are appended after every sibling already queued.
+    for (const child of childDirs) queue.push(child);
+  }
+  return results;
 }
 
 function mkdirSync(path, options) {
-  const recursive = options === true || !!(options && typeof options === "object" && options.recursive);
-  call("fs", "mkdir", { path: pirPathArg(path, "path"), recursive: recursive });
+  let opts = options;
+  if (typeof opts === "number" || typeof opts === "string") opts = { mode: opts };
+  if (opts === undefined || opts === null) opts = {};
+  if (typeof opts !== "object") {
+    throw pirInvalidArgType("options", "one of type object or string", opts);
+  }
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (opts.recursive !== undefined) {
+    pirValidateBooleanProperty(opts.recursive, "options.recursive");
+  }
+  const mode = pirParseModeStrict(opts.mode, "options.mode", 0o777, true);
+  call("fs", "mkdir", { path: target, recursive: !!opts.recursive, mode: mode });
+}
+
+/// Node's rm options: `force`/`recursive` must be booleans and the retry knobs
+/// are uint32s (libuv semantics).
+function pirRmOptions(options) {
+  if (options === undefined || options === null) return { recursive: false, force: false };
+  if (typeof options !== "object") {
+    throw pirInvalidArgType("options", "an object", options);
+  }
+  if (options.force !== undefined) pirValidateBooleanProperty(options.force, "options.force");
+  if (options.recursive !== undefined) pirValidateBooleanProperty(options.recursive, "options.recursive");
+  if (options.maxRetries !== undefined) {
+    pirValidateIntegerProperty(options.maxRetries, "options.maxRetries", 0, 4294967295);
+  }
+  if (options.retryDelay !== undefined) {
+    pirValidateIntegerProperty(options.retryDelay, "options.retryDelay", 0, 4294967295);
+  }
+  return { recursive: !!options.recursive, force: !!options.force };
 }
 
 function rmSync(path, options) {
-  const opts = options === undefined || options === null || typeof options !== "object" ? {} : options;
-  call("fs", "rm", { path: pirPathArg(path, "path"), recursive: !!opts.recursive, force: !!opts.force });
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const opts = pirRmOptions(options);
+  // Node's rimraf path checks lstat first: a directory without `recursive` is
+  // an ERR_FS_EISDIR carrying the path, before the host rm is reached.
+  if (!opts.recursive) {
+    const stats = lstatSync(target, { throwIfNoEntry: !opts.force });
+    if (stats !== undefined && stats.isDirectory()) throw pirEisdirError(target);
+  }
+  call("fs", "rm", { path: target, recursive: opts.recursive, force: opts.force });
+}
+
+function pirWarnRmdirRecursive() {
+  pirEmitWarningOnce(
+    "DEP0147",
+    "In future versions of Node.js, fs.rmdir(path, { recursive: true }) " +
+      "will be removed. Use fs.rm(path, { recursive: true }) instead",
+    { type: "DeprecationWarning", code: "DEP0147" },
+  );
 }
 
 function unlinkSync(path) {
@@ -405,35 +1074,76 @@ function renameSync(from, to) {
   call("fs", "rename", { from: pirPathArg(from, "oldPath"), to: pirPathArg(to, "newPath") });
 }
 
-function copyFileSync(from, to) {
-  call("fs", "copyFile", { from: pirPathArg(from, "src"), to: pirPathArg(to, "dest") });
+/// Node's `copyFile` mode validation (`validateMode`): a number, coerced to an
+/// int32, in the `COPYFILE_*` bit range. The message text and error classes are
+/// Node's, including the non-integer acceptance (`5.5` becomes `5`).
+function pirCopyFileMode(mode) {
+  if (mode === undefined || mode === null) return 0;
+  if (typeof mode !== "number") {
+    throw pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE", "mode must be int32 or null/undefined");
+  }
+  if (mode < 0 || mode > 7) {
+    throw pirCodedError(RangeError, "ERR_OUT_OF_RANGE", "mode is out of range: >= 0 && <= 7");
+  }
+  return mode | 0;
 }
 
-function realpathSync(path) {
-  return call("fs", "realpath", { path: pirPathArg(path, "path") });
+function copyFileSync(from, to, mode) {
+  const src = pirPathArg(from, "src");
+  const dest = pirPathArg(to, "dest");
+  const parsedMode = pirCopyFileMode(mode);
+  call("fs", "copyFile", { from: src, to: dest, mode: parsedMode });
+}
+
+function realpathSync(path, options) {
+  const opts = pirEncodingOptions(options);
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  // The host canonicalizer already returns the native spelling, which is the
+  // `__filename` spelling Node uses on win32 (`test-fs-realpath-native`
+  // compares the two lowercased), so no separator rewrite is applied.
+  const resolved = String(call("fs", "realpath", { path: target }));
+  return pirEncodePathResult(resolved, opts.encoding);
 }
 
 function accessSync(path, mode) {
-  call("fs", "access", { path: pirPathArg(path, "path"), mode: mode === undefined ? 0 : mode });
+  call("fs", "access", { path: pirPathArg(path, "path"), mode: pirAccessMode(mode) });
 }
 
-function readlinkSync(path) {
-  return call("fs", "readlink", { path: pirPathArg(path, "path") });
+function readlinkSync(path, options) {
+  const opts = pirEncodingOptions(options);
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const linked = String(call("fs", "readlink", { path: target }));
+  return pirEncodePathResult(linked, opts.encoding);
 }
 
 // ---- fd family ------------------------------------------------------------
 
+// Node's `stringToFlags` accepted set, verbatim (the r/w/a bases with `+`,
+// `x` and the `s` sync hints, in both orders). Anything else is
+// ERR_INVALID_ARG_VALUE before the host is reached.
+const kOpenFlagStrings = new Set([
+  "r", "rs", "sr", "r+", "rs+", "sr+",
+  "w", "wx", "xw", "w+", "wx+", "xw+",
+  "a", "as", "sa", "ax", "xa", "a+", "as+", "sa+", "ax+", "xa+",
+]);
+
 /// Node's `stringToFlags`: a number is an int32 `fs.constants` mask (node
 /// range-checks it and so does this shim), `null`/`undefined` mean `O_RDONLY`,
-/// a string keeps its own validation (the host rejects unknown flag strings
-/// with node's `ERR_INVALID_ARG_VALUE`) and anything else raises node's
+/// a string is range-checked against Node's accepted set (unknown strings are
+/// a `TypeError [ERR_INVALID_ARG_VALUE]`), and anything else raises Node's
 /// argument error. The host bridge accepts both forms.
 function pirOpenFlags(flags) {
   if (typeof flags === "number") {
     return pirValidateInteger(flags, "flags", -2147483648, 2147483647);
   }
   if (flags === undefined || flags === null) return constants.O_RDONLY;
-  if (typeof flags === "string") return flags;
+  if (typeof flags === "string") {
+    if (!kOpenFlagStrings.has(flags)) {
+      throw pirCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
+        "The argument 'flags' is invalid. Received " + pirPrimitiveText(flags));
+    }
+    return flags;
+  }
   throw pirCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
     "The argument 'flags' is invalid. Received " + pirFlagsReceived(flags));
 }
@@ -452,6 +1162,92 @@ function pirFlagsReceived(value) {
   return pirPrimitiveText(value);
 }
 
+/// `util.inspect`-shaped tail for ERR_INVALID_ARG_VALUE. Typed arrays are the
+/// common carrier (an empty read buffer) and Node prints them as
+/// `Uint8Array(0) []`, not `{}`.
+function pirInspectReceived(value) {
+  if (pirIsArrayBufferView(value)) {
+    const name = value.constructor && value.constructor.name ? value.constructor.name : "Uint8Array";
+    const length = value.byteLength;
+    let items = "";
+    if (length > 0 && length <= 50) {
+      const list = [];
+      for (let i = 0; i < length; i++) list.push(String(value[i]));
+      items = " [ " + list.join(", ") + " ]";
+    } else if (length > 50) {
+      items = " …";
+    } else {
+      items = " []";
+    }
+    return name + "(" + length + ")" + items;
+  }
+  return pirFlagsReceived(value);
+}
+
+/// Node's `validateObject` default mode: null/undefined are accepted by the
+/// callers that pass `kValidateObjectAllowNullable`; arrays and functions are
+/// not options objects.
+function pirValidateOptionsValue(value, name) {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw pirInvalidArgType(name === undefined ? "options" : name, "an object", value);
+  }
+  return value;
+}
+
+/// `getOptions(options, { encoding })` for the path-returning calls
+/// (readlink/realpath/mkdtemp/watch/streams). `buffer` is carried through
+/// untouched and handled by the caller.
+function pirEncodingOptions(options, fallback) {
+  const def = fallback === undefined ? "utf8" : fallback;
+  if (options === undefined || options === null || typeof options === "function") {
+    return { encoding: def, source: undefined };
+  }
+  let opts;
+  if (typeof options === "string") opts = { encoding: options };
+  else if (typeof options === "object") opts = options;
+  else throw pirInvalidArgType("options", "one of type string or object", options);
+  let encoding = opts.encoding;
+  if (encoding === undefined || encoding === null || encoding === "") encoding = def;
+  if (encoding !== "buffer") pirValidateEncodingValue(encoding);
+  return { encoding: encoding, source: opts };
+}
+
+/// `encodeRealpathResult`: utf8 passes the string through; everything else is
+/// decoded from the UTF-8 bytes (and `buffer` keeps them).
+function pirEncodePathResult(value, encoding) {
+  if (encoding === undefined || encoding === null || encoding === "utf8") return value;
+  const bytes = Buffer.from(value, "utf8");
+  if (encoding === "buffer") return bytes;
+  return bytes.toString(encoding);
+}
+
+/// Node's `ERR_MISSING_ARGS`.
+function pirMissingArgs(name) {
+  return pirCodedError(TypeError, "ERR_MISSING_ARGS",
+    'The "' + name + '" argument must be specified');
+}
+
+/// Node's `ERR_FS_EISDIR` SystemError (rm on a directory without recursive).
+function pirEisdirError(path) {
+  const error = new Error("Path is a directory: rm returned EISDIR (is a directory) " + path);
+  error.code = "ERR_FS_EISDIR";
+  error.path = path;
+  error.syscall = "rm";
+  return error;
+}
+
+/// `validateAbortSignal` (duck-typed: the abort_global implementation is the
+/// only AbortSignal class this runtime has).
+function pirValidateSignal(signal, name) {
+  if (signal === undefined) return;
+  if (signal === null || typeof signal !== "object" ||
+      typeof signal.aborted !== "boolean" ||
+      typeof signal.addEventListener !== "function") {
+    throw pirInvalidArgType(name === undefined ? "signal" : name, "an instance of AbortSignal", signal);
+  }
+}
+
 /// Whether the flags read the file and nothing else (a `O_RDONLY` access mode
 /// with no create/truncate/append bit): the whole-file host read needs exactly
 /// that, every other flag routes through the fd family.
@@ -462,32 +1258,116 @@ function pirFlagsPureRead(flags) {
   return flags === "r" || flags === "rs" || flags === "sr";
 }
 
-/// Whether the flags append (a string `a`/`a+` or a numeric `O_APPEND` bit).
+/// Whether the flags append (a string `a`/`a+`/`as` family or a numeric
+/// `O_APPEND` bit).
 function pirFlagsAppend(flags) {
   if (typeof flags === "number") return (flags & constants.O_APPEND) !== 0;
-  return flags === "a" || flags === "a+";
+  return flags === "a" || flags === "a+" ||
+    flags === "as" || flags === "sa" || flags === "as+" || flags === "sa+";
+}
+
+/// Track the access mode of every descriptor opened through this module, so
+/// read/write on a wrong-way descriptor fail with Node's EBADF shape before
+/// the host syscall (Windows otherwise reports EACCES).
+const pirFdAccess = new Map();
+
+/// 1 = read, 2 = write, 3 = both, from Node's flag string or int32 mask.
+function pirFlagAccess(flags) {
+  if (typeof flags === "number") {
+    const access = flags & 3;
+    if (access === 0) return 1;      // O_RDONLY
+    if (access === 1) return 2;      // O_WRONLY
+    return 3;                         // O_RDWR
+  }
+  const text = String(flags);
+  if (text.startsWith("r")) return text.indexOf("+") === -1 ? 1 : 3;
+  return text.indexOf("+") === -1 ? 2 : 3;
+}
+
+function pirRecordFd(fd, flags) {
+  pirFdAccess.set(fd, pirFlagAccess(flags));
+  return fd;
+}
+
+function pirAccessError(fd, op) {
+  const error = pirCodedError(Error, "EBADF", "EBADF: bad file descriptor, " + op);
+  // Node's uvException sets `errno` on the instance. Assigning through the
+  // prototype chain is observable (test-fs-writesync-crash plants an
+  // Object.prototype.errno setter that must see this write).
+  error.errno = -4083;
+  return error;
+}
+
+function pirRequireReadAccess(fd) {
+  const access = pirFdAccess.get(fd);
+  if (access !== undefined && (access & 1) === 0) throw pirAccessError(fd, "read");
+}
+
+function pirRequireWriteAccess(fd) {
+  const access = pirFdAccess.get(fd);
+  if (access !== undefined && (access & 2) === 0) throw pirAccessError(fd, "write");
+}
+
+/// Whether the flag mask/string creates the file (O_CREAT bit, or one of the
+/// `w`/`a`/`x` string bases).
+function pirFlagsCreate(flags) {
+  if (typeof flags === "number") return (flags & constants.O_CREAT) !== 0;
+  return flags[0] === "w" || flags[0] === "a" || flags[0] === "x";
 }
 
 function openSync(path, flags, mode) {
-  return call("fs", "open", {
-    path: pirPathArg(path, "path"),
-    flags: pirOpenFlags(flags),
-    mode: mode === undefined || mode === null ? 0o666 : mode | 0,
-  });
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const parsedFlags = pirOpenFlags(flags);
+  const modeSupplied = mode !== undefined && mode !== null;
+  const parsedMode = pirParseModeStrict(mode, "mode", 0o666, false);
+  // The host applies `mode` on Unix only. Windows has just the readonly
+  // attribute, which libuv maps onto the owner-write bit at creation time
+  // (`test-fs-open-mode-mask`); apply it here, but only when this open is the
+  // one creating the file (Node never changes an existing file's mode).
+  const applyMode = globalThis.__pirPlatform === "win32" && modeSupplied &&
+    (parsedMode & 0o200) === 0 && pirFlagsCreate(parsedFlags) && !existsSync(target);
+  const fd = call("fs", "open", { path: target, flags: parsedFlags, mode: parsedMode });
+  if (applyMode) {
+    try {
+      call("fs", "chmod", { path: target, mode: parsedMode });
+    } catch (error) {
+      try { call("fs", "close", { fd: fd | 0 }); } catch { /* the open error wins */ }
+      throw error;
+    }
+  }
+  return pirRecordFd(fd, parsedFlags);
 }
 
-function readSync(fd, buffer, offset, length, position) {
-  if (offset !== null && typeof offset === "object") {
-    // fs.readSync(fd, buffer, options) form
-    const options = offset;
+function readSync(fd, buffer, offsetOrOptions, length, position) {
+  // Node's readSync validates the buffer first, then the offset/length window.
+  pirValidateBuffer(buffer, "buffer");
+  let offset = offsetOrOptions;
+  if (arguments.length <= 3 || (offsetOrOptions !== null && typeof offsetOrOptions === "object")) {
+    // `readSync(fd, buffer, options)`: Node's validateObject rejects arrays and
+    // functions, and allows null/undefined (the defaults).
+    pirValidateOptionsValue(offsetOrOptions, "options");
+    const options = offsetOrOptions || {};
     offset = options.offset;
     length = options.length;
     position = options.position;
   }
-  offset = offset === undefined ? 0 : offset | 0;
-  length = length === undefined ? buffer.length - offset : length | 0;
+  if (offset === undefined || offset === null) offset = 0;
+  else pirValidateInteger(offset, "offset", 0);
+  // Node coerces the length with `|= 0` (undefined/null take the default).
+  if (length === undefined || length === null) length = buffer.byteLength - offset;
+  else length = length | 0;
+  if (position === undefined || position === null) position = -1;
+  else position = pirValidatePosition(position, length);
+  if (length === 0) return 0;
+  if (buffer.byteLength === 0) {
+    throw pirInvalidArgValue("buffer", buffer, "is empty and cannot be written");
+  }
+  pirValidateOffsetLengthRead(offset, length, buffer.byteLength);
+  pirValidateFd(fd);
+  pirRequireReadAccess(fd);
   const payload = { fd: fd | 0, length: length };
   if (typeof position === "number" && position >= 0) payload.position = Math.trunc(position);
+  else if (typeof position === "bigint" && position >= 0n) payload.position = Number(position);
   const bytes = Buffer.from(call("fs", "read", payload), "base64");
   for (let i = 0; i < bytes.length; i++) buffer[offset + i] = bytes[i];
   return bytes.length;
@@ -497,46 +1377,119 @@ function writeSync(fd, data, offsetOrPosition, lengthOrEncoding, position) {
   let bytes;
   let at;
   let encoding;
-  if (typeof data === "string") {
-    // fs.writeSync(fd, string[, position[, encoding]])
-    at = typeof offsetOrPosition === "number" ? Math.trunc(offsetOrPosition) : undefined;
-    encoding = "utf8";
-    if (typeof offsetOrPosition === "string") encoding = offsetOrPosition;
-    else if (typeof lengthOrEncoding === "string") encoding = lengthOrEncoding;
-  } else {
-    // fs.writeSync(fd, buffer[, offset[, length[, position]]])
+  if (pirIsArrayBufferView(data)) {
+    // fs.writeSync(fd, buffer[, offset[, length[, position]]]) and the
+    // fs.writeSync(fd, buffer, options) form.
+    let offset = offsetOrPosition;
+    let length = lengthOrEncoding;
+    if (offset !== null && typeof offset === "object") {
+      const options = offset;
+      offset = options.offset;
+      length = options.length;
+      position = options.position;
+    }
+    if (offset === undefined || offset === null) offset = 0;
+    else pirValidateInteger(offset, "offset", 0);
+    if (typeof length !== "number") length = data.byteLength - offset;
+    if (position === undefined || position === null) position = null;
+    else if (typeof position !== "number") position = null;
+    pirValidateOffsetLengthWrite(offset, length, data.byteLength);
+    pirValidateFd(fd);
+    pirRequireWriteAccess(fd);
     const source = data instanceof ArrayBuffer
       ? Buffer.from(new Uint8Array(data))
-      : (data instanceof Uint8Array ? Buffer.from(data) : Buffer.from(data));
-    const start = typeof offsetOrPosition === "number" ? Math.trunc(offsetOrPosition) : 0;
-    const size = typeof lengthOrEncoding === "number" ? Math.trunc(lengthOrEncoding) : source.length - start;
+      : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    const start = offset | 0;
+    const size = length | 0;
     bytes = source.subarray(start, start + size);
-    at = typeof position === "number" ? Math.trunc(position) : undefined;
+    at = typeof position === "number" && position >= 0 ? Math.trunc(position) : undefined;
+  } else {
+    // fs.writeSync(fd, string[, position[, encoding]]). Node's third argument
+    // is the position and the fourth is the encoding.
+    pirValidateStringOrView(data, "buffer");
+    at = typeof offsetOrPosition === "number" && offsetOrPosition >= 0
+      ? Math.trunc(offsetOrPosition)
+      : undefined;
+    encoding = typeof lengthOrEncoding === "string" ? lengthOrEncoding : "utf8";
+    // `validateEncoding` only rejects an odd-length hex payload; an unknown
+    // encoding falls back to UTF-8 at the binding, which is what Node does.
+    if (encoding === "hex" && data.length % 2 !== 0) {
+      throw pirInvalidArgValue("encoding", encoding,
+        "is invalid for data of length " + data.length);
+    }
+    if (!Buffer.isEncoding(encoding)) encoding = "utf8";
+    pirValidateFd(fd);
+    pirRequireWriteAccess(fd);
+    bytes = Buffer.from(data, encoding);
   }
-  // A string write rides the text channel (`dataText`) when its bytes are
-  // exactly its UTF-8 encoding; byte writes and every other string keep the
-  // base64 `data` channel, byte-for-byte as before.
   const payload = { fd: fd | 0 };
-  if (typeof data === "string") pirWriteData(payload, data, encoding);
-  else payload.data = bytes.toString("base64");
-  if (at !== undefined && at >= 0) payload.position = at;
+  if (bytes !== undefined) payload.data = bytes.toString("base64");
+  if (at !== undefined) payload.position = at;
   return call("fs", "write", payload);
 }
 
 function closeSync(fd) {
+  pirValidateFd(fd);
+  pirFdAccess.delete(fd);
+  // The three stdio descriptors are real in Node but not in the host fd
+  // table; a close is a successful no-op for the shim's synthetic view.
+  if (fd >= 0 && fd <= 2) return;
   call("fs", "close", { fd: fd | 0 });
 }
 
-function fstatSync(fd) {
-  return new Stats(call("fs", "fstat", { fd: fd | 0 }));
+/// The process' three stdio descriptors are not in the host fd table (it
+/// starts at 3), but Node's `fstat(0|1|2)` succeeds. Report a character
+/// device with the fields the Stats shape requires.
+function pirStdioStatRaw() {
+  return {
+    isFile: false,
+    isDirectory: false,
+    isSymbolicLink: false,
+    mode: 0o020000 | 0o666,
+    size: 0n,
+    dev: 0n,
+    ino: 0n,
+    nlink: 1n,
+    uid: 0n,
+    gid: 0n,
+    rdev: 0n,
+    blksize: 0n,
+    blocks: 0n,
+    atimeMs: 0,
+    mtimeMs: 0,
+    ctimeMs: 0,
+    birthtimeMs: 0,
+    atimeNs: 0n,
+    mtimeNs: 0n,
+    ctimeNs: 0n,
+    birthtimeNs: 0n,
+  };
+}
+
+function fstatSync(fd, options) {
+  pirValidateFd(fd);
+  const bigint = options !== null && typeof options === "object" && options.bigint === true;
+  if (fd >= 0 && fd <= 2) {
+    return bigint ? new BigIntStats(pirStdioStatRaw()) : new Stats(pirStdioStatRaw());
+  }
+  const raw = call("fs", "fstat", { fd: fd | 0 });
+  return bigint ? new BigIntStats(raw) : new Stats(raw);
 }
 
 function fsyncSync(fd) {
+  pirValidateFd(fd);
   call("fs", "fsync", { fd: fd | 0 });
 }
 
+function fdatasyncSync(fd) {
+  pirValidateFd(fd);
+  call("fs", "fdatasync", { fd: fd | 0 });
+}
+
 function fchmodSync(fd, mode) {
-  call("fs", "fchmod", { fd: fd | 0, mode: pirParseMode(mode, "mode") });
+  const parsedMode = pirParseModeStrict(mode, "mode", undefined, false);
+  pirValidateFd(fd);
+  call("fs", "fchmod", { fd: fd | 0, mode: parsedMode });
 }
 
 // ---- misc surface ---------------------------------------------------------
@@ -558,29 +1511,76 @@ function pirMkdtempPrefix(prefix) {
 }
 
 function chmodSync(path, mode) {
-  call("fs", "chmod", { path: pirPathArg(path, "path"), mode: pirParseMode(mode, "mode") });
+  call("fs", "chmod", {
+    path: pirPathArg(path, "path"),
+    mode: pirParseModeStrict(mode, "mode", undefined, false),
+  });
 }
 
 function cpSync(from, to, options) {
   const opts = options === undefined || options === null || typeof options !== "object" ? {} : options;
-  call("fs", "cp", { from: pirPathArg(from, "src"), to: pirPathArg(to, "dest"), recursive: !!opts.recursive });
+  const src = pirCheckPathBytes(pirPathArg(from, "src"), "src");
+  const dest = pirCheckPathBytes(pirPathArg(to, "dest"), "dest");
+  if (opts.recursive !== undefined) {
+    pirValidateBooleanProperty(opts.recursive, "options.recursive");
+  }
+  call("fs", "cp", { from: src, to: dest, recursive: !!opts.recursive });
 }
 
-function mkdtempSync(prefix) {
+function mkdtempSync(prefix, options) {
+  // Node's getOptions runs before the prefix is validated.
+  const opts = pirEncodingOptions(options);
   const target = pirMkdtempPrefix(prefix);
-  return String(call("fs", "mkdtemp", { prefix: target }));
+  const created = String(call("fs", "mkdtemp", { prefix: target }));
+  return pirEncodePathResult(created, opts.encoding);
 }
 
 function rmdirSync(path, options) {
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (options !== undefined && options !== null && typeof options === "object" &&
+      options.recursive !== undefined) {
+    pirValidateBooleanProperty(options.recursive, "options.recursive");
+  }
   const recursive = options === true || !!(options && typeof options === "object" && options.recursive);
-  call("fs", "rmdir", { path: pirPathArg(path, "path"), recursive: recursive });
+  if (recursive) pirWarnRmdirRecursive();
+  try {
+    call("fs", "rmdir", { path: target, recursive: recursive });
+  } catch (error) {
+    // libuv's Windows rmdir reports ENOENT for a file in both modes
+    // (RemoveDirectoryW yields ERROR_DIRECTORY); the host already remaps the
+    // non-recursive arm, and the recursive remove_dir_all surfaces ENOTDIR.
+    // Node's test only relies on the code.
+    if (recursive && globalThis.__pirPlatform === "win32" &&
+        error && error.code === "ENOTDIR") {
+      const mapped = pirCodedError(Error, "ENOENT",
+        "ENOENT: no such file or directory, rmdir '" + target + "'");
+      mapped.errno = -4058;
+      mapped.syscall = "rmdir";
+      mapped.path = target;
+      throw mapped;
+    }
+    throw error;
+  }
+}
+
+/// `validateOneOf(type, ['dir','file','junction',null,undefined])`.
+function pirValidateSymlinkType(type) {
+  if (type === undefined || type === null || type === "dir" || type === "file" ||
+      type === "junction") {
+    return type;
+  }
+  throw pirInvalidArgValue("type", type,
+    "must be one of: 'dir', 'file', 'junction', null, undefined");
 }
 
 function symlinkSync(target, path, type) {
+  pirValidateSymlinkType(type);
+  const linkTarget = pirCheckPathBytes(pirPathArg(target, "target"), "target");
+  const linkPath = pirCheckPathBytes(pirPathArg(path, "path"), "path");
   call("fs", "symlink", {
-    target: String(target),
-    path: pirPathArg(path, "path"),
-    kind: type === undefined || type === null ? "file" : String(type),
+    target: linkTarget,
+    path: linkPath,
+    kind: type === undefined || type === null ? "file" : type,
   });
 }
 
@@ -590,33 +1590,76 @@ function microtask(run) {
   globalThis.__pirMicrotask(run);
 }
 
+/// Run a node-style operation after the current turn. The AbortSignal tests
+/// abort from a `process.nextTick` scheduled right after the call; a timer
+/// keeps that abort observable before the (synchronous) shim work starts.
+function deferred(run) {
+  globalThis.setTimeout(run, 0);
+}
+
+function pirOptionsSignal(options) {
+  return options !== null && typeof options === "object" ? options.signal : undefined;
+}
+
 function readFile(path, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
-  microtask(() => {
+  pirValidateFunction(callback, "cb");
+  const opts = fileOptions(options);
+  pirValidateReadFileBufferOption(opts);
+  const signal = opts.signal;
+  if (typeof path === "number") pirValidateFd(path);
+  else pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  deferred(() => {
+    if (signal && signal.aborted === true) { callback(pirAbortError(signal)); return; }
     let value;
     try { value = readFileSync(path, options); } catch (error) { callback(error); return; }
+    if (signal && signal.aborted === true) { callback(pirAbortError(signal)); return; }
     callback(null, value);
   });
 }
 
 function writeFile(path, data, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
-  microtask(() => {
+  pirValidateFunction(callback, "cb");
+  const opts = fileOptions(options);
+  if (opts.flush !== undefined) pirValidateBooleanProperty(opts.flush, "options.flush");
+  // Node validates the data before it opens the path.
+  pirWriteBytesFor(data, opts.encoding, "data");
+  if (typeof path === "number") pirValidateFd(path);
+  else pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const signal = opts.signal;
+  deferred(() => {
+    if (signal && signal.aborted === true) { callback(pirAbortError(signal)); return; }
     try { writeFileSync(path, data, options); } catch (error) { callback(error); return; }
+    if (signal && signal.aborted === true) { callback(pirAbortError(signal)); return; }
     callback(null);
   });
 }
 
 function appendFile(path, data, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
-  microtask(() => {
+  pirValidateFunction(callback, "cb");
+  const opts = fileOptions(options);
+  pirWriteBytesFor(data, opts.encoding, "data");
+  if (typeof path === "number") pirValidateFd(path);
+  else pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const signal = opts.signal;
+  deferred(() => {
+    if (signal && signal.aborted === true) { callback(pirAbortError(signal)); return; }
     try { appendFileSync(path, data, options); } catch (error) { callback(error); return; }
+    if (signal && signal.aborted === true) { callback(pirAbortError(signal)); return; }
     callback(null);
   });
 }
 
 function readdir(path, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "cb");
+  const opts = pirReaddirOptions(options);
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (opts.recursive !== undefined && opts.recursive !== null) {
+    pirValidateBooleanProperty(opts.recursive, "options.recursive");
+  }
   microtask(() => {
     let value;
     try { value = readdirSync(path, options); } catch (error) { callback(error); return; }
@@ -624,24 +1667,36 @@ function readdir(path, options, callback) {
   });
 }
 
-function stat(path, callback) {
+function stat(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "callback");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     let value;
-    try { value = statSync(path); } catch (error) { callback(error); return; }
+    try { value = statSync(path, options); } catch (error) { callback(error); return; }
     callback(null, value);
   });
 }
 
-function lstat(path, callback) {
+function lstat(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "callback");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     let value;
-    try { value = lstatSync(path); } catch (error) { callback(error); return; }
+    try { value = lstatSync(path, options); } catch (error) { callback(error); return; }
     callback(null, value);
   });
 }
 
 function mkdir(path, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  if (options !== undefined && options !== null && typeof options === "object" &&
+      options.recursive !== undefined) {
+    pirValidateBooleanProperty(options.recursive, "options.recursive");
+  }
   microtask(() => {
     try { mkdirSync(path, options); } catch (error) { callback(error); return; }
     callback(null);
@@ -650,6 +1705,8 @@ function mkdir(path, options, callback) {
 
 function rm(path, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     try { rmSync(path, options); } catch (error) { callback(error); return; }
     callback(null);
@@ -657,6 +1714,8 @@ function rm(path, options, callback) {
 }
 
 function unlink(path, callback) {
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     try { unlinkSync(path); } catch (error) { callback(error); return; }
     callback(null);
@@ -664,23 +1723,31 @@ function unlink(path, callback) {
 }
 
 function rename(from, to, callback) {
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(from, "oldPath"), "oldPath");
+  pirCheckPathBytes(pirPathArg(to, "newPath"), "newPath");
   microtask(() => {
     try { renameSync(from, to); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
-function copyFile(from, to, callback) {
+function copyFile(from, to, mode, callback) {
+  if (typeof mode === "function") { callback = mode; mode = undefined; }
+  pirValidateFunction(callback, "cb");
+  const src = pirCheckPathBytes(pirPathArg(from, "src"), "src");
+  const dest = pirCheckPathBytes(pirPathArg(to, "dest"), "dest");
+  const parsedMode = pirCopyFileMode(mode);
   microtask(() => {
-    try { copyFileSync(from, to); } catch (error) { callback(error); return; }
+    try { copyFileSync(src, dest, parsedMode); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
 function chmod(path, mode, callback) {
-  // Node validates synchronously, before the operation is queued.
-  const target = pirPathArg(path, "path");
-  const parsedMode = pirParseMode(mode, "mode");
+  pirValidateFunction(callback, "cb");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const parsedMode = pirParseModeStrict(mode, "mode", 0o666, false);
   microtask(() => {
     try { chmodSync(target, parsedMode); } catch (error) { callback(error); return; }
     callback(null);
@@ -689,6 +1756,8 @@ function chmod(path, mode, callback) {
 
 function rmdir(path, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     try { rmdirSync(path, options); } catch (error) { callback(error); return; }
     callback(null);
@@ -698,60 +1767,311 @@ function rmdir(path, options, callback) {
 function mkdtemp(prefix, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
   pirCheckCallback(callback);
+  const opts = pirEncodingOptions(options);
   const target = pirMkdtempPrefix(prefix);
   microtask(() => {
     let value;
-    try { value = String(call("fs", "mkdtemp", { prefix: target })); } catch (error) { callback(error); return; }
+    try {
+      value = pirEncodePathResult(String(call("fs", "mkdtemp", { prefix: target })), opts.encoding);
+    } catch (error) { callback(error); return; }
     callback(null, value);
   });
 }
 
 function symlink(target, path, type, callback) {
   if (typeof type === "function") { callback = type; type = undefined; }
+  // Node validates the explicit type before the callback and the paths.
+  if (callback !== undefined) pirValidateSymlinkType(type);
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(target, "target"), "target");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     try { symlinkSync(target, path, type); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
-/// Promise-side handle for `fs.promises.open`: every method routes through
-/// the fd family, so read/write positions and sequential offsets behave
-/// exactly like the sync surface.
-class FileHandle {
-  constructor(fd) {
-    this.fd = fd;
+/// Promise-side handle for `fs.promises.open`. Node's FileHandle is an
+/// EventEmitter whose methods reject with `EBADF` ("file closed") after
+/// `close()`, and whose read/write directions follow the open flags.
+class FileHandle extends EventEmitter {
+  constructor(fd, flags) {
+    super();
+    this._fd = fd;
+    this._flags = flags;
+    this._closeReason = undefined;
+    // Node has `close` as an own bound function, not a prototype method.
+    this.close = () => this._close();
   }
-  async read(buffer, offset, length, position) {
-    return { bytesRead: readSync(this.fd, buffer, offset, length, position), buffer: buffer };
+
+  get fd() {
+    return this._fd;
   }
-  async write(data, position, encoding) {
-    if (typeof data === "string") {
-      const enc = encoding === undefined ? "utf8" : encoding;
-      return { bytesWritten: writeSync(this.fd, data, position, enc), buffer: Buffer.from(data, enc) };
+
+  getAsyncId() {
+    return 1;
+  }
+
+  _guard(name) {
+    if (this._fd === -1) {
+      const error = pirCodedError(Error, "EBADF", this._closeReason || "file closed");
+      error.syscall = name;
+      throw error;
     }
-    const view = data instanceof Uint8Array ? data : Buffer.from(data);
-    return { bytesWritten: writeSync(this.fd, view, 0, view.length, position), buffer: view };
   }
+
+  _close() {
+    if (this._fd === -1) return Promise.resolve();
+    const fd = this._fd;
+    this._fd = -1;
+    pirFdAccess.delete(fd);
+    try {
+      call("fs", "close", { fd: fd | 0 });
+    } catch (error) {
+      // Node treats a repeated/already-released close as success.
+    }
+    this.emit("close");
+    return Promise.resolve();
+  }
+
+  async read(bufferOrOptions, offset, length, position) {
+    this._guard("read");
+    let buffer = bufferOrOptions;
+    if (!pirIsArrayBufferView(buffer)) {
+      if (bufferOrOptions !== undefined && bufferOrOptions !== null &&
+          typeof bufferOrOptions !== "object") {
+        throw pirInvalidArgType("options", "an object", bufferOrOptions);
+      }
+      const options = bufferOrOptions || {};
+      buffer = options.buffer === undefined ? Buffer.alloc(16384) : options.buffer;
+      offset = options.offset;
+      length = options.length;
+      position = options.position;
+    } else if (offset !== null && typeof offset === "object") {
+      const options = offset;
+      offset = options.offset;
+      length = options.length;
+      position = options.position;
+    }
+    pirValidateBuffer(buffer, "buffer");
+    if (offset === undefined || offset === null) offset = 0;
+    else pirValidateInteger(offset, "offset", 0);
+    if (length === undefined || length === null) length = buffer.byteLength - offset;
+    else length = length | 0;
+    if (position === undefined || position === null) position = -1;
+    else position = pirValidatePosition(position, length);
+    if (length === 0) return { bytesRead: 0, buffer: buffer };
+    if (buffer.byteLength === 0) {
+      throw pirInvalidArgValue("buffer", buffer, "is empty and cannot be written");
+    }
+    pirValidateOffsetLengthRead(offset, length, buffer.byteLength);
+    const bytesRead = readSync(this._fd, buffer, offset, length, position);
+    return { bytesRead: bytesRead, buffer: buffer };
+  }
+
+  async readv(buffers, position) {
+    this._guard("readv");
+    pirValidateBufferArray(buffers);
+    if (typeof position !== "number") position = null;
+    else position = pirValidatePosition(position, 0);
+    let total = 0;
+    let at = typeof position === "number" && position >= 0 ? position : undefined;
+    for (const buffer of buffers) {
+      const count = readSync(this._fd, buffer, 0, buffer.byteLength, at);
+      total += count;
+      if (at !== undefined) at += count;
+      if (count < buffer.byteLength) break;
+    }
+    return { bytesRead: total, buffers: buffers };
+  }
+
+  async write(data, offsetOrOptions, length, position) {
+    this._guard("write");
+    if (data !== null && data !== undefined && data.byteLength === 0) {
+      return { bytesWritten: 0, buffer: data };
+    }
+    if (pirIsArrayBufferView(data)) {
+      let offset = offsetOrOptions;
+      if (offset !== null && typeof offset === "object") {
+        const options = offset;
+        offset = options.offset;
+        length = options.length;
+        position = options.position;
+      }
+      if (offset === undefined || offset === null) offset = 0;
+      else pirValidateInteger(offset, "offset", 0);
+      if (typeof length !== "number") length = data.byteLength - offset;
+      if (typeof position !== "number") position = null;
+      pirValidateOffsetLengthWrite(offset, length, data.byteLength);
+      const bytesWritten = writeSync(this._fd, data, offset, length,
+        typeof position === "number" ? position : undefined);
+      return { bytesWritten: bytesWritten, buffer: data };
+    }
+    // String form: `offset` is the position, `length` is the encoding.
+    pirValidateStringOrView(data, "buffer");
+    const encoding = typeof length === "string" ? length : "utf8";
+    if (encoding === "hex" && data.length % 2 !== 0) {
+      throw pirInvalidArgValue("encoding", encoding,
+        "is invalid for data of length " + data.length);
+    }
+    const at = typeof offsetOrOptions === "number" && offsetOrOptions >= 0
+      ? Math.trunc(offsetOrOptions)
+      : undefined;
+    const bytesWritten = writeSync(this._fd, data, at, encoding);
+    // Node echoes a Buffer of the written bytes even when the caller passed
+    // a string (the `buffer` field is always a Buffer).
+    return { bytesWritten: bytesWritten, buffer: Buffer.from(data, encoding) };
+  }
+
+  async writev(buffers, position) {
+    this._guard("writev");
+    pirValidateBufferArray(buffers);
+    if (typeof position !== "number") position = null;
+    let total = 0;
+    let at = typeof position === "number" && position >= 0 ? position : undefined;
+    for (const buffer of buffers) {
+      const count = writeSync(this._fd, buffer, 0, buffer.byteLength, at);
+      total += count;
+      if (at !== undefined) at += count;
+    }
+    return { bytesWritten: total, buffers: buffers };
+  }
+
   async readFile(options) {
-    const encoding = typeof options === "string" ? options : (options && options.encoding);
-    const total = fstatSync(this.fd).size;
-    const out = Buffer.alloc(total);
+    this._guard("readFile");
+    const opts = fileOptions(options);
+    const signal = opts.signal;
+    pirCheckAborted(signal);
+    // Node's FileHandle.readFile yields before the first chunk, so an abort
+    // scheduled from process.nextTick is observed.
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+    pirCheckAborted(signal);
+    const value = this._readAllBytes(opts.encoding);
+    pirCheckAborted(signal);
+    return value;
+  }
+
+  _readAllBytes(encoding) {
+    const total = fstatSync(this._fd).size;
+    const out = Buffer.alloc(total === 0 ? 8192 : total);
     let done = 0;
-    while (done < total) {
-      const n = readSync(this.fd, out, done, total - done, done);
+    // Read the whole file from offset 0 regardless of where earlier writes
+    // left the descriptor's position (Node's FileHandle.readFile is a
+    // whole-file read, not "read from current offset").
+    while (done < out.length) {
+      const n = readSync(this._fd, out, done, out.length - done, done);
       if (n <= 0) break;
       done += n;
     }
-    return encoding === undefined || encoding === null ? out.slice(0, done) : out.toString(encoding, 0, done);
+    const bytes = out.slice(0, done);
+    return encoding === undefined || encoding === null ? bytes : bytes.toString(encoding);
   }
+
   async writeFile(data, options) {
-    const encoding = typeof options === "string" ? options : (options && options.encoding);
-    if (typeof data === "string") writeSync(this.fd, data, undefined, encoding === undefined || encoding === null ? "utf8" : encoding);
-    else writeSync(this.fd, data);
+    this._guard("writeFile");
+    const opts = fileOptions(options);
+    pirCheckAborted(opts.signal);
+    await this._writeAll(data, opts);
   }
-  async stat() { return fstatSync(this.fd); }
-  async sync() { fsyncSync(this.fd); }
-  async close() { closeSync(this.fd); }
+
+  async appendFile(data, options) {
+    this._guard("appendFile");
+    const opts = fileOptions(options);
+    pirCheckAborted(opts.signal);
+    await this._writeAll(data, opts);
+  }
+
+  async _writeAll(data, opts) {
+    const signal = opts.signal;
+    // Node yields to the event loop before the first write, so an abort
+    // scheduled from `process.nextTick`/a timer is observable.
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+    pirCheckAborted(signal);
+    const writeChunk = (chunk) => {
+      pirCheckAborted(signal);
+      const bytes = pirWriteBytesFor(chunk, opts.encoding, "data");
+      let done = 0;
+      while (done < bytes.length) {
+        done += writeSync(this._fd, bytes, done, bytes.length - done);
+      }
+    };
+    if (data !== null && typeof data === "object" &&
+        typeof data[Symbol.asyncIterator] === "function") {
+      for await (const chunk of data) writeChunk(chunk);
+      return;
+    }
+    if (data !== null && typeof data === "object" &&
+        typeof data[Symbol.iterator] === "function" && !pirIsArrayBufferView(data)) {
+      for (const chunk of data) writeChunk(chunk);
+      return;
+    }
+    writeChunk(data);
+  }
+
+  async chmod(mode) {
+    this._guard("chmod");
+    fchmodSync(this._fd, mode);
+  }
+
+  async chown(uid, gid) {
+    this._guard("chown");
+    pirValidateInteger(uid, "uid", 0, 4294967295);
+    pirValidateInteger(gid, "gid", 0, 4294967295);
+    // libuv's fchown is a successful no-op on Windows.
+    if (globalThis.__pirPlatform !== "win32") {
+      throw pirFsUnsupported("fs.promises.FileHandle.chown");
+    }
+  }
+
+  async utimes(atime, mtime) {
+    this._guard("utimes");
+    call("fs", "futimes", { fd: this._fd | 0, atimeMs: utimesMs(atime), mtimeMs: utimesMs(mtime) });
+  }
+
+  async truncate(len) {
+    this._guard("truncate");
+    ftruncateSync(this._fd, len);
+  }
+
+  async sync() {
+    this._guard("sync");
+    fsyncSync(this._fd);
+  }
+
+  async datasync() {
+    this._guard("datasync");
+    fdatasyncSync(this._fd);
+  }
+
+  async stat(options) {
+    this._guard("fstat");
+    return fstatSync(this._fd, options);
+  }
+
+  createReadStream(options) {
+    return new ReadStream(undefined, Object.assign({}, options, { fd: this }));
+  }
+
+  createWriteStream(options) {
+    return new WriteStream(undefined, Object.assign({}, options, { fd: this }));
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.close();
+  }
+}
+
+/// `validateBufferArray`: every readv/writev slot must be an ArrayBufferView.
+function pirValidateBufferArray(buffers) {
+  if (!Array.isArray(buffers)) {
+    throw pirInvalidArgType("buffers", "of type ArrayBufferView[]", buffers);
+  }
+  for (let i = 0; i < buffers.length; i++) {
+    if (!pirIsArrayBufferView(buffers[i])) {
+      throw pirInvalidArgType("buffers", "of type ArrayBufferView[]", buffers[i]);
+    }
+  }
+  return buffers;
 }
 
 /// Directory handle behind `fs.opendir`, `fs.opendirSync` and
@@ -759,10 +2079,13 @@ class FileHandle {
 /// the callback/promise surface. The entries are listed once up front (the
 /// host readdir is synchronous), then walked one by one.
 class Dir {
-  constructor(path, bufferSize) {
+  constructor(path, bufferSize, encoding) {
+    // Node's Dir takes a handle; constructing without one is ERR_MISSING_ARGS.
+    if (path === undefined) throw pirMissingArgs("path");
     this._path = path;
     this._bufferSize = bufferSize === undefined ? 32 : bufferSize;
-    this._entries = readdirSync(path, { withFileTypes: true });
+    this._encoding = encoding === undefined || encoding === null || encoding === "" ? "utf8" : encoding;
+    this._entries = readdirSync(path, { withFileTypes: true, encoding: this._encoding });
     this._index = 0;
     this._closed = false;
     // In-flight async reads; Node refuses synchronous work while any exist.
@@ -864,6 +2187,31 @@ class Dir {
       [Symbol.asyncIterator]() { return this; },
     };
   }
+  /// Node's `dir.entries()` async generator closes the handle when drained.
+  async *entries() {
+    try {
+      for (;;) {
+        const entry = await this.read();
+        if (entry === null) return;
+        yield entry;
+      }
+    } finally {
+      if (!this._closed) {
+        try { await this.close(); } catch { /* already closed */ }
+      }
+    }
+  }
+  /// Explicit resource management (`await using`): close, idempotently.
+  async [Symbol.asyncDispose]() {
+    if (this._closed) return;
+    await this.close();
+  }
+  /// Sync `using` form; a repeated call is a no-op (Node's closeSync would
+  /// throw ERR_DIR_CLOSED, but [Symbol.dispose] swallows the second call).
+  [Symbol.dispose]() {
+    if (this._closed) return;
+    this.closeSync();
+  }
 }
 
 // `dir.path` is a prototype accessor in Node: reading it off the prototype
@@ -886,78 +2234,148 @@ Object.defineProperty(Dir.prototype, "path", {
   configurable: true,
 });
 
-/// Node's `options.bufferSize` validation for `opendir`: the host readdir has
-/// no buffer, but the argument contract (and its error codes) is observable.
+/// Node's `opendir` options (`getOptions` + uint32 bufferSize). `encoding` is
+/// observable through the Dirent names and the validation errors.
+function pirOpendirOptions(options) {
+  if (options === undefined || options === null || typeof options === "function") {
+    return { bufferSize: undefined, encoding: "utf8" };
+  }
+  if (typeof options === "string") {
+    if (options !== "buffer") pirValidateEncodingValue(options);
+    return { bufferSize: undefined, encoding: options === "" ? "utf8" : options };
+  }
+  if (typeof options !== "object") {
+    throw pirInvalidArgType("options", "one of type string or object", options);
+  }
+  let encoding = options.encoding;
+  if (encoding === undefined || encoding === null || encoding === "") encoding = "utf8";
+  if (encoding !== "buffer") pirValidateEncodingValue(encoding);
+  if (options.recursive !== undefined) {
+    pirValidateBooleanProperty(options.recursive, "options.recursive");
+  }
+  let bufferSize = options.bufferSize;
+  if (bufferSize !== undefined) {
+    bufferSize = pirValidateIntegerProperty(bufferSize, "options.bufferSize", 1, 4294967295);
+  }
+  return { bufferSize: bufferSize, encoding: encoding };
+}
+
+/// Backwards-compatible helper for the existing call sites.
 function pirOpendirBufferSize(options) {
-  if (options === undefined || options === null || typeof options !== "object") return undefined;
-  const size = options.bufferSize;
-  if (size === undefined) return undefined;
-  return pirValidateIntegerProperty(size, "options.bufferSize", 1, 4294967295);
+  return pirOpendirOptions(options).bufferSize;
 }
 
 function access(path, mode, callback) {
   if (typeof mode === "function") { callback = mode; mode = undefined; }
+  pirValidateFunction(callback, "cb");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const parsedMode = pirAccessMode(mode);
   microtask(() => {
-    try { accessSync(path, mode); } catch (error) { callback(error); return; }
+    try { accessSync(target, parsedMode); } catch (error) { callback(error); return; }
     callback(null);
   });
+}
+
+/// Node's `access` mode contract: int32 in the F_OK..X_OK bit range.
+function pirAccessMode(mode) {
+  if (mode === undefined || mode === null) return 0;
+  if (typeof mode !== "number") {
+    throw pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE", "mode must be int32 or null/undefined");
+  }
+  if (!Number.isInteger(mode) || mode < 0 || mode > 7) {
+    throw pirCodedError(RangeError, "ERR_OUT_OF_RANGE", "mode is out of range: >= 0 && <= 7");
+  }
+  return mode;
 }
 
 // ---- truncate / utimes / fd extras ----------------------------------------
 
 function truncateSync(path, len) {
-  call("fs", "truncate", {
-    path: pirPathArg(path, "path"),
-    len: len === undefined || len === null ? 0 : Math.trunc(len),
-  });
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  let length = len === undefined ? 0 : len;
+  pirValidateInteger(length, "len");
+  length = Math.max(0, length);
+  call("fs", "truncate", { path: target, len: length });
 }
 
 function truncate(path, len, callback) {
   if (typeof len === "function") { callback = len; len = 0; }
+  else if (len === undefined) len = 0;
+  // Node validates the length before the callback and before opening.
+  pirValidateInteger(len, "len");
+  const length = Math.max(0, len);
+  pirValidateFunction(callback, "cb");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
-    try { truncateSync(path, len); } catch (error) { callback(error); return; }
+    try { truncateSync(target, length); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
-// Node accepts seconds (number) or a Date for the time arguments.
+// Node accepts seconds (number or numeric string), Dates and negative numbers
+// ("now") for the time arguments.
 function utimesMs(value) {
-  if (value instanceof Date) return value.getTime();
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds)) {
-    throw new TypeError("The time argument must be a number or an instance of Date");
-  }
-  return seconds * 1000;
+  return _toUnixTimestamp(value) * 1000;
 }
 
 function utimesSync(path, atime, mtime) {
-  call("fs", "utimes", { path: pirPathArg(path, "path"), atimeMs: utimesMs(atime), mtimeMs: utimesMs(mtime) });
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  call("fs", "utimes", { path: target, atimeMs: utimesMs(atime), mtimeMs: utimesMs(mtime) });
 }
 
 function utimes(path, atime, mtime, callback) {
+  pirValidateFunction(callback, "cb");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const at = utimesMs(atime);
+  const mt = utimesMs(mtime);
   microtask(() => {
-    try { utimesSync(path, atime, mtime); } catch (error) { callback(error); return; }
+    try { call("fs", "utimes", { path: target, atimeMs: at, mtimeMs: mt }); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function futimesSync(fd, atime, mtime) {
+  const at = utimesMs(atime);
+  const mt = utimesMs(mtime);
+  pirValidateFd(fd);
+  call("fs", "futimes", { fd: fd | 0, atimeMs: at, mtimeMs: mt });
+}
+
+function futimes(fd, atime, mtime, callback) {
+  const at = utimesMs(atime);
+  const mt = utimesMs(mtime);
+  pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
+  microtask(() => {
+    try { call("fs", "futimes", { fd: fd | 0, atimeMs: at, mtimeMs: mt }); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
 function ftruncateSync(fd, len) {
-  call("fs", "ftruncate", { fd: fd | 0, len: len === undefined || len === null ? 0 : Math.trunc(len) });
+  pirValidateFd(fd);
+  let length = len === undefined ? 0 : len;
+  pirValidateInteger(length, "len");
+  length = Math.max(0, length);
+  call("fs", "ftruncate", { fd: fd | 0, len: length });
 }
 
 function ftruncate(fd, len, callback) {
   if (typeof len === "function") { callback = len; len = 0; }
+  // Node validates `len` before the callback and lets the binding validate
+  // the descriptor afterwards.
+  pirValidateInteger(len === undefined ? 0 : len, "len");
+  pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
   microtask(() => {
     try { ftruncateSync(fd, len); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
-function fdatasyncSync(fd) {
-  call("fs", "fdatasync", { fd: fd | 0 });
-}
-
 function fdatasync(fd, callback) {
+  pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
   microtask(() => {
     try { fdatasyncSync(fd); } catch (error) { callback(error); return; }
     callback(null);
@@ -966,27 +2384,38 @@ function fdatasync(fd, callback) {
 
 // `fs.exists` never surfaces an error: the callback gets one boolean.
 function exists(path, callback) {
+  pirValidateFunction(callback, "cb");
   microtask(() => callback(existsSync(path)));
 }
 
 // ---- callback wrappers for the remaining sync surface ----------------------
 
 function close(fd, callback) {
+  // Node's close has a default callback, so the fd error wins when the caller
+  // omits it (fs.close('') throws about "fd", not "cb").
+  if (callback === undefined) callback = function () {};
+  else pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
   microtask(() => {
     try { closeSync(fd); } catch (error) { callback(error); return; }
     callback(null);
   });
 }
 
-function fstat(fd, callback) {
+function fstat(fd, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "callback");
+  pirValidateFd(fd);
   microtask(() => {
     let value;
-    try { value = fstatSync(fd); } catch (error) { callback(error); return; }
+    try { value = fstatSync(fd, options); } catch (error) { callback(error); return; }
     callback(null, value);
   });
 }
 
 function fsync(fd, callback) {
+  pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
   microtask(() => {
     try { fsyncSync(fd); } catch (error) { callback(error); return; }
     callback(null);
@@ -994,7 +2423,10 @@ function fsync(fd, callback) {
 }
 
 function fchmod(fd, mode, callback) {
-  const parsedMode = pirParseMode(mode, "mode");
+  // Node parses the mode before it validates the callback.
+  const parsedMode = pirParseModeStrict(mode, "mode", undefined, false);
+  pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
   microtask(() => {
     try { fchmodSync(fd, parsedMode); } catch (error) { callback(error); return; }
     callback(null);
@@ -1002,18 +2434,77 @@ function fchmod(fd, mode, callback) {
 }
 
 function open(path, flags, mode, callback) {
-  if (typeof mode === "function") { callback = mode; mode = undefined; }
+  if (typeof flags === "function") { callback = flags; flags = undefined; mode = undefined; }
+  else if (typeof mode === "function") { callback = mode; mode = undefined; }
+  pirValidateFunction(callback, "cb");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const parsedFlags = pirOpenFlags(flags === undefined ? "r" : flags);
+  const parsedMode = pirParseModeStrict(mode, "mode", 0o666, false);
   microtask(() => {
     let value;
-    try { value = openSync(path, flags, mode); } catch (error) { callback(error); return; }
+    try {
+      value = openSync(target, parsedFlags, parsedMode);
+    } catch (error) { callback(error); return; }
     callback(null, value);
   });
 }
 
-function read(fd, buffer, offset, length, position, callback) {
-  if (typeof offset === "function") { callback = offset; offset = undefined; length = undefined; position = undefined; }
-  else if (typeof length === "function") { callback = length; length = undefined; position = undefined; }
-  else if (typeof position === "function") { callback = position; position = undefined; }
+function read(fd, buffer, offsetOrOptions, length, position, callback) {
+  // Node's overloads: read(fd, cb), read(fd, bufferOrOptions, cb),
+  // read(fd, buffer, options, cb) and the full positional form. Validation is
+  // synchronous (Node validates before queuing the binding read).
+  pirValidateFd(fd);
+  let offset;
+  if (arguments.length <= 4) {
+    let params = null;
+    if (arguments.length === 4) {
+      // fs.read(fd, buffer, options, callback)
+      pirValidateOptionsValue(offsetOrOptions, "options");
+      callback = length;
+      params = offsetOrOptions;
+    } else if (arguments.length === 3) {
+      // fs.read(fd, bufferOrOptions, callback)
+      if (!pirIsArrayBufferView(buffer)) {
+        params = buffer;
+        buffer = params !== null && params !== undefined && params.buffer !== undefined
+          ? params.buffer
+          : Buffer.alloc(16384);
+      }
+      callback = offsetOrOptions;
+    } else {
+      // fs.read(fd, callback)
+      callback = buffer;
+      buffer = Buffer.alloc(16384);
+    }
+    pirValidateOptionsValue(params, "options");
+    const opts = params || {};
+    offset = opts.offset;
+    length = opts.length;
+    position = opts.position;
+    if (offset === undefined) offset = 0;
+    if (length === undefined) {
+      // A null buffer is reported by validateBuffer below, exactly like Node's
+      // `buffer?.byteLength` destructuring default.
+      length = (buffer === null || buffer === undefined ? undefined : buffer.byteLength) - offset;
+    }
+  } else {
+    offset = offsetOrOptions;
+  }
+  pirValidateBuffer(buffer, "buffer");
+  pirValidateFunction(callback, "cb");
+  if (offset === undefined || offset === null) offset = 0;
+  else pirValidateInteger(offset, "offset", 0);
+  length |= 0;
+  if (position === undefined || position === null) position = -1;
+  else position = pirValidatePosition(position, length);
+  if (length === 0) {
+    microtask(() => callback(null, 0, buffer));
+    return;
+  }
+  if (buffer.byteLength === 0) {
+    throw pirInvalidArgValue("buffer", buffer, "is empty and cannot be written");
+  }
+  pirValidateOffsetLengthRead(offset, length, buffer.byteLength);
   microtask(() => {
     let count;
     try { count = readSync(fd, buffer, offset, length, position); } catch (error) { callback(error); return; }
@@ -1022,42 +2513,82 @@ function read(fd, buffer, offset, length, position, callback) {
 }
 
 function write(fd, data, offsetOrPosition, lengthOrEncoding, position, callback) {
-  // Node shapes: write(fd, buffer[, off[, len[, pos]]], cb) and
-  // write(fd, string[, pos[, enc]], cb) — the tail function is the callback.
+  // Node's write(fd, buffer[, off[, len[, pos]]], cb) and
+  // write(fd, string[, pos[, enc]], cb) shapes, plus `options` objects.
   const args = Array.prototype.slice.call(arguments);
   const cb = typeof args[args.length - 1] === "function" ? args.pop() : undefined;
-  const payload = args.slice(1);
+  // The popped callback leaves the positional arguments in `args` (the named
+  // parameters are only a convenience and may still point at the callback).
+  const arg = (index) => (index < args.length ? args[index] : undefined);
+  pirValidateFd(fd);
+  if (pirIsArrayBufferView(data)) {
+    let offset = arg(2);
+    let length = arg(3);
+    let at = arg(4);
+    if (typeof offset === "function") offset = undefined;
+    if (offset !== null && typeof offset === "object") {
+      const options = offset || {};
+      offset = options.offset;
+      length = options.length;
+      at = options.position;
+    } else if (offset !== undefined && offset !== null && typeof offset !== "number") {
+      throw pirInvalidArgType("options", "an object", offset);
+    }
+    // Node validates the offset/length window synchronously, before queuing
+    // the write (the official test asserts the throw).
+    if (offset === undefined || offset === null) offset = 0;
+    else pirValidateInteger(offset, "offset", 0);
+    if (typeof length !== "number") length = data.byteLength - offset;
+    if (typeof at !== "number") at = null;
+    pirValidateOffsetLengthWrite(offset, length, data.byteLength);
+    pirValidateFunction(cb, "cb");
+    microtask(() => {
+      let count;
+      try { count = writeSync(fd, data, offset, length, at); } catch (error) { cb(error); return; }
+      cb(null, count, data);
+    });
+    return;
+  }
+  pirValidateStringOrView(data, "buffer");
+  pirValidateFunction(cb, "cb");
+  // Node string form: the position is the third argument and the encoding the
+  // fourth (a third function is the callback).
+  let at = arg(2);
+  let encoding = arg(3);
+  if (typeof at === "function") at = undefined;
+  if (typeof encoding !== "string") encoding = "utf8";
   microtask(() => {
     let count;
-    try {
-      count = writeSync.apply(null, [fd].concat(payload));
-    } catch (error) {
-      if (cb) { cb(error); return; }
-      throw error;
-    }
-    if (cb) cb(null, count, typeof data === "string" ? undefined : data);
+    try { count = writeSync(fd, data, at, encoding); } catch (error) { cb(error); return; }
+    cb(null, count, data);
   });
 }
 
 // readv/writev over the sync core (descriptor-forwarded vectored IO; no
 // batching across the host boundary).
 function readvSync(fd, buffers, position) {
+  pirValidateBufferArray(buffers);
+  pirValidateFd(fd);
+  if (typeof position !== "number") position = null;
   let total = 0;
-  let at = typeof position === "number" ? position : undefined;
+  let at = typeof position === "number" && position >= 0 ? position : undefined;
   for (const buffer of buffers) {
-    const count = readSync(fd, buffer, 0, buffer.length, at);
+    const count = readSync(fd, buffer, 0, buffer.byteLength, at);
     total += count;
     if (at !== undefined) at += count;
-    if (count < buffer.length) break;
+    if (count < buffer.byteLength) break;
   }
   return total;
 }
 
 function writevSync(fd, buffers, position) {
+  pirValidateBufferArray(buffers);
+  pirValidateFd(fd);
+  if (typeof position !== "number") position = null;
   let total = 0;
-  let at = typeof position === "number" ? position : undefined;
+  let at = typeof position === "number" && position >= 0 ? position : undefined;
   for (const buffer of buffers) {
-    const count = writeSync(fd, buffer, 0, buffer.length, at);
+    const count = writeSync(fd, buffer, 0, buffer.byteLength, at);
     total += count;
     if (at !== undefined) at += count;
   }
@@ -1066,6 +2597,9 @@ function writevSync(fd, buffers, position) {
 
 function readv(fd, buffers, position, callback) {
   if (typeof position === "function") { callback = position; position = undefined; }
+  pirValidateFunction(callback, "cb");
+  pirValidateBufferArray(buffers);
+  pirValidateFd(fd);
   microtask(() => {
     let count;
     try { count = readvSync(fd, buffers, position); } catch (error) { callback(error); return; }
@@ -1075,6 +2609,9 @@ function readv(fd, buffers, position, callback) {
 
 function writev(fd, buffers, position, callback) {
   if (typeof position === "function") { callback = position; position = undefined; }
+  pirValidateFunction(callback, "cb");
+  pirValidateBufferArray(buffers);
+  pirValidateFd(fd);
   microtask(() => {
     let count;
     try { count = writevSync(fd, buffers, position); } catch (error) { callback(error); return; }
@@ -1086,21 +2623,29 @@ function writev(fd, buffers, position, callback) {
 
 function opendirSync(path, options) {
   const target = pirPathArg(path, "path");
-  const bufferSize = pirOpendirBufferSize(options);
-  return new Dir(target, bufferSize);
+  const opts = pirOpendirOptions(options);
+  return new Dir(target, opts.bufferSize, opts.encoding);
 }
 
 // ---- legacy timestamp helper ----------------------------------------------
 
-// Node's legacy coercion: Date -> integer seconds, numeric string -> number,
-// number -> number, everything else throws (Node produces NaN).
+// Node's `toUnixTimestamp`. A numeric string is coerced (loose comparison, so
+// '1.0' works), a negative number means "now", and Dates keep fractional
+// seconds.
 function _toUnixTimestamp(time) {
-  if (typeof time === "object" && time !== null && typeof time.getTime === "function") {
-    return Math.floor(time.getTime() / 1000);
+  if (typeof time === "string") {
+    const asNumber = Number(time);
+    // eslint-disable-next-line eqeqeq
+    if (asNumber == time) return asNumber;
   }
-  if (typeof time === "string" && String(Number(time)) === time && time !== "") return Number(time);
-  if (typeof time === "number") return time;
-  throw new TypeError("Cannot parse time: " + time);
+  if (typeof time === "number" && Number.isFinite(time)) {
+    if (time < 0) return Date.now() / 1000;
+    return time;
+  }
+  if (time !== null && typeof time === "object" && typeof time.getTime === "function") {
+    return time.getTime() / 1000;
+  }
+  throw pirInvalidArgType("time", "an instance of Date or a time in seconds", time);
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +2681,51 @@ function pirFsWatchCall(op, payload) {
   return response.value;
 }
 
+/// Node's watch `getOptions` plus the v24 `ignore` option.
+function pirValidateIgnoreOption(ignore) {
+  if (typeof ignore === "string") {
+    if (ignore === "") throw pirInvalidArgValue("options.ignore", ignore, "must not be empty");
+    return;
+  }
+  if (Array.isArray(ignore)) {
+    for (const entry of ignore) {
+      if (typeof entry !== "string") {
+        throw pirInvalidArgType("options.ignore", "of type string", entry);
+      }
+      if (entry === "") throw pirInvalidArgValue("options.ignore", entry, "must not be empty");
+    }
+    return;
+  }
+  throw pirInvalidArgType("options.ignore", "of type string or an instance of Array", ignore);
+}
+
+function pirWatchOptions(options) {
+  if (options === undefined || options === null || typeof options === "function") {
+    return { encoding: "utf8", recursive: false, persistent: true, signal: undefined, ignore: undefined };
+  }
+  let opts;
+  if (typeof options === "string") opts = { encoding: options };
+  else if (typeof options === "object") opts = options;
+  else throw pirInvalidArgType("options", "one of type string or object", options);
+  let encoding = opts.encoding;
+  if (encoding === undefined || encoding === null || encoding === "") encoding = "utf8";
+  if (encoding !== "buffer") pirValidateEncodingValue(encoding);
+  if (opts.persistent !== undefined) pirValidateBooleanProperty(opts.persistent, "options.persistent");
+  if (opts.recursive !== undefined) pirValidateBooleanProperty(opts.recursive, "options.recursive");
+  if (opts.throwIfNoEntry !== undefined) {
+    pirValidateBooleanProperty(opts.throwIfNoEntry, "options.throwIfNoEntry");
+  }
+  if (opts.ignore !== undefined) pirValidateIgnoreOption(opts.ignore);
+  pirValidateSignal(opts.signal, "options.signal");
+  return {
+    encoding: encoding,
+    recursive: !!opts.recursive,
+    persistent: opts.persistent !== false,
+    signal: opts.signal,
+    ignore: opts.ignore,
+  };
+}
+
 class FSWatcher extends EventEmitter {
   constructor(filename, options, listener) {
     if (typeof options === "function") {
@@ -1143,17 +2733,37 @@ class FSWatcher extends EventEmitter {
       options = undefined;
     }
     super();
-    this._filename = pirResolveWatchPath(filename);
-    this._options = options || {};
+    const opts = pirWatchOptions(options);
+    const target = pirCheckPathBytes(pirPathArg(filename, "filename"), "filename");
+    this._filename = pirResolveWatchPath(target);
+    this._encoding = opts.encoding;
+    this._options = opts;
     this.closed = false;
     this._id = 0;
     this._timer = undefined;
+    // `persistent: false` means the watcher must not keep the event loop
+    // alive. This runtime's timers have no unref(), and arming the polling
+    // interval would pin the loop forever (test-fs-watch-close-when-destroyed
+    // exits after its own 100 ms timer); so a non-persistent watcher only
+    // polls after an explicit ref().
+    this._persistent = opts.persistent;
+    this._signal = opts.signal;
     if (typeof listener === "function") this.on("change", listener);
+    if (this._signal !== undefined) {
+      if (this._signal.aborted === true) {
+        const self = this;
+        globalThis.setTimeout(function () { self.close(); }, 0);
+      } else {
+        const self = this;
+        this._onAbort = function () { self.close(); };
+        this._signal.addEventListener("abort", this._onAbort);
+      }
+    }
     let value;
     try {
       value = pirFsWatchCall("watchStart", {
         path: this._filename,
-        recursive: Boolean(this._options.recursive),
+        recursive: Boolean(opts.recursive),
       });
     } catch (error) {
       // Host start failure surfaces async like Node's watcher error path.
@@ -1164,6 +2774,11 @@ class FSWatcher extends EventEmitter {
       return;
     }
     this._id = value.id;
+    this._startTimer();
+  }
+  _startTimer() {
+    if (this.closed || this._id === 0 || this._timer !== undefined) return;
+    if (!this._persistent) return;
     const self = this;
     this._timer = globalThis.setInterval(function () {
       self._pirPump();
@@ -1181,11 +2796,26 @@ class FSWatcher extends EventEmitter {
     }
     const events = value.events || [];
     for (const event of events) {
-      this.emit("change", event.type, event.filename === undefined ? null : event.filename);
+      // A listener that closes the watcher stops the rest of this batch, like
+      // Node (test-fs-watch-encoding would otherwise run `done` twice).
+      if (this.closed) break;
+      let name = event.filename === undefined ? null : event.filename;
+      if (name !== null && this._encoding !== "utf8") {
+        const bytes = Buffer.from(name, "utf8");
+        name = this._encoding === "buffer" ? bytes : bytes.toString(this._encoding);
+      }
+      this.emit("change", event.type, name);
     }
   }
-  ref() { return this; }
-  unref() { return this; }
+  ref() { this._persistent = true; this._startTimer(); return this; }
+  unref() {
+    this._persistent = false;
+    if (this._timer !== undefined) {
+      globalThis.clearInterval(this._timer);
+      this._timer = undefined;
+    }
+    return this;
+  }
   close() {
     if (this.closed) return this;
     this.closed = true;
@@ -1193,14 +2823,58 @@ class FSWatcher extends EventEmitter {
       globalThis.clearInterval(this._timer);
       this._timer = undefined;
     }
+    if (this._signal !== undefined && this._onAbort !== undefined) {
+      try { this._signal.removeEventListener("abort", this._onAbort); } catch { /* noop */ }
+      this._onAbort = undefined;
+    }
     if (this._id !== 0) {
       try {
         pirFsWatchCall("watchStop", { id: this._id });
       } catch (error) {}
       this._id = 0;
     }
+    this.emit("close");
     return this;
   }
+}
+
+/// libuv reports a missing watch target as an all-zero stat. Number and BigInt
+/// shapes differ in field type, so both variants are built from the same raw.
+function pirZeroStatRaw() {
+  return {
+    isFile: false,
+    isDirectory: false,
+    isSymbolicLink: false,
+    mode: 0n,
+    size: 0n,
+    dev: 0n,
+    ino: 0n,
+    nlink: 0n,
+    uid: 0n,
+    gid: 0n,
+    rdev: 0n,
+    blksize: 0n,
+    blocks: 0n,
+    atimeMs: 0,
+    mtimeMs: 0,
+    ctimeMs: 0,
+    birthtimeMs: 0,
+    atimeNs: 0n,
+    mtimeNs: 0n,
+    ctimeNs: 0n,
+    birthtimeNs: 0n,
+  };
+}
+
+function pirZeroStats(bigint) {
+  const raw = pirZeroStatRaw();
+  return bigint ? new BigIntStats(raw) : new Stats(raw);
+}
+
+/// The fields libuv's fs_poll compares before reporting a change.
+function pirStatSignature(stats) {
+  return String(stats.mode) + ":" + String(stats.size) + ":" +
+    String(stats.mtimeMs) + ":" + String(stats.ctimeMs) + ":" + String(stats.ino);
 }
 
 /// polling StatWatcher: re-stats on the Node default cadence (5007 ms) so a
@@ -1211,55 +2885,60 @@ class StatWatcher extends EventEmitter {
     super();
     this._filename = String(filename);
     this._options = options || {};
-    this._interval = Number(this._options.interval) > 0 ? Math.trunc(this._options.interval) : 5007;
+    this._bigint = this._options.bigint === true;
+    const interval = Number(this._options.interval);
+    this._interval = Number.isFinite(interval) && interval >= 0
+      ? Math.max(1, Math.trunc(interval))
+      : 5007;
     this._timer = undefined;
-    this._listener = typeof listener === "function" ? listener : undefined;
-    this._last = null;
     this._stopped = false;
-    if (this._listener) this.on("change", this._listener);
+    this._first = true;
+    if (typeof listener === "function") this.on("change", listener);
+    this._last = pirZeroStats(this._bigint);
     this.start();
   }
   start() {
     if (this._stopped || this._timer !== undefined) return this;
-    try {
-      this._last = statSync(this._filename);
-    } catch {
-      this._last = null;
-    }
     this._timer = globalThis.setInterval(() => this._poll(), this._interval);
     return this;
   }
   stop() {
-    if (this._timer !== undefined) {
-      globalThis.clearInterval(this._timer);
-      this._timer = undefined;
-    }
+    if (this._timer === undefined) return this;
+    globalThis.clearInterval(this._timer);
+    this._timer = undefined;
     this._stopped = true;
+    // Node's StatWatcher emits 'stop' asynchronously, after the handle stops.
+    const emitStop = () => this.emit("stop");
+    if (typeof globalThis.setImmediate === "function") globalThis.setImmediate(emitStop);
+    else globalThis.setTimeout(emitStop, 0);
     return this;
   }
   _poll() {
     if (this._stopped) return;
     let current;
     try {
-      current = statSync(this._filename);
+      current = statSync(this._filename, { bigint: this._bigint });
     } catch {
-      current = null;
+      current = pirZeroStats(this._bigint);
     }
-    if (current !== null && this._last !== null &&
-        (current.mtimeMs !== this._last.mtimeMs || current.size !== this._last.size)) {
+    if (this._first || pirStatSignature(current) !== pirStatSignature(this._last)) {
       const previous = this._last;
       this._last = current;
+      this._first = false;
       this.emit("change", current, previous);
       return;
     }
     this._last = current;
   }
-  ref() { return this.start(); }
+  ref() {
+    if (this._stopped || this._timer !== undefined) return this;
+    this._timer = globalThis.setInterval(() => this._poll(), this._interval);
+    return this;
+  }
   unref() {
     if (this._timer !== undefined) {
       globalThis.clearInterval(this._timer);
       this._timer = undefined;
-      this._stopped = false;
     }
     return this;
   }
@@ -1287,20 +2966,28 @@ function watch(filename, options, listener) {
 }
 
 function watchFile(filename, options, listener) {
-  if (typeof options === "function") { listener = options; options = undefined; }
-  const key = String(filename);
+  // Node resolves the filename before interpreting the overloaded options.
+  const target = pirCheckPathBytes(pirPathArg(filename, "filename"), "filename");
+  const resolved = pirResolveWatchPath(target);
+  if (options === null || typeof options !== "object") {
+    listener = options;
+    options = null;
+  }
+  pirValidateFunction(listener, "listener");
+  const key = resolved;
   const existing = watchedFiles.get(key);
   if (existing !== undefined) {
-    if (typeof listener === "function") existing.on("change", listener);
+    existing.on("change", listener);
     return existing;
   }
-  const watcher = new StatWatcher(filename, options, listener);
+  const watcher = new StatWatcher(resolved, options, listener);
   watchedFiles.set(key, watcher);
   return watcher;
 }
 
 function unwatchFile(filename, listener) {
-  const key = String(filename);
+  const target = pirCheckPathBytes(pirPathArg(filename, "filename"), "filename");
+  const key = pirResolveWatchPath(target);
   const watcher = watchedFiles.get(key);
   if (watcher === undefined) return;
   if (typeof listener === "function") {
@@ -1332,66 +3019,662 @@ function pirStreamBound(options, name) {
   return pirValidateInteger(value, name, 0, Number.MAX_SAFE_INTEGER);
 }
 
-class ReadStream extends EventEmitter {
+/// Stream `getOptions`: a string is an encoding; anything else non-object is
+/// ERR_INVALID_ARG_TYPE. `options.fs` overrides are validated by the caller.
+function pirStreamOptions(options) {
+  if (options === undefined || options === null) return {};
+  if (typeof options === "string") {
+    pirValidateEncodingValue(options);
+    return { encoding: options };
+  }
+  if (typeof options !== "object") {
+    throw pirInvalidArgType("options", "one of type string or object", options);
+  }
+  pirValidateEncodingValue(options.encoding);
+  if (options.fs !== undefined) {
+    if (options.fs === null || typeof options.fs !== "object") {
+      throw pirInvalidArgTypeProperty("options.fs", "of type object", options.fs);
+    }
+  }
+  return options;
+}
+
+function pirValidateStreamFs(options, names) {
+  const fsImpl = options.fs;
+  if (fsImpl === undefined) return;
+  for (const name of names) {
+    const value = fsImpl[name];
+    // Node requires open/write/close but treats writev as optional: an absent
+    // one degrades to per-chunk writes (test-fs-write-stream-fs passes only
+    // open/write/close), while a present non-function is still an error
+    // (test-fs-stream-fs-options nulls it out and expects the throw).
+    if (name === "writev" && value === undefined) continue;
+    if (typeof value !== "function") {
+      throw pirInvalidArgTypeProperty("options.fs." + name, "of type function", value);
+    }
+  }
+}
+
+function pirStreamAbortError(cause) {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  // Node carries the signal's abort reason as `cause`.
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
+/// `options.signal` support shared by the fs streams: Node destroys the
+/// stream with an AbortError (already-aborted signals fire on the next tick).
+function pirAttachStreamSignal(self, options) {
+  const signal = options.signal;
+  if (signal === undefined) return;
+  if (signal === null || typeof signal !== "object" ||
+      typeof signal.addEventListener !== "function" ||
+      typeof signal.aborted !== "boolean") {
+    throw pirInvalidArgTypeProperty(
+      "options.signal", "an instance of AbortSignal", signal);
+  }
+  if (signal.aborted) {
+    const cause = signal.reason;
+    globalThis.__pirMicrotask(() => {
+      if (!self.destroyed) self.destroy(pirStreamAbortError(cause));
+    });
+    return;
+  }
+  signal.addEventListener("abort", function () {
+    if (!self.destroyed) self.destroy(pirStreamAbortError(signal.reason));
+  }, { once: true });
+}
+
+/// `start`/`end` on the fs streams: non-negative safe integers; `end` also
+/// accepts Infinity (Node's "read to EOF" sentinel).
+function pirInitReadStream(self, path, options) {
+  const opts = pirStreamOptions(options);
+  EventEmitter.call(self);
+  self._options = opts;
+  self._fd = opts.fd === undefined || opts.fd === null
+    ? undefined
+    : (typeof opts.fd === "object" ? opts.fd.fd : pirValidateFd(opts.fd));
+  let streamPath;
+  if (path !== undefined && path !== null) {
+    streamPath = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  } else if (self._fd === undefined) {
+    // Node allows a falsy path only when `fd` is supplied.
+    throw pirInvalidArgType("path", kPathExpectation, path);
+  }
+  self.path = streamPath;
+  self._encoding = opts.encoding;
+  self.flags = opts.flags === undefined ? "r" : opts.flags;
+  self.mode = opts.mode === undefined ? 0o666 : opts.mode;
+  self.autoClose = opts.autoClose === undefined
+    ? true
+    : pirValidateBooleanProperty(opts.autoClose, "options.autoClose");
+  self.fd = self._fd === undefined ? null : self._fd;
+  // `fd: FileHandle` keeps a reference so reads go through the handle (a
+  // monkey-patched `handle.read` is observable) and close is coupled.
+  self._handle = self._fd === undefined || opts.fd === null ||
+    typeof opts.fd !== "object" ? undefined : opts.fd;
+  if (self._handle !== undefined && opts.fs !== undefined) {
+    throw pirCodedError(Error, "ERR_METHOD_NOT_IMPLEMENTED",
+      "The FileHandle with fs method is not implemented");
+  }
+  self._start = pirStreamBound(opts, "start");
+  const end = opts.end === undefined || opts.end === Infinity
+    ? (opts.end === Infinity ? Infinity : undefined)
+    : pirStreamBound(opts, "end");
+  self._end = end;
+  if (self._start !== undefined && end !== undefined && end !== Infinity && self._start > end) {
+    throw pirOutOfRange("start", "<= " + end, self._start);
+  }
+  self.start = self._start;
+  self.end = end;
+  self.bytesRead = 0;
+  self.readableEnded = false;
+  self.destroyed = false;
+  self.closed = false;
+  // Node's `pending` getter is `fd === null`; an fd-backed stream is already
+  // open (and never emits 'open'/'ready').
+  self.pending = self._fd === undefined;
+  self._started = false;
+  self._openScheduled = false;
+  self._flowRequested = false;
+  self._paused = false;
+  self._bytes = undefined;
+  self._offset = 0;
+  self._ended = false;
+  self._decoder = opts.encoding !== undefined && opts.encoding !== "buffer"
+    ? new StringDecoder(opts.encoding)
+    : undefined;
+  self._fsImpl = opts.fs === undefined ? fs : opts.fs;
+  self._nodeFs = undefined;
+  self._openDone = self._fd !== undefined;
+  self._position = self._start;
+  pirValidateStreamFs(opts, ["open", "read", "close"]);
+  if (self._handle !== undefined) {
+    // Closing the handle out from under the stream ends it (Node couples the
+    // two through the same FileHandle state).
+    self._handle.once("close", () => {
+      if (self.closed) return;
+      self.destroyed = true;
+      self.closed = true;
+      self.fd = null;
+      self.emit("close");
+    });
+  }
+  pirAttachStreamSignal(self, opts);
+  if (self._fd === undefined) {
+    // Node opens path-backed streams on the next tick (Readable._construct);
+    // `pending` is true until then. A `open` patched before construction owns
+    // that step instead (and emits 'open'/'ready' itself). The public
+    // constructor is the legacy function wrapper, so this hook lives here
+    // (not in the class constructor, which that wrapper bypasses).
+    const patched = self.open !== pirDefaultReadOpen;
+    globalThis.__pirMicrotask(() => {
+      if (self.destroyed) return;
+      if (patched) { self._openScheduled = true; self.open(); }
+      else self._open();
+    });
+  }
+}
+
+/// The built-in (deprecated no-op) `ReadStream.prototype.open`. Node keeps it
+/// as a deprecation shim and calls a *monkey-patched* `open` from the stream
+/// construct hook instead (`test-fs-read-stream-patch-open`). Identity
+/// against this function is how the constructor tells them apart.
+function pirDefaultReadOpen() {
+  pirEmitWarningOnce(
+    "DEP0135-ReadStream-open",
+    "ReadStream.prototype.open() is deprecated",
+    { type: "DeprecationWarning", code: "DEP0135" },
+  );
+  this._open();
+  return this;
+}
+
+class ReadStreamImpl extends EventEmitter {
   constructor(path, options) {
     super();
-    this.path = String(path);
-    this._options = options === undefined || options === null ? {} : options;
-    // Node validates the byte range up front (the official
-    // test-fs-non-number-arguments-throw.js asserts the TypeError) and the
-    // window is inclusive on both ends.
-    this._start = pirStreamBound(this._options, "start");
-    this._end = pirStreamBound(this._options, "end");
-    this.start = this._start;
-    this.bytesRead = 0;
-    this.readableEnded = false;
-    this.destroyed = false;
-    this.closed = false;
-    this.pending = true;
-    this._started = false;
+    pirInitReadStream(this, path, options);
   }
-  _ensureStarted() {
-    if (this._started || this.destroyed) return;
+  /// Schedule the open/ready emission (once). An fd-backed stream is already
+  /// open: Node emits neither event for it.
+  _open() {
+    if (this._openScheduled) return;
+    this._openScheduled = true;
+    if (this._fd !== undefined) { this.pending = false; return; }
+    this._openInFlight = true;
+    if (this._useNodeFs()) { this._openNode(); return; }
+    const self = this;
+    globalThis.__pirMicrotask(() => {
+      self.pending = false;
+      self._openInFlight = false;
+      // Node finishes the in-flight open even after destroy(): `open` fires,
+      // then the stream closes (test-fs-stream-double-close).
+      self.emit("open", self.fd);
+      self.emit("ready");
+      self._afterOpen();
+    });
+  }
+  /// Completion shared by both open paths: start reading, or close the
+  /// just-opened descriptor when the stream was destroyed while opening.
+  _afterOpen() {
+    if (!this.destroyed) {
+      if (this._flowRequested) this._startPump();
+      return;
+    }
+    this._closeFdOnly();
+    const error = this._destroyError;
+    this._destroyError = undefined;
+    if (error) {
+      this.emit("error", error);
+    } else if (!this.closed) {
+      this.closed = true;
+      this.emit("close");
+    }
+    const callback = this._destroyCallback;
+    this._destroyCallback = undefined;
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+  }
+  /// Release the descriptor without touching the stream flags (used by the
+  /// open-in-flight destroy path, where `closed` follows the error/close event).
+  _closeFdOnly() {
+    const fd = this.fd;
+    const handle = this._handle;
+    this.fd = null;
+    if (!this.autoClose) return;
+    if (handle !== undefined) {
+      try { handle.close(); } catch (_) { /* already gone */ }
+    } else if (fd !== null && fd !== undefined) {
+      try { this._fsImpl.close(fd, function () {}); } catch (_) { /* already gone */ }
+    }
+  }
+  /// Node's stream uses the live `fs` object (or `options.fs`), so a patched
+  /// open/read/close is observable. The mode is fixed on first use.
+  _useNodeFs() {
+    if (this._nodeFs === undefined) {
+      this._nodeFs = this._options.fs !== undefined ||
+        this._fsImpl !== fs || fs.open !== open || fs.read !== read ||
+        fs.close !== close;
+    }
+    return this._nodeFs;
+  }
+  _openNode() {
+    const self = this;
+    globalThis.__pirMicrotask(() => {
+      self._fsImpl.open(self.path, self.flags, self.mode, (error, fd) => {
+        self._openInFlight = false;
+        if (error) {
+          self.pending = false;
+          self._openInFlight = false;
+          self.emit("error", error);
+          return;
+        }
+        self.fd = fd;
+        self.pending = false;
+        self._openDone = true;
+        self.emit("open", fd);
+        self.emit("ready");
+        self._flowRequested = true;
+        self._afterOpen();
+      });
+    });
+  }
+  /// One Node read: `bufferSize` wins over highWaterMark (Node maps the
+  /// legacy option to the chunk size), then the 64 KiB default.
+  _nodeChunkSize() {
+    const size = Number(this._options.bufferSize);
+    if (Number.isInteger(size) && size > 0) return size;
+    const hwm = Number(this._options.highWaterMark);
+    if (Number.isInteger(hwm) && hwm > 0) return hwm;
+    return kDefaultChunkSize;
+  }
+  _pumpNode() {
+    if (this.destroyed || this._ended || this._paused) return;
+    const buffer = Buffer.allocUnsafe(this._nodeChunkSize());
+    this._fsImpl.read(this.fd, buffer, 0, buffer.length, this._position ?? null,
+      (error, count) => {
+        if (this.destroyed || this._ended) return;
+        if (error) { this._failNodeRead(error); return; }
+        if (this._position !== undefined) this._position += count;
+        if (count === 0) { this._finishNode(); return; }
+        const chunk = buffer.subarray(0, count);
+        this.bytesRead += count;
+        const value = this._pirChunkValue(chunk);
+        if (typeof value !== "string" || value.length > 0) this.emit("data", value);
+        if (!this._paused) this._pumpNode();
+      });
+  }
+  /// FileHandle-backed streams read through the handle's async `read`, so an
+  /// own-property patch on the handle is used (test-fs-read-stream-file-handle).
+  _pumpHandle() {
+    if (this.destroyed || this._ended || this._paused) return;
+    const buffer = Buffer.allocUnsafe(kDefaultChunkSize);
+    this._handle.read(buffer, 0, buffer.length, this._position ?? null)
+      .then((result) => {
+        if (this.destroyed || this._ended) return;
+        const count = result.bytesRead;
+        if (this._position !== undefined) this._position += count;
+        if (count === 0) { this._finishNode(); return; }
+        this.bytesRead += count;
+        const chunk = (result.buffer || buffer).subarray(0, count);
+        const value = this._pirChunkValue(chunk);
+        if (typeof value !== "string" || value.length > 0) this.emit("data", value);
+        if (!this._paused) this._pumpHandle();
+      }, (error) => {
+        if (this.destroyed || this._ended) return;
+        this._failNodeRead(error);
+      });
+  }
+  /// On a read error Node closes the descriptor first (listeners observe
+  /// `fd` while close runs) and only then emits the error.
+  _failNodeRead(error) {
+    const fd = this.fd;
+    if (this._handle !== undefined) {
+      // `closed` is set first so the handle's own close listener stays quiet.
+      this.closed = true;
+      try { this._handle.close(); } catch (_) { /* already gone */ }
+    } else if (fd !== null && fd !== undefined) {
+      try { this._fsImpl.close(fd, function () {}); } catch (_) { /* already gone */ }
+    }
+    this.fd = null;
+    this.emit("error", error);
+  }
+  _finishNode() {
+    if (this._decoder !== undefined) {
+      const tail = this._decoder.end();
+      if (tail.length > 0) this.emit("data", tail);
+    }
+    this._ended = true;
+    this.readableEnded = true;
+    this.emit("end");
+    this._closeNode();
+  }
+  _closeNode() {
+    if (this.closed) { this.fd = null; return; }
+    const fd = this.fd;
+    this.closed = true;
+    if (this.autoClose) {
+      if (this._handle !== undefined) {
+        try { this._handle.close(); } catch (_) { /* already gone */ }
+      } else if (fd !== null && fd !== undefined) {
+        try { this._fsImpl.close(fd, function () {}); } catch (_) { /* already gone */ }
+      }
+    }
+    this.fd = null;
+    this.emit("close");
+  }
+  _startPump() {
+    if (this._started || this.destroyed || this.pending) return;
     this._started = true;
     globalThis.__pirMicrotask(() => this._pump());
   }
+  _ensureStarted() {
+    if (this.destroyed) return;
+    this._flowRequested = true;
+    this._open();
+    this._startPump();
+  }
+  /// Adding any of the read-driving listeners starts the flow (Node's
+  /// Readable does the same through its `on`/`once` hooks; the stream shim's
+  /// EventEmitter calls `_addListener` directly for `once`).
+  _noteEvent(event) {
+    if (event === "data") {
+      this._ensureStarted();
+      // The body may already be buffered from a paused `read()`; a newly
+      // added data listener switches the same buffer to the drain path.
+      if (this._bytes !== undefined) {
+        const self = this;
+        globalThis.__pirMicrotask(() => {
+          if (!self.destroyed && !self._ended && self._hasDataListener()) self._drain();
+        });
+      }
+      return;
+    }
+    if (event === "readable" || event === "end") {
+      this._ensureStarted();
+    }
+  }
   on(event, listener) {
     const result = super.on(event, listener);
-    if (event === "data" || event === "readable") this._ensureStarted();
+    this._noteEvent(event);
     return result;
   }
-  resume() { this._ensureStarted(); return this; }
-  pause() { return this; }
-  read() { return null; }
+  once(event, listener) {
+    const result = super.once(event, listener);
+    this._noteEvent(event);
+    return result;
+  }
+  addListener(event, listener) {
+    const result = super.addListener(event, listener);
+    this._noteEvent(event);
+    return result;
+  }
+  prependListener(event, listener) {
+    const result = super.prependListener(event, listener);
+    this._noteEvent(event);
+    return result;
+  }
+  prependOnceListener(event, listener) {
+    const result = super.prependOnceListener(event, listener);
+    this._noteEvent(event);
+    return result;
+  }
+  setEncoding(encoding) {
+    if (typeof encoding !== "string" || !Buffer.isEncoding(encoding)) {
+      throw pirInvalidArgValue("encoding", encoding, "is invalid encoding");
+    }
+    this._encoding = encoding;
+    this._decoder = new StringDecoder(encoding);
+    return this;
+  }
+  isPaused() { return this._paused; }
+  resume() {
+    this._paused = false;
+    // Node's resume() switches the stream to flowing mode even without a
+    // `data` listener (the chunks are simply discarded); a paused `read()`
+    // consumer is the case that stays in buffered mode.
+    this._forceFlow = true;
+    this._ensureStarted();
+    // Bytes collected while paused are still pending: resume the same drain.
+    if (this._bytes !== undefined && !this._ended) {
+      globalThis.__pirMicrotask(() => this._drain());
+    }
+    return this;
+  }
+  pause() { this._paused = true; return this; }
+  /// Buffered readable mode: `read(n)` pulls from the collected body (path
+  /// streams only) and `unshift` puts data back, like Node's paused Readable.
+  /// fd/FileHandle/node-fs streams keep the event-driven body.
+  read(n) {
+    if (this.destroyed || this._ended) return null;
+    if (this._handle !== undefined || this._fd !== undefined || this._useNodeFs()) return null;
+    if (this._bytes === undefined) {
+      try {
+        this._bytes = this._collect();
+        this._offset = 0;
+        this.pending = false;
+      } catch (error) {
+        this.emit("error", error);
+        return null;
+      }
+    }
+    const remaining = this._bytes.length - this._offset;
+    let size = n === undefined
+      ? (Number(this._options.highWaterMark) > 0
+        ? Math.trunc(this._options.highWaterMark) : kDefaultChunkSize)
+      : Math.trunc(Number(n));
+    if (!Number.isFinite(size) || size < 0) size = 0;
+    if (remaining <= 0) { this._finishReadEof(); return null; }
+    if (size === 0) return null;
+    if (this._decoder !== undefined ||
+        (this._encoding !== undefined && this._encoding !== "buffer")) {
+      const enc = this._encoding === undefined || this._encoding === "buffer"
+        ? "utf8" : this._encoding;
+      const text = this._bytes.subarray(this._offset).toString(enc);
+      const piece = text.slice(0, size);
+      if (piece.length === 0) { this._finishReadEof(); return null; }
+      const used = Math.max(1, Buffer.byteLength(piece, enc));
+      this._offset = Math.min(this._offset + used, this._bytes.length);
+      this.bytesRead += used;
+      if (this._offset >= this._bytes.length) this._finishReadEof();
+      return piece;
+    }
+    const chunk = Buffer.from(
+      this._bytes.subarray(this._offset, this._offset + Math.min(size, remaining)));
+    this._offset += chunk.length;
+    this.bytesRead += chunk.length;
+    if (this._offset >= this._bytes.length) this._finishReadEof();
+    return chunk;
+  }
+  unshift(chunk) {
+    if (this.destroyed || chunk === undefined || chunk === null) return false;
+    const enc = this._encoding === undefined || this._encoding === "buffer"
+      ? "utf8" : this._encoding;
+    const bytes = typeof chunk === "string" ? Buffer.from(chunk, enc) : Buffer.from(chunk);
+    if (this._bytes === undefined) {
+      this._bytes = Buffer.from(bytes);
+      this._offset = 0;
+    } else {
+      const rest = Buffer.from(this._bytes.subarray(this._offset));
+      this._bytes = Buffer.concat([bytes, rest]);
+      this._offset = 0;
+    }
+    this.bytesRead = Math.max(0, this.bytesRead - bytes.length);
+    return true;
+  }
+  _hasDataListener() {
+    return typeof this.listenerCount === "function" && this.listenerCount("data") > 0;
+  }
+  /// Whether the body should be pushed out rather than left for `read()`:
+  /// a `data` listener or an explicit resume() (Node's flowing mode).
+  _wantFlow() {
+    return this._forceFlow === true || this._hasDataListener();
+  }
+  /// No `data` consumer yet: buffer the body and emit `readable` (the paused
+  /// consumer pulls with `read`). A `data` listener switches to the drain.
+  _emitReadable() {
+    if (this.destroyed || this._ended) return;
+    if (this._wantFlow()) { this._drain(); return; }
+    this.pending = false;
+    this.emit("readable");
+  }
+  /// A pull reached EOF with no data consumer: finish like `_drain` does.
+  _finishReadEof() {
+    if (this._ended || this._eofScheduled) return;
+    this._eofScheduled = true;
+    const self = this;
+    globalThis.__pirMicrotask(() => {
+      if (self.destroyed || self._ended) return;
+      if (self._decoder !== undefined) {
+        const tail = self._decoder.end();
+        if (tail.length > 0) self.emit("data", tail);
+      }
+      self._ended = true;
+      self.readableEnded = true;
+      self.emit("end");
+      if (self.autoClose) {
+        self.closed = true;
+        self.emit("close");
+      }
+    });
+  }
+
+  /// A Node stream emits 'error' and then destroys itself; the stream is
+  /// already `destroyed` inside the error listener (the compat tests assert
+  /// that). `destroy()` sets the flag first, so its own path stays untouched.
+  emit(type, ...args) {
+    if (type === "error" && !this.destroyed) {
+      this.destroyed = true;
+      this.closed = true;
+      this.fd = null;
+      const result = super.emit(type, ...args);
+      super.emit("close");
+      return result;
+    }
+    return super.emit(type, ...args);
+  }
+
+  /// The stream body. A path streams the whole file (host readFile); an `fd`
+  /// option reads sequentially from the descriptor's current position, which
+  /// is what Node's fd-backed ReadStream does (FileHandle.createReadStream,
+  /// `fs.createReadStream(null, { fd })`).
+  _collect() {
+    if (this._fd !== undefined) {
+      const chunks = [];
+      const buffer = Buffer.alloc(kDefaultChunkSize);
+      while (!this.destroyed) {
+        const count = readSync(this._fd, buffer, 0, buffer.length);
+        if (count <= 0) break;
+        chunks.push(Buffer.from(buffer.subarray(0, count)));
+      }
+      return Buffer.concat(chunks);
+    }
+    let bytes = Buffer.from(call("fs", "readFile", { path: this.path }), "base64");
+    const from = this._start === undefined ? 0 : Math.min(this._start, bytes.length);
+    const to = this._end === undefined ? bytes.length - 1 : Math.min(this._end, bytes.length - 1);
+    return from > to ? bytes.subarray(0, 0) : bytes.subarray(from, to + 1);
+  }
+  _pirChunkValue(chunk) {
+    if (this._decoder !== undefined) return this._decoder.write(chunk);
+    if (this._encoding !== undefined && this._encoding !== "buffer") {
+      return chunk.toString(this._encoding);
+    }
+    return chunk;
+  }
   _pump() {
-    if (this.destroyed) return;
+    if (this.destroyed || this._ended) return;
+    if (this._handle !== undefined) { this._pumpHandle(); return; }
+    if (this._useNodeFs()) { this._pumpNode(); return; }
+    // A paused `read()` may have collected the body already; drain that
+    // snapshot instead of re-reading the file.
+    if (this._bytes !== undefined) {
+      this.pending = false;
+      if (!this._wantFlow()) { this._emitReadable(); return; }
+      this._drain();
+      return;
+    }
     let bytes;
     try {
-      bytes = Buffer.from(call("fs", "readFile", { path: this.path }), "base64");
+      bytes = this._collect();
     } catch (error) {
       this.emit("error", error);
       return;
     }
-    // The `start`/`end` byte window (inclusive), like Node's ReadStream.
-    const from = this._start === undefined ? 0 : Math.min(this._start, bytes.length);
-    const to = this._end === undefined ? bytes.length - 1 : Math.min(this._end, bytes.length - 1);
-    bytes = from > to ? bytes.subarray(0, 0) : bytes.subarray(from, to + 1);
     this.pending = false;
-    this.emit("open", undefined);
+    this._bytes = bytes;
+    this._offset = 0;
+    if (!this._wantFlow()) { this._emitReadable(); return; }
+    this._drain();
+  }
+  _drain() {
+    if (this.destroyed || this._ended) return;
     const chunkSize = Number(this._options.highWaterMark) > 0
       ? Math.trunc(this._options.highWaterMark)
       : kDefaultChunkSize;
-    for (let offset = 0; offset < bytes.length && !this.destroyed; offset += chunkSize) {
-      const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+    while (!this.destroyed && !this._paused && this._offset < this._bytes.length) {
+      const chunk = this._bytes.subarray(
+        this._offset, Math.min(this._offset + chunkSize, this._bytes.length));
+      this._offset += chunk.length;
       this.bytesRead += chunk.length;
-      this.emit("data", chunk);
+      const value = this._pirChunkValue(chunk);
+      if (typeof value !== "string" || value.length > 0) this.emit("data", value);
     }
-    if (!this.destroyed) {
+    if (!this.destroyed && this._offset >= this._bytes.length && !this._paused) {
+      if (this._decoder !== undefined) {
+        const tail = this._decoder.end();
+        if (tail.length > 0) this.emit("data", tail);
+      }
+      this._ended = true;
       this.readableEnded = true;
       this.emit("end");
-      this.emit("close");
-      this.closed = true;
+      if (this.autoClose) {
+        this.closed = true;
+        if (this._handle !== undefined) {
+          try { this._handle.close(); } catch (_) { /* already gone */ }
+        } else if (this._fd !== undefined) {
+          try { this._fsImpl.close(this._fd, function () {}); } catch (_) { /* already gone */ }
+        }
+        this.emit("close");
+      }
     }
+  }
+  /// `for await (const chunk of stream)`: the whole body, split into the same
+  /// highWaterMark chunks the event path emits.
+  [Symbol.asyncIterator]() {
+    const stream = this;
+    let chunks;
+    let index = 0;
+    const chunkSize = Number(this._options.highWaterMark) > 0
+      ? Math.trunc(this._options.highWaterMark)
+      : kDefaultChunkSize;
+    return {
+      async next() {
+        if (chunks === undefined) {
+          const bytes = stream._collect();
+          chunks = [];
+          for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+            chunks.push(bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+          }
+          stream.bytesRead = bytes.length;
+          stream.readableEnded = true;
+          stream.closed = true;
+        }
+        if (index >= chunks.length) {
+          if (!stream._ended) {
+            stream._ended = true;
+            if (stream._decoder !== undefined) {
+              const tail = stream._decoder.end();
+              if (tail.length > 0) return { value: tail, done: false };
+            }
+          }
+          return { value: undefined, done: true };
+        }
+        const chunk = chunks[index++];
+        return { value: stream._pirChunkValue(chunk), done: false };
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
   }
   pipe(destination, options) {
     this._ensureStarted();
@@ -1405,44 +3688,139 @@ class ReadStream extends EventEmitter {
     this.destroy();
     if (typeof callback === "function") globalThis.__pirMicrotask(callback);
   }
-  destroy(error) {
-    if (this.destroyed) return this;
+  destroy(error, callback) {
+    if (this.destroyed) {
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      return this;
+    }
     this.destroyed = true;
-    this.closed = true;
-    if (error) this.emit("error", error);
-    this.emit("close");
+    // A path-backed stream that has not finished opening still completes that
+    // open (Node's `_construct` callback runs even after destroy); the close
+    // happens from `_afterOpen` with the resulting descriptor.
+    if (this._fd === undefined && (!this._openScheduled || this._openInFlight)) {
+      if (!this._openScheduled) this._open();
+      this._destroyError = error;
+      this._destroyCallback = callback;
+      return this;
+    }
+    this._closeFdOnly();
+    if (error) {
+      this.emit("error", error);
+    } else if (!this.closed) {
+      this.closed = true;
+      this.emit("close");
+    }
+    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
     return this;
   }
 }
+ReadStreamImpl.prototype.open = pirDefaultReadOpen;
 
-class WriteStream extends EventEmitter {
+/// Deprecated identity for `WriteStream.prototype.open` (the construct-compat
+/// tests monkey-patch it and Node calls the override from `_construct`).
+function pirDefaultWriteOpen() {
+  pirEmitWarningOnce(
+    "DEP0135-WriteStream-open",
+    "WriteStream.prototype.open() is deprecated",
+    { type: "DeprecationWarning", code: "DEP0135" },
+  );
+  if (this._useNodeFs()) this._openNodeWrite();
+  else if (this._fd === undefined && !this._writeOpenDone) this._openBuffered();
+  return this;
+}
+
+function pirInitWriteStream(self, path, options) {
+  const opts = pirStreamOptions(options);
+  EventEmitter.call(self);
+  self._options = opts;
+  self._fd = opts.fd === undefined || opts.fd === null
+    ? undefined
+    : (typeof opts.fd === "object" ? opts.fd.fd : pirValidateFd(opts.fd));
+  let streamPath;
+  if (path !== undefined && path !== null) {
+    streamPath = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  } else if (self._fd === undefined) {
+    throw pirInvalidArgType("path", kPathExpectation, path);
+  }
+  self.path = streamPath;
+  self._encoding = opts.encoding;
+  self.flags = opts.flags === undefined ? "w" : opts.flags;
+  self.mode = opts.mode === undefined ? 0o666 : opts.mode;
+  self.autoClose = opts.autoClose === undefined
+    ? true
+    : pirValidateBooleanProperty(opts.autoClose, "options.autoClose");
+  self.fd = self._fd === undefined ? null : self._fd;
+  self._handle = self._fd === undefined || opts.fd === null ||
+    typeof opts.fd !== "object" ? undefined : opts.fd;
+  if (self._handle !== undefined && opts.fs !== undefined) {
+    throw pirCodedError(Error, "ERR_METHOD_NOT_IMPLEMENTED",
+      "The FileHandle with fs method is not implemented");
+  }
+  // Start is validated like the readable side; `end` is not an option the
+  // writable stream acts on (Node ignores it rather than rejecting it).
+  self.start = pirStreamBound(opts, "start");
+  self._writePosition = self.start;
+  self._chunks = [];
+  // Parallel text view of `_chunks`: string chunks whose bytes are exactly
+  // their UTF-8 encoding land here too, and `end` sends them as `dataText`
+  // (no base64 round trip). Any chunk that is not (Buffer/typed array,
+  // non-utf8 encoding, lone surrogate) drops `_pirTextOk` for the whole
+  // stream and the aggregate goes out as base64 `data`, byte-identical to
+  // before.
+  self._pirText = [];
+  self._pirTextOk = true;
+  self.bytesWritten = 0;
+  self.writableEnded = false;
+  self.destroyed = false;
+  self.closed = false;
+  self.pending = true;
+  self._fsImpl = opts.fs === undefined ? fs : opts.fs;
+  // Node resolves open/write/close through the live `fs` object at call time,
+  // so a patch applied after construction still applies (see
+  // test-fs-write-stream-err). Resolve lazily on first use.
+  self._nodeFs = undefined;
+  self._nodeQueue = [];
+  self._nodeWriting = false;
+  self._nodeOpening = false;
+  self._nodeOpenDone = self._fd !== undefined;
+  self._nodeEndPending = false;
+  self._nodeEndCallback = undefined;
+  self._nodeFinishing = false;
+  self._writeOpenDone = self._fd !== undefined;
+  self._writeOpenInFlight = false;
+  self._pendingConstruct = true;
+  self._destroyError = undefined;
+  self._destroyCallback = undefined;
+  // Node copies `options.fs` verbatim: open/write/close are required, writev
+  // is validated only when present (see pirValidateStreamFs).
+  pirValidateStreamFs(opts, ["open", "write", "writev", "close"]);
+  if (self._handle !== undefined) {
+    self._handle.once("close", () => {
+      if (self.closed) return;
+      self.destroyed = true;
+      self.closed = true;
+      self.fd = null;
+      self.emit("close");
+    });
+  }
+  pirAttachStreamSignal(self, opts);
+  const patched = self.open !== pirDefaultWriteOpen;
+  globalThis.__pirMicrotask(() => {
+    self._pendingConstruct = false;
+    // Node's construct step always runs: `open` (possibly the legacy
+    // monkey-patched override) is called, and an fd-backed stream starts
+    // already open with no `open` event.
+    if (patched) { self.open(); return; }
+    if (self._fd !== undefined) { self.pending = false; self._writeOpenDone = true; return; }
+    if (self._useNodeFs()) { self._openNodeWrite(); return; }
+    self._openBuffered();
+  });
+}
+
+class WriteStreamImpl extends EventEmitter {
   constructor(path, options) {
     super();
-    this.path = String(path);
-    this._options = options === undefined || options === null ? {} : options;
-    // Start is validated like the readable side; `end` is not an option the
-    // writable stream acts on (Node ignores it rather than rejecting it).
-    this.start = pirStreamBound(this._options, "start");
-    this._chunks = [];
-    // Parallel text view of `_chunks`: string chunks whose bytes are exactly
-    // their UTF-8 encoding land here too, and `end` sends them as `dataText`
-    // (no base64 round trip). Any chunk that is not (Buffer/typed array,
-    // non-utf8 encoding, lone surrogate) drops `_pirTextOk` for the whole
-    // stream and the aggregate goes out as base64 `data`, byte-identical to
-    // before.
-    this._pirText = [];
-    this._pirTextOk = true;
-    this.bytesWritten = 0;
-    this.writableEnded = false;
-    this.destroyed = false;
-    this.closed = false;
-    this.pending = true;
-    globalThis.__pirMicrotask(() => {
-      if (!this.destroyed) {
-        this.pending = false;
-        this.emit("open", undefined);
-      }
-    });
+    pirInitWriteStream(this, path, options);
   }
   write(chunk, encoding, callback) {
     if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
@@ -1452,12 +3830,51 @@ class WriteStream extends EventEmitter {
       if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return false; }
       throw error;
     }
+    // Node decodes a string chunk with the per-call encoding, falling back to
+    // the stream's own `encoding` option (a WriteStream opened as base64
+    // decodes pipe chunks that arrive without an explicit encoding).
+    const chunkEncoding = encoding === undefined
+      ? (this._encoding === undefined ? "utf8" : this._encoding)
+      : encoding;
     const bytes = typeof chunk === "string"
-      ? Buffer.from(chunk, encoding === undefined ? "utf8" : encoding)
+      ? Buffer.from(chunk, chunkEncoding)
       : Buffer.from(chunk);
+    if (this._useNodeFs()) {
+      // Node mode: every write goes through the captured `fs.write`, serially,
+      // so a failing write calls back with the error and closes the stream.
+      if (this.destroyed) {
+        const error = new Error("write after end");
+        error.code = "ERR_STREAM_WRITE_AFTER_END";
+        if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return false; }
+        throw error;
+      }
+      this._nodeQueue.push({ bytes: bytes, callback: callback });
+      this._drainNodeWrite();
+      return true;
+    }
+    if (this._fd !== undefined) {
+      // fd-backed stream: every write is a sequential host write (the
+      // FileHandle owns the descriptor and stays open). `start` (when given)
+      // makes the writes positional, like Node's `stream.pos`.
+      try {
+        let done = 0;
+        while (done < bytes.length) {
+          const written = writeSync(this._fd, bytes, done, bytes.length - done, this._writePosition);
+          done += written;
+          if (this._writePosition !== undefined) this._writePosition += written;
+        }
+      } catch (error) {
+        if (typeof callback === "function") { globalThis.__pirMicrotask(() => callback(error)); return false; }
+        this.emit("error", error);
+        return false;
+      }
+      this.bytesWritten += bytes.length;
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      return true;
+    }
     this._chunks.push(bytes);
     if (this._pirTextOk) {
-      if (pirWriteTextEncodable(chunk, encoding)) this._pirText.push(chunk);
+      if (pirWriteTextEncodable(chunk, chunkEncoding)) this._pirText.push(chunk);
       else this._pirTextOk = false;
     }
     this.bytesWritten += bytes.length;
@@ -1469,40 +3886,393 @@ class WriteStream extends EventEmitter {
     else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
     if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
     this.writableEnded = true;
-    try {
-      const append = pirFlagsAppend(this._options.flags);
-      // Pure-text stream: `dataText` carries the exact UTF-8 image of the
-      // bytes the base64 aggregate would decode to (every chunk passed
-      // `pirWriteTextEncodable`), so the host skips the base64 round trip.
-      // Everything else keeps the byte channel, byte-for-byte as before.
-      const text = this._pirTextOk ? this._pirText.join("") : "";
-      const payload = { path: this.path, append: append };
-      if (text.length > 0) payload.dataText = text;
-      else payload.data = Buffer.concat(this._chunks).toString("base64");
-      call("fs", "writeFile", payload);
-    } catch (error) {
-      this.emit("error", error);
+    if (this._useNodeFs()) {
+      this._nodeEndPending = true;
+      this._nodeEndCallback = callback;
+      this._drainNodeWrite();
       return this;
     }
-    this.emit("finish");
-    this.emit("close");
-    this.closed = true;
-    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+    // Node's finish/close are asynchronous: listeners registered right after
+    // `end()` (and the `open` event queued at construction) must run first
+    // (test-fs-write-stream-end, test-fs-write-stream-autoclose-option).
+    const self = this;
+    globalThis.__pirMicrotask(() => {
+      if (self.destroyed) return;
+      if (self._fd === undefined) {
+        try {
+          const append = pirFlagsAppend(self._options.flags);
+          // Pure-text stream: `dataText` carries the exact UTF-8 image of the
+          // bytes the base64 aggregate would decode to (every chunk passed
+          // `pirWriteTextEncodable`), so the host skips the base64 round trip.
+          // Everything else keeps the byte channel, byte-for-byte as before.
+          const text = self._pirTextOk ? self._pirText.join("") : "";
+          const payload = { path: self.path, append: append };
+          if (text.length > 0) payload.dataText = text;
+          else payload.data = Buffer.concat(self._chunks).toString("base64");
+          call("fs", "writeFile", payload);
+        } catch (error) {
+          self.emit("error", error);
+          return;
+        }
+      }
+      self.emit("finish");
+      if (self.autoClose) {
+        self._closeWriteFd(() => {
+          self.closed = true;
+          self.emit("close");
+        });
+      }
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+    });
     return this;
   }
-  close(callback) {
-    this.destroy();
-    if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+  /// The live `fs` object (or `options.fs`) is used at call time; a patch
+  /// applied after construction is observed. Resolved once.
+  _useNodeFs() {
+    if (this._nodeFs === undefined) {
+      this._nodeFs = this._handle !== undefined || this._options.fs !== undefined ||
+        this._fsImpl !== fs || fs.open !== open || fs.write !== write ||
+        fs.close !== close;
+    }
+    return this._nodeFs;
   }
-  destroy(error) {
-    if (this.destroyed) return this;
+  _openNodeWrite() {
+    if (this._nodeOpenDone || this._nodeOpening) return;
+    this._nodeOpening = true;
+    this._writeOpenInFlight = true;
+    const self = this;
+    this._fsImpl.open(this.path, this.flags, this.mode, (error, fd) => {
+      self._nodeOpening = false;
+      self._writeOpenInFlight = false;
+      self._writeOpenDone = true;
+      if (error) {
+        self.pending = false;
+        self.emit("error", error);
+        if (!self.closed) {
+          self.closed = true;
+          self.emit("close");
+        }
+        return;
+      }
+      self.fd = fd;
+      self._nodeOpenDone = true;
+      self.pending = false;
+      self.emit("open", fd);
+      self.emit("ready");
+      self._afterOpenWrite();
+    });
+  }
+  /// Buffered path (the default): Node always opens a descriptor in
+  /// `_construct`, even when the bytes are later flushed through the whole-file
+  /// host write. `fd`, `open`/`close` and destroy-before-open depend on it
+  /// (test-fs-write-stream, test-fs-write-stream-end).
+  _openBuffered() {
+    this._writeOpenInFlight = true;
+    try {
+      const fd = openSync(this.path, this.flags, this.mode);
+      this.fd = fd;
+      this._bufferedFd = true;
+      this.pending = false;
+      this._writeOpenDone = true;
+      this._writeOpenInFlight = false;
+      this.emit("open", fd);
+      this.emit("ready");
+    } catch (error) {
+      this.pending = false;
+      this._writeOpenDone = true;
+      this._writeOpenInFlight = false;
+      this.emit("error", error);
+      if (!this.closed) {
+        this.closed = true;
+        this.emit("close");
+      }
+      return;
+    }
+    this._afterOpenWrite();
+  }
+  /// Completion shared by the open paths: drain queued writes, or finish a
+  /// destroy() that arrived while the descriptor was being opened.
+  _afterOpenWrite() {
+    if (!this.destroyed) {
+      if (this._nodeFs) this._drainNodeWrite();
+      return;
+    }
+    const error = this._destroyError;
+    this._destroyError = undefined;
+    const callback = this._destroyCallback;
+    this._destroyCallback = undefined;
+    this._closeWriteFd(() => {
+      globalThis.__pirMicrotask(() => {
+        if (error) this.emit("error", error);
+        if (!this.closed) {
+          this.closed = true;
+          this.emit("close");
+        }
+        if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      });
+    }, true);
+  }
+  /// Close the stream's descriptor (FileHandle, fd-backed or buffered). The
+  /// `done` callback always runs: a monkey-patched `fs.close` that ignores its
+  /// callback must not stall the stream's own `close` event. `force` closes
+  /// even under `autoClose: false` — an explicit `close()`/`destroy()` does.
+  _closeWriteFd(done, force) {
+    const fd = this.fd;
+    const handle = this._handle;
+    this.fd = null;
+    if (!this.autoClose && force !== true) {
+      if (done) done();
+      return;
+    }
+    if (handle !== undefined) {
+      try { handle.close(); } catch (_) { /* already gone */ }
+      if (done) done();
+      return;
+    }
+    if (fd === null || fd === undefined) {
+      if (done) done();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (done) done();
+    };
+    try { this._fsImpl.close(fd, finish); } catch (_) { /* already gone */ }
+    globalThis.__pirMicrotask(finish);
+  }
+  _drainNodeWrite() {
+    if (this.destroyed) return;
+    if (!this._nodeOpenDone) { this._openNodeWrite(); return; }
+    if (this._nodeWriting) return;
+    // Node batches more than one pending chunk into a single `writev` when
+    // the fs surface provides one (test-fs-write-stream-fs asserts the call).
+    if (this._nodeQueue.length > 1 && this._handle === undefined &&
+        typeof this._fsImpl.writev === "function") {
+      const items = this._nodeQueue;
+      this._nodeQueue = [];
+      this._nodeWriting = true;
+      const self = this;
+      const total = items.reduce((sum, item) => sum + item.bytes.length, 0);
+      this._fsImpl.writev(this.fd, items.map((item) => item.bytes),
+        this._writePosition, (error, written) => {
+          if (self.destroyed) return;
+          self._nodeWriting = false;
+          if (error) {
+            for (const item of items) {
+              if (typeof item.callback === "function") {
+                globalThis.__pirMicrotask(() => item.callback(error));
+              }
+            }
+            self._failNodeWrite(error);
+            return;
+          }
+          self.bytesWritten += total;
+          if (self._writePosition !== undefined) self._writePosition += written;
+          for (const item of items) {
+            if (typeof item.callback === "function") globalThis.__pirMicrotask(item.callback);
+          }
+          self._drainNodeWrite();
+        });
+      return;
+    }
+    const item = this._nodeQueue.shift();
+    if (item === undefined) {
+      if (this._nodeEndPending) this._finishNodeWrite();
+      return;
+    }
+    this._nodeWriting = true;
+    const self = this;
+    const bytes = item.bytes;
+    let done = 0;
+    const step = () => {
+      if (self.destroyed) return;
+      // FileHandle-backed streams write through `handle.write` (observable by
+      // a patch on the handle); path/fd streams use `fs.write`.
+      const invoke = (callback) => {
+        if (self._handle !== undefined) {
+          self._handle.write(bytes.subarray(done), 0, bytes.length - done,
+            self._writePosition ?? null).then(
+            (result) => callback(null, result.bytesWritten),
+            (error) => callback(error));
+        } else {
+          self._fsImpl.write(self.fd, bytes, done, bytes.length - done,
+            self._writePosition, callback);
+        }
+      };
+      invoke((error, written) => {
+          if (self.destroyed) return;
+          if (error) {
+            self._nodeWriting = false;
+            // Node hands the failing write's callback the error before the
+            // stream-wide `error` event.
+            if (typeof item.callback === "function") {
+              globalThis.__pirMicrotask(() => item.callback(error));
+            }
+            self._failNodeWrite(error);
+            return;
+          }
+          done += written;
+          if (self._writePosition !== undefined) self._writePosition += written;
+          if (done < bytes.length) { step(); return; }
+          self.bytesWritten += bytes.length;
+          self._nodeWriting = false;
+          if (typeof item.callback === "function") globalThis.__pirMicrotask(item.callback);
+          self._drainNodeWrite();
+        });
+    };
+    if (bytes.length === 0) {
+      self._nodeWriting = false;
+      if (typeof item.callback === "function") globalThis.__pirMicrotask(item.callback);
+      self._drainNodeWrite();
+      return;
+    }
+    step();
+  }
+  /// A failed write drains the descriptor exactly like Node: `close` runs
+  /// while `stream.fd` still holds the descriptor, then `fd` is nulled and the
+  /// error is emitted. Remaining queued writes never reach the fs methods.
+  _failNodeWrite(error) {
+    if (this.destroyed) return;
     this.destroyed = true;
+    this._nodeQueue.length = 0;
+    const fd = this.fd;
+    if (this._handle !== undefined) {
+      // Mark closed before handing the handle back so its close listener does
+      // not emit a second `close` for the stream.
+      this.closed = true;
+      this.fd = null;
+      try { this._handle.close(); } catch (_) { /* already gone */ }
+    } else if (fd !== null && fd !== undefined) {
+      try { this._fsImpl.close(fd, function () {}); } catch (_) { /* already gone */ }
+      this.fd = null;
+    }
     this.closed = true;
-    if (error) this.emit("error", error);
+    this.pending = false;
+    this.emit("error", error);
     this.emit("close");
+  }
+  _finishNodeWrite() {
+    if (this._nodeFinishing) return;
+    this._nodeFinishing = true;
+    const self = this;
+    const done = () => {
+      self.emit("finish");
+      if (self.autoClose) {
+        self.closed = true;
+        self.emit("close");
+      }
+      if (typeof self._nodeEndCallback === "function") {
+        globalThis.__pirMicrotask(self._nodeEndCallback);
+      }
+    };
+    const handle = this._handle;
+    const fd = this.fd;
+    if (this.autoClose && handle !== undefined) {
+      this.closed = true;
+      this.fd = null;
+      try { handle.close(); } catch (_) { /* already gone */ }
+      done();
+    } else if (this.autoClose && fd !== null && fd !== undefined) {
+      this._fsImpl.close(fd, (error) => {
+        self.fd = null;
+        self._nodeOpenDone = false;
+        if (error) {
+          if (typeof self._nodeEndCallback === "function") {
+            globalThis.__pirMicrotask(() => self._nodeEndCallback(error));
+          }
+          self.emit("error", error);
+          return;
+        }
+        done();
+      });
+    } else {
+      done();
+    }
+  }
+  close(callback) {
+    // The callback runs after `close` (Node's fs streams); passing it into
+    // destroy keeps that ordering (test-fs-write-stream-double-close asserts
+    // the close event was already emitted).
+    this.destroy(undefined, callback);
+  }
+  destroy(error, callback) {
+    if (this.destroyed) {
+      if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      return this;
+    }
+    this.destroyed = true;
+    this._nodeQueue.length = 0;
+    // Open still pending: Node finishes the in-flight open and then closes
+    // (`open` is still emitted, test-fs-stream-double-close).
+    if (this._fd === undefined && (this._pendingConstruct || this._writeOpenInFlight)) {
+      this._destroyError = error;
+      this._destroyCallback = callback;
+      return this;
+    }
+    this._closeWriteFd(() => {
+      // Node emits destroy's error/close on a later tick; a listener attached
+      // right after destroy() must still see close (construct-compat tests).
+      globalThis.__pirMicrotask(() => {
+        if (error) this.emit("error", error);
+        if (!this.closed) {
+          this.closed = true;
+          this.emit("close");
+        }
+        if (typeof callback === "function") globalThis.__pirMicrotask(callback);
+      });
+    }, true);
     return this;
   }
 }
+WriteStreamImpl.prototype.open = pirDefaultWriteOpen;
+
+// Node's ReadStream/WriteStream are legacy function constructors: calling
+// them without `new`, or via `fs.ReadStream.call(this, ...)` from a subclass,
+// must work. The class bodies stay as the implementation; these wrappers give
+// them that calling convention (and `instanceof` still holds).
+function ReadStream(path, options) {
+  if (!(this instanceof ReadStream)) return new ReadStream(path, options);
+  pirInitReadStream(this, path, options);
+  return this;
+}
+ReadStream.prototype = ReadStreamImpl.prototype;
+Object.defineProperty(ReadStream.prototype, "constructor", {
+  value: ReadStream, writable: true, enumerable: false, configurable: true,
+});
+
+function WriteStream(path, options) {
+  if (!(this instanceof WriteStream)) return new WriteStream(path, options);
+  pirInitWriteStream(this, path, options);
+  return this;
+}
+WriteStream.prototype = WriteStreamImpl.prototype;
+Object.defineProperty(WriteStream.prototype, "constructor", {
+  value: WriteStream, writable: true, enumerable: false, configurable: true,
+});
+// Node exposes `autoClose` as a prototype accessor backed by the stream
+// state, so reading it off the prototype itself is ERR_INVALID_THIS
+// (test-fs-write-stream-autoclose-option). Instances get an own data property
+// through the setter, exactly like a state-backed accessor would behave.
+Object.defineProperty(WriteStream.prototype, "autoClose", {
+  get() {
+    if (!(this instanceof WriteStream)) {
+      throw pirCodedError(TypeError, "ERR_INVALID_THIS", 'Value of "this" must be of type WriteStream');
+    }
+    return undefined;
+  },
+  set(value) {
+    if (!(this instanceof WriteStream)) {
+      throw pirCodedError(TypeError, "ERR_INVALID_THIS", 'Value of "this" must be of type WriteStream');
+    }
+    Object.defineProperty(this, "autoClose", {
+      value: value, writable: true, enumerable: false, configurable: true,
+    });
+  },
+  enumerable: false,
+  configurable: true,
+});
 
 class FileReadStream extends ReadStream {}
 class FileWriteStream extends WriteStream {}
@@ -1535,24 +4305,162 @@ function pirReject(api) {
   return function () { return Promise.reject(pirFsUnsupported(api)); };
 }
 
-const chown = pirFsThrower("fs.chown");
-const chownSync = pirFsThrower("fs.chownSync");
-const fchown = pirFsThrower("fs.fchown");
-const fchownSync = pirFsThrower("fs.fchownSync");
-const futimes = pirFsThrower("fs.futimes");
-const futimesSync = pirFsThrower("fs.futimesSync");
-const lchown = pirFsThrower("fs.lchown");
-const lchownSync = pirFsThrower("fs.lchownSync");
-const link = pirFsThrower("fs.link");
-const linkSync = pirFsThrower("fs.linkSync");
-const lutimes = pirFsThrower("fs.lutimes");
-const lutimesSync = pirFsThrower("fs.lutimesSync");
+// Ownership/link/lutimes are not backed by the host bridge, but Node's
+// argument validation happens before the unsupported syscall. Validating here
+// keeps the observable error contract (the null-bytes and type-check suites).
+const kMaxUserId = 4294967295;
+
+function pirValidateUidGid(uid, gid) {
+  pirValidateInteger(uid, "uid", -1, kMaxUserId);
+  pirValidateInteger(gid, "gid", -1, kMaxUserId);
+}
+
+/// libuv's chown/fchown/lchown are successful no-ops on Windows (the platform
+/// has no file ownership); Node's tests exercise that (`-1` "leave unchanged"
+/// and the plain success path). Everywhere else the host bridge has no chown.
+function pirChownNoop() {
+  return globalThis.__pirPlatform === "win32";
+}
+
+function chown(path, uid, gid, callback) {
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  pirValidateUidGid(uid, gid);
+  if (pirChownNoop()) { microtask(() => callback(null)); return; }
+  throw pirFsUnsupported("fs.chown");
+}
+
+function chownSync(path, uid, gid) {
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  pirValidateUidGid(uid, gid);
+  if (pirChownNoop()) return;
+  throw pirFsUnsupported("fs.chownSync");
+}
+
+function fchown(fd, uid, gid, callback) {
+  // Node validates uid/gid before the callback, and the binding validates
+  // `fd` last (`test-fs-fchown`'s two-argument forms expect the uid/gid error).
+  pirValidateUidGid(uid, gid);
+  pirValidateFunction(callback, "cb");
+  pirValidateFd(fd);
+  if (pirChownNoop()) { microtask(() => callback(null)); return; }
+  throw pirFsUnsupported("fs.fchown");
+}
+
+function fchownSync(fd, uid, gid) {
+  pirValidateUidGid(uid, gid);
+  pirValidateFd(fd);
+  if (pirChownNoop()) return;
+  throw pirFsUnsupported("fs.fchownSync");
+}
+
+function lchown(path, uid, gid, callback) {
+  pirValidateFunction(callback, "cb");
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  pirValidateUidGid(uid, gid);
+  if (pirChownNoop()) { microtask(() => callback(null)); return; }
+  throw pirFsUnsupported("fs.lchown");
+}
+
+function lchownSync(path, uid, gid) {
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  pirValidateUidGid(uid, gid);
+  if (pirChownNoop()) return;
+  throw pirFsUnsupported("fs.lchownSync");
+}
+
+/// Node's two-path fs errors (link/rename/symlink) name the destination and
+/// carry `err.dest`. The host returns code/syscall/path for the source; add the
+/// second half here so no NodeError field is needed.
+function pirLinkDecorateError(error, to) {
+  if (error !== null && typeof error === "object" && error.syscall === "link") {
+    error.dest = to;
+    if (typeof error.message === "string" && error.message.indexOf(" -> ") === -1) {
+      error.message += " -> '" + to + "'";
+    }
+  }
+  return error;
+}
+
+function link(existingPath, newPath, callback) {
+  pirValidateFunction(callback, "cb");
+  const from = pirCheckPathBytes(pirPathArg(existingPath, "existingPath"), "existingPath");
+  const to = pirCheckPathBytes(pirPathArg(newPath, "newPath"), "newPath");
+  microtask(() => {
+    try { linkSync(from, to); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function linkSync(existingPath, newPath) {
+  const from = pirCheckPathBytes(pirPathArg(existingPath, "existingPath"), "existingPath");
+  const to = pirCheckPathBytes(pirPathArg(newPath, "newPath"), "newPath");
+  try {
+    call("fs", "link", { from: from, to: to });
+  } catch (error) {
+    throw pirLinkDecorateError(error, to);
+  }
+}
+
+function lutimes(path, atime, mtime, callback) {
+  pirValidateFunction(callback, "cb");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  const at = utimesMs(atime);
+  const mt = utimesMs(mtime);
+  microtask(() => {
+    try { call("fs", "lutimes", { path: target, atimeMs: at, mtimeMs: mt }); } catch (error) { callback(error); return; }
+    callback(null);
+  });
+}
+
+function lutimesSync(path, atime, mtime) {
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  call("fs", "lutimes", { path: target, atimeMs: utimesMs(atime), mtimeMs: utimesMs(mtime) });
+}
+
 const glob = pirFsThrower("fs.glob");
 const globSync = pirFsThrower("fs.globSync");
 const mkdtempDisposableSync = pirFsThrower("fs.mkdtempDisposableSync");
 const openAsBlob = pirFsThrower("fs.openAsBlob");
-const statfs = pirFsThrower("fs.statfs");
-const statfsSync = pirFsThrower("fs.statfsSync");
+
+function pirValidateStatfsOptions(options) {
+  if (options === undefined || options === null) return;
+  if (typeof options !== "object") throw pirInvalidArgType("options", "an object", options);
+  if (options.bigint !== undefined) pirValidateBooleanProperty(options.bigint, "options.bigint");
+}
+
+function pirStatfsShape(info, options) {
+  const bigint = options !== undefined && options !== null && Boolean(options.bigint);
+  const field = (value) => bigint ? BigInt(value) : Number(value);
+  return {
+    type: field(info.type),
+    bsize: field(info.bsize),
+    frsize: field(info.frsize),
+    blocks: field(info.blocks),
+    bfree: field(info.bfree),
+    bavail: field(info.bavail),
+    files: field(info.files),
+    ffree: field(info.ffree),
+  };
+}
+
+function statfs(path, options, callback) {
+  if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "callback");
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  pirValidateStatfsOptions(options);
+  microtask(() => {
+    let stats;
+    try { stats = statfsSync(target, options); } catch (error) { callback(error); return; }
+    callback(null, stats);
+  });
+}
+
+function statfsSync(path, options) {
+  const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+  pirValidateStatfsOptions(options);
+  return pirStatfsShape(call("fs", "statfs", { path: target }), options);
+}
 
 // `fs.lchmod` exists only on the platforms whose libuv implements it (macOS).
 // Everywhere else Node still publishes the *name* (`Object.keys(fs)` contains
@@ -1573,6 +4481,10 @@ class Utf8Stream {
 
 function realpath(path, options, callback) {
   if (typeof options === "function") { callback = options; options = undefined; }
+  pirValidateFunction(callback, "callback");
+  // getValidatedPath and getOptions both run synchronously in Node.
+  pirEncodingOptions(options);
+  pirCheckPathBytes(pirPathArg(path, "path"), "path");
   microtask(() => {
     let value;
     try { value = realpathSync(path, options); } catch (error) { callback(error); return; }
@@ -1580,28 +4492,143 @@ function realpath(path, options, callback) {
   });
 }
 
+/// `fs.promises.watch`: an async iterator over the same FSWatcher events.
+function pirPromisesWatch(filename, options) {
+  const opts = pirWatchOptions(options);
+  const watcher = new FSWatcher(filename, opts);
+  const queue = [];
+  let waiter;
+  let done = false;
+  let failure;
+  const wake = () => {
+    if (waiter !== undefined) {
+      const resolve = waiter;
+      waiter = undefined;
+      resolve();
+    }
+  };
+  const onAbort = () => {
+    failure = pirAbortError(opts.signal);
+    done = true;
+    watcher.close();
+    wake();
+  };
+  if (opts.signal !== undefined) {
+    if (opts.signal.aborted === true) onAbort();
+    else opts.signal.addEventListener("abort", onAbort);
+  }
+  watcher.on("change", (eventType, name) => {
+    if (done) return;
+    queue.push({ eventType: eventType, filename: name });
+    wake();
+  });
+  watcher.on("error", (error) => {
+    failure = error;
+    wake();
+  });
+  return {
+    [Symbol.asyncIterator]() { return this; },
+    async next() {
+      for (;;) {
+        if (queue.length > 0) return { value: queue.shift(), done: false };
+        if (failure !== undefined) {
+          const error = failure;
+          failure = undefined;
+          throw error;
+        }
+        if (done) return { value: undefined, done: true };
+        await new Promise((resolve) => { waiter = resolve; });
+      }
+    },
+    async return() {
+      done = true;
+      watcher.close();
+      if (opts.signal !== undefined && typeof opts.signal.removeEventListener === "function") {
+        try { opts.signal.removeEventListener("abort", onAbort); } catch { /* noop */ }
+      }
+      wake();
+      return { value: undefined, done: true };
+    },
+  };
+}
+
+/// Promise-side write/append: signals abort before the first host write (Node
+/// yields a turn first) and iterables/async iterables are collected.
+async function pirPromiseWriteFile(path, data, options, append) {
+  const opts = fileOptions(options);
+  // `fs.promises.writeFile/appendFile(fileHandle, …)` write through the
+  // handle (Node's documented `file` type includes FileHandle).
+  if (path instanceof FileHandle) {
+    if (append) await path.appendFile(data, options);
+    else await path.writeFile(data, options);
+    return;
+  }
+  const signal = opts.signal;
+  pirCheckAborted(signal);
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+  pirCheckAborted(signal);
+  const iterable = data !== null && typeof data === "object" &&
+    !pirIsArrayBufferView(data) &&
+    (typeof data[Symbol.asyncIterator] === "function" ||
+     typeof data[Symbol.iterator] === "function");
+  if (iterable) {
+    const chunks = [];
+    const push = (chunk) => {
+      pirCheckAborted(signal);
+      chunks.push(pirWriteBytesFor(chunk, opts.encoding, "data"));
+    };
+    if (typeof data[Symbol.asyncIterator] === "function") {
+      for await (const chunk of data) push(chunk);
+    } else {
+      for (const chunk of data) push(chunk);
+    }
+    const combined = Buffer.concat(chunks);
+    if (append) appendFileSync(path, combined, opts.source);
+    else writeFileSync(path, combined, opts.source);
+  } else if (append) {
+    appendFileSync(path, data, options);
+  } else {
+    writeFileSync(path, data, options);
+  }
+  pirCheckAborted(signal);
+}
+
 const promises = {
-  readFile: async (path, options) => readFileSync(path, options),
-  writeFile: async (path, data, options) => { writeFileSync(path, data, options); },
-  appendFile: async (path, data, options) => { appendFileSync(path, data, options); },
+  readFile: async (path, options) => {
+    // `fs.promises.readFile(fileHandle)` reads from the handle's position.
+    if (path instanceof FileHandle) return path.readFile(options);
+    const opts = fileOptions(options);
+    pirCheckAborted(opts.signal);
+    // Node's promise readFile yields before the first read.
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+    pirCheckAborted(opts.signal);
+    const value = readFileSync(path, options);
+    pirCheckAborted(opts.signal);
+    return value;
+  },
+  writeFile: async (path, data, options) => { await pirPromiseWriteFile(path, data, options, false); },
+  appendFile: async (path, data, options) => { await pirPromiseWriteFile(path, data, options, true); },
   readdir: async (path, options) => readdirSync(path, options),
-  stat: async (path) => statSync(path),
-  lstat: async (path) => lstatSync(path),
+  stat: async (path, options) => statSync(path, options),
+  lstat: async (path, options) => lstatSync(path, options),
   mkdir: async (path, options) => { mkdirSync(path, options); },
   rm: async (path, options) => { rmSync(path, options); },
   unlink: async (path) => { unlinkSync(path); },
   rename: async (from, to) => { renameSync(from, to); },
-  copyFile: async (from, to) => { copyFileSync(from, to); },
-  realpath: async (path) => realpathSync(path),
+  copyFile: async (from, to, mode) => { copyFileSync(from, to, mode); },
+  realpath: async (path, options) => realpathSync(path, options),
   access: async (path, mode) => { accessSync(path, mode); },
-  readlink: async (path) => readlinkSync(path),
-  open: async (path, flags, mode) => new FileHandle(openSync(path, flags, mode)),
+  readlink: async (path, options) => readlinkSync(path, options),
+  open: async (path, flags, mode) => {
+    const fd = openSync(path, flags, mode);
+    return new FileHandle(fd, flags === undefined ? "r" : flags);
+  },
   opendir: async (path, options) => {
     const target = pirPathArg(path, "path");
-    const bufferSize = pirOpendirBufferSize(options);
-    return new Dir(target, bufferSize);
+    const opts = pirOpendirOptions(options);
+    return new Dir(target, opts.bufferSize, opts.encoding);
   },
-  mkdtemp: async (prefix) => mkdtempSync(prefix),
+  mkdtemp: async (prefix, options) => mkdtempSync(prefix, options),
   chmod: async (path, mode) => { chmodSync(path, mode); },
   cp: async (from, to, options) => { cpSync(from, to, options); },
   rmdir: async (path, options) => { rmdirSync(path, options); },
@@ -1609,25 +4636,71 @@ const promises = {
   truncate: async (path, len) => { truncateSync(path, len); },
   utimes: async (path, atime, mtime) => { utimesSync(path, atime, mtime); },
   constants: constants,
-  chown: pirReject("fs.promises.chown"),
+  chown: async (path, uid, gid) => {
+    // Same validation order as the callback form; Windows then succeeds as a
+    // no-op (libuv has no ownership there).
+    const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+    pirValidateUidGid(uid, gid);
+    if (pirChownNoop()) return;
+    throw pirFsUnsupported("fs.promises.chown");
+  },
   // Node keeps `fs.promises.lchmod` as a function even where libuv has no
   // lchmod: it rejects with ERR_METHOD_NOT_IMPLEMENTED (the sync twins do not
   // exist at all there).
   lchmod: pirHasLchmod
     ? pirReject("fs.promises.lchmod")
     : () => Promise.reject(pirCodedError(Error, "ERR_METHOD_NOT_IMPLEMENTED", "The lchmod() method is not implemented")),
-  lchown: pirReject("fs.promises.lchown"),
-  link: pirReject("fs.promises.link"),
-  lutimes: pirReject("fs.promises.lutimes"),
+  lchown: async (path, uid, gid) => {
+    // test-fs-lchown asserts the path/uid/gid validation errors arrive as
+    // rejections before the (unsupported on POSIX) syscall.
+    const target = pirCheckPathBytes(pirPathArg(path, "path"), "path");
+    pirValidateUidGid(uid, gid);
+    if (pirChownNoop()) return;
+    throw pirFsUnsupported("fs.promises.lchown");
+  },
+  link: async (existingPath, newPath) => { linkSync(existingPath, newPath); },
+  lutimes: async (path, atime, mtime) => { lutimesSync(path, atime, mtime); },
   glob: pirReject("fs.promises.glob"),
   mkdtempDisposable: pirReject("fs.promises.mkdtempDisposable"),
-  statfs: pirReject("fs.promises.statfs"),
-  watch: async function* () {
-    // No notification source exists (see FSWatcher): the async iterator
-    // stays idle; awaiting a first event waits forever, exactly like
-    // watching a file that never changes.
-  },
+  statfs: async (path, options) => statfsSync(path, options),
+  watch: (filename, options) => pirPromisesWatch(filename, options),
 };
+
+/// `util.promisify` support. Node registers kCustomPromisifyArgsSymbol and
+/// lets promisify assemble the multi-value result; this runtime's promisify
+/// only honours `Symbol.for('nodejs.util.promisify.custom')`, so the custom
+/// functions are installed directly with the same result shapes.
+const kPirPromisify = Symbol.for("nodejs.util.promisify.custom");
+
+function pirSetPromisifyCustom(fn, build) {
+  Object.defineProperty(fn, kPirPromisify, {
+    value: function (...args) {
+      return new Promise((resolve, reject) => {
+        args.push((err, first, second) => {
+          if (err) { reject(err); return; }
+          resolve(build(first, second));
+        });
+        fn.apply(this, args);
+      });
+    },
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+}
+
+pirSetPromisifyCustom(read, (bytesRead, buffer) => ({ bytesRead, buffer }));
+pirSetPromisifyCustom(write, (bytesWritten, buffer) => ({ bytesWritten, buffer }));
+pirSetPromisifyCustom(readv, (bytesRead, buffers) => ({ bytesRead, buffers }));
+pirSetPromisifyCustom(writev, (bytesWritten, buffers) => ({ bytesWritten, buffers }));
+Object.defineProperty(exists, kPirPromisify, {
+  value: function (path) {
+    return new Promise((resolve) => exists(path, resolve));
+  },
+  enumerable: false,
+  configurable: true,
+  writable: true,
+});
 
 const fs = {
   readFileSync: readFileSync,
@@ -1757,21 +4830,24 @@ function opendir(pathArg, options, callback) {
   // throw is part of the contract the official test asserts.
   pirCheckCallback(callback);
   const target = pirPathArg(pathArg, "path");
-  const bufferSize = pirOpendirBufferSize(options);
+  const opts = pirOpendirOptions(options);
   microtask(() => {
     let dir;
-    try { dir = new Dir(target, bufferSize); } catch (error) { callback(error); return; }
+    try { dir = new Dir(target, opts.bufferSize, opts.encoding); } catch (error) { callback(error); return; }
     callback(null, dir);
   });
 }
 
 function readlink(pathArg, options, callback) {
   if (typeof options === 'function') { callback = options; options = undefined; }
+  pirValidateFunction(callback, "cb");
+  // Node's getOptions validates the encoding before the path is looked up.
+  pirEncodingOptions(options);
+  pirCheckPathBytes(pirPathArg(pathArg, "path"), "path");
   microtask(() => {
     let value;
     try {
-      value = readlinkSync(pathArg);
-      if (options && options.encoding === 'buffer') value = Buffer.from(value, 'utf8');
+      value = readlinkSync(pathArg, options);
     } catch (error) { callback(error); return; }
     callback(null, value);
   });

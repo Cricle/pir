@@ -57,7 +57,7 @@ pub(super) fn register_session_host_fns(
     {
         let st = state.clone();
         sync_fn!("getContextJson", move || -> String {
-            context_json(&lock_state(&st))
+            context_json(&lock_state(&st)).to_string()
         });
     }
     {
@@ -434,25 +434,7 @@ pub(super) fn register_session_host_fns(
     {
         let st = state.clone();
         sync_fn!("getActiveToolsJson", move || -> String {
-            let s = lock_state(&st);
-            // The override wins; without one the active set is every
-            // host-pushed def (core tools plus Rust-backend plugin tools)
-            // plus every extension-registered tool.
-            match &s.active_tools_override {
-                Some(names) => serde_json::to_string(names).unwrap_or_else(|_| "[]".into()),
-                None => {
-                    // Borrows only: serializing `&str` avoids cloning every host
-                    // tool name plus every not-yet-listed extension tool name.
-                    let mut names: Vec<&str> =
-                        s.core_tools.iter().map(|def| def.name.as_str()).collect();
-                    for def in &s.tool_defs {
-                        if !names.contains(&def.name.as_str()) {
-                            names.push(def.name.as_str());
-                        }
-                    }
-                    serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
-                }
-            }
+            active_tools_value(&lock_state(&st)).to_string()
         });
     }
     {
@@ -625,7 +607,30 @@ pub(super) fn register_session_host_fns(
 /// `ToolDefinition.reachesTools`; `pi.getAllTools()` re-attaches the live hook
 /// in QuickJS) and the raw `namespace` object with its `aliases` (upstream
 /// `ToolNamespace.aliases`).
-fn build_all_tools_json(s: &RuntimeState) -> String {
+/// Active tool names as a JSON value (shared by the string host fn and the
+/// native object tier). The override wins; otherwise every host-pushed def
+/// plus every extension-registered tool, first name wins.
+pub(super) fn active_tools_value(s: &RuntimeState) -> JsonValue {
+    match &s.active_tools_override {
+        Some(names) => JsonValue::Array(names.iter().cloned().map(JsonValue::String).collect()),
+        None => {
+            let mut names: Vec<JsonValue> = s
+                .core_tools
+                .iter()
+                .map(|def| JsonValue::String(def.name.clone()))
+                .collect();
+            for def in &s.tool_defs {
+                let name = JsonValue::String(def.name.clone());
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            JsonValue::Array(names)
+        }
+    }
+}
+
+pub(super) fn build_all_tools_value(s: &RuntimeState) -> JsonValue {
     let mut defs: Vec<JsonValue> = Vec::with_capacity(s.core_tools.len() + s.tool_defs.len());
     // First name wins with CORE first, exactly like
     // `merge_plugin_tools` builds the run registry: a name appears at most
@@ -663,7 +668,11 @@ fn build_all_tools_json(s: &RuntimeState) -> String {
             defs.push(value);
         }
     }
-    serde_json::to_string(&defs).unwrap_or_else(|_| "[]".into())
+    JsonValue::Array(defs)
+}
+
+fn build_all_tools_json(s: &RuntimeState) -> String {
+    build_all_tools_value(s).to_string()
 }
 
 /// Fingerprint of every input [`build_all_tools_json`] reads, computed by
@@ -677,7 +686,7 @@ fn build_all_tools_json(s: &RuntimeState) -> String {
 /// a map (its iteration order is stable for one map instance); a wholesale
 /// replacement with an equivalent map may change the hash and cost exactly one
 /// rebuild — conservative, never stale.
-fn all_tools_fingerprint(s: &RuntimeState) -> Option<u64> {
+pub(super) fn all_tools_fingerprint(s: &RuntimeState) -> Option<u64> {
     let mut hasher = DefaultHasher::new();
     let mut sink = HashSink(&mut hasher);
     serde_json::to_writer(&mut sink, &(&s.core_tools, &s.tool_defs, &s.tool_extras)).ok()?;

@@ -51,7 +51,30 @@
   };
 
   // --- structuredClone ----------------------------------------------------
-  globalThis.structuredClone = globalThis.structuredClone || function structuredClone(value) {
+  globalThis.structuredClone = globalThis.structuredClone || function structuredClone(value, options) {
+    // Transfer list: the engine's ES `ArrayBuffer.prototype.transfer()`
+    // detaches its receiver and returns the buffer that owns the bytes — the
+    // structured-clone transfer step. The moved buffer replaces the source in
+    // the cloned graph; every view over the (now detached) source reads empty.
+    const transferred = new Map();
+    const transferList = options !== null && typeof options === "object"
+      ? options.transfer
+      : undefined;
+    if (transferList !== undefined) {
+      if (!Array.isArray(transferList)) {
+        const error = new Error("The transfer option is not a sequence.");
+        error.name = "DataCloneError";
+        throw error;
+      }
+      for (const item of transferList) {
+        if (!(item instanceof ArrayBuffer)) {
+          const error = new Error("Transferable object could not be transferred.");
+          error.name = "DataCloneError";
+          throw error;
+        }
+        transferred.set(item, item.transfer());
+      }
+    }
     function cloneNode(node, seen) {
       if (node === null || typeof node !== "object") {
         return node;
@@ -76,6 +99,8 @@
         return copy;
       }
       if (node instanceof ArrayBuffer) {
+        const moved = transferred.get(node);
+        if (moved !== undefined) return moved;
         const copy = new ArrayBuffer(node.byteLength);
         new Uint8Array(copy).set(new Uint8Array(node));
         return copy;
@@ -371,7 +396,7 @@
       if (handle === undefined || handle === null) return;
       if (handle._cancelled === false) {
         handle._cancelled = true;
-        if (typeof handle._timer === "number") globalThis.clearTimeout(handle._timer);
+        globalThis.clearTimeout(handle._timer); // Timeout object or legacy id
         return;
       }
       // A raw timer id from an older pir build (or a passed-through

@@ -5,7 +5,7 @@ function applyFormat(schema, opts) {
   // Upstream TypeBox copies every own option (constraints like minimum/
   // maxLength as well as metadata like description/default).
   if (opts && typeof opts === "object") {
-    for (const key of Object.keys(opts)) {
+    for (const key of globalThis.Object.keys(opts)) {
       schema[key] = opts[key];
     }
   }
@@ -44,13 +44,13 @@ function cloneDefault(value) {
 function itemSchemas(schema) {
   if (!schema || typeof schema !== "object") return undefined;
   const items = schema.items;
-  if (Array.isArray(items)) return items;
+  if (globalThis.Array.isArray(items)) return items;
   return items && typeof items === "object" ? [items, undefined] : undefined;
 }
 
 function applyDefaults(schema, value) {
   if (value === null || typeof value !== "object") return value;
-  const branches = schema && typeof schema === "object" && Array.isArray(schema.anyOf) ? schema.anyOf : undefined;
+  const branches = schema && typeof schema === "object" && globalThis.Array.isArray(schema.anyOf) ? schema.anyOf : undefined;
   if (branches !== undefined) {
     for (const branch of branches) {
       // Fill defaults from the branch the value already satisfies.
@@ -60,7 +60,7 @@ function applyDefaults(schema, value) {
     }
     return value;
   }
-  if (Array.isArray(value)) {
+  if (globalThis.Array.isArray(value)) {
     const items = itemSchemas(schema);
     if (items === undefined) return value;
     for (let index = 0; index < value.length; index++) {
@@ -73,7 +73,7 @@ function applyDefaults(schema, value) {
       ? schema.properties
       : undefined;
   if (properties === undefined) return value;
-  for (const key of Object.keys(properties)) {
+  for (const key of globalThis.Object.keys(properties)) {
     const property = properties[key];
     if (property === null || typeof property !== "object") continue;
     if (!(key in value)) {
@@ -87,7 +87,7 @@ function applyDefaults(schema, value) {
 
 function cleanValue(schema, value) {
   if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) {
+  if (globalThis.Array.isArray(value)) {
     const items = itemSchemas(schema);
     if (items === undefined) return value;
     return value.map((item, index) => cleanValue(items[index] !== undefined ? items[index] : items[0], item));
@@ -98,7 +98,7 @@ function cleanValue(schema, value) {
       : undefined;
   if (properties === undefined) return value;
   const out = {};
-  for (const key of Object.keys(value)) {
+  for (const key of globalThis.Object.keys(value)) {
     // `undefined` values are dropped with the property, as upstream does (the
     // strict-JSON contract of the consumers this shim serves forbids them).
     if (key in properties && value[key] !== undefined) out[key] = cleanValue(properties[key], value[key]);
@@ -122,9 +122,9 @@ function keyPattern(key) {
   if (typeof key.pattern === "string") return key.pattern;
   if (key.type === "string") return "^.*$";
   if (key.type === "number" || key.type === "integer") return "^-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$";
-  if ("const" in key) return "^" + String(key.const).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
-  if (Array.isArray(key.enum)) {
-    const alternatives = key.enum.map((item) => String(item).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if ("const" in key) return "^" + globalThis.String(key.const).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$";
+  if (globalThis.Array.isArray(key.enum)) {
+    const alternatives = key.enum.map((item) => globalThis.String(item).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
     return "^(?:" + alternatives.join("|") + ")$";
   }
   return undefined;
@@ -136,6 +136,7 @@ export const Type = {
   Integer: prim("integer"),
   Boolean: prim("boolean"),
   Null: prim("null"),
+  Undefined: prim("undefined"),
   /** Upstream `Type.Void()` is `{ type: "void" }`; no value validates against it. */
   Void: prim("void"),
   Never: () => ({ not: {} }),
@@ -165,7 +166,7 @@ export const Type = {
   },
   Object: (properties, opts) => {
     const schema = { type: "object", properties: {}, required: [] };
-    for (const [key, value] of Object.entries(properties ?? {})) {
+    for (const [key, value] of globalThis.Object.entries(properties ?? {})) {
       const stripped = stripOptional(value);
       schema.properties[key] = stripped;
       if (stripped === value) schema.required.push(key);
@@ -204,5 +205,32 @@ export const Value = {
   /** TypeBox semantics: drop properties the schema does not declare, recursively. */
   Clean: (schema, value) => cleanValue(schema, value),
 };
+
+// Upstream `import * as Type from "typebox"` exposes the builders at the
+// module root as well as under the `Type` namespace. Preserve both shapes;
+// aliases are declared after the namespace so they cannot shadow helpers used
+// inside this module. Global built-ins above are qualified to avoid collisions.
+export const String = Type.String;
+export const Number = Type.Number;
+export const Integer = Type.Integer;
+export const Boolean = Type.Boolean;
+export const Null = Type.Null;
+export const Undefined = Type.Undefined;
+export const Void = Type.Void;
+export const Never = Type.Never;
+export const Unknown = Type.Unknown;
+export const Any = Type.Any;
+export const Unsafe = Type.Unsafe;
+export const Literal = Type.Literal;
+export const Enum = Type.Enum;
+export const Union = Type.Union;
+export const Intersect = Type.Intersect;
+export const Optional = Type.Optional;
+export const Readonly = Type.Readonly;
+export const Immutable = Type.Immutable;
+export const Array = Type.Array;
+export const Function = Type.Function;
+export const Record = Type.Record;
+export const Object = Type.Object;
 
 export default Type;

@@ -446,6 +446,35 @@ impl ExtensionRuntime {
         Ok(())
     }
 
+    /// Call a JS entry with typed QuickJS value args (no JSON string envelope)
+    /// and convert the returned value tree back to `JsonValue`, all inside one
+    /// `ctx.async_with` scope (`Value<'js>` cannot outlive it).
+    pub(super) async fn invoke_native3(
+        &self,
+        name: &str,
+        a: &serde_json::Value,
+        b: &serde_json::Value,
+        c: &serde_json::Value,
+    ) -> rquickjs::Result<serde_json::Value> {
+        let a = a.clone();
+        let b = b.clone();
+        let c = c.clone();
+        self.ctx
+            .async_with(async |ctx| {
+                let f: rquickjs::Function = ctx.globals().get(name)?;
+                // The clones above are owned by this future; hand them to the
+                // owning bridge so the tree is copied once, not twice (the
+                // borrowing `json_to_js` clones every container entry again).
+                let a = super::native_bridge::json_to_js_owned(&ctx, a)?;
+                let b = super::native_bridge::json_to_js_owned(&ctx, b)?;
+                let c = super::native_bridge::json_to_js_owned(&ctx, c)?;
+                let result: MaybePromise = f.call((a, b, c))?;
+                let value: rquickjs::Value = result.into_future().await?;
+                super::native_bridge::js_to_json(&value)
+            })
+            .await
+    }
+
     pub(super) async fn invoke_0(&self, name: &str) -> rquickjs::Result<String> {
         self.ctx
             .async_with(async |ctx| {

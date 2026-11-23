@@ -115,6 +115,14 @@ console.log("posix-join:", path.posix.join("a", "b"));
 console.log("win32-join:", path.win32.join("a", "b"));
 console.log("isAbsolute:", path.isAbsolute("/x"));
 console.log("normalize:", path.normalize("a//b/../c/"));
+console.log("win32-normalize:", path.win32.normalize("C:\\a\\..\\b\\\\c\\"));
+console.log("win32-unc:", path.win32.normalize("\\\\server\\share\\x\\..\\y"));
+console.log("win32-relative:", path.win32.relative("C:\\a\\b", "C:\\a\\c"));
+console.log("win32-reserved:", path.win32.normalize("C:\\CON"));
+console.log("posix-normalize:", path.posix.normalize("/a//b/../c/"));
+console.log("posix-relative:", path.posix.relative("/a/b/c", "/a/b/d/e"));
+console.log("posix-resolve:", path.posix.resolve("/a", "b", "..", "c"));
+console.log("posix-join-dup:", path.posix.join("a/", "/b", "//c"));
 "#,
         skip_reason: None,
     },
@@ -157,6 +165,46 @@ console.log("httpbase-frag:", new URL("#f2", "https://example.com/p?q=1#f1").hre
 console.log("httpbase-creds:", new URL("/p", "https://u:p@example.com:8443/sub/").href);
 console.log("httpbase-barehost:", new URL("x", "https://example.com").href);
 console.log("httpbase-proto-rel:", new URL("//other.com/p", "https://a.com/").href);
+// Corpus: every component, including the shapes the native fast path must
+// match (credentials, default ports, IDN, IPv6, dot segments, empty
+// query/fragment, percent-encoding, whitespace).
+const corpus = [
+  "http://example.com",
+  "https://example.com:8443/p/q?x=1&y=2#f",
+  "https://u:p@example.com:8443/a/../b/./c?q=%E4%B8%AD#h",
+  "https://example.com:443/x",
+  "http://example.com:80/x",
+  "HTTP://EXAMPLE.COM/Path?Q=1",
+  "https://[::1]:8080/x?y",
+  "https://bücher.example/straße?q=1",
+  "http://user:pa%20ss@example.com/",
+  "https://example.com/",
+  "https://example.com/?",
+  "https://example.com/#",
+  "https://example.com/p?",
+  "https://example.com/p#",
+  "https://example.com/a/b/../../../c",
+  "https://example.com/a%2Fb/c?d=%2F",
+  "  https://example.com/trim  ",
+  "http://example.com:0/x",
+];
+for (const raw of corpus) {
+  try {
+    const v = new URL(raw);
+    console.log("corpus:", raw, "=>",
+      [v.href, v.protocol, v.username, v.password, v.host, v.hostname, v.port, v.pathname, v.search, v.hash].join("|"));
+  } catch (error) {
+    console.log("corpus:", raw, "=> ERR", error.code || error.name);
+  }
+}
+const bases = ["https://example.com/a/b/c?q=1#f", "http://u:p@example.com:8080/dir/"];
+const rels = ["", ".", "..", "./x", "../x", "../../y", "?q=2", "#g", "//other.com/z", "/abs", "rel", "a/../b"];
+for (const base of bases) {
+  for (const rel of rels) {
+    const v = new URL(rel, base);
+    console.log("base:", base, "+", rel, "=>", v.href);
+  }
+}
         "##,
         skip_reason: None,
     },
@@ -169,6 +217,205 @@ const parsed = qs.parse("x=1%20&y=%26z");
 console.log("parse-x:", parsed.x);
 console.log("parse-y:", parsed.y);
 console.log("escape:", qs.escape("a b/c"));
+"#,
+        skip_reason: None,
+    },
+    Case {
+        name: "url_corpus_indexed",
+        script: r##"
+// The `url` case logs repeated `corpus:`/`base:` keys (later lines overwrite
+// earlier ones in the harness map). This variant indexes every line so the
+// whole WHATWG corpus and the relative-reference matrix are actually compared.
+const corpus = [
+  "http://example.com",
+  "https://example.com:8443/p/q?x=1&y=2#f",
+  "https://u:p@example.com:8443/a/../b/./c?q=%E4%B8%AD#h",
+  "https://example.com:443/x",
+  "http://example.com:80/x",
+  "HTTP://EXAMPLE.COM/Path?Q=1",
+  "https://[::1]:8080/x?y",
+  "https://bücher.example/straße?q=1",
+  "http://user:pa%20ss@example.com/",
+  "https://example.com/",
+  "https://example.com/?",
+  "https://example.com/#",
+  "https://example.com/p?",
+  "https://example.com/p#",
+  "https://example.com/a/b/../../../c",
+  "https://example.com/a%2Fb/c?d=%2F",
+  "  https://example.com/trim  ",
+  "http://example.com:0/x",
+  "data:text/plain,hi",
+  "file:///tmp/a b#x?y",
+  "ftp://Example.COM:21/a",
+  "ws://example.com:80/x",
+  "wss://example.com:443/x",
+  "blob:https://example.com/uuid",
+  "http://",
+];
+for (let i = 0; i < corpus.length; i++) {
+  const raw = corpus[i];
+  try {
+    const v = new URL(raw);
+    console.log("corpus" + i + ":",
+      [v.href, v.protocol, v.username, v.password, v.host, v.hostname, v.port,
+       v.pathname, v.search, v.hash, v.origin].join("|"));
+  } catch (error) {
+    console.log("corpus" + i + ":", "ERR " + (error.code || error.name));
+  }
+}
+const bases = ["https://example.com/a/b/c?q=1#f", "http://u:p@example.com:8080/dir/"];
+const rels = ["", ".", "..", "./x", "../x", "../../y", "?q=2", "#g", "//other.com/z", "/abs", "rel", "a/../b"];
+let n = 0;
+for (const base of bases) {
+  for (const rel of rels) {
+    console.log("baseline" + n + ":", new URL(rel, base).href);
+    n += 1;
+  }
+}
+"##,
+        skip_reason: None,
+    },
+    Case {
+        name: "url_components",
+        script: r##"
+const u = new URL("https://user:pa%20ss@example.com:8443/a/../b?q=1&r=2#frag");
+console.log("u-href:", u.href);
+console.log("u-origin:", u.origin);
+console.log("u-protocol:", u.protocol);
+console.log("u-username:", u.username);
+console.log("u-password:", u.password);
+console.log("u-host:", u.host);
+console.log("u-hostname:", u.hostname);
+console.log("u-port:", u.port);
+console.log("u-pathname:", u.pathname);
+console.log("u-search:", u.search);
+console.log("u-hash:", u.hash);
+console.log("u-json:", JSON.stringify(u));
+console.log("u-string:", u.toString());
+console.log("u-ownkeys:", Object.keys(u).length);
+console.log("u-canparse:", URL.canParse("https://x/"), URL.canParse("nope"));
+console.log("u-parse-static:", URL.parse("https://x/y?a=1").href, URL.parse("nope"));
+console.log("u-rel:", new URL("../x?q=2#g", "https://example.com/a/b/c?q=1#f").href);
+console.log("u-empty-path:", new URL("http://x").href, new URL("http://x").pathname);
+console.log("u-empty-query:", JSON.stringify(new URL("https://example.com/?").search), new URL("https://example.com/?").href);
+console.log("u-empty-hash:", JSON.stringify(new URL("https://example.com/#").hash), new URL("https://example.com/#").href);
+console.log("u-origin-file:", new URL("file:///tmp/x").origin);
+console.log("u-origin-data:", new URL("data:text/plain,hi").origin);
+console.log("u-origin-ftp:", new URL("ftp://example.com/a").origin);
+console.log("u-origin-ws:", new URL("ws://example.com/x").origin);
+console.log("u-origin-wss:", new URL("wss://example.com:443/x").origin);
+console.log("u-origin-blob:", new URL("blob:https://example.com/id").origin);
+const s = new URL("https://example.com/a/b?q=1#f");
+s.pathname = "/c/d";
+console.log("u-set-pathname:", s.href);
+s.search = "?z=9";
+console.log("u-set-search:", s.href);
+s.hash = "#h2";
+console.log("u-set-hash:", s.href);
+s.protocol = "http:";
+console.log("u-set-protocol:", s.href);
+console.log("u-baseobj:", new URL("x", new URL("https://a.com/d/e/")).href);
+try { new URL("http://x", null); } catch (error) { console.log("u-null-base:", error.code, JSON.stringify(error.base)); }
+try { new URL("./x"); } catch (error) { console.log("u-rel-nobase:", error.code, JSON.stringify(error.message), JSON.stringify(error.input)); }
+try { new URL("http://"); } catch (error) { console.log("u-invalid:", error.code, JSON.stringify(error.message), JSON.stringify(error.input)); }
+try { new URL("https://x/", "not a url"); } catch (error) { console.log("u-bad-base:", error.code, JSON.stringify(error.input), JSON.stringify(error.base)); }
+console.log("u-tag:", Object.prototype.toString.call(u));
+console.log("u-tojson-type:", typeof u.toJSON());
+"##,
+        skip_reason: None,
+    },
+    Case {
+        name: "url_search_params",
+        script: r#"
+const sp = new URLSearchParams("a=1&b=x+y&a=3&c=%E4%B8%AD");
+console.log("sp-get:", sp.get("a"), sp.get("missing"));
+console.log("sp-getall:", JSON.stringify(sp.getAll("a")));
+console.log("sp-size:", sp.size);
+console.log("sp-has:", sp.has("a"), sp.has("a", "3"), sp.has("a", "1"));
+console.log("sp-tostring:", sp.toString());
+console.log("sp-entries:", JSON.stringify([...sp.entries()]));
+console.log("sp-keys:", JSON.stringify([...sp.keys()]));
+console.log("sp-values:", JSON.stringify([...sp.values()]));
+console.log("sp-spread:", JSON.stringify([...sp]));
+const forEachOut = [];
+sp.forEach((value, key, obj) => { forEachOut.push(key + "=" + value + ":" + (obj === sp)); });
+console.log("sp-foreach:", forEachOut.join(","));
+const s2 = new URLSearchParams("b=1&a=2&b=3");
+s2.set("b", "9");
+s2.append("d", "4");
+console.log("sp-set:", s2.toString());
+s2.sort();
+console.log("sp-sort:", s2.toString());
+s2.delete("a");
+console.log("sp-delete:", s2.toString());
+s2.delete("b", "9");
+console.log("sp-delete-value:", s2.toString());
+console.log("sp-iter-ident:", URLSearchParams.prototype[Symbol.iterator] === URLSearchParams.prototype.entries);
+console.log("sp-tostringtag:", Object.prototype.toString.call(s2));
+console.log("sp-encode-set:", new URLSearchParams([["k", "~!*'() -._"], ["a b", "c+d"], ["%", "%"]]).toString());
+console.log("sp-invalid-pct:", new URLSearchParams("a=%E4%B8%AD%ZZ").get("a"));
+console.log("sp-bad-utf8:", new URLSearchParams("a=%E4%B8").get("a"));
+console.log("sp-qmark:", new URLSearchParams("?a=1").toString());
+console.log("sp-two-qmark:", new URLSearchParams("??a=1").toString());
+console.log("sp-noeq:", new URLSearchParams("abc").toString());
+console.log("sp-empty-name:", new URLSearchParams("=v").toString());
+console.log("sp-dups:", new URLSearchParams([["k", "1"], ["k", "2"]]).toString());
+console.log("sp-record:", new URLSearchParams({ a: 1, b: "x y" }).toString());
+console.log("sp-num:", new URLSearchParams(5).toString());
+console.log("sp-null:", new URLSearchParams(null).toString());
+console.log("sp-lone-get:", JSON.stringify(new URLSearchParams("a=\uD800").get("a")));
+console.log("sp-lone-tostring:", new URLSearchParams([["a", "\uD800"]]).toString());
+const u = new URL("https://example.com/p?a=1&b=2");
+console.log("sp-url:", u.searchParams.get("b"), u.searchParams === u.searchParams);
+console.log("u-lone-path:", new URL("https://x/\uD800").href);
+try { new URL("http://a\uD800b/"); } catch (error) { console.log("u-lone-host:", error.code); }
+"#,
+        skip_reason: None,
+    },
+    Case {
+        name: "querystring_details",
+        script: r#"
+const qs = require("querystring");
+console.log("qs-parse-basic:", JSON.stringify(qs.parse("a=1&b=2&a=3")));
+console.log("qs-parse-plus:", JSON.stringify(qs.parse("a=x+y&b=%2B")));
+console.log("qs-parse-noeq:", JSON.stringify(qs.parse("abc&d=")));
+console.log("qs-parse-empty:", JSON.stringify(qs.parse("")));
+console.log("qs-parse-nonstr:", JSON.stringify(qs.parse(5)));
+console.log("qs-parse-multi-eq:", JSON.stringify(qs.parse("a=b=c")));
+console.log("qs-parse-empty-chunks:", JSON.stringify(qs.parse("&&a=1&&")));
+console.log("qs-parse-invalid:", JSON.stringify(qs.parse("a=%2Q&b=%E4%B8")));
+console.log("qs-parse-max0:", JSON.stringify(qs.parse("a=1&b=2", "&", "=", { maxKeys: 0 })));
+console.log("qs-parse-max1:", JSON.stringify(qs.parse("a=1&b=2&c=3", "&", "=", { maxKeys: 1 })));
+console.log("qs-parse-maxneg:", JSON.stringify(qs.parse("a=1&b=2&c=3", "&", "=", { maxKeys: -1 })));
+console.log("qs-parse-max-empty-first:", JSON.stringify(qs.parse("&&a=1", "&", "=", { maxKeys: 1 })));
+console.log("qs-parse-sep:", JSON.stringify(qs.parse("a=1;b=2", ";")));
+console.log("qs-parse-eq:", JSON.stringify(qs.parse("a:1&b:2", "&", ":")));
+console.log("qs-parse-multi-sep:", JSON.stringify(qs.parse("a=1||b=2||c=3", "||")));
+console.log("qs-parse-partial:", JSON.stringify(qs.parse("a=1|x|b=2", "||")));
+console.log("qs-parse-custom-decode:", JSON.stringify(qs.parse("a=1&b=2", "&", "=", { decodeURIComponent: (s) => "[" + s + "]" })));
+console.log("qs-proto-null:", Object.getPrototypeOf(qs.parse("a=1")) === null);
+const dup = qs.parse("a=1&a=2");
+console.log("qs-dup-array:", Array.isArray(dup.a), dup.a.join("|"));
+console.log("qs-stringify-basic:", qs.stringify({ a: 1, b: "x y", c: [1, 2] }));
+console.log("qs-stringify-empty-array:", qs.stringify({ a: [], b: 1 }));
+console.log("qs-stringify-nan:", qs.stringify({ a: NaN, b: Infinity }));
+console.log("qs-stringify-bigint:", qs.stringify({ a: 10n }));
+console.log("qs-stringify-1e21:", qs.stringify({ a: 1e21, b: 1e20 }));
+console.log("qs-stringify-sep:", qs.stringify({ a: 1, b: 2 }, ";", ":"));
+console.log("qs-stringify-custom:", qs.stringify({ a: "x y" }, "&", "=", { encodeURIComponent: (s) => "[" + s + "]" }));
+console.log("qs-stringify-null:", qs.stringify(null));
+console.log("qs-escape:", qs.escape("a b/c"), qs.escape("!'()*~"), qs.escape("中"));
+console.log("qs-unescape:", qs.unescape("a%20b"), qs.unescape("a+b"), qs.unescape("%2Q"), qs.unescape("%E4%B8%AD%ZZ"), qs.unescape("%E4%B8"));
+console.log("qs-decode-alias:", qs.decode === qs.parse, qs.encode === qs.stringify);
+try { qs.escape("\uD800"); } catch (error) { console.log("qs-escape-lone:", error.code); }
+console.log("qs-override:", (() => {
+  const original = qs.unescape;
+  qs.unescape = (s) => "[" + s + "]";
+  const result = qs.parse("a=1").a;
+  qs.unescape = original;
+  return result;
+})());
 "#,
         skip_reason: None,
     },
@@ -200,6 +447,10 @@ console.log("bytelen:", Buffer.byteLength("中", "utf8"));
 console.log("alloc-fill:", Buffer.alloc(3, 7).toString("hex"));
 console.log("concat:", Buffer.concat([Buffer.from("ab"), Buffer.from("cd")]).toString());
 console.log("isbuffer:", Buffer.isBuffer(b));
+console.log("compare:", Buffer.compare(Buffer.from("abc"), Buffer.from("abd")), Buffer.compare(Buffer.from("abc"), Buffer.from("abc")), Buffer.compare(Buffer.from("abc"), Buffer.from("abcd")));
+console.log("swap16:", Buffer.from([1, 2, 3, 4]).swap16().toString("hex"));
+console.log("swap32:", Buffer.from([1, 2, 3, 4]).swap32().toString("hex"));
+console.log("swap64:", Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]).swap64().toString("hex"));
 "#,
         skip_reason: None,
     },

@@ -2,10 +2,11 @@
 // ReadableStream / WritableStream / TransformStream — minimal Web-streams
 // surface for the global fetch body plumbing (LLRT tier: minimal, same tier
 // as the node:stream pad). LIMITS (documented, not accidental): no true
-// backpressure or highWaterMark accounting, no byte streams/BYOB readers, no
-// tee/pipeThrough fidelity (pipeTo is a simple read/write loop), `pull` is
-// only invoked when a reader is waiting, and queuing strategies are ignored.
-// Installed only when the engine has no such global.
+// backpressure (the default reader's queue accounting is real, but `pull` is
+// still demand-driven only), no byte streams/BYOB readers, no tee/pipeThrough
+// fidelity (pipeTo is a simple read/write loop). Queuing strategies are
+// honored for the default reader (`highWaterMark`/`size` drive desiredSize).
+// Installed only when the engine has no such globals.
 
 (function () {
   class PirReadableStreamDefaultController {
@@ -17,16 +18,22 @@
       const stream = this.__stream;
       if (stream.__errored !== undefined) return null;
       if (stream.__closed) return 0;
-      return Math.max(0, 16 - this.__queue.length); // fixed pseudo HWM
+      return Math.max(0, stream.__highWaterMark - stream.__queueTotalSize);
     }
     enqueue(chunk) {
       const stream = this.__stream;
       if (stream.__closed) throw new TypeError("Cannot enqueue on a closed stream");
       if (stream.__errored !== undefined) throw stream.__errored;
-      stream.__queue.push(chunk);
+      // WHATWG: each chunk contributes strategy.size(chunk) to queueTotalSize
+      // (the default size algorithm returns 1).
+      const size = stream.__strategySize === null ? 1 : stream.__strategySize(chunk);
+      stream.__queue.push({ value: chunk, size: size });
+      stream.__queueTotalSize += size;
       const pending = stream.__pendingReads;
       while (pending.length > 0 && stream.__queue.length > 0) {
-        pending.shift().ok(stream.__queue.shift());
+        const entry = stream.__queue.shift();
+        stream.__queueTotalSize -= entry.size;
+        pending.shift().ok(entry.value);
       }
     }
     close() {
@@ -36,8 +43,11 @@
       const pending = stream.__pendingReads;
       while (pending.length > 0) {
         const entry = pending.shift();
-        if (stream.__queue.length > 0) entry.ok(stream.__queue.shift());
-        else entry.done();
+        if (stream.__queue.length > 0) {
+          const queued = stream.__queue.shift();
+          stream.__queueTotalSize -= queued.size;
+          entry.ok(queued.value);
+        } else entry.done();
       }
       if (stream.__closeWaiters) {
         const waiters = stream.__closeWaiters;
@@ -73,7 +83,9 @@
       if (stream.__errored !== undefined) return Promise.reject(stream.__errored);
       if (stream.__queue.length > 0) {
         pirPump(stream);
-        return Promise.resolve({ value: stream.__queue.shift(), done: false });
+        const entry = stream.__queue.shift();
+        stream.__queueTotalSize -= entry.size;
+        return Promise.resolve({ value: entry.value, done: false });
       }
       if (this.__closed || stream.__closed) {
         return Promise.resolve({ value: undefined, done: true });
@@ -148,6 +160,15 @@
       this.__source = underlyingSource || {};
       this.__controller = new PirReadableStreamDefaultController(this);
       this.__queue = [];
+      // WHATWG SetUpReadableStreamDefaultControllerFromSource: hwm defaults to
+      // 1 and the strategy's size algorithm drives queueTotalSize.
+      this.__queueTotalSize = 0;
+      this.__highWaterMark =
+        strategy !== undefined && strategy !== null &&
+        typeof strategy.highWaterMark === "number" ? strategy.highWaterMark : 1;
+      this.__strategySize =
+        strategy !== undefined && strategy !== null &&
+        typeof strategy.size === "function" ? strategy.size.bind(strategy) : null;
       this.__pendingReads = [];
       this.__closeWaiters = [];
       this.__closed = false;
@@ -165,15 +186,47 @@
             (error) => controller.error(error)
           );
       }
-      void strategy;
     }
     getReader() {
       if (this.locked) {
-        throw new TypeError("ReadableStream is already locked to a reader");
+        // Node's ERR_INVALID_STATE.TypeError (lib/internal/webstreams/
+        // readablestream.js setupReadableStreamDefaultReader).
+        const error = new TypeError("ReadableStream is locked");
+        error.code = "ERR_INVALID_STATE";
+        throw error;
       }
       this.locked = true;
       this.__reader = new PirReadableStreamDefaultReader(this);
       return this.__reader;
+    }
+    // Node aliases Symbol.asyncIterator to values(); the iterator acquires the
+    // reader eagerly, so a locked stream throws ERR_INVALID_STATE from
+    // `for await (... of stream)` (stream/consumers' locked cases).
+    values(options) {
+      const reader = this.getReader();
+      const preventCancel = Boolean(options && options.preventCancel);
+      let done = false;
+      return {
+        next() {
+          if (done) return Promise.resolve({ value: undefined, done: true });
+          return reader.read().then((result) => {
+            if (result.done) done = true;
+            return result;
+          });
+        },
+        return(value) {
+          done = true;
+          if (preventCancel) return Promise.resolve({ value, done: true });
+          return reader.cancel(value).then(
+            () => ({ value, done: true }),
+            () => ({ value, done: true }),
+          );
+        },
+        [Symbol.asyncIterator]() { return this; },
+      };
+    }
+    [Symbol.asyncIterator]() {
+      return this.values();
     }
     cancel(reason) {
       if (this.locked && this.__reader && !this.__reader.__closed) {
@@ -300,10 +353,15 @@
           );
         },
         close() {
-          if (typeof transformer.flush === "function") {
-            return Promise.resolve(transformer.flush(controller));
-          }
-          return undefined;
+          // WHATWG TransformStream: flushing the transformer is followed by
+          // closing the readable side. Without this the readable side never
+          // reports done, so every reader (compose's Duplex.fromWeb,
+          // stream/consumers) waits forever.
+          return Promise.resolve(
+            typeof transformer.flush === "function"
+              ? transformer.flush(controller)
+              : undefined
+          ).then(() => controller.close());
         },
       });
       this.readable = readable;

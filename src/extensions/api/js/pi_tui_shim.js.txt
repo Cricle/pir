@@ -4704,6 +4704,18 @@ export function getNativeClipboard() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// keybindings.ts: page-step helper for list navigation
+// ---------------------------------------------------------------------------
+
+export function getSelectPageIndex(keybindings, data, selectedIndex, itemCount, pageSize) {
+  let direction;
+  if (keybindings.matches(data, "tui.select.pageUp")) direction = -1;
+  else if (keybindings.matches(data, "tui.select.pageDown")) direction = 1;
+  else return undefined;
+  return Math.max(0, Math.min(itemCount - 1, selectedIndex + direction * pageSize));
+}
+
 export default {
   Text: Text,
   Container: Container,
@@ -4719,6 +4731,7 @@ export default {
   isKittyProtocolActive: isKittyProtocolActive,
   fuzzyMatch: fuzzyMatch,
   fuzzyFilter: fuzzyFilter,
+  getSelectPageIndex: getSelectPageIndex,
   truncateToWidth: truncateToWidth,
   visibleWidth: visibleWidth,
   wrapTextWithAnsi: wrapTextWithAnsi,

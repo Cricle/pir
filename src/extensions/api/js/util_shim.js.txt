@@ -1,6 +1,16 @@
 
 const kCustomPromisify = Symbol.for("nodejs.util.promisify.custom");
+const kCustomPromisifyArgs = Symbol.for("nodejs.util.promisify.customArgs");
 const kInspectCustom = Symbol.for("nodejs.util.inspect.custom");
+
+// Primordials captured at module load. util.inspect must stay usable after
+// user code replaces Object.keys (test-util-primordial-monkeypatching.js);
+// Node reads the same functions through primordials.
+const pirObjectKeys = Object.keys;
+const pirObjectGetOwnPropertyNames = Object.getOwnPropertyNames;
+const pirObjectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+const pirObjectToString = Object.prototype.toString;
+const pirPropertyIsEnumerable = Object.prototype.propertyIsEnumerable;
 
 // ---------------------------------------------------------------------------
 // Type brand checks. Node's inspect/comparisons read these from
@@ -45,8 +55,13 @@ const pirIsMap = (value) => pirBrand(value, (v) => pirMapHas.call(v, undefined))
 const pirIsSet = (value) => pirBrand(value, (v) => pirSetHas.call(v, undefined));
 const pirIsWeakMap = (value) => pirBrand(value, (v) => pirWeakMapHas.call(v, undefined));
 const pirIsWeakSet = (value) => pirBrand(value, (v) => pirWeakSetHas.call(v, undefined));
-const pirIsNativeError = (value) => value instanceof Error;
-const pirIsError = (value) => value instanceof Error;
+// `instanceof Error` misses errors created in another realm (vm contexts);
+// the toString tag is "[object Error]" for every native error and for nothing
+// that merely inherits Error.prototype (test-util.js cross-context cases).
+const pirIsNativeError = (value) =>
+  value instanceof Error ||
+  (value !== null && typeof value === "object" && pirObjectToString.call(value) === "[object Error]");
+const pirIsError = pirIsNativeError;
 const pirIsPromise = (value) => value instanceof Promise;
 // node internal/util/inspect isURL: a URL instance with a string href.
 const pirIsURLInstance = (value) => value !== null && typeof value === "object" &&
@@ -176,6 +191,19 @@ const pirInspectDefaultOptions = Object.seal({
   getters: false,
   numericSeparator: false,
 });
+
+// The native inspect/format entry points implement exactly this option set
+// (see inspect_ops.rs). `util.inspect.defaultOptions` is a live, mutable
+// object — node's `format` and `inspect` both consult it — so a mutated
+// default must route through the JS implementation instead.
+function pirInspectDefaultsUntouched() {
+  const d = pirInspectDefaultOptions;
+  return d.showHidden === false && d.depth === 2 && d.colors === false &&
+    d.customInspect === true && d.showProxy === false &&
+    d.maxArrayLength === 100 && d.maxStringLength === 10000 &&
+    d.breakLength === 80 && d.compact === 3 && d.sorted === false &&
+    d.getters === false && d.numericSeparator === false;
+}
 
 /* eslint-disable no-control-regex */
 const pirStrEscapeSequencesRegExp = /[\x00-\x1f\x27\x5c\x7f-\x9f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
@@ -559,15 +587,10 @@ function pirGetPrefix(constructor, tag, fallback, size) {
   }
   let result = constructor + suffix + " ";
   if (tag !== "") {
-    const position = constructor.indexOf(tag);
-    if (position === -1) {
-      result += "[" + tag + "] ";
-    } else {
-      const endPos = position + tag.length;
-      if (endPos !== constructor.length && constructor[endPos] === constructor[endPos].toLowerCase()) {
-        result += "[" + tag + "] ";
-      }
-    }
+    // Node only tags constructors that are not themselves the tag: `Map`
+    // renders as `Map(1) {`, while every subclass (`SubMap`, `MyMap`, …)
+    // renders as `SubMap(1) [Map] {`.
+    if (tag !== constructor) result += "[" + tag + "] ";
   }
   return result;
 }
@@ -576,15 +599,15 @@ function pirGetPrefix(constructor, tag, fallback, size) {
 // symbols when showHidden is set.
 function pirGetKeys(value, showHidden) {
   let keys;
-  const symbols = Object.getOwnPropertySymbols(value);
+  const symbols = pirObjectGetOwnPropertySymbols(value);
   if (showHidden) {
-    keys = Object.getOwnPropertyNames(value);
+    keys = pirObjectGetOwnPropertyNames(value);
     if (symbols.length !== 0) keys.push(...symbols);
   } else {
-    keys = Object.keys(value);
+    keys = pirObjectKeys(value);
     if (symbols.length !== 0) {
       for (const symbol of symbols) {
-        if (Object.prototype.propertyIsEnumerable.call(value, symbol)) keys.push(symbol);
+        if (pirPropertyIsEnumerable.call(value, symbol)) keys.push(symbol);
       }
     }
   }
@@ -601,12 +624,12 @@ function pirIsArrayIndex(key) {
 // Node's getOwnNonIndexProperties(name|symbol keys, filter).
 function pirGetOwnNonIndexProperties(value, allProperties) {
   const keys = [];
-  const names = allProperties ? Object.getOwnPropertyNames(value) : Object.keys(value);
+  const names = allProperties ? pirObjectGetOwnPropertyNames(value) : pirObjectKeys(value);
   for (const name of names) {
     if (!pirIsArrayIndex(name)) keys.push(name);
   }
-  for (const symbol of Object.getOwnPropertySymbols(value)) {
-    if (allProperties || Object.prototype.propertyIsEnumerable.call(value, symbol)) keys.push(symbol);
+  for (const symbol of pirObjectGetOwnPropertySymbols(value)) {
+    if (allProperties || pirPropertyIsEnumerable.call(value, symbol)) keys.push(symbol);
   }
   return keys;
 }
@@ -981,10 +1004,17 @@ function pirGetFunctionBase(ctx, value, constructor, tag) {
     }
   }
   let type = "Function";
-  if (typeof value === "function" && Object.prototype.toString.call(value) === "[object GeneratorFunction]") {
+  // Node's util.types.isGeneratorFunction/isAsyncFunction are both true for
+  // async generator functions, so the tags compose to AsyncGeneratorFunction
+  // (matching node's `[AsyncGeneratorFunction: agen]`; QuickJS's
+  // Object.prototype.toString already reports the full `Symbol.toStringTag`).
+  const functionTag = typeof value === "function" ? Object.prototype.toString.call(value) : "";
+  if (functionTag === "[object GeneratorFunction]" ||
+      functionTag === "[object AsyncGeneratorFunction]") {
     type = "Generator" + type;
   }
-  if (typeof value === "function" && Object.prototype.toString.call(value) === "[object AsyncFunction]") {
+  if (functionTag === "[object AsyncFunction]" ||
+      functionTag === "[object AsyncGeneratorFunction]") {
     type = "Async" + type;
   }
   let base = "[" + type;
@@ -1278,7 +1308,7 @@ function pirFormatNamespaceObject(keys, ctx, value, recurseTimes) {
 
 // Sparse arrays and arrays with extra keys.
 function pirFormatSpecialArray(ctx, value, recurseTimes, maxLength, output, i) {
-  const keys = Object.keys(value);
+  const keys = pirObjectKeys(value);
   let index = i;
   for (; i < keys.length && output.length < maxLength; i++) {
     const key = keys[i];
@@ -1531,9 +1561,15 @@ function pirHasBuiltInToString(value) {
 
   if (pointer === null) return true;
   const descriptor = Object.getOwnPropertyDescriptor(pointer, "constructor");
-  return descriptor !== undefined &&
-    typeof descriptor.value === "function" &&
-    pirBuiltInObjects.has(descriptor.value.name);
+  if (descriptor === undefined || typeof descriptor.value !== "function") return false;
+  // Node snapshots `builtInObjects` while `internal/util/inspect` loads,
+  // before the Buffer and URLSearchParams globals are installed. Their
+  // `toString` therefore counts as *not* built-in, and `%s` uses
+  // String(value) (`"hi"` for a Buffer, `"a=1"` for URLSearchParams).
+  if (descriptor.value.name === "Buffer" || descriptor.value.name === "URLSearchParams") {
+    return false;
+  }
+  return pirBuiltInObjects.has(descriptor.value.name);
 }
 
 const pirFirstErrorLine = (error) => String(error.message).split("\n", 1)[0];
@@ -1557,6 +1593,24 @@ function pirTryStringify(arg) {
 }
 
 function pirInspect(value, opts) {
+  // Typed C-ABI fast path: renders the common shapes (primitives, plain and
+  // null-prototype objects, dense arrays, Map/Set, Date, RegExp, named class
+  // instances) for the default option set. It answers the value `undefined`
+  // for everything else (and for non-default options), so the faithful JS
+  // formatter below stays the source of truth. The sentinel must be the value
+  // `undefined`, not the string: `util.inspect(undefined)` legitimately
+  // renders "undefined".
+  //
+  // Skip it for the legacy `inspect(value, showHidden, depth, colors)`
+  // signature: those extra arguments are not part of the native option model.
+  if ((arguments.length <= 2 || arguments[2] === undefined) &&
+      (arguments.length <= 3 || arguments[3] === undefined)) {
+    const native = globalThis.__pirInspect;
+    if (typeof native === "function" && pirInspectDefaultsUntouched()) {
+      const out = native(value, opts);
+      if (out !== undefined) return out;
+    }
+  }
   const ctx = {
     budget: {},
     indentationLvl: 0,
@@ -1585,7 +1639,7 @@ function pirInspect(value, opts) {
     if (typeof opts === "boolean") {
       ctx.showHidden = opts;
     } else if (opts) {
-      for (const key of Object.keys(opts)) {
+      for (const key of pirObjectKeys(opts)) {
         if (Object.prototype.hasOwnProperty.call(pirInspectDefaultOptions, key) || key === "stylize") {
           ctx[key] = opts[key];
         } else if (ctx.userOptions === undefined) {
@@ -1615,6 +1669,64 @@ Object.defineProperty(pirInspect, "defaultOptions", {
     Object.assign(pirInspectDefaultOptions, options);
   },
 });
+
+// ---------------------------------------------------------------------------
+// Buffer's util.inspect.custom hook.
+//
+// Node installs `Buffer.prototype[customInspectSymbol]` (aliased to
+// Buffer.prototype.inspect) in lib/buffer.js, which is why `util.inspect` and
+// `console.log` print `<Buffer 01 02 03>` while `{ customInspect: false }`
+// keeps the plain `Buffer(3) [Uint8Array] [...]` rendering. The buffer shim
+// already implements the `<Buffer ...>` body (50-byte cap + "N more bytes");
+// this wires it to the well-known symbol and adds Node's extra-property tail
+// (`<Buffer 01, foo: 'bar'>`) for the inspect call that supplies options.
+// ---------------------------------------------------------------------------
+const kBufferInspectExtra = Symbol("pir.buffer.inspect.extra");
+
+// Node installs ONE function object in both slots (`Buffer.prototype.inspect`
+// and `Buffer.prototype[customInspectSymbol]`). Capture the plain
+// `<Buffer ...>` body first: the hook below must call the body directly,
+// because `Buffer.prototype.inspect` itself becomes the hook (self-call would
+// recurse).
+const pirBufferInspectBody = typeof Buffer === "function" && Buffer.prototype &&
+  typeof Buffer.prototype.inspect === "function"
+  ? Buffer.prototype.inspect
+  : null;
+
+function pirBufferCustomInspect(recurseTimes, options) {
+  const base = pirBufferInspectBody.call(this);
+  if (options === undefined || options === null || options[kBufferInspectExtra] === true) {
+    return base;
+  }
+  let keys;
+  try {
+    keys = pirGetOwnNonIndexProperties(this, options.showHidden === true);
+  } catch { /* throwing proxy/getter: the hex body is the safe answer */ }
+  if (keys === undefined || keys.length === 0) return base;
+  const extras = { __proto__: null };
+  for (const key of keys) extras[key] = this[key];
+  // Node: utilInspect(obj, {...ctx, breakLength: Infinity, compact: true})
+  // then slice(27, -2) to drop `[Object: null prototype] { ` and ` }`.
+  const rendered = pirInspect(extras, Object.assign({}, options, {
+    breakLength: Infinity,
+    compact: true,
+    [kBufferInspectExtra]: true,
+  }));
+  const tail = rendered.slice(27, -2);
+  return base.slice(0, -1) + (this.length !== 0 ? ", " : "") + tail + ">";
+}
+
+if (pirBufferInspectBody !== null && Buffer.prototype[kInspectCustom] === undefined) {
+  Object.defineProperty(Buffer.prototype, kInspectCustom, {
+    value: pirBufferCustomInspect,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  // Node: lib/buffer.js aliases the two slots to the same function object;
+  // test-buffer-generic-methods asserts the reference identity.
+  Buffer.prototype.inspect = pirBufferCustomInspect;
+}
 
 // ---------------------------------------------------------------------------
 // util.format / util.formatWithOptions — port of nodejs/node v24.19.0
@@ -1651,6 +1763,18 @@ function pirFormatBigIntNoColor(bigint, options) {
 }
 
 function pirFormatWithOptionsInternal(inspectOptions, args) {
+  // Typed C-ABI fast path for the default option set (`util.format(...)`).
+  // It mirrors this function for literal `%s/%d/%i/%f/%j/%o/%O/%%` strings and
+  // answers the value `undefined` for everything else (non-string first
+  // argument, `%o`, unsupported values, non-default options), so the JS
+  // implementation below stays the source of truth.
+  if (inspectOptions === undefined) {
+    const nativeFormat = globalThis.__pirFormat;
+    if (typeof nativeFormat === "function" && pirInspectDefaultsUntouched()) {
+      const out = nativeFormat(args[0], args);
+      if (out !== undefined) return out;
+    }
+  }
   const first = args[0];
   let a = 0;
   let str = "";
@@ -1760,47 +1884,111 @@ function pirFormatWithOptionsInternal(inspectOptions, args) {
   return str;
 }
 
+function pirIsPromiseLike(value) {
+  return value !== null && (typeof value === "object" || typeof value === "function") &&
+    typeof value.then === "function";
+}
+
+function pirCopyFunctionDescriptors(target, original) {
+  const descriptors = Object.getOwnPropertyDescriptors(original);
+  for (const key of pirObjectKeys(descriptors)) descriptors[key].__proto__ = null;
+  return Object.defineProperties(target, descriptors);
+}
+
 function promisify(original) {
   if (typeof original !== "function") {
-    throw new TypeError("The \"original\" argument must be of type function");
+    throw pirInvalidArgType("original", "Function", original);
   }
+  // Node only takes the custom path for a truthy property, but validates it:
+  // a non-function value is ERR_INVALID_ARG_TYPE, not silently ignored.
   const custom = original[kCustomPromisify];
-  if (typeof custom === "function") return custom;
+  if (custom) {
+    if (typeof custom !== "function") {
+      throw pirInvalidArgType("util.promisify.custom", "Function", custom);
+    }
+    Object.defineProperty(custom, kCustomPromisify, {
+      __proto__: null,
+      value: custom, enumerable: false, writable: false, configurable: true,
+    });
+    return custom;
+  }
+  // fs.read-style multi-result callbacks declare their names here.
+  const argumentNames = original[kCustomPromisifyArgs];
   function fn(...args) {
     return new Promise((resolve, reject) => {
-      original.call(this, ...args, (err, value) => {
-        if (err) reject(err);
-        else resolve(value);
+      args.push(function (err, ...values) {
+        if (err) return reject(err);
+        if (argumentNames !== undefined && values.length > 1) {
+          const obj = {};
+          for (let i = 0; i < argumentNames.length; i++) {
+            obj[argumentNames[i]] = values[i];
+          }
+          resolve(obj);
+        } else {
+          resolve(values[0]);
+        }
       });
+      const result = original.apply(this, args);
+      if (pirIsPromiseLike(result)) {
+        const proc = globalThis.process;
+        if (proc && typeof proc.emitWarning === "function") {
+          proc.emitWarning(
+            "Calling promisify on a function that returns a Promise is likely a mistake.",
+            "DeprecationWarning",
+            "DEP0174");
+        }
+      }
     });
   }
   Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
-  fn[kCustomPromisify] = fn;
-  return fn;
+  Object.defineProperty(fn, kCustomPromisify, {
+    __proto__: null,
+    value: fn, enumerable: false, writable: false, configurable: true,
+  });
+  return pirCopyFunctionDescriptors(fn, original);
 }
 promisify.custom = kCustomPromisify;
 
 const kCustomCallbackify = Symbol.for("nodejs.util.callbackify.custom");
 
+// Node's callbackifyOnRejected: a falsy rejection reason would read as "no
+// error" in callback style, so it is wrapped and exposed as `reason`.
+function pirCallbackifyOnRejected(reason, callback) {
+  if (!reason) {
+    const error = new Error("Promise was rejected with falsy value");
+    error.code = "ERR_FALSY_VALUE_REJECTION";
+    error.reason = reason;
+    reason = error;
+  }
+  return callback(reason);
+}
+
 function callbackify(original) {
   if (typeof original !== "function") {
-    throw new TypeError("The \"original\" argument must be of type function");
+    throw pirInvalidArgType("original", "Function", original);
   }
-  function wrapped(...args) {
-    const callback = args.pop();
-    if (typeof callback !== "function") {
-      throw new TypeError("The last argument must be of type function");
+  function callbackified(...args) {
+    const maybeCallback = args.pop();
+    if (typeof maybeCallback !== "function") {
+      throw pirInvalidArgType("last argument", "Function", maybeCallback);
     }
-    if (original.length >= args.length + 1) {
-      return original.call(this, ...args, callback);
-    }
-    Promise.resolve(original.call(this, ...args)).then(
-      (value) => callback(null, value),
-      (error) => callback(error)
+    const callback = maybeCallback.bind(this);
+    original.apply(this, args).then(
+      (value) => process.nextTick(callback, null, value),
+      (error) => process.nextTick(pirCallbackifyOnRejected, error, callback)
     );
   }
-  wrapped[kCustomCallbackify] = wrapped;
-  return wrapped;
+  const descriptors = Object.getOwnPropertyDescriptors(original);
+  if (descriptors.length && typeof descriptors.length.value === "number") {
+    descriptors.length.value++;
+  }
+  if (descriptors.name && typeof descriptors.name.value === "string") {
+    descriptors.name.value += "Callbackified";
+  }
+  for (const key of pirObjectKeys(descriptors)) descriptors[key].__proto__ = null;
+  Object.defineProperties(callbackified, descriptors);
+  callbackified[kCustomCallbackify] = callbackified;
+  return callbackified;
 }
 callbackify.custom = kCustomCallbackify;
 
@@ -1816,14 +2004,22 @@ function pirDescribeReceived(value) {
   if (type === "string") return "type string ('" + value + "')";
   if (type === "symbol") return "type symbol (" + String(value) + ")";
   if (type === "bigint") return "type bigint (" + String(value) + "n)";
-  if (type === "function") return "function " + (value.name ? value.name : "(anonymous)");
+  if (type === "function") return "function " + value.name;
   if (type === "object") return "an instance of " + pirInternalGetConstructorName(value);
   return "type " + type + " (" + String(value) + ")";
 }
 
 function pirInvalidArgType(name, expected, value) {
-  const kind = name.indexOf(".") === -1 ? "argument" : "property";
-  const error = new TypeError('The "' + name + '" ' + kind + " must be of type " +
+  // Node's template special-cases names like "last argument" (no quotes and
+  // no extra "argument" word).
+  let msg = "The ";
+  if (name.endsWith(" argument")) {
+    msg += name + " ";
+  } else {
+    const kind = name.indexOf(".") === -1 ? "argument" : "property";
+    msg += '"' + name + '" ' + kind + " ";
+  }
+  const error = new TypeError(msg + "must be of type " +
     expected.toLowerCase() + ". Received " + pirDescribeReceived(value));
   error.code = "ERR_INVALID_ARG_TYPE";
   return error;
@@ -1875,22 +2071,48 @@ function deprecate(fn, message, code) {
   return wrapper;
 }
 
-function debuglog(section) {
-  // Phase 1: process.env is empty, so DEBUG namespaces never match; the
-  // returned function keeps Node's shape (callable + `.enabled`).
+function pirDebugEnabled(debugEnv, set) {
+  if (!debugEnv) return false;
+  const pattern = debugEnv.replace(/[|\\{}()[\]^$+?.]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/,/g, "$|^");
+  return new RegExp("^" + pattern + "$", "i").test(set);
+}
+
+function debuglog(section, callback) {
+  // Node reads NODE_DEBUG (not DEBUG), upper-cases the section and treats `*`
+  // and `,` as wildcards/alternatives. The returned function is callable and
+  // exposes a live `.enabled`.
   const env = (globalThis.process && globalThis.process.env) || {};
-  const namespaces = String(env.DEBUG || "").split(/[\s,]+/).filter(Boolean);
-  const name = String(section);
-  const enabled = namespaces.indexOf("*") !== -1 || namespaces.indexOf(name) !== -1;
-  const fn = () => {};
-  fn.enabled = enabled;
+  const name = String(section).toUpperCase();
+  const enabled = pirDebugEnabled(env.NODE_DEBUG, name);
+  const fn = (...args) => {
+    if (!enabled) return;
+    const proc = globalThis.process;
+    if (!proc || !proc.stderr || typeof proc.stderr.write !== "function") return;
+    const pid = proc.pid === undefined ? "" : proc.pid;
+    proc.stderr.write(name + " " + pid + ": " + pirFormatWithOptionsInternal(undefined, args) + "\n");
+  };
+  Object.defineProperty(fn, "enabled", {
+    __proto__: null,
+    get() { return enabled; },
+    enumerable: true,
+    configurable: true,
+  });
+  if (typeof callback === "function") callback(fn);
   return fn;
 }
 
-const VT_CONTROL_RE = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\d\/#&.:=?%@~_]+)*|[a-zA-Z\d]+(?:;[-a-zA-Z\d\/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
+// Node v24's ansi regex (lib/internal/util/inspect.js): OSC sequences
+// (including hyperlinks) terminate with BEL, ST (ESC \\) or 8-bit ST, and CSI
+// parameter bytes accept both ';' and ':' separators.
+const VT_CONTROL_RE = /(?:\u001B\][\s\S]*?(?:\u0007|\u001B\\|\u009C))|[\u001B\u009B][[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]/g;
 
 function stripVTControlCharacters(str) {
-  return String(str).replace(VT_CONTROL_RE, "");
+  if (typeof str !== "string") throw pirInvalidArgType("str", "string", str);
+  // Fast path: every VT sequence starts with ESC or 8-bit CSI.
+  if (str.indexOf("\u001B") === -1 && str.indexOf("\u009B") === -1) return str;
+  return str.replace(VT_CONTROL_RE, "");
 }
 
 const types = {
@@ -1970,11 +2192,30 @@ const errnoTable = {
   ETIMEDOUT: 138, ETXTBSY: 139, EWOULDBLOCK: 140, EXDEV: 18,
 };
 
-function getSystemErrorName(errorCode) {
-  for (const name of Object.keys(errnoTable)) {
-    if (errnoTable[name] === errorCode) return name;
+// Node's errno surface speaks libuv error numbers, which are negative
+// (`getSystemErrorName(-2) === 'ENOENT'`); the table itself stores the
+// positive errno values used by os.constants.errno.
+function pirValidateErrorNumber(errorCode, name) {
+  if (typeof errorCode !== "number") throw pirInvalidArgType(name, "number", errorCode);
+  if (errorCode >= 0 || !Number.isSafeInteger(errorCode)) {
+    const error = new RangeError('The value of "' + name +
+      '" is out of range. It must be a negative integer. Received ' + errorCode);
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
   }
-  return undefined;
+}
+
+function pirSystemErrorName(errorCode) {
+  const positive = -errorCode;
+  for (const name of pirObjectKeys(errnoTable)) {
+    if (errnoTable[name] === positive) return name;
+  }
+  return "UNKNOWN";
+}
+
+function getSystemErrorName(errorCode) {
+  pirValidateErrorNumber(errorCode, "err");
+  return pirSystemErrorName(errorCode);
 }
 
 function errnoDescription(name) {
@@ -1992,33 +2233,68 @@ function errnoDescription(name) {
 }
 
 function getSystemErrorMessage(errorCode) {
-  const name = getSystemErrorName(errorCode);
-  return name === undefined
-    ? "Unknown system error " + errorCode
-    : name + ": " + (errnoDescription(name) || "unknown error " + errorCode);
+  pirValidateErrorNumber(errorCode, "err");
+  const name = pirSystemErrorName(errorCode);
+  if (name === "UNKNOWN") return "Unknown system error " + errorCode;
+  return name + ": " + (errnoDescription(name) || "unknown error " + errorCode);
 }
 
 function getSystemErrorMap() {
   const map = new Map();
-  for (const name of Object.keys(errnoTable)) {
-    map.set(errnoTable[name], [name, errnoDescription(name) || "unknown error"]);
+  for (const name of pirObjectKeys(errnoTable)) {
+    map.set(-errnoTable[name], [name, errnoDescription(name) || "unknown error"]);
   }
   return map;
 }
 
 function _errnoException(errorCode, syscall, original) {
-  const error = new Error(original && original.message ? String(original.message) : syscall + " " + (getSystemErrorMessage(errorCode) || ""));
-  error.code = getSystemErrorName(errorCode) || String(errorCode);
+  const code = getSystemErrorName(errorCode);
+  const error = new Error(original === undefined
+    ? syscall + " " + code
+    : syscall + " " + code + " " + String(original));
+  error.code = code;
   error.errno = errorCode;
   error.syscall = syscall;
+  pirHideExceptionFrames(error);
   return error;
 }
 
+// Node builds ExceptionWithHostPort with stack snapping: the helper frames are
+// not part of `err.stack` (test-util-exception-with-host-port.js asserts the
+// wrapper name never appears). Drop them after the stack is materialized.
+function pirHideExceptionFrames(error) {
+  try {
+    const stack = error.stack;
+    if (typeof stack !== "string") return;
+    const lines = stack.split("\n").filter(
+      (line) => !/[_]exceptionWithHostPort|[_]errnoException/.test(line));
+    Object.defineProperty(error, "stack", {
+      __proto__: null,
+      value: lines.join("\n"),
+      writable: true,
+      configurable: true,
+    });
+  } catch { /* cosmetic */ }
+}
+
 function _exceptionWithHostPort(errorCode, syscall, hostname, port, additional) {
-  const error = _errnoException(errorCode, syscall);
+  const code = getSystemErrorName(errorCode);
+  let details = "";
+  if (port && port > 0) {
+    details = " " + hostname + ":" + port;
+  } else if (hostname) {
+    details = " " + hostname;
+  }
+  if (additional) {
+    details += " - Local (" + additional + ")";
+  }
+  const error = new Error(syscall + " " + code + details);
+  error.errno = errorCode;
+  error.code = code;
+  error.syscall = syscall;
   error.address = hostname;
-  error.port = port;
-  if (additional !== undefined) error.message = error.message + " " + additional;
+  if (port) error.port = port;
+  pirHideExceptionFrames(error);
   return error;
 }
 
@@ -2585,6 +2861,16 @@ const PIR_EVAL_PLACEHOLDERS = {
   "<input>": true, "<anonymous>": true, "<eval>": true, "eval_script": true, "": true,
 };
 
+// Script names of the shim bundle itself. `getCallSites` must report the
+// caller's first frame (node ignores its own implementation frames), and the
+// bundle's wrapper helpers are anonymous in the captured stack, so they are
+// skipped by file name. `eval_script` is the old bundle name; both are kept so
+// a stale bytecode overlay does not shift the reported frame.
+const PIR_IMPL_SCRIPTS = {
+  "node_globals.js.txt": true,
+  "eval_script": true,
+};
+
 function pirCallSiteName(site) {
   if (site === null || site === undefined) return null;
   const value = typeof site.getFileName === "function" ? site.getFileName() : null;
@@ -2596,11 +2882,14 @@ function pirCallSiteIsPlaceholder(name) {
 }
 
 /// `pir-ext:<abs path>` is the loader's module scheme; `__filename` is the bare
-/// path, so the scheme is stripped (forward-slashed, matching
-/// node_cjs_runtime's normalization).
+/// path, so the scheme is stripped and spelled the way `__filename` is
+/// (node_cjs_runtime's native-spelling rule: backslashes on win32).
 function pirNormalizeScriptName(name) {
   if (name === null) return "";
-  if (name.indexOf("pir-ext:") === 0) return name.slice("pir-ext:".length);
+  if (name.indexOf("pir-ext:") === 0) {
+    const bare = name.slice("pir-ext:".length);
+    return globalThis.__pirPlatform === "win32" ? bare.replace(/\//g, "\\") : bare;
+  }
   return name;
 }
 
@@ -2611,7 +2900,10 @@ function pirCallSiteScriptName(sites, index) {
   if (!pirCallSiteIsPlaceholder(own)) return pirNormalizeScriptName(own);
   for (let i = index + 1; i < sites.length; i += 1) {
     const outer = pirCallSiteName(sites[i]);
-    if (outer !== null && !pirCallSiteIsPlaceholder(outer)) return pirNormalizeScriptName(outer);
+    if (outer !== null && !pirCallSiteIsPlaceholder(outer) &&
+        PIR_IMPL_SCRIPTS[outer] !== true) {
+      return pirNormalizeScriptName(outer);
+    }
   }
   return own;
 }
@@ -2649,8 +2941,10 @@ function pirCaptureSites(limit) {
   while (start < frames.length) {
     const site = frames[start];
     const name = site && typeof site.getFunctionName === "function" ? site.getFunctionName() : null;
+    const file = site && typeof site.getFileName === "function" ? site.getFileName() : null;
     if (name === "call" || name === "captureStackTrace" ||
-        name === "pirCaptureSites" || name === "getCallSites") {
+        name === "pirCaptureSites" || name === "getCallSites" ||
+        (file !== null && PIR_IMPL_SCRIPTS[file] === true)) {
       start += 1;
       continue;
     }
@@ -2743,108 +3037,388 @@ function getCallSites(frameCount, options) {
   return out;
 }
 
-function parseArgs(config) {
-  const cfg = config === undefined || config === null ? {} : config;
-  const args = Array.isArray(cfg.args) ? cfg.args.slice() : process.argv.slice(2);
-  const strict = cfg.strict !== false;
-  const options = cfg.options || {};
-  const result = { values: {}, positionals: [] };
-  const tokens = cfg.tokens;
-  if (strict && !cfg.allowPositionals && tokens !== undefined) {
-    // Strict mode positionals handling is upstream-specific; the runtime
-    // keeps the permissive read-mostly behavior documented here.
+// ---------------------------------------------------------------------------
+// util.parseArgs — port of Node v24's
+// lib/internal/util/parse_args/{parse_args,utils}.js. The primordials wrappers
+// are inlined and the internal validators are implemented locally with the
+// same error codes; the parser itself is unchanged (tokens, short-option
+// groups, `--`, greedy string values, defaults and --no- negation).
+// ---------------------------------------------------------------------------
+
+function pirParseArgsHasOwn(obj, prop) {
+  return Object.prototype.hasOwnProperty.call(obj, prop);
+}
+
+function pirParseArgsGetOwn(obj, prop) {
+  if (pirParseArgsHasOwn(obj, prop)) return obj[prop];
+}
+
+function pirParseArgsOptionsGetOwn(options, longOption, prop) {
+  if (pirParseArgsHasOwn(options, longOption)) {
+    return pirParseArgsGetOwn(options[longOption], prop);
   }
-  for (let i = 0; i < args.length; i++) {
-    const arg = String(args[i]);
-    if (arg === "--") {
-      for (let j = i + 1; j < args.length; j++) result.positionals.push(String(args[j]));
-      break;
-    }
-    if (arg.startsWith("--")) {
-      let name = arg.slice(2);
-      let value;
-      const eq = name.indexOf("=");
-      if (eq !== -1) {
-        value = name.slice(eq + 1);
-        name = name.slice(0, eq);
-      }
-      const option = options[name];
-      if (strict && option === undefined) {
-        throw new TypeError("Unknown option --" + name);
-      }
-      const wantsValue = option !== undefined && (option.type === "string" || option.type === "number");
-      if (value === undefined) {
-        if (wantsValue) {
-          i += 1;
-          if (i >= args.length) throw new TypeError("Option --" + name + " requires a value");
-          value = String(args[i]);
-        } else {
-          value = true;
-        }
-      }
-      if (option !== undefined && option.type === "number") value = Number(value);
-      const multiple = option !== undefined && option.multiple === true;
-      if (multiple) {
-        const list = result.values[name] === undefined ? [] : result.values[name];
-        result.values[name] = [].concat(list, [value]);
-      } else {
-        result.values[name] = value;
-      }
-    } else if (arg.startsWith("-") && arg.length > 1) {
-      let name = arg.slice(1);
-      let value;
-      const eq = name.indexOf("=");
-      if (eq !== -1) {
-        value = name.slice(eq + 1);
-        name = name.slice(0, eq);
-      }
-      const option = options[name];
-      if (strict && option === undefined) {
-        throw new TypeError("Unknown option -" + name);
-      }
-      const wantsValue = option !== undefined && (option.type === "string" || option.type === "number");
-      if (value === undefined) {
-        if (wantsValue) {
-          i += 1;
-          if (i >= args.length) throw new TypeError("Option -" + name + " requires a value");
-          value = String(args[i]);
-        } else {
-          value = true;
-        }
-      }
-      if (option !== undefined && option.type === "number") value = Number(value);
-      const multiple = option !== undefined && option.multiple === true;
-      if (multiple) {
-        const list = result.values[name] === undefined ? [] : result.values[name];
-        result.values[name] = [].concat(list, [value]);
-      } else {
-        result.values[name] = value;
+}
+
+function pirParseArgsError(ctor, code, message) {
+  const error = new ctor(message);
+  error.code = code;
+  return error;
+}
+
+function pirParseArgsInvalidOptionValue(message) {
+  return pirParseArgsError(TypeError, "ERR_PARSE_ARGS_INVALID_OPTION_VALUE", message);
+}
+
+function pirParseArgsUnexpectedPositional(value) {
+  return pirParseArgsError(TypeError, "ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL",
+    "Unexpected argument '" + value + "'. This command does not take positional arguments");
+}
+
+function pirParseArgsUnknownOption(option, allowPositionals) {
+  const suggestDashDash = allowPositionals ? ". To specify a positional " +
+    "argument starting with a '-', place it at the end of the command after " +
+    "'--', as in '-- " + JSON.stringify(option) : "";
+  return pirParseArgsError(TypeError, "ERR_PARSE_ARGS_UNKNOWN_OPTION",
+    "Unknown option '" + option + "'" + suggestDashDash);
+}
+
+function pirParseArgsValidateArray(value, name) {
+  if (!Array.isArray(value)) throw pirInvalidArgType(name, "Array", value);
+}
+
+function pirParseArgsValidateBoolean(value, name) {
+  if (typeof value !== "boolean") throw pirInvalidArgType(name, "boolean", value);
+}
+
+function pirParseArgsValidateString(value, name) {
+  if (typeof value !== "string") throw pirInvalidArgType(name, "string", value);
+}
+
+function pirParseArgsValidateObject(value, name) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw pirInvalidArgType(name, "Object", value);
+  }
+}
+
+function pirParseArgsValidateStringArray(value, name) {
+  pirParseArgsValidateArray(value, name);
+  for (let i = 0; i < value.length; i++) pirParseArgsValidateString(value[i], name);
+}
+
+function pirParseArgsValidateBooleanArray(value, name) {
+  pirParseArgsValidateArray(value, name);
+  for (let i = 0; i < value.length; i++) pirParseArgsValidateBoolean(value[i], name);
+}
+
+function pirParseArgsIsOptionValue(value) {
+  return value !== null && value !== undefined;
+}
+
+function pirParseArgsIsOptionLikeValue(value) {
+  if (value === null || value === undefined) return false;
+  return value.length > 1 && value.charAt(0) === "-";
+}
+
+function pirParseArgsIsLoneShortOption(arg) {
+  return arg.length === 2 && arg.charAt(0) === "-" && arg.charAt(1) !== "-";
+}
+
+function pirParseArgsIsLoneLongOption(arg) {
+  return arg.length > 2 && arg.startsWith("--") && arg.indexOf("=", 3) === -1;
+}
+
+function pirParseArgsIsLongOptionAndValue(arg) {
+  return arg.length > 2 && arg.startsWith("--") && arg.indexOf("=", 3) !== -1;
+}
+
+function pirParseArgsFindLongOptionForShort(shortOption, options) {
+  pirParseArgsValidateObject(options, "options");
+  const entries = Object.entries(options);
+  for (let i = 0; i < entries.length; i++) {
+    if (pirParseArgsGetOwn(entries[i][1], "short") === shortOption) return entries[i][0];
+  }
+  return shortOption;
+}
+
+function pirParseArgsIsShortOptionGroup(arg, options) {
+  if (arg.length <= 2) return false;
+  if (arg.charAt(0) !== "-") return false;
+  if (arg.charAt(1) === "-") return false;
+  const firstShort = arg.charAt(1);
+  const longOption = pirParseArgsFindLongOptionForShort(firstShort, options);
+  return pirParseArgsOptionsGetOwn(options, longOption, "type") !== "string";
+}
+
+function pirParseArgsIsShortOptionAndValue(arg, options) {
+  pirParseArgsValidateObject(options, "options");
+  if (arg.length <= 2) return false;
+  if (arg.charAt(0) !== "-") return false;
+  if (arg.charAt(1) === "-") return false;
+  const shortOption = arg.charAt(1);
+  const longOption = pirParseArgsFindLongOptionForShort(shortOption, options);
+  return pirParseArgsOptionsGetOwn(options, longOption, "type") === "string";
+}
+
+function pirParseArgsUseDefaultValueOption(longOption, optionConfig, values) {
+  return pirParseArgsGetOwn(optionConfig, "default") !== undefined &&
+    values[longOption] === undefined;
+}
+
+function pirParseArgsCheckOptionUsage(config, token) {
+  let tokenName = token.name;
+  if (!pirParseArgsHasOwn(config.options, tokenName)) {
+    if (config.allowNegative && tokenName.startsWith("no-")) {
+      tokenName = tokenName.slice(3);
+      if (!pirParseArgsHasOwn(config.options, tokenName) ||
+          pirParseArgsOptionsGetOwn(config.options, tokenName, "type") !== "boolean") {
+        throw pirParseArgsUnknownOption(token.rawName, config.allowPositionals);
       }
     } else {
-      result.positionals.push(arg);
+      throw pirParseArgsUnknownOption(token.rawName, config.allowPositionals);
     }
   }
-  if (cfg.default && typeof cfg.default === "object") {
-    for (const name of Object.keys(cfg.default)) {
-      if (result.values[name] === undefined) result.values[name] = cfg.default[name];
+  const short = pirParseArgsOptionsGetOwn(config.options, tokenName, "short");
+  const shortAndLong = (short ? "-" + short + ", " : "") + "--" + tokenName;
+  const type = pirParseArgsOptionsGetOwn(config.options, tokenName, "type");
+  if (type === "string" && typeof token.value !== "string") {
+    throw pirParseArgsInvalidOptionValue("Option '" + shortAndLong + " <value>' argument missing");
+  }
+  if (type === "boolean" && token.value !== null && token.value !== undefined) {
+    throw pirParseArgsInvalidOptionValue("Option '" + shortAndLong + "' does not take an argument");
+  }
+}
+
+function pirParseArgsCheckOptionLikeValue(token) {
+  if (!token.inlineValue && pirParseArgsIsOptionLikeValue(token.value)) {
+    const example = token.rawName.startsWith("--")
+      ? "'" + token.rawName + "=-XYZ'"
+      : "'--" + token.name + "=-XYZ' or '" + token.rawName + "-XYZ'";
+    throw pirParseArgsInvalidOptionValue(
+      "Option '" + token.rawName + "' argument is ambiguous.\n" +
+      "Did you forget to specify the option argument for '" + token.rawName + "'?\n" +
+      "To specify an option argument starting with a dash use " + example + ".");
+  }
+}
+
+function pirParseArgsStoreOption(token, options, values, allowNegative) {
+  let longOption = token.name;
+  let optionValue = token.value;
+  if (longOption === "__proto__") return;
+  if (allowNegative && longOption.startsWith("no-") && optionValue === undefined) {
+    longOption = longOption.slice(3);
+    token.name = longOption;
+    optionValue = false;
+  }
+  const newValue = optionValue === null || optionValue === undefined ? true : optionValue;
+  if (pirParseArgsOptionsGetOwn(options, longOption, "multiple")) {
+    if (values[longOption]) values[longOption].push(newValue);
+    else values[longOption] = [newValue];
+  } else {
+    values[longOption] = newValue;
+  }
+}
+
+function pirParseArgsStoreDefaultOption(longOption, optionValue, values) {
+  if (longOption === "__proto__") return;
+  values[longOption] = optionValue;
+}
+
+function pirParseArgsArgsToTokens(args, options) {
+  const tokens = [];
+  let index = -1;
+  let groupCount = 0;
+  const remainingArgs = args.slice();
+  while (remainingArgs.length > 0) {
+    const arg = remainingArgs.shift();
+    const nextArg = remainingArgs[0];
+    if (groupCount > 0) groupCount--;
+    else index++;
+
+    if (arg === "--") {
+      tokens.push({ kind: "option-terminator", index });
+      while (remainingArgs.length > 0) {
+        tokens.push({ kind: "positional", index: ++index, value: remainingArgs.shift() });
+      }
+      break;
+    }
+
+    if (pirParseArgsIsLoneShortOption(arg)) {
+      const shortOption = arg.charAt(1);
+      const longOption = pirParseArgsFindLongOptionForShort(shortOption, options);
+      let value;
+      let inlineValue;
+      if (pirParseArgsOptionsGetOwn(options, longOption, "type") === "string" &&
+          pirParseArgsIsOptionValue(nextArg)) {
+        value = remainingArgs.shift();
+        inlineValue = false;
+      }
+      tokens.push({ kind: "option", name: longOption, rawName: arg, index, value, inlineValue });
+      if (value !== null && value !== undefined) ++index;
+      continue;
+    }
+
+    if (pirParseArgsIsShortOptionGroup(arg, options)) {
+      const expanded = [];
+      for (let i = 1; i < arg.length; i++) {
+        const shortOption = arg.charAt(i);
+        const longOption = pirParseArgsFindLongOptionForShort(shortOption, options);
+        if (pirParseArgsOptionsGetOwn(options, longOption, "type") !== "string" ||
+            i === arg.length - 1) {
+          expanded.push("-" + shortOption);
+        } else {
+          expanded.push("-" + arg.slice(i));
+          break;
+        }
+      }
+      for (let i = expanded.length - 1; i >= 0; i--) remainingArgs.unshift(expanded[i]);
+      groupCount = expanded.length;
+      continue;
+    }
+
+    if (pirParseArgsIsShortOptionAndValue(arg, options)) {
+      const shortOption = arg.charAt(1);
+      const longOption = pirParseArgsFindLongOptionForShort(shortOption, options);
+      const value = arg.slice(2);
+      tokens.push({ kind: "option", name: longOption, rawName: "-" + shortOption,
+        index, value, inlineValue: true });
+      continue;
+    }
+
+    if (pirParseArgsIsLoneLongOption(arg)) {
+      const longOption = arg.slice(2);
+      let value;
+      let inlineValue;
+      if (pirParseArgsOptionsGetOwn(options, longOption, "type") === "string" &&
+          pirParseArgsIsOptionValue(nextArg)) {
+        value = remainingArgs.shift();
+        inlineValue = false;
+      }
+      tokens.push({ kind: "option", name: longOption, rawName: arg, index, value, inlineValue });
+      if (value !== null && value !== undefined) ++index;
+      continue;
+    }
+
+    if (pirParseArgsIsLongOptionAndValue(arg)) {
+      const equalIndex = arg.indexOf("=");
+      const longOption = arg.slice(2, equalIndex);
+      const value = arg.slice(equalIndex + 1);
+      tokens.push({ kind: "option", name: longOption, rawName: "--" + longOption,
+        index, value, inlineValue: true });
+      continue;
+    }
+
+    tokens.push({ kind: "positional", index, value: arg });
+  }
+  return tokens;
+}
+
+function parseArgs(config = {}) {
+  const args = pirParseArgsGetOwn(config, "args") ?? process.argv.slice(2);
+  const strict = pirParseArgsGetOwn(config, "strict") ?? true;
+  const allowPositionals = pirParseArgsGetOwn(config, "allowPositionals") ?? !strict;
+  const returnTokens = pirParseArgsGetOwn(config, "tokens") ?? false;
+  const allowNegative = pirParseArgsGetOwn(config, "allowNegative") ?? false;
+  const options = pirParseArgsGetOwn(config, "options") ?? { __proto__: null };
+  const parseConfig = { args, strict, options, allowPositionals, allowNegative };
+
+  pirParseArgsValidateArray(args, "args");
+  pirParseArgsValidateBoolean(strict, "strict");
+  pirParseArgsValidateBoolean(allowPositionals, "allowPositionals");
+  pirParseArgsValidateBoolean(returnTokens, "tokens");
+  pirParseArgsValidateBoolean(allowNegative, "allowNegative");
+  pirParseArgsValidateObject(options, "options");
+  const optionEntries = Object.entries(options);
+  for (let e = 0; e < optionEntries.length; e++) {
+    const longOption = optionEntries[e][0];
+    const optionConfig = optionEntries[e][1];
+    pirParseArgsValidateObject(optionConfig, "options." + longOption);
+    const optionType = pirParseArgsGetOwn(optionConfig, "type");
+    if (optionType !== "string" && optionType !== "boolean") {
+      throw pirParseArgsError(TypeError, "ERR_INVALID_ARG_TYPE",
+        'The "options.' + longOption + '.type" property must be one of type string or boolean. Received ' +
+        pirDescribeReceived(optionType));
+    }
+    if (pirParseArgsHasOwn(optionConfig, "short")) {
+      const shortOption = optionConfig.short;
+      pirParseArgsValidateString(shortOption, "options." + longOption + ".short");
+      if (shortOption.length !== 1) {
+        throw pirParseArgsError(TypeError, "ERR_INVALID_ARG_VALUE",
+          "The argument 'options." + longOption + ".short' must be a single character. Received " +
+          "'" + shortOption + "'");
+      }
+    }
+    const multipleOption = pirParseArgsGetOwn(optionConfig, "multiple");
+    if (pirParseArgsHasOwn(optionConfig, "multiple")) {
+      pirParseArgsValidateBoolean(multipleOption, "options." + longOption + ".multiple");
+    }
+    const defaultValue = pirParseArgsGetOwn(optionConfig, "default");
+    if (defaultValue !== undefined) {
+      const name = "options." + longOption + ".default";
+      if (optionType === "string") {
+        if (multipleOption) pirParseArgsValidateStringArray(defaultValue, name);
+        else pirParseArgsValidateString(defaultValue, name);
+      } else if (optionType === "boolean") {
+        if (multipleOption) pirParseArgsValidateBooleanArray(defaultValue, name);
+        else pirParseArgsValidateBoolean(defaultValue, name);
+      }
+    }
+  }
+
+  const tokens = pirParseArgsArgsToTokens(args, options);
+  const result = { values: { __proto__: null }, positionals: [] };
+  if (returnTokens) result.tokens = tokens;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.kind === "option") {
+      if (strict) {
+        pirParseArgsCheckOptionUsage(parseConfig, token);
+        pirParseArgsCheckOptionLikeValue(token);
+      }
+      pirParseArgsStoreOption(token, options, result.values, allowNegative);
+    } else if (token.kind === "positional") {
+      if (!allowPositionals) throw pirParseArgsUnexpectedPositional(token.value);
+      result.positionals.push(token.value);
+    }
+  }
+  for (let e = 0; e < optionEntries.length; e++) {
+    const longOption = optionEntries[e][0];
+    const optionConfig = optionEntries[e][1];
+    if (pirParseArgsUseDefaultValueOption(longOption, optionConfig, result.values)) {
+      pirParseArgsStoreDefaultOption(longOption,
+        pirParseArgsGetOwn(optionConfig, "default"), result.values);
     }
   }
   return result;
 }
 
+// Port of Node v24's dotenv parser (the C++ `binding.parseEnv`): an
+// `export `-prefixed `KEY=VALUE` line, keys and values trimmed, single
+// quotes/backticks literal, double quotes expanding \n and \r, `#` starting an
+// inline comment outside quotes, and quoted values spanning lines.
+// `test/fixtures/dotenv/valid.env` pins every branch.
+const PIR_ENV_LINE = /(?:^|^)\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?)(\s*'(?:\\'|[^'])*'|\s*"(?:\\"|[^"])*"|\s*`(?:\\`|[^`])*`|[^#\r\n]+)?\s*(?:#.*)?(?:$|$)/mg;
+
 function parseEnv(content) {
+  if (typeof content !== "string") {
+    throw pirInvalidArgType("content", "string", content);
+  }
   const result = {};
-  const text = String(content === undefined || content === null ? "" : content);
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq === -1) continue;
-    let value = line.slice(eq + 1);
-    if (value.length >= 2 && ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'")))) {
+  const text = content.replace(/\r\n?/g, "\n");
+  PIR_ENV_LINE.lastIndex = 0;
+  let match;
+  while ((match = PIR_ENV_LINE.exec(text)) !== null) {
+    const key = match[1];
+    let value = match[2] || "";
+    value = value.trim();
+    const quote = value[0];
+    if ((quote === "'" || quote === "\"" || quote === "`") &&
+        value.length >= 2 && value[value.length - 1] === quote) {
       value = value.slice(1, -1);
     }
-    result[line.slice(0, eq)] = value;
+    if (quote === "\"") {
+      value = value.replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+    }
+    result[key] = value;
   }
   return result;
 }
@@ -2858,12 +3432,23 @@ function toUSVString(input) {
   return String(input).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|([\uD800-\uDBFF][\uDC00-\uDFFF])|[\uDC00-\uDFFF]/g, (match, pair) => (pair ? match : "\uFFFD"));
 }
 
-function transferableAbortController(controller) {
-  // The runtime has no structured clone; the controller passes through.
-  return controller;
+function pirIsAbortSignal(signal) {
+  return signal !== null && typeof signal === "object" &&
+    typeof signal.addEventListener === "function" &&
+    typeof signal.aborted === "boolean" &&
+    "reason" in signal;
+}
+
+function transferableAbortController() {
+  // No structured clone host support, but the call shape is node's: a fresh
+  // controller whose signal may be transferred.
+  return new AbortController();
 }
 
 function transferableAbortSignal(signal) {
+  if (!pirIsAbortSignal(signal)) {
+    throw pirInvalidArgType("signal", "AbortSignal", signal);
+  }
   return signal;
 }
 

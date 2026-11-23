@@ -730,7 +730,7 @@ mod shim_deflate {
         ),
         (
             "assert_shim.js.txt",
-            "1b79ed2bfb0383af322584d2d497b617d4eb57411fd126bbeda13b985ceb9a3c",
+            "e91b7a0b54cc4b005ff0a49723f9b42f1367b9cbf712a3950a7137e502218a6a",
         ),
         (
             "assert_strict_shim.js.txt",
@@ -746,15 +746,15 @@ mod shim_deflate {
         ),
         (
             "better_sqlite3_shim.js.txt",
-            "5489d34efe18336953f70f4fee858e4d704fbc034720690f8f1d9116d796ad2d",
+            "594e1d9578d806421397716aea54aedbdb345026169f4780ff89f049e4b7340c",
         ),
         (
             "buffer_global.js.txt",
-            "05a45999acaed4b7b7b9f8e6f23983765f28fc94223639bca1886246b89a641c",
+            "092eddc18f95ee58afa482c9ad7fd642a4f4e82927ed56cc1579635dd4247dd4",
         ),
         (
             "child_process_shim.js.txt",
-            "936b44e90fdb74d543c18d3dbefa68619eba1389c3db3639ae09a63515c5baaa",
+            "d6f5a0f5d5648b47be93b857147fb79bca6d59f26a97b5f2a5922fd20727bcc3",
         ),
         (
             "cluster_shim.js.txt",
@@ -762,7 +762,7 @@ mod shim_deflate {
         ),
         (
             "console_shim.js.txt",
-            "4ca4d77f71d58f0701a7554edad37f0012ab602c20991c959aecd371f4a8ba27",
+            "52c88f1498a7cc12834c4223347b7d812390ba2c3e64a91537820f946a8e33f4",
         ),
         (
             "constants_shim.js.txt",
@@ -770,7 +770,7 @@ mod shim_deflate {
         ),
         (
             "crypto_shim.js.txt",
-            "7e5ed94b011b9f7114b0c81ff73ffde9c747d41134b8ed3b28c1a025c29714bb",
+            "7bbe9b8f22f5a7924fead913e3b94385fb15511ccb6ec14a3e58401e52f55ccf",
         ),
         (
             "dgram_shim.js.txt",
@@ -794,19 +794,19 @@ mod shim_deflate {
         ),
         (
             "events_shim.js.txt",
-            "1ed561342ad793ff57bd16526667f6811ef3ad506130d4a3f8d5b83d63e3492a",
+            "b9affb308562a1ec14dcc82afbb1873300dfe6319e00b56d8d8bd42030fcb2a0",
         ),
         (
             "fetch_global.js.txt",
-            "3da00e6ce6b483e76a1b8fdaf903ad0df4dc2c68718125a6d67271bb01547109",
+            "c5345944297059fa5397b42cb4deffc2ad3f3732fe1d140e1cfef97d5e58cf9f",
         ),
         (
             "fs_promises_shim.js.txt",
-            "0cd010dc43c5512e989a8a436702e2653fc214f27d21ef699df3713553f3d021",
+            "9adae70490f8a34406e842b1d949ec552488604856fe6095147c89e37d2afe61",
         ),
         (
             "fs_shim.js.txt",
-            "5ed9e10ee1aea9dcb7f5ab8702940cacafe4a4f7650d7f42d0557e574a2aec20",
+            "7ed3ab742e8be11497d06f952b3757850573f770ba7d36944f5bbe9f420552ab",
         ),
         (
             "http2_shim.js.txt",
@@ -834,7 +834,7 @@ mod shim_deflate {
         ),
         (
             "http_shim.js.txt",
-            "57e64657df5ecd61890d1a9f3590fe5f80e6ad5b8ee63cee2c66380c5c108d60",
+            "5fa0b1cbf72d97e4d9fbef18e01379dbf5e3d3c305a2ccd33e54b730346300b9",
         ),
         (
             "https_shim.js.txt",
@@ -862,19 +862,19 @@ mod shim_deflate {
         ),
         (
             "node_call_helper.js.txt",
-            "a9507416a5b02ea62bd773c8d204a154e4cf8d0f7e8b75362db390876c087309",
+            "5703b977c91a2c48c569f37fbfb193318efbff97b26d801401bf7915dbe42e37",
         ),
         (
             "node_cjs_runtime.js.txt",
-            "44c1e1a25d3157625dfde28205c4b1dd6a1ad50029f9349eec919f43090b203b",
+            "3d43337f7e30a4153ea859ae6427822cf47900ebe5fb5b63ab4cc6c1edd1574c",
         ),
         (
             "os_shim.js.txt",
-            "2449edbff8d21013edd18fa45dc552bd761e2096d759a5324e798174736bb646",
+            "66de0ffb53884f65ab8f137403793e1674ac00bf355f6300f0c7c9606c48e433",
         ),
         (
             "path_shim.js.txt",
-            "f948af6fd0c6cdbe46c955f56618c281d43a78b247f1f909a8eb51f2e13ce5cd",
+            "477fed9801e5ac02a08c3d0db836e5aa0377a9ea8583fc6ab4346a48fa671023",
         ),
         (
             "pi_agent_core_shim.js.txt",
@@ -886,11 +886,11 @@ mod shim_deflate {
         ),
         (
             "pi_ai_providers_all_shim.js.txt",
-            "3384ccc3e25473017d2bae4c5d9772a2738105ec8c5f892ca11dd28c399f63ca",
+            "b5e23e30997ef2fc9fd0767d2d7b9c703342047b0260cdf25d55e71b774b42d0",
         ),
         (
             "pi_ai_shim.js.txt",
-            "bbd0ffb9bb4590d5a1111a198ad8aed8c31fe77fd17f1a118b705c51a6acf9df",
+            "9ff0d7a7f55a320ee45163a397781ea278a526f71ddc26719ae6992446abe300",
         ),
         (
             "pi_chord_node_shim.js.txt",
@@ -906,7 +906,7 @@ mod shim_deflate {
         ),
         (
             "pi_coding_agent_shim.js.txt",
-            "2aec26739a5868a189d1fea313e23c55384fe3aed568921a34295a441c3bb01f",
+            "4b86ef01d34d0500455219c0da11383bd7e83dc59778cf997ee3654f5503171d",
         ),
         (
             "pi_durable_env_shim.js.txt",
@@ -926,7 +926,7 @@ mod shim_deflate {
         ),
         (
             "pi_tui_shim.js.txt",
-            "c4ae0e5f5e62e95df6e848d0918eb3cfeed03a811af8f4cdfddf412be7f9f679",
+            "c54cfca10bcdcd90a74ffc3f3c2a6a9e0bcbf565dc3a53bccb494c834e3f3b78",
         ),
         (
             "prelude.js.txt",
@@ -966,11 +966,17 @@ mod shim_deflate {
             // #11630: host-resolved `keyText`/`keyHint` are injected into
             // `ToolRenderContext`, `MessageRenderOptions`, and
             // `EntryRenderOptions`.
-            "45a68a8e771059aa331794fed6c539c088a1337b78ad1023dd0b95f36e8168a8",
+            // NATIVE-VALUE-BRIDGE: `__pir_native` tier — typed context and
+            // event/tool dispatch entries crossing the boundary as live
+            // QuickJS objects instead of JSON strings.
+            // AOT-MODULE: the prelude now executes as an ES module, so the
+            // timer registry/sequence it shares with `process_global_stub`
+            // are published on `globalThis`.
+            "d9e92d365a2ce76eb1641db54ff1d89134534b658ab94b8eaf0742e387ef223b",
         ),
         (
             "process_global_stub.js.txt",
-            "04e058ff5c8b3dea2fbae6632064b7de29c9253d070e225cc5b7d67289142a5b",
+            "2f9af7f48e5460650704d1c0272ab203555b8d3e5de8a24c8f342114e65315ef",
         ),
         (
             "process_shim.js.txt",
@@ -982,7 +988,7 @@ mod shim_deflate {
         ),
         (
             "querystring_shim.js.txt",
-            "e3af9a97c5e5731006ea348e643f79e8b303092e8500d775666ec585e06dd165",
+            "5d955bdf299f3a03cbb84864e299ea02aa02b37da3d1ef36b759878b54aeb436",
         ),
         (
             "readline_promises_shim.js.txt",
@@ -990,7 +996,7 @@ mod shim_deflate {
         ),
         (
             "readline_shim.js.txt",
-            "1568905235f0a2e7557daf69cf6d0a0c2d94b294e958b9445f407e2af37ce9cd",
+            "0f3c882be8ba8539e1b2a4e15b20ac74090790506e4eeed033a8aef96ddfa2a1",
         ),
         (
             "repl_shim.js.txt",
@@ -1002,15 +1008,15 @@ mod shim_deflate {
         ),
         (
             "sqlite3_shim.js.txt",
-            "8ff5ad48e8f810270e9fac1a5c51d2748bd882938021deb38cd69259b926e1b4",
+            "03878683d7fc10c7d8228ec2dc304aa5ccd2779e1892205fcf4332ff4502a581",
         ),
         (
             "sqlite_shim.js.txt",
-            "5c3c2376eb2b856ef86726778abb542cd0359dd6c1ffe7206dc87906c04f6637",
+            "7a6ef9a4c49fe6971f5bfaa7a045c0423b82cd34d441df835e31e1a5e7d9fafa",
         ),
         (
             "stream_consumers_shim.js.txt",
-            "d3d6db7785fd94a369a8a18784e6333176df05fd4ef5a6bbc89bbd4a71e83986",
+            "fb10d18394eebd18805cd5ca1cbdbe3d07c5e3fea39520541ffe62d0d6efd8ca",
         ),
         (
             "stream_empty_internals_shim.js.txt",
@@ -1018,15 +1024,15 @@ mod shim_deflate {
         ),
         (
             "stream_internals_shim.js.txt",
-            "09f808bdace71cbe3d5bf1466d7959c4a92692919e4a60194d2b54201bd05b74",
+            "5822f216420236880af8982be0e947b531904d62baea947397f458078df1431a",
         ),
         (
             "stream_promises_shim.js.txt",
-            "0dfaa7b328e5ab4fa90a84891070fe44d4abfb94b3e1d272ac98942ed37de40d",
+            "b6fc3cf5b326e068b6c3169bfc512c62f8946a794d306df9928f1ddf45adcce7",
         ),
         (
             "stream_shim.js.txt",
-            "7ec02231b08f5402c125571c85a2ba3bf5c1eb1027f3b2611afbed8146cfd391",
+            "ae3d9c38ecdd30378b8cad02175dcd38bc3d7047aacabd2b0131f91b4cddb43a",
         ),
         (
             "stream_web_shim.js.txt",
@@ -1034,7 +1040,7 @@ mod shim_deflate {
         ),
         (
             "string_decoder_shim.js.txt",
-            "7be9e1bec39f66b3ba311aa576ce8a8602925f583f8ca2387dbb88b36c9da30a",
+            "00300eee46bb5faf9765e203f94a8f0cadf7cbda21b340b5ad88296a61f8989d",
         ),
         (
             "sys_shim.js.txt",
@@ -1042,15 +1048,15 @@ mod shim_deflate {
         ),
         (
             "test_reporters_shim.js.txt",
-            "8ab71679a2bf6ba99b2ccc22d8914b4dde0fe4d944bd51bac50193b99b3a6b87",
+            "1a73d1e75af68aad9c3021f0886995729c60835d6f5de9c89576ee525a7434ca",
         ),
         (
             "test_shim.js.txt",
-            "5c26a3be89ec90c12cc175fb9ae1ea6dc3cae9d9390ef89ca59660a0b7f9c412",
+            "f367c00a3bc7e71599a3be43d761411ebec30ca5e28c0b13a17b5573e5b14545",
         ),
         (
             "textcodec_global.js.txt",
-            "3110147026a316946d94130b67e1ac785770bd2ab5209a2621758ea76fc43a89",
+            "2d529c78d0d4315b5611b7fe3f3769b4a1aacdc31562cf5e04b9820efe719c5e",
         ),
         (
             "tls_internals_shim.js.txt",
@@ -1070,7 +1076,7 @@ mod shim_deflate {
         ),
         (
             "typebox_shim.js.txt",
-            "0c93422b544f03fe804ef8e0deb2a7231c229685ddd765bbb68aedd781d06cd4",
+            "0ef49b8babf3a6f91f52961167b72714b970154d5d98112cca231396344b134c",
         ),
         (
             "typebox_value_shim.js.txt",
@@ -1078,11 +1084,11 @@ mod shim_deflate {
         ),
         (
             "url_shim.js.txt",
-            "16e06ce718da6231ebc517c08c744c6b5f8520c16951b4e10f75108727ba6687",
+            "e140aa3883ec3d75ab9e9879fb8c77b2a2bebfca6ef3a3d337b057bf14192ab3",
         ),
         (
             "util_shim.js.txt",
-            "5f45e2e1dc50f0fb0dc30ac7bd8ea17781ed367f02fd7d8f860c69a9eae9ca63",
+            "1bec437079b45ccd1bfadf7fafe69d39290bf2a3fa6102e358d88ce137a55eaf",
         ),
         (
             "util_types_shim.js.txt",
@@ -1090,11 +1096,11 @@ mod shim_deflate {
         ),
         (
             "v8_shim.js.txt",
-            "3e036c2eb29ba8e09b05eef4fd0c9059e491bf266810bf81611365937090eba3",
+            "f69e19ca03ea873014370c5a5d147b734063605449345643397c8fb82cc47f1b",
         ),
         (
             "vm_shim.js.txt",
-            "f341502c7fb77c1d0d5d2be7f89bc598160b1f4fdf0368809ddf9e1934868492",
+            "75d870714e217c851fb45e3b95e09dad51859e0ac930df40fb998ccc7327b976",
         ),
         (
             "wasi_shim.js.txt",
@@ -1102,23 +1108,23 @@ mod shim_deflate {
         ),
         (
             "web_streams.js.txt",
-            "7c816f51ac4f83b399755c2ac2aacbafd35dda3da14c30530f601b57b278714a",
+            "b8b7c8ebb76f834464407d190517b899b884873ceb58c46b5115b6df8275920f",
         ),
         (
             "webcompat_globals.js.txt",
-            "bb17b685713ffcf730706fdb30afb0cff5d92994354db58ec84770843ee5f4bf",
+            "abb27a7dbc63562355653ec1a5cf4932beba1302ef7273c63f7e55b225789a03",
         ),
         (
             "worker_boot.js.txt",
-            "03abfb87773e349160352fd226e0f7a8bafb2471401cd1b8299f5419c5fe3236",
+            "13e4b3437db3aaedfb78d0cbd6b57b4cba28f3824c71d5fed44eae9eaa458659",
         ),
         (
             "worker_threads_shim.js.txt",
-            "4d763a31eeb9854ce85c714ed5729debf081bb9cc6b50b49a31c45a6e2f169e6",
+            "f14cd346057c7e19f46f9ae6c5d7cc1a3fba620f5c15ada4f47830a91c21c645",
         ),
         (
             "zlib_shim.js.txt",
-            "79e741c8d42a8c4d73eeac2962b89b0c05ed38678f18e5055b904737bbfc6971",
+            "ad84d3d2518c073a367d2826d3113b95d468894faf7c89a2d9e42c417a7d0f8d",
         ),
     ];
 
@@ -1188,10 +1194,162 @@ mod shim_deflate {
         }
     }
 
-    /// The inflate gate above walks `all_shims()`; this test pins the other
-    /// direction so a newly added `*.js.txt` cannot silently ship without a
-    /// blob: every source is either embedded through one of the shim
-    /// registries or is the one file `src/main_cli` embeds directly
+    /// AOT bytecode: every virtual module has a blob compiled under its
+    /// canonical name, the guard header validates, and the payload digest
+    /// matches the generated manifest. Regenerate with
+    /// `cargo run --bin pir-gen-bytecode --features extensions` after changing
+    /// a shim or upgrading the engine.
+    #[test]
+    fn bytecode_assets_cover_every_virtual_module_and_validate() {
+        use pir::extensions::api::bytecode;
+        use std::collections::BTreeMap;
+
+        let manifest_text = std::fs::read_to_string("assets/bytecode/virtual-manifest.txt")
+            .expect("read virtual manifest");
+        let manifest: BTreeMap<&str, &str> = manifest_text
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .map(|line| line.split_once(' ').expect("manifest line"))
+            .collect();
+
+        let modules = pir::extensions::api::all_virtual_modules();
+        for (canonical, _shim) in modules.iter() {
+            let blob = bytecode::virtual_blob(canonical).unwrap_or_else(|| {
+                panic!(
+                    "{canonical}: no AOT blob; run `cargo run --bin pir-gen-bytecode --features extensions`"
+                )
+            });
+            let payload = bytecode::payload(blob)
+                .unwrap_or_else(|| panic!("{canonical}: guard header rejected the blob"));
+            assert_eq!(
+                blob.len(),
+                bytecode::HEADER_LEN + payload.len(),
+                "{canonical}: header/payload length mismatch"
+            );
+
+            let digest = sha256_hex(payload);
+            let expected = manifest.get(*canonical).unwrap_or_else(|| {
+                panic!("{canonical}: missing from assets/bytecode/virtual-manifest.txt")
+            });
+            assert_eq!(&digest, expected, "{canonical}: manifest digest mismatch");
+            assert_eq!(
+                &blob[20..52],
+                Sha256::digest(payload).as_slice(),
+                "{canonical}: header digest mismatch"
+            );
+        }
+        assert_eq!(
+            manifest.len(),
+            modules.len(),
+            "manifest/registry count drifted"
+        );
+
+        // The specifier-facing entry point must resolve through the canonical
+        // name to the same blob the loader will use.
+        for specifier in ["node:fs", "@node/fs", "fs"] {
+            assert_eq!(
+                pir::extensions::api::shims::canonical_virtual_name(specifier),
+                Some("@node/fs"),
+                "{specifier}: canonical name drifted"
+            );
+            assert!(
+                pir::extensions::api::shims::bytecode_for(specifier).is_some(),
+                "{specifier}: loader lookup returned no blob"
+            );
+        }
+    }
+
+    /// The prelude is the one boot shim evaluated from a standalone blob.
+    #[test]
+    fn bytecode_prelude_boot_blob_validates() {
+        use pir::extensions::api::bytecode;
+        let name = pir::extensions::api::HOST_PRELUDE.name();
+        let blob = bytecode::bytecode_for(name).expect("prelude blob");
+        let payload = bytecode::payload(blob).expect("prelude guard header");
+        assert_eq!(blob.len(), bytecode::HEADER_LEN + payload.len());
+        assert!(
+            payload.len() * 2 < pir::extensions::api::HOST_PRELUDE.source().len(),
+            "prelude bytecode should be materially smaller than its source"
+        );
+        let manifest = std::fs::read_to_string("assets/bytecode/manifest.txt").expect("manifest");
+        let expected = manifest
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.split_once(' '))
+            .expect("manifest entry");
+        assert_eq!(expected.0, name, "manifest entry drifted");
+        assert_eq!(sha256_hex(payload), expected.1, "prelude digest mismatch");
+    }
+
+    /// Load-time stub used by [`bytecode_assets_load_into_quickjs`]: QuickJS
+    /// resolves a module's import specifiers while reading the bytecode, so
+    /// the check runtime needs a loader even though nothing is evaluated. The
+    /// stub returns an empty module for every specifier.
+    struct StubResolver;
+    impl rquickjs::loader::Resolver for StubResolver {
+        fn resolve<'js>(
+            &mut self,
+            _ctx: &rquickjs::Ctx<'js>,
+            _base: &str,
+            name: &str,
+            _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
+        ) -> rquickjs::Result<String> {
+            Ok(name.to_owned())
+        }
+    }
+
+    struct StubLoader;
+    impl rquickjs::loader::Loader for StubLoader {
+        fn load<'js>(
+            &mut self,
+            ctx: &rquickjs::Ctx<'js>,
+            name: &str,
+            _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
+        ) -> rquickjs::Result<rquickjs::Module<'js, rquickjs::module::Declared>> {
+            rquickjs::Module::declare(ctx.clone(), name, "export default undefined;")
+        }
+    }
+
+    /// Every blob must be loadable by the same QuickJS build that generated
+    /// it. A QuickJS upgrade without regenerating fails here (and the guard
+    /// header makes the runtime fall back to source rather than crash).
+    #[test]
+    #[allow(unsafe_code)]
+    fn bytecode_assets_load_into_quickjs() {
+        use pir::extensions::api::bytecode;
+
+        let rt = rquickjs::Runtime::new().expect("runtime");
+        rt.set_loader(StubResolver, StubLoader);
+        let ctx = rquickjs::Context::full(&rt).expect("context");
+        ctx.with(|ctx| {
+            let mut blobs: Vec<(&str, &'static [u8])> = Vec::new();
+            let prelude = pir::extensions::api::HOST_PRELUDE.name();
+            blobs.push((
+                prelude,
+                bytecode::bytecode_for(prelude).expect("prelude blob"),
+            ));
+            for (canonical, _shim) in pir::extensions::api::all_virtual_modules() {
+                blobs.push((
+                    canonical,
+                    bytecode::virtual_blob(canonical)
+                        .unwrap_or_else(|| panic!("{canonical}: no AOT blob")),
+                ));
+            }
+
+            for (name, blob) in blobs {
+                let payload = bytecode::payload(blob)
+                    .unwrap_or_else(|| panic!("{name}: guard header rejected the blob"));
+                // SAFETY: the payload was produced by `pir-gen-bytecode` from
+                // the same engine and the guard header above validated it.
+                unsafe {
+                    rquickjs::Module::load(ctx.clone(), payload)
+                        .unwrap_or_else(|error| panic!("{name}: Module::load failed: {error}"));
+                }
+            }
+        });
+    }
+
+
     /// (`script_boot.js.txt`, `include_str!`, no deflate), and `assets/shims`
     /// holds exactly one blob per embedded shim (no missing or orphan blobs).
     #[test]

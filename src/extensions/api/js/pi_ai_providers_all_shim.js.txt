@@ -2,6 +2,22 @@
 const CATALOG_UNAVAILABLE =
   "the generated built-in model catalog is not bundled in the pir runtime";
 
+function hostCatalog() {
+  try {
+    if (typeof globalThis.__pir_native?.getModels === "function") return globalThis.__pir_native.getModels();
+    if (typeof globalThis.__pir_host?.getModelsJson === "function") {
+      const value = JSON.parse(globalThis.__pir_host.getModelsJson());
+      return value && typeof value === "object" ? value : {};
+    }
+  } catch { /* fall through to an empty read-only catalog */ }
+  return { models: [], providers: [] };
+}
+
+function catalogModels(provider) {
+  const models = Array.isArray(hostCatalog().models) ? hostCatalog().models : [];
+  return provider === undefined ? models : models.filter((model) => model?.provider === provider);
+}
+
 function catalogUnavailable(what) {
   throw new Error(what + " is not available: " + CATALOG_UNAVAILABLE);
 }
@@ -17,13 +33,16 @@ function unavailableExport(what) {
   });
 }
 
-export function getBuiltinModel() { return catalogUnavailable("getBuiltinModel"); }
-export function getBuiltinImageModel() { return catalogUnavailable("getBuiltinImageModel"); }
-export function getBuiltinClassifierModel() { return catalogUnavailable("getBuiltinClassifierModel"); }
-export function getBuiltinModels() { return catalogUnavailable("getBuiltinModels"); }
-export function getBuiltinImageModels() { return catalogUnavailable("getBuiltinImageModels"); }
-export function getBuiltinClassifierModels() { return catalogUnavailable("getBuiltinClassifierModels"); }
-export function getAllBuiltinModels() { return catalogUnavailable("getAllBuiltinModels"); }
+// The model catalog objects are not bundled in the pir runtime; lookups must
+// fail loudly (matching builtinProviders/builtinModels) instead of silently
+// returning undefined, while still answering real rows if a catalog is ever
+// bundled (hostCatalog()).
+function requireBundledCatalog(what) {
+  if (catalogModels(undefined).length === 0) catalogUnavailable(what);
+}
+export function getBuiltinModel(provider, id) { requireBundledCatalog("getBuiltinModel"); return catalogModels(provider).find((model) => model?.id === id); }
+export function getBuiltinModels(provider) { requireBundledCatalog("getBuiltinModels"); return catalogModels(provider); }
+export function getAllBuiltinModels(provider) { requireBundledCatalog("getAllBuiltinModels"); return catalogModels(provider); }
 export function builtinProviders() { return catalogUnavailable("builtinProviders"); }
 export function builtinModels() { return catalogUnavailable("builtinModels"); }
 
@@ -124,6 +143,23 @@ export function getBuiltinModelDataVersion() { return PIR_BUILTIN_MODEL_DATA_VER
 // Upstream exports the radius provider object (providers/radius.ts); the
 // implementation cannot be faked, so any use fails with a clear error.
 export const radiusProvider = unavailableExport("radiusProvider");
+
+// Image/classifier model lookups are upstream surfaces whose concrete model
+// objects pir does not bundle; they must exist as named exports (the
+// providers/all default object re-exports them) and fail loudly on use, like
+// the catalog helpers above.
+export function getBuiltinImageModel(provider, id) {
+  return catalogUnavailable("getBuiltinImageModel");
+}
+export function getBuiltinImageModels(provider) {
+  return catalogUnavailable("getBuiltinImageModels");
+}
+export function getBuiltinClassifierModel(provider, id) {
+  return catalogUnavailable("getBuiltinClassifierModel");
+}
+export function getBuiltinClassifierModels(provider) {
+  return catalogUnavailable("getBuiltinClassifierModels");
+}
 
 export default {
   getBuiltinModel,

@@ -120,7 +120,13 @@ function pirChunkToBuffer(chunk, encoding) {
 }
 
 // Unpaired surrogate code unit anywhere in `text`.
+const PIR_SURROGATE_RE = /[\uD800-\uDFFF]/;
+
 function pirHasLoneSurrogate(text) {
+  // An ASCII-dominant SSE/tool-output chunk usually carries no surrogate at
+  // all: let the engine's regex scan reject it in one native pass instead of
+  // interpreting the whole string in JS.
+  if (!PIR_SURROGATE_RE.test(text)) return false;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     if (code >= 0xd800 && code <= 0xdbff) {
@@ -136,6 +142,19 @@ function pirHasLoneSurrogate(text) {
   return false;
 }
 
+// Memoized utf8-label check (the per-chunk `toLowerCase()` allocation showed
+// up on the text-channel decision for every SSE chunk).
+const pirUtf8Encoding = Object.create(null);
+
+function pirIsUtf8Encoding(encoding) {
+  const cached = pirUtf8Encoding[encoding];
+  if (cached !== undefined) return cached;
+  const normalized = encoding.toLowerCase();
+  const ok = normalized === "utf8" || normalized === "utf-8";
+  pirUtf8Encoding[encoding] = ok;
+  return ok;
+}
+
 // Can this chunk ride the text channel (`bodyText`) instead of `bodyB64`?
 // Only when its bytes are exactly its UTF-8 encoding: the encoding argument
 // must resolve to utf8 (Buffer.from's default; `lookupEncoding` in
@@ -148,8 +167,7 @@ function pirHasLoneSurrogate(text) {
 function pirTextChunkEncodable(chunk, encoding) {
   if (typeof chunk !== "string") return false;
   if (typeof encoding === "string" && encoding.length !== 0) {
-    const normalized = encoding.toLowerCase();
-    if (normalized !== "utf8" && normalized !== "utf-8") return false;
+    if (!pirIsUtf8Encoding(encoding)) return false;
   }
   return !pirHasLoneSurrogate(chunk);
 }
@@ -165,8 +183,30 @@ function pirAbortError(reason) {
   return error;
 }
 
+const PIR_INVALID_HEADER_NAME_RE = /[:\r\n \t]/;
+
+// Header names are a small, repetitive vocabulary (SSE/tool traffic reuses the
+// same dozen names per response). Lowercasing is a native call per header in
+// node's C++ parser, but a JS `toLowerCase()` per pair is measurable here;
+// memoize the mapping behind a bounded cache. `toLowerCase` is deterministic
+// for a given string, so the result is identical.
+const pirLowerNameCache = Object.create(null);
+let pirLowerNameCount = 0;
+const PIR_LOWER_NAME_CAP = 512;
+
+function pirLowerHeaderName(name) {
+  const cached = pirLowerNameCache[name];
+  if (cached !== undefined) return cached;
+  const lower = name.toLowerCase();
+  if (pirLowerNameCount < PIR_LOWER_NAME_CAP) {
+    pirLowerNameCache[name] = lower;
+    pirLowerNameCount += 1;
+  }
+  return lower;
+}
+
 function pirValidateHeaderName(name) {
-  if (typeof name !== "string" || !/^[^:\r\n]*$/.test(name) || /[ \t]/.test(name)) {
+  if (typeof name !== "string" || PIR_INVALID_HEADER_NAME_RE.test(name)) {
     const error = new TypeError("Invalid header name: " + JSON.stringify(name));
     error.code = "ERR_INVALID_HTTP_TOKEN";
     throw error;
@@ -175,7 +215,15 @@ function pirValidateHeaderName(name) {
 }
 
 function pirValidateHeaderValue(name, value) {
-  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "undefined") {
+  // Node's ERR_HTTP_INVALID_HEADER_VALUE: `undefined` is not a value a header
+  // can carry (setHeader(name, undefined) must throw instead of silently
+  // storing an empty header).
+  if (value === undefined) {
+    const error = new TypeError("Invalid value \"undefined\" for header \"" + String(name) + "\"");
+    error.code = "ERR_HTTP_INVALID_HEADER_VALUE";
+    throw error;
+  }
+  if (typeof value !== "string" && typeof value !== "number") {
     const error = new TypeError("Invalid value in \"" + String(name) + "\" header");
     error.code = "ERR_HTTP_INVALID_CHAR";
     throw error;
@@ -436,7 +484,8 @@ function pirNormalizeRequestArgs(input, options, callback, defaultProtocol) {
   const headerEntries = [];
   const raw = opts.headers;
   if (Array.isArray(raw)) {
-    for (const pair of raw) {
+    for (let i = 0; i < raw.length; i++) {
+      const pair = raw[i];
       if (!Array.isArray(pair) || pair.length < 2) {
         const error = new TypeError("Headers must be [name, value] arrays");
         error.code = "ERR_INVALID_ARG_VALUE";
@@ -445,10 +494,12 @@ function pirNormalizeRequestArgs(input, options, callback, defaultProtocol) {
       headerEntries.push([String(pair[0]), String(pair[1])]);
     }
   } else if (raw !== undefined && raw !== null) {
-    for (const name of Object.keys(raw)) {
+    const names = Object.keys(raw);
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
       const value = raw[name];
       if (Array.isArray(value)) {
-        for (const item of value) headerEntries.push([name, String(item)]);
+        for (let k = 0; k < value.length; k++) headerEntries.push([name, String(value[k])]);
       } else {
         headerEntries.push([name, String(value)]);
       }
@@ -511,28 +562,49 @@ class OutgoingMessage extends EventEmitter {
     this._pirHeaders = new Map(); // lowercase name -> {name, value}
   }
   setHeader(name, value) {
-    pirValidateHeaderName(String(name));
-    pirValidateHeaderValue(String(name), value);
-    this._pirHeaders.set(String(name).toLowerCase(), { name: String(name), value: value });
+    if (this.headersSent) {
+      const error = new Error("Cannot set headers after they are sent to the client");
+      error.code = "ERR_HTTP_HEADERS_SENT";
+      throw error;
+    }
+    const text = String(name);
+    pirValidateHeaderName(text);
+    pirValidateHeaderValue(text, value);
+    this._pirHeaders.set(pirLowerHeaderName(text), { name: text, value: value });
     return this;
   }
   getHeader(name) {
-    const entry = this._pirHeaders.get(String(name).toLowerCase());
+    const entry = this._pirHeaders.get(pirLowerHeaderName(String(name)));
     return entry === undefined ? undefined : entry.value;
   }
   getHeaders() {
     const out = {};
-    for (const [name, entry] of this._pirHeaders) out[name] = entry.value;
+    for (const [name, entry] of this._pirHeaders) {
+      // A header may legitimately be named `__proto__` (it is a valid token):
+      // assignment would hit Object.prototype's setter and drop it.
+      if (name === "__proto__") {
+        Object.defineProperty(out, name, {
+          value: entry.value, enumerable: true, writable: true, configurable: true,
+        });
+      } else {
+        out[name] = entry.value;
+      }
+    }
     return out;
   }
   getHeaderNames() {
     return [...this._pirHeaders.keys()];
   }
   hasHeader(name) {
-    return this._pirHeaders.has(String(name).toLowerCase());
+    return this._pirHeaders.has(pirLowerHeaderName(String(name)));
   }
   removeHeader(name) {
-    this._pirHeaders.delete(String(name).toLowerCase());
+    if (this.headersSent) {
+      const error = new Error("Cannot remove headers after they are sent to the client");
+      error.code = "ERR_HTTP_HEADERS_SENT";
+      throw error;
+    }
+    this._pirHeaders.delete(pirLowerHeaderName(String(name)));
   }
   // OutgoingMessage sits on the events-shim EventEmitter, which has no
   // destroy — provide the stream-shim semantics here so ClientRequest's
@@ -541,16 +613,30 @@ class OutgoingMessage extends EventEmitter {
     if (this.destroyed) return this;
     this.destroyed = true;
     if (error) {
-      try {
+      // Only the no-listener case is tolerated: Node's EventEmitter throws the
+      // error itself when no 'error' listener is attached (the events shim
+      // mirrors that), and the runtime cannot let a destroy() call crash the
+      // process. An exception thrown by a *user* listener must propagate —
+      // swallowing it hid application bugs.
+      if (this.listenerCount("error") === 0) {
+        try {
+          this.emit("error", error);
+        } catch (unhandled) {}
+      } else {
         this.emit("error", error);
-      } catch (unhandled) {} // no 'error' listener: events-shim throws; Node would crash the process
+      }
     }
     this.emit("close");
     return this;
   }
   appendHeader(name, value) {
+    if (this.headersSent) {
+      const error = new Error("Cannot append headers after they are sent to the client");
+      error.code = "ERR_HTTP_HEADERS_SENT";
+      throw error;
+    }
     pirValidateHeaderName(String(name));
-    const key = String(name).toLowerCase();
+    const key = pirLowerHeaderName(String(name));
     const entry = this._pirHeaders.get(key);
     if (entry === undefined) {
       this._pirHeaders.set(key, { name: String(name), value: value });
@@ -573,7 +659,12 @@ class OutgoingMessage extends EventEmitter {
     if (typeof callback === "function") callback();
     return this;
   }
-  flushHeaders() {}
+  flushHeaders() {
+    // The host sends the header block with the aggregated message (there is no
+    // separate flush op); the observable Node rule still applies: headers are
+    // final from here on, so setHeader/appendHeader/removeHeader throw.
+    this.headersSent = true;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -581,12 +672,18 @@ class OutgoingMessage extends EventEmitter {
 // `data`/`end` events, pause()/resume() gate the pump that feeds it.
 // ---------------------------------------------------------------------------
 
+// Shared empty holders for the message constructor: a field that is never
+// mutated (an empty stash is only ever inspected/shifted-when-nonempty) does
+// not need a fresh array/object per message.
+const PIR_EMPTY_META = {};
+const PIR_EMPTY_STASH = [];
+
 class IncomingMessage extends pirReadableBase {
   constructor(meta) {
-    meta = meta === undefined || meta === null ? {} : meta;
+    meta = meta === undefined || meta === null ? PIR_EMPTY_META : meta;
     super();
     this._pirId = typeof meta.id === "number" ? meta.id : 0;
-    this._pirStash = Array.isArray(meta.stash) ? meta.stash : [];
+    this._pirStash = Array.isArray(meta.stash) ? meta.stash : PIR_EMPTY_STASH;
     this._pirFinished = false;
     this._pirPaused = false;
     this._poller = new PirPoller();
@@ -609,19 +706,26 @@ class IncomingMessage extends pirReadableBase {
     // case, flat [name, value, ...]).
     const headers = Object.create(null);
     const rawHeaders = [];
-    const setCookie = [];
-    for (const pair of meta.headers || []) {
-      const name = String(pair[0]);
-      const value = String(pair[1]);
-      rawHeaders.push(name, value);
-      const key = name.toLowerCase();
-      if (key === "set-cookie") {
-        setCookie.push(value);
-        continue;
+    let setCookie = null;
+    const pairs = meta.headers;
+    if (pairs !== undefined && pairs !== null) {
+      for (let i = 0; i < pairs.length; i++) {
+        const pair = pairs[i];
+        const rawName = pair[0];
+        const rawValue = pair[1];
+        const name = typeof rawName === "string" ? rawName : String(rawName);
+        const value = typeof rawValue === "string" ? rawValue : String(rawValue);
+        rawHeaders.push(name, value);
+        const key = pirLowerHeaderName(name);
+        if (key === "set-cookie") {
+          if (setCookie === null) setCookie = [];
+          setCookie.push(value);
+          continue;
+        }
+        headers[key] = headers[key] === undefined ? value : headers[key] + ", " + value;
       }
-      headers[key] = headers[key] === undefined ? value : headers[key] + ", " + value;
     }
-    if (setCookie.length > 0) headers["set-cookie"] = setCookie;
+    if (setCookie !== null) headers["set-cookie"] = setCookie;
     this.headers = headers;
     this.rawHeaders = rawHeaders;
     // Server-side requests stream their body through the host slot on the
@@ -797,10 +901,22 @@ class ClientRequest extends OutgoingMessage {
     this._pirStarted = false;
     this._pirId = 0;
     this._pirResponse = undefined;
+    this._pirDetachAbort = null;
     this._poller = new PirPoller();
     // Wire URL: userinfo rides a Basic Authorization header (Node's behavior);
     // the explicit port is kept unless it is the scheme default.
-    for (const [name, value] of normalized.headerEntries) this.setHeader(name, value);
+    // `headerEntries` already carries strings: validate once and insert,
+    // instead of re-stringifying through the public setHeader() path.
+    const entries = normalized.headerEntries;
+    const headers = this._pirHeaders;
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const name = entry[0];
+      const value = entry[1];
+      pirValidateHeaderName(name);
+      pirValidateHeaderValue(name, value);
+      headers.set(pirLowerHeaderName(name), { name: name, value: value });
+    }
     if (normalized.auth !== undefined && !this.hasHeader("authorization")) {
       this.setHeader("Authorization", "Basic " + Buffer.from(normalized.auth, "utf8").toString("base64"));
     }
@@ -831,19 +947,33 @@ class ClientRequest extends OutgoingMessage {
       throw error;
     }
     if (normalized.signal) {
-      if (normalized.signal.aborted) {
-        const reason = normalized.signal.reason;
+      const signal = normalized.signal;
+      if (signal.aborted) {
+        const reason = signal.reason;
         const self = this;
         globalThis.setTimeout(function () {
           self.destroy(pirAbortError(reason));
         }, 0);
       } else {
         const self = this;
-        normalized.signal.addEventListener("abort", function () {
-          self.destroy(pirAbortError(normalized.signal.reason));
-        }, { once: true });
+        const onAbort = function () {
+          self.destroy(pirAbortError(signal.reason));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        // Requests share one long-lived signal (a session abort controller):
+        // detach this request's listener when it is done, or the signal keeps
+        // every completed request (and its response) alive forever.
+        this._pirDetachAbort = function () {
+          try { signal.removeEventListener("abort", onAbort); } catch (abortError) {}
+        };
       }
     }
+  }
+  _pirRemoveAbortListener() {
+    const detach = this._pirDetachAbort;
+    if (detach === null) return;
+    this._pirDetachAbort = null;
+    detach();
   }
   // minimal: request bodies are aggregated and sent with end()
   write(chunk, encoding, callback) {
@@ -859,6 +989,9 @@ class ClientRequest extends OutgoingMessage {
     }
     const bytes = pirChunkToBuffer(chunk, encoding);
     this._pirBody.push(bytes);
+    // Node sends the header block implicitly on the first write; from then on
+    // setHeader()/appendHeader()/removeHeader() throw ERR_HTTP_HEADERS_SENT.
+    this.headersSent = true;
     if (this._pirBodyTextOk) {
       if (pirTextChunkEncodable(chunk, encoding)) this._pirBodyText.push(chunk);
       else this._pirBodyTextOk = false;
@@ -887,6 +1020,7 @@ class ClientRequest extends OutgoingMessage {
   destroy(error) {
     if (this.destroyed) return this;
     this.destroyed = true;
+    this._pirRemoveAbortListener();
     if (this._pirId !== 0) {
       const id = this._pirId;
       this._pirId = 0;
@@ -936,9 +1070,9 @@ class ClientRequest extends OutgoingMessage {
     if (this._pirStarted || this.destroyed) return;
     this._pirStarted = true;
     const entries = [];
-    this._pirHeaders.forEach(function (entry) {
-      entries.push([entry.name, String(entry.value)]);
-    });
+    for (const entry of this._pirHeaders.values()) {
+      entries.push([entry.name, typeof entry.value === "string" ? entry.value : String(entry.value)]);
+    }
     const payload = { url: this._pirUrl, method: this.method, headers: entries, noRedirect: true };
     // Pure-text request body: `bodyText` carries the exact UTF-8 image of the
     // bytes `bodyB64` would decode to (every chunk passed
@@ -1023,6 +1157,14 @@ class ClientRequest extends OutgoingMessage {
         });
         this._pirId = 0; // the response pump owns the fetch id now
         this._pirResponse = response;
+        // The response outlives the request; detach the signal listener when
+        // it closes (end or destroy) so a shared signal cannot retain it.
+        const self = this;
+        if (typeof response.once === "function") {
+          response.once("close", function () { self._pirRemoveAbortListener(); });
+        } else if (typeof response.on === "function") {
+          response.on("close", function () { self._pirRemoveAbortListener(); });
+        }
         this.emit("response", response);
         // First pump at the end of this job (microtask) so the response
         // handler can attach data/end listeners synchronously before any data
@@ -1108,6 +1250,9 @@ class ServerResponse extends OutgoingMessage {
         }
       }
     }
+    // writeHead sent the header block: a second writeHead, or a setHeader/
+    // appendHeader/removeHeader after it, is Node's ERR_HTTP_HEADERS_SENT.
+    this.headersSent = true;
     return this;
   }
   write(chunk, encoding, callback) {
@@ -1122,6 +1267,7 @@ class ServerResponse extends OutgoingMessage {
       return false;
     }
     this._pirBody.push(pirChunkToBuffer(chunk, encoding));
+    this.headersSent = true;
     if (this._pirBodyTextOk) {
       if (pirTextChunkEncodable(chunk, encoding)) this._pirBodyText.push(chunk);
       else this._pirBodyTextOk = false;

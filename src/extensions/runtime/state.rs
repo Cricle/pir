@@ -1,194 +1,5 @@
 use super::*;
 
-/// Open file-descriptor registry for the fs v2 surface (`openSync` family).
-/// Lives in [`RuntimeState`]; the state itself survives `/reload`, so entries
-/// carry the runtime generation that opened them. Each runtime releases only
-/// its own generation's entries at teardown (`ExtensionRuntime::drop`); an
-/// old runtime whose `Drop` is deferred by in-flight work can therefore
-/// never close a descriptor opened by its successor.
-///
-/// GENERATION IS PER DESCRIPTOR, never table-global: `/reload` builds the
-/// successor runtime BEFORE the predecessor is torn down, and the predecessor's
-/// still-running JS may keep calling `fs.openSync` during that window. A
-/// mutable "current generation" on the table would then stamp the OLD
-/// runtime's later descriptors with the NEW generation — its own `Drop` would
-/// leave them open forever, and the successor's teardown would close
-/// descriptors it never opened out from under the still-live predecessor. So
-/// every insert carries the CALLER's generation explicitly.
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-pub(crate) struct FdTable {
-    next_fd: i32,
-    entries: HashMap<i32, FdEntry>,
-}
-
-/// Hard cap on simultaneously open `fs.open` descriptors per runtime.
-///
-/// The JS side can open descriptors in a loop and never close them; without a
-/// cap that exhausts the host process's OS descriptor budget (and every later
-/// host operation with `EMFILE`). 256 is Node's common soft-limit scale while
-/// staying far below a constrained device's process-wide descriptor budget;
-/// the table is shared by every extension of one runtime, so the cap is the
-/// runtime's total, not one extension's.
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-pub(crate) const MAX_OPEN_FDS: usize = 256;
-
-/// One open descriptor: the OS handle plus the host-tracked sequential
-/// offset (`fs.readSync(fd, buf, ..., null)` reads from here).
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-pub(crate) struct FdEntry {
-    pub(crate) file: std::fs::File,
-    /// Path text for Node-shaped error messages.
-    pub(crate) path: PathBuf,
-    /// Node `a`/`a+` semantics: writes append regardless of the offset.
-    append: bool,
-    /// Sequential offset; explicit positions never move it (Node/pread
-    /// behavior), absent positions read/write from here and advance it.
-    position: u64,
-    /// Generation of the runtime that opened this descriptor (see
-    /// [`FdTable`]).
-    generation: u64,
-}
-
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-impl FdTable {
-    pub(crate) fn new() -> Self {
-        Self {
-            // 0/1/2 are the stdio descriptors in Node; the first host fd is 3.
-            next_fd: 3,
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Register `file` and return its descriptor. Numbers are monotonic
-    /// (never reused), so a stale descriptor can only fail with EBADF.
-    ///
-    /// `generation` is the OPENING runtime's own key (see the type docs): the
-    /// descriptor is released by that runtime's teardown and by nothing else.
-    ///
-    /// `Err(())` when [`MAX_OPEN_FDS`] descriptors are already open; the
-    /// caller maps that to Node's `EMFILE` before the file handle is stored
-    /// (the unregistered `file` drops with the caller's error path).
-    pub(crate) fn insert(
-        &mut self,
-        file: std::fs::File,
-        path: PathBuf,
-        append: bool,
-        generation: u64,
-    ) -> Result<i32, ()> {
-        if self.entries.len() >= MAX_OPEN_FDS {
-            return Err(());
-        }
-        let fd = self.next_fd;
-        self.next_fd += 1;
-        self.entries.insert(
-            fd,
-            FdEntry {
-                file,
-                path,
-                append,
-                position: 0,
-                generation,
-            },
-        );
-        Ok(fd)
-    }
-
-    pub(crate) fn get_mut(&mut self, fd: i32) -> Option<&mut FdEntry> {
-        self.entries.get_mut(&fd)
-    }
-
-    /// Close: the returned entry drops (and releases the handle) with the
-    /// caller's binding.
-    pub(crate) fn remove(&mut self, fd: i32) -> Option<FdEntry> {
-        self.entries.remove(&fd)
-    }
-
-    /// Close every descriptor owned by `generation` (runtime teardown /
-    /// `/reload`). Scoped by generation: a reload's old generation and its
-    /// successor share this table, and the old `Drop` may run after the
-    /// successor has already opened descriptors of its own.
-    pub(crate) fn clear_generation(&mut self, generation: u64) {
-        self.entries
-            .retain(|_, entry| entry.generation != generation);
-    }
-}
-
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-impl FdEntry {
-    /// Read up to `length` bytes; `position` absent = sequential (advances
-    /// the tracked offset), explicit = a positioned read (offset untouched).
-    pub(crate) fn read(
-        &mut self,
-        length: usize,
-        position: Option<u64>,
-    ) -> std::io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; length];
-        let at = position.unwrap_or(self.position);
-        let read = positioned_read(&self.file, &mut buffer, at)?;
-        buffer.truncate(read);
-        if position.is_none() {
-            self.position = at + read as u64;
-        }
-        Ok(buffer)
-    }
-
-    /// Write `data`; `position` absent = sequential. Append-mode descriptors
-    /// write at EOF regardless (Node's documented `a` flag behavior).
-    pub(crate) fn write(&mut self, data: &[u8], position: Option<u64>) -> std::io::Result<usize> {
-        let at = if self.append {
-            self.file.metadata()?.len()
-        } else {
-            position.unwrap_or(self.position)
-        };
-        positioned_write(&self.file, data, at)?;
-        if self.append || position.is_none() {
-            self.position = at + data.len() as u64;
-        }
-        Ok(data.len())
-    }
-}
-
-/// Positioned read that does not move the OS file pointer (`pread` /
-/// `seek_read`); the tracked offset is the only sequential cursor.
-#[cfg(windows)]
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-fn positioned_read(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
-}
-
-#[cfg(unix)]
-fn positioned_read(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
-}
-
-/// Positioned write-all (`pwrite` / a `seek_write` loop — the Windows trait
-/// has no `write_all_at`).
-#[cfg(windows)]
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-fn positioned_write(file: &std::fs::File, data: &[u8], offset: u64) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        let n = std::os::windows::fs::FileExt::seek_write(
-            file,
-            &data[written..],
-            offset + written as u64,
-        )?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to write the whole buffer",
-            ));
-        }
-        written += n;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn positioned_write(file: &std::fs::File, data: &[u8], offset: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::write_all_at(file, data, offset)
-}
-
 /// Lock a shared-state mutex, recovering from poisoning instead of panicking.
 ///
 /// The extension-runtime state only holds plain data guarded by short critical
@@ -273,6 +84,7 @@ impl RuntimeState {
             tool_defs: Vec::new(),
             tool_extras: HashMap::new(),
             all_tools_json: None,
+            all_tools_value: None,
             command_defs: Vec::new(),
             shortcut_defs: Vec::new(),
             handler_counts: HashMap::new(),
@@ -305,7 +117,6 @@ impl RuntimeState {
             keybinding_hints: JsonValue::Null,
             has_autocomplete_suggesters: false,
             stream_hook_bridges: HashMap::new(),
-            fd_table: FdTable::new(),
             before_agent_start_timeout:
                 crate::extensions::limits::DEFAULT_BEFORE_AGENT_START_TIMEOUT,
             pending_commands: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -345,6 +156,7 @@ impl RuntimeState {
         // fingerprint would already miss, but dropping it here keeps the
         // invalidation explicit at the clear site.
         self.all_tools_json = None;
+        self.all_tools_value = None;
         self.command_defs.clear();
         self.shortcut_defs.clear();
         self.handler_counts.clear();

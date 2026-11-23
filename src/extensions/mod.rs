@@ -26,6 +26,10 @@
 
 #[cfg(feature = "extensions")]
 pub mod api;
+/// Persistent QuickJS bytecode cache for on-disk extension modules (see the
+/// module docs: keys, layout, pruning, `PIR_EXT_BYTECODE_CACHE`).
+#[cfg(feature = "extensions")]
+pub mod bytecode_cache;
 #[cfg(feature = "extensions")]
 pub mod esm_cjs;
 pub mod handle;

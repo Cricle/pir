@@ -64,7 +64,7 @@ pub static SQLITE3_SHIM: Shim = Shim::new(
     include_bytes!("../../../assets/shims/sqlite3_shim.js.txt.deflate"),
 );
 /// `bcrypt` virtual package: the NAPI native addon's JS face over a host
-/// EksBlowfish implementation (`host_functions/bcrypt_fns.rs`), so
+/// EksBlowfish implementation (`crates/pir-node/src/modules/bcrypt.rs`), so
 /// `hashSync`/`compareSync`/`hash`/`compare`/`genSalt(Sync)`/`getRounds` run
 /// without the native binding (see `js/bcrypt_shim.js.txt`).
 pub static BCRYPT_SHIM: Shim = Shim::new(
@@ -156,8 +156,7 @@ pub static PI_DURABLE_THROWS_SHIM: Shim = Shim::new(
     include_bytes!("../../../assets/shims/pi_durable_throws_shim.js.txt.deflate"),
 );
 
-pub fn canonical_virtual_name(name: &str) -> Option<&'static str> {
-    const KNOWN: &[(&str, &str)] = &[
+pub(crate) const VIRTUAL_KNOWN: &[(&str, &str)] = &[
         ("typebox", "typebox"),
         ("typebox/compile", "typebox/compile"),
         ("typebox/value", "typebox/value"),
@@ -341,12 +340,85 @@ pub fn canonical_virtual_name(name: &str) -> Option<&'static str> {
             "@earendil-works/pi-ai/utils/validation",
             "@earendil-works/pi-ai",
         ),
-    ];
-    KNOWN
+];
+
+pub fn canonical_virtual_name(name: &str) -> Option<&'static str> {
+    VIRTUAL_KNOWN
         .iter()
         .find(|(from, _)| *from == name)
         .map(|(_, canonical)| *canonical)
         .or_else(|| super::node_shims::canonical_node_name(name))
+}
+
+/// Shim handle for a canonical virtual package name.
+pub fn shim_for(canonical: &str) -> Option<&'static Shim> {
+    Some(match canonical {
+        "typebox" => &TYPEBOX_SHIM,
+        "typebox/compile" => &TYPEBOX_COMPILE_SHIM,
+        "typebox/value" => &TYPEBOX_VALUE_SHIM,
+        "@earendil-works/pi-coding-agent" => &PI_CODING_AGENT_SHIM,
+        "@earendil-works/pi-agent-core" => &PI_AGENT_CORE_SHIM,
+        "@earendil-works/pi-ai" => &PI_AI_SHIM,
+        "@earendil-works/pi-ai/oauth" => &PI_AI_OAUTH_SHIM,
+        "@earendil-works/pi-ai/providers/all" => &PI_AI_PROVIDERS_ALL_SHIM,
+        "@earendil-works/pi-tui" => &PI_TUI_SHIM,
+        "@earendil-works/pi-codemode" => &PI_CODEMODE_SHIM,
+        "@earendil-works/pi-env" => &PI_ENV_SHIM,
+        "@earendil-works/chord" => &PI_CHORD_SHIM,
+        "@earendil-works/chord/node" => &PI_CHORD_NODE_SHIM,
+        "@earendil-works/pi-durable" => &PI_DURABLE_SHIM,
+        "@earendil-works/pi-durable/env" => &PI_DURABLE_ENV_SHIM,
+        "@earendil-works/pi-durable/throws" => &PI_DURABLE_THROWS_SHIM,
+        "better-sqlite3" => &BETTER_SQLITE3_SHIM,
+        "sqlite3" => &SQLITE3_SHIM,
+        "bcrypt" => &BCRYPT_SHIM,
+        _ => return super::node_shims::shim_for(canonical),
+    })
+}
+
+/// Whether embedded AOT bytecode (`assets/bytecode/*.qc`) is used at all.
+///
+/// `PIR_EXT_BYTECODE=0` (also `false`/`off`) forces every shim through the
+/// source path. Development aid: the guard header records the payload, not the
+/// source, so editing a `src/extensions/api/js/*.js.txt` shim without
+/// regenerating the blobs would otherwise load stale code.
+pub fn bytecode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("PIR_EXT_BYTECODE").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// AOT bytecode payload for a virtual module specifier, when one was
+/// precompiled. Callers fall back to [`source_for`] when this returns `None`.
+pub fn bytecode_for(name: &str) -> Option<&'static [u8]> {
+    if !bytecode_enabled() {
+        return None;
+    }
+    let canonical = canonical_virtual_name(name)?;
+    let blob = super::bytecode::virtual_blob(canonical)?;
+    super::bytecode::payload(blob)
+}
+
+/// Every virtual module served from a file-backed shim, keyed by canonical
+/// name (aliases collapse onto one canonical). This is the AOT generator's
+/// input: the loader resolves every specifier to one of these names, so each
+/// needs bytecode compiled under exactly that module name.
+pub fn known_modules() -> Vec<(&'static str, &'static Shim)> {
+    let mut out: Vec<(&'static str, &'static Shim)> = Vec::new();
+    for (_, canonical) in VIRTUAL_KNOWN {
+        let canonical = *canonical;
+        if out.iter().any(|(name, _)| *name == canonical) {
+            continue;
+        }
+        if let Some(shim) = shim_for(canonical) {
+            out.push((canonical, shim));
+        }
+    }
+    out
 }
 
 pub fn source_for(canonical: &str) -> Option<String> {

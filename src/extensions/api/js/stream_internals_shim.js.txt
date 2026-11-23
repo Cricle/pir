@@ -3,7 +3,7 @@
 // interop pair (`fromWeb`/`toWeb`) cannot be served by the minimal stream
 // pad and throws the unified error; the internal state classes are inert
 // skeletons; `_fromList`/`wrap` are documented-minimal helpers.
-import { Duplex, Readable, Writable } from "@node/stream";
+import { Duplex, PassThrough, Readable, Transform, Writable } from "@node/stream";
 
 function streamInternalUnsupported(api) {
   const error = new Error("node:_stream_" + api + " is not supported by the pir extension runtime (minimal stream pad)");
@@ -17,6 +17,7 @@ class ReadableState {
     this.stream = stream;
     this.highWaterMark = options && typeof options.highWaterMark === "number" ? options.highWaterMark : 16384;
     this.buffer = [];
+    this.bufferIndex = 0;
     this.length = 0;
     this.ended = false;
     this.endedEmitted = false;
@@ -41,8 +42,14 @@ class WritableState {
 // Minimal `_fromList`: returns the first buffered chunk (the real one drains
 // n bytes across buffers; the minimal pad buffers whole chunks).
 function _fromList(_n, state) {
-  if (state && Array.isArray(state.buffer) && state.buffer.length > 0) {
-    return state.buffer.shift();
+  if (state && Array.isArray(state.buffer)) {
+    const index = typeof state.bufferIndex === "number" ? state.bufferIndex : 0;
+    if (index < state.buffer.length) {
+      const chunk = state.buffer[index];
+      state.buffer[index] = null;
+      state.bufferIndex = index + 1;
+      return chunk;
+    }
   }
   return null;
 }
@@ -51,6 +58,9 @@ function _fromList(_n, state) {
 // iterator through the pad's push surface on microtasks.
 function from(iterable) {
   const readable = new Readable();
+  // This pad is push-driven; a direct Readable's default _read reports
+  // ERR_METHOD_NOT_IMPLEMENTED, so supply the no-op like node's from().
+  readable._read = function () {};
   if (iterable === undefined || iterable === null || typeof iterable[Symbol.asyncIterator] !== "function" && typeof iterable[Symbol.iterator] !== "function") {
     globalThis.__pirMicrotask(() => readable.destroy(new TypeError("The list argument must be an iterable")));
     return readable;
@@ -112,6 +122,46 @@ const streamInternals = {
   _fromList: _fromList,
   wrap: wrap,
 };
+
+// --- node's constructor statics + a `require("_stream_*")` identity ---------
+//
+// Node's private modules export their constructor directly
+// (`module.exports = Readable`), and each constructor carries the real
+// internals as own properties. The loader serves these specifiers from this
+// one file, so the named module objects cannot be the constructors themselves;
+// instead, preseed the builtin require cache with the five constructor
+// identities before user code runs (all shims are imported at boot). This makes
+// `require("stream").Readable === require("_stream_readable")` hold exactly as
+// test-stream-aliases-legacy requires.
+function pirInstallStreamStatics() {
+  if (Readable.ReadableState === undefined) Readable.ReadableState = ReadableState;
+  if (Readable._fromList === undefined) Readable._fromList = _fromList;
+  if (Readable.fromWeb === undefined) Readable.fromWeb = fromWeb;
+  if (Readable.toWeb === undefined) Readable.toWeb = toWeb;
+  if (Readable.wrap === undefined) Readable.wrap = wrap;
+  if (Writable.WritableState === undefined) Writable.WritableState = WritableState;
+  if (Writable.fromWeb === undefined) Writable.fromWeb = fromWeb;
+  if (Writable.toWeb === undefined) Writable.toWeb = toWeb;
+  if (Duplex.from === undefined) Duplex.from = Readable.from;
+  if (Duplex.fromWeb === undefined) Duplex.fromWeb = fromWeb;
+  if (Duplex.toWeb === undefined) Duplex.toWeb = toWeb;
+
+  const cache = globalThis.__pirBuiltinRequireCache;
+  if (cache === undefined || cache === null || typeof cache.has !== "function") return;
+  const identities = [
+    ["_stream_readable", Readable],
+    ["_stream_writable", Writable],
+    ["_stream_duplex", Duplex],
+    ["_stream_transform", Transform],
+    ["_stream_passthrough", PassThrough],
+  ];
+  for (let i = 0; i < identities.length; i++) {
+    const name = identities[i][0];
+    if (!cache.has(name)) cache.set(name, identities[i][1]);
+  }
+}
+
+pirInstallStreamStatics();
 
 export default streamInternals;
 export { Duplex, Readable, Writable, from, fromWeb, toWeb, ReadableState, WritableState, _fromList, wrap };

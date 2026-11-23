@@ -59,23 +59,34 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // "_" every three characters counted from the END of the decimal string
   // (Node's formatValue quirk — it groups the raw `String(value)`, exponent and
   // fractional forms included).
+  // Node's `addNumericalSeparator` (lib/internal/errors.js): group in threes
+  // from the right, starting at `start + 4` so a leading `-` never gets an
+  // underscore (`-549755813889` -> `-549_755_813_889`, not `-_549...`).
   function pirGroupDigits(text) {
+    const start = text[0] === "-" ? 1 : 0;
     let out = "";
-    for (let i = 0; i < text.length; i++) {
-      if (i > 0 && (text.length - i) % 3 === 0) out += "_";
-      out += text[i];
+    let i = text.length;
+    for (; i >= start + 4; i -= 3) {
+      out = "_" + text.slice(i - 3, i) + out;
     }
-    return out;
+    return text.slice(0, i) + out;
   }
 
   function pirFormatReceived(value) {
     if (typeof value === "number") {
-      if (Math.abs(value) > 4294967296) return pirGroupDigits(String(value));
+      // ERR_OUT_OF_RANGE groups only integer magnitudes above 2 ** 32
+      // (lib/internal/errors.js: `NumberIsInteger(input) && MathAbs(input) >
+      // 2 ** 32`); the separator itself is sign-aware.
+      if (Number.isInteger(value) && Math.abs(value) > 4294967296) {
+        return pirGroupDigits(String(value));
+      }
       return String(value);
     }
     if (typeof value === "bigint") {
-      const magnitude = value < 0n ? -value : value;
-      return (magnitude > 4294967296n ? pirGroupDigits(String(value)) : String(value)) + "n";
+      const text = String(value);
+      return (value > 4294967296n || value < -4294967296n
+        ? pirGroupDigits(text)
+        : text) + "n";
     }
     return String(value);
   }
@@ -91,11 +102,18 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       'The "' + name + '" argument must be ' + expected + "." + pirReceivedDetail(value));
   }
 
+  // Node's INSPECT_MAX_BYTES (lib/buffer.js): a live, process-wide value the
+  // `buffer` module exposes through an accessor. The shim keeps it here so
+  // `Buffer.prototype.inspect` (and therefore util.inspect) sees mutations;
+  // the module-object hook below wires `require('buffer').INSPECT_MAX_BYTES`
+  // to this cell with Node's validateNumber(>= 0) contract.
+  let pirInspectMaxBytes = 50;
+
   // Node renders raw bytes as `<Buffer 61 62 63>` in its internal inspect (and
   // truncates at INSPECT_MAX_BYTES with "… N more bytes"); the shared util
   // shim renders Buffers differently, so error values get the Node form here.
-  function pirInspectBufferLike(buffer, tag) {
-    const max = 50;
+  function pirInspectBufferLike(buffer, tag, max) {
+    if (max === undefined) max = 50;
     let out = "<" + (tag === undefined ? "Buffer" : tag) + " ";
     const count = Math.min(buffer.byteLength, max);
     for (let i = 0; i < count; i++) {
@@ -131,10 +149,28 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   }
 
   function errUnknownEncoding(encoding) {
-    // Node renders -0 as "-0" here (String(-0) would lose the sign).
-    const text = typeof encoding === "number" && Object.is(encoding, -0)
-      ? "-0"
-      : String(encoding);
+    // Node's internal error formatting: a value with a *custom* toString is
+    // rendered through String() (`buf.toString({ toString: () => "hex" })`
+    // reports "Unknown encoding: hex"), everything else non-primitive through
+    // util.inspect (`{}`, `[ 1, 2 ]`), bigints with the trailing `n`.
+    let text;
+    if (encoding === null || encoding === undefined) {
+      text = String(encoding);
+    } else if (typeof encoding === "bigint") {
+      text = String(encoding) + "n";
+    } else if (typeof encoding === "number" && Object.is(encoding, -0)) {
+      // Node's internal formatter inspects numbers (util.inspect(-0) === "-0").
+      text = "-0";
+    } else if (typeof encoding === "object" && !Array.isArray(encoding) &&
+               typeof encoding.toString === "function" &&
+               encoding.toString !== Object.prototype.toString) {
+      text = String(encoding);
+    } else if (typeof encoding === "object") {
+      text = pirInspect(encoding, { colors: false });
+      if (typeof text !== "string") text = String(text);
+    } else {
+      text = String(encoding);
+    }
     return pirError(TypeError, "ERR_UNKNOWN_ENCODING", "Unknown encoding: " + text);
   }
 
@@ -155,24 +191,43 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // Encodings (Node's table: ascii is latin1, ucs2 is utf16le, base64url is
   // base64 with the URL-safe alphabet and no padding).
   // ---------------------------------------------------------------------------
-  const PIR_ENCODINGS = {
+  // `ascii` stays distinct from latin1: writes use latin1 bytes, but
+  // toString('ascii') masks the high bit of every byte (Node's asciiSlice).
+  const PIR_ENCODINGS = Object.assign(Object.create(null), {
     utf8: "utf8", "utf-8": "utf8",
     utf16le: "utf16le", "utf-16le": "utf16le", ucs2: "utf16le", "ucs-2": "utf16le",
-    latin1: "latin1", binary: "latin1", ascii: "latin1",
+    latin1: "latin1", binary: "latin1", ascii: "ascii",
     base64: "base64", base64url: "base64url",
     hex: "hex",
-  };
+  });
 
   function lookupEncoding(encoding) {
     if (typeof encoding !== "string") return null;
-    return PIR_ENCODINGS[encoding.toLowerCase()] || null;
+    // Canonical names (the overwhelming majority of calls) hit the direct
+    // lookup; only mixed-case aliases pay for `toLowerCase`. The table has a
+    // null prototype, so inherited names ("constructor", …) cannot alias an
+    // encoding.
+    const direct = PIR_ENCODINGS[encoding];
+    if (direct !== undefined) return direct;
+    const lower = encoding.toLowerCase();
+    if (lower === encoding) return null;
+    return PIR_ENCODINGS[lower] || null;
   }
 
-  // toString/write: a missing encoding means utf8, anything else that is not a
-  // known encoding NAME (null, a number, an unknown string) throws.
+  // toString/write: a missing encoding means utf8. Node's slowToString
+  // String()s any other value through a template literal (so a Symbol throws
+  // the engine's "Cannot convert a Symbol value to a string" before any
+  // encoding validation) and lowercases it before the lookup; the error still
+  // reports the ORIGINAL value (see errUnknownEncoding).
   function normalizeEncoding(encoding) {
     if (encoding === undefined) return "utf8";
-    const enc = lookupEncoding(encoding);
+    if (typeof encoding === "string") {
+      const enc = lookupEncoding(encoding);
+      if (enc === null) throw errUnknownEncoding(encoding);
+      return enc;
+    }
+    const lower = `${encoding}`.toLowerCase();
+    const enc = lookupEncoding(lower);
     if (enc === null) throw errUnknownEncoding(encoding);
     return enc;
   }
@@ -251,6 +306,14 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   function latin1Decode(bytes) {
     let out = "";
     for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+    return out;
+  }
+
+  // Node's asciiSlice: decode each byte as latin1 with the high bit cleared.
+  // (Encoding a string as ascii is plain latin1; only the decode masks.)
+  function asciiDecode(bytes) {
+    let out = "";
+    for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] & 0x7f);
     return out;
   }
 
@@ -364,6 +427,11 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // Variadic (1..6 byte) LE/BE integer kernel binding: null keeps the JS BigInt
   // implementation of writeVariadicInteger/readVariadicInteger as the tier.
   let pirVariadicKernel = null;
+  // Byte-range compare binding (`Buffer.compare`/`compareOffset`). Null keeps
+  // the JS lexicographic loop.
+  let pirCompareKernel = null;
+  // In-place endian-swap binding (`swap16/32/64`). Null keeps the JS loops.
+  let pirSwapKernel = null;
   if (pirNativeCodec) {
     const jsUtf8Bytes = utf8Bytes;
     const jsUtf8Decode = utf8Decode;
@@ -470,12 +538,34 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       } catch (error) { /* fall through */ }
       return undefined;
     };
+    // Byte-range compare: both views plus the already-resolved ranges cross the
+    // bridge; the JS layer keeps Node's offset validation and error shapes, and
+    // an unreadable receiver/range keeps the JS loop below.
+    pirCompareKernel = function (source, sourceStart, sourceEnd, target, targetStart, targetEnd) {
+      try {
+        const verdict = nativeCodec("compareBytes", source, false, false,
+          { target, s: sourceStart, se: sourceEnd, ts: targetStart, te: targetEnd });
+        if (typeof verdict === "number") return verdict;
+      } catch (error) { /* fall through */ }
+      return undefined;
+    };
+    // In-place endian swap. The caller has already validated the length
+    // multiple; a native miss falls back to the byte loops.
+    pirSwapKernel = function (buffer, size) {
+      try {
+        const done = nativeCodec("swapBytes", buffer, false, false, undefined, size);
+        if (typeof done === "number") return true;
+      } catch (error) { /* fall through */ }
+      return false;
+    };
   }
 
   // Encode to bytes with an encoding that is already one of the normalized names.
   function encodeToBytesWith(value, enc) {
     if (enc === "utf8") return utf8Bytes(value);
     if (enc === "latin1") return latin1Bytes(value);
+    // Writing ascii is writing latin1 (Node only masks on decode).
+    if (enc === "ascii") return latin1Bytes(value);
     if (enc === "utf16le") return utf16leBytes(value);
     if (enc === "hex") return hexBytes(value);
     if (enc === "base64url") return base64urlBytes(value);
@@ -487,6 +577,9 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // (Node: `write('ыы', 3, 'ucs2')` on a 4-byte buffer writes nothing).
   function writableByteCount(bytes, enc, limit) {
     if (!(limit > 0)) return 0;
+    // The whole payload fits (the common `write(string)` shape): nothing can
+    // be split, so skip the character walk entirely.
+    if (bytes.length <= limit) return bytes.length;
     if (enc === "utf16le") return limit & ~1;
     if (enc !== "utf8") return Math.min(limit, bytes.length);
     let written = 0;
@@ -500,6 +593,25 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       written += size;
     }
     return written;
+  }
+
+  // Node's raw `*Write` kernels (`asciiWrite`/`latin1Write`/`utf8Write` and
+  // their string_decoder-less siblings): same bounds contract as `write`, but
+  // an out-of-range length is ERR_BUFFER_OUT_OF_BOUNDS rather than
+  // ERR_OUT_OF_RANGE, and no offset/length coercion beyond NaN -> 0. Kept as
+  // a closure (not a prototype method) so the prototype surface matches
+  // Node's — test-buffer-generic-methods enumerates it.
+  function pirRawWrite(buffer, string, offset, length, enc) {
+    const len = buffer.length;
+    let start = offset === undefined ? 0 : Number(offset);
+    if (Number.isNaN(start)) start = 0;
+    const count = length === undefined ? len - start : Number(length);
+    if (!(count >= 0) || start < 0 || start + count > len) throw errBufferOutOfBounds("length");
+    const bytes = encodeToBytesWith(String(string), enc);
+    const limit = Math.max(0, Math.min(count, bytes.length));
+    const writable = writableByteCount(bytes, enc, limit);
+    pirCopyEncodedBytes(buffer, start, bytes, writable);
+    return writable;
   }
 
   // Node's `adjustOffset` for slice/subarray: NaN/undefined are 0, negatives
@@ -547,15 +659,40 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     return true;
   }
 
+  // Node v24's search encoding lookup: the value is string-coerced (a symbol
+  // throws the engine's ToPrimitive TypeError, like `encoding += ''`) and an
+  // unknown name yields null (the caller decides between ERR_UNKNOWN_ENCODING
+  // for string needles and a silent utf8 fallback for Buffer needles).
+  function pirSearchEncoding(encoding) {
+    if (encoding === undefined) return "utf8";
+    return lookupEncoding(String(encoding));
+  }
+
+  // Node's `validateBuffer` for the search family (lib/buffer.js
+  // bidirectionalIndexOf). A receiver without the Uint8Array brand is a
+  // TypeError, not a silent empty search.
+  function pirValidateSearchBuffer(buffer) {
+    if (!(buffer instanceof Uint8Array)) {
+      throw pirError(TypeError, "ERR_INVALID_ARG_TYPE",
+        'The "buffer" argument must be an instance of Buffer, TypedArray, or DataView.' +
+        pirReceivedDetail(buffer));
+    }
+  }
+
   // Node's bidirectionalIndexOf: one offset/needle resolution for both
-  // directions. `dir` is 1 for indexOf, -1 for lastIndexOf.
-  function pirBidirectionalIndexOf(buffer, value, byteOffset, encoding, dir) {
+  // directions. `dir` is 1 for indexOf, -1 for lastIndexOf. The search window
+  // is `[0, end)` (end already resolved and clamped by the caller), so a
+  // needle must fit entirely inside it.
+  function pirBidirectionalIndexOf(buffer, value, byteOffset, end, encoding, dir) {
+    pirValidateSearchBuffer(buffer);
     const len = buffer.length;
     let offset;
     let enc = "utf8";
     if (typeof byteOffset === "string") {
       enc = byteOffset;
-      offset = 0;
+      // Node leaves the offset undefined here: NaN coerces to the direction's
+      // natural start (front for indexOf, end for lastIndexOf).
+      offset = dir === 1 ? 0 : len;
     } else if (byteOffset === undefined) {
       // lastIndexOf starts at the end of the buffer, indexOf at the front.
       offset = dir === 1 ? 0 : len;
@@ -564,12 +701,21 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       offset = Number(byteOffset);
       if (offset > 0x7fffffff) offset = 0x7fffffff;
       else if (offset < -0x80000000) offset = -0x80000000;
-      if (Number.isNaN(offset)) offset = dir === 1 ? 0 : len - 1;
+      if (Number.isNaN(offset)) offset = dir === 1 ? 0 : len;
       if (encoding !== undefined) enc = encoding;
     }
     if (offset < 0) {
       offset = len + offset;
       if (offset < 0) offset = dir === 1 ? 0 : -1;
+    }
+    // `end` bounds the searchable bytes: negatives/NaN are empty, overshoot
+    // clamps to the buffer length.
+    let searchEnd;
+    if (end === undefined) searchEnd = len;
+    else {
+      searchEnd = Math.trunc(Number(end));
+      if (!(searchEnd > 0)) searchEnd = 0;
+      else if (searchEnd > len) searchEnd = len;
     }
     let needle;
     let align = 1;
@@ -577,7 +723,8 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       // Number needles are single bytes: Node never looks at the encoding.
       needle = [value & 0xff];
     } else if (typeof value === "string") {
-      const normalized = normalizeEncodingOptional(enc);
+      const normalized = pirSearchEncoding(enc);
+      if (normalized === null) throw errUnknownEncoding(enc);
       needle = encodeToBytesWith(value, normalized);
       // ucs2 searches only line up on 16-bit boundaries (Node's
       // indexOfStringBidirectional) — an odd offset never matches.
@@ -587,8 +734,10 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       needle = [];
       for (let i = 0; i < count; i++) needle.push(value[i] & 0xff);
       // Node's indexOfBuffer aligns ucs2 searches to 16-bit units and rejects
-      // odd-length ucs2 needles outright.
-      if (normalizeEncodingOptional(enc) === "utf16le") {
+      // odd-length ucs2 needles outright; an unknown encoding silently means
+      // utf8 for Buffer needles.
+      const normalized = pirSearchEncoding(enc);
+      if (normalized === "utf16le") {
         if (needle.length % 2 !== 0) return -1;
         align = 2;
       }
@@ -598,34 +747,38 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     }
     const size = needle.length;
     if (size === 0) {
-      if (dir === 1) return Math.min(offset, len);
       if (offset < 0) return 0;
-      return Math.min(offset, len);
+      return Math.min(offset, searchEnd);
     }
-    if (size > len) return -1;
+    if (size > searchEnd) return -1;
     // `byteLength === len` pins the native scan to receivers whose JS-visible
     // `length` is the view's own byteLength (a spoofed `length` or a plain
-    // indexable object keeps the JS loop, which reads `buffer[i]`).
+    // indexable object keeps the JS loop, which reads `buffer[i]`). A bounded
+    // window (end !== len) also stays in JS.
     if (dir === 1) {
       let start = offset < 0 ? 0 : offset;
+      if (start > searchEnd - size) return -1;
       if (align === 2) start += start % 2;
-      if (pirSearchKernel !== null && buffer.byteLength === len) {
+      if (start > searchEnd - size) return -1;
+      if (pirSearchKernel !== null && buffer.byteLength === len && searchEnd === len) {
         const found = pirSearchKernel(buffer, needle, start, false, align);
         if (found !== undefined) return found;
       }
-      for (let i = start; i + size <= len; i += align) {
+      for (let i = start; i + size <= searchEnd; i += align) {
         if (pirRegionEquals(buffer, needle, i)) return i;
       }
       return -1;
     }
-    let start = offset > len - size ? len - size : offset;
+    let start = offset > searchEnd - size ? searchEnd - size : offset;
+    if (start < 0) return -1;
     if (align === 2) start -= start % 2;
-    if (pirSearchKernel !== null && buffer.byteLength === len) {
+    if (start < 0) return -1;
+    if (pirSearchKernel !== null && buffer.byteLength === len && searchEnd === len) {
       const found = pirSearchKernel(buffer, needle, start, true, align);
       if (found !== undefined) return found;
     }
     for (let i = start; i >= 0; i -= align) {
-      if (pirRegionEquals(buffer, needle, i)) return i;
+      if (i + size <= searchEnd && pirRegionEquals(buffer, needle, i)) return i;
     }
     return -1;
   }
@@ -639,14 +792,45 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     return out;
   }
 
+  // Copy `count` leading encoded bytes into `target[offset..]` with the
+  // engine's own memcpy (`%TypedArray%.prototype.set`). The per-byte JS loop
+  // this replaces cost one interpreted iteration per byte on every `write`
+  // and every raw `utf8Write`/`latin1Write`. `bytes` is either a native
+  // `Uint8Array` or the JS codec fallback's plain Array, both accepted by
+  // `set`.
+  function pirCopyEncodedBytes(target, offset, bytes, count) {
+    if (count <= 0) return;
+    if (count === bytes.length) {
+      Uint8Array.prototype.set.call(target, bytes, offset);
+    } else if (isUint8ArrayLike(bytes)) {
+      Uint8Array.prototype.set.call(
+        target, Uint8Array.prototype.subarray.call(bytes, 0, count), offset);
+    } else {
+      Uint8Array.prototype.set.call(target, bytes.slice(0, count), offset);
+    }
+  }
+
+  const pirABByteLengthGetter = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+  const pirSABByteLengthGetter = typeof SharedArrayBuffer === "function"
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength").get
+    : null;
+
   function isAnyArrayBufferLike(value) {
-    if (value instanceof ArrayBuffer) return true;
-    if (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer) return true;
-    // vm.runInNewContext hands out ArrayBuffers from another realm, where
-    // `instanceof` is useless — brand-check through the internal tag instead.
-    if (value !== null && typeof value === "object" && typeof value.byteLength === "number") {
-      const tag = Object.prototype.toString.call(value);
-      return tag === "[object ArrayBuffer]" || tag === "[object SharedArrayBuffer]";
+    if (value === null || value === undefined || typeof value !== "object") return false;
+    // Brand check through the native accessor: an object whose prototype chain
+    // reaches ArrayBuffer.prototype without the internal slot (test-buffer-
+    // arraybuffer builds one) inherits the Symbol.toStringTag, so a toString
+    // tag test would wrongly accept it and then throw the engine's
+    // incompatible-receiver TypeError on `.byteLength`. QuickJS-ng's accessor
+    // can return `undefined` instead of throwing for a slot-less receiver, so
+    // the result is also required to be a number.
+    try {
+      if (typeof pirABByteLengthGetter.call(value) === "number") return true;
+    } catch (_) { /* not an ArrayBuffer */ }
+    if (pirSABByteLengthGetter !== null) {
+      try {
+        if (typeof pirSABByteLengthGetter.call(value) === "number") return true;
+      } catch (_) { /* not a SharedArrayBuffer */ }
     }
     return false;
   }
@@ -656,27 +840,56 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       Object.prototype.toString.call(value) === "[object Uint8Array]";
   }
 
+  // Allocate an engine-native `Uint8Array` whose prototype is already
+  // `Buffer.prototype`. `Reflect.construct` with the callable facade as
+  // newTarget lets the typed-array constructor install the subclass prototype
+  // directly — measurably cheaper than allocating a plain view and then
+  // paying `Object.setPrototypeOf`, which also forces the engine's slow
+  // "custom prototype" element-access path. (`Buffer` is a hoisted function
+  // declaration, so it is defined before any of these paths run.)
+  function pirNewBuffer(count) {
+    try {
+      return Reflect.construct(Uint8Array, [count], Buffer);
+    } catch (error) {
+      // QuickJS-ng's typed-array backing-store limit is far below V8's, and it
+      // reports the failure as a RangeError ("invalid array buffer length").
+      // Node's Buffer layer reports an allocation the engine cannot satisfy as
+      // ERR_MEMORY_ALLOCATION_FAILED with V8's own "Array buffer allocation
+      // failed" text (the official large-buffer tests catch exactly that
+      // message/code and skip).
+      if (error !== null && typeof error === "object" && error instanceof RangeError) {
+        const failure = new RangeError("Array buffer allocation failed");
+        failure.code = "ERR_MEMORY_ALLOCATION_FAILED";
+        throw failure;
+      }
+      throw error;
+    }
+  }
+
+  function pirNewBufferView(arrayBuffer, byteOffset, byteLength) {
+    return Reflect.construct(Uint8Array, [arrayBuffer, byteOffset, byteLength], Buffer);
+  }
+
   function fromBytes(bytes) {
-    // A typed-array input (the native codec's answer: `__pirBufferCodec` hands
-    // back a Uint8Array) takes the engine's own memcpy path: `fromView` copies
-    // through `set` and produces the same Buffer-typed copy as the element loop
-    // below, without paying one interpreted iteration per byte — a multi-MB
-    // chunk (the `fetch` body bridge decodes one per poll window) stays a
-    // memcpy instead of ~8M interpreted iterations. Anything else (a plain
-    // Array from the JS codec fallback) keeps the element-wise copy.
-    if (isUint8ArrayLike(bytes)) return fromView(bytes);
-    const buffer = new Uint8Array(bytes.length);
+    // A typed-array input is a freshly allocated `Uint8Array` from the native
+    // codec (`__pirBufferCodec` hands one back), so it can be adopted by
+    // switching the prototype: no second allocation and no byte copy. Anything
+    // else (a plain Array from the JS codec fallback) keeps the element-wise
+    // copy.
+    if (bytes instanceof Uint8Array) {
+      Object.setPrototypeOf(bytes, Buffer.prototype);
+      return bytes;
+    }
+    const buffer = pirNewBuffer(bytes.length);
     for (let i = 0; i < bytes.length; i++) buffer[i] = bytes[i] & 0xff;
-    Object.setPrototypeOf(buffer, Buffer.prototype);
     return buffer;
   }
 
   // Copy of a typed-array view through the engine's own memcpy (`set`), for the
   // large-ArrayBuffer paths where a JS element loop would dominate.
   function fromView(view) {
-    const buffer = new Uint8Array(view.byteLength);
+    const buffer = pirNewBuffer(view.byteLength);
     buffer.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-    Object.setPrototypeOf(buffer, Buffer.prototype);
     return buffer;
   }
 
@@ -686,9 +899,8 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     let length = obj.length;
     length = typeof length === "number" ? Math.trunc(length) : 0;
     if (!(length > 0)) return fromBytes([]);
-    const buffer = new Uint8Array(length);
+    const buffer = pirNewBuffer(length);
     for (let i = 0; i < length; i++) buffer[i] = obj[i];
-    Object.setPrototypeOf(buffer, Buffer.prototype);
     return buffer;
   }
 
@@ -697,21 +909,30 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // "Start offset N is outside the bounds of the buffer" RangeError, a
   // negative remaining length is ERR_BUFFER_OUT_OF_BOUNDS("offset") and an
   // over-long explicit length is ERR_BUFFER_OUT_OF_BOUNDS("length").
+  //
+  // The truncation happens BEFORE the negativity test: `-0.5` truncates to
+  // `-0` and is a valid offset in Node (`Buffer.from(ab, -0.5)` is the whole
+  // buffer), while BigInt arguments throw the engine's own ToNumber error.
+  function pirToIndex(value) {
+    if (typeof value === "bigint") {
+      throw new TypeError("Cannot convert a BigInt value to a number");
+    }
+    return Math.trunc(value);
+  }
+
   function pirArrayBufferArgs(arrayBuffer, byteOffset, length) {
-    let offset = byteOffset === undefined ? 0 : Number(byteOffset);
+    let offset = byteOffset === undefined ? 0 : pirToIndex(byteOffset);
     if (Number.isNaN(offset)) offset = 0;
     if (offset < 0) {
       throw pirError(RangeError, undefined,
         "Start offset " + offset + " is outside the bounds of the buffer");
     }
-    offset = Math.trunc(offset);
     const maxLength = arrayBuffer.byteLength - offset;
     if (maxLength < 0) throw errBufferOutOfBounds("offset");
     let viewLength = maxLength;
     if (length !== undefined) {
-      viewLength = Number(length);
+      viewLength = pirToIndex(length);
       if (Number.isNaN(viewLength) || viewLength < 0) viewLength = 0;
-      viewLength = Math.trunc(viewLength);
       if (viewLength > maxLength) throw errBufferOutOfBounds("length");
     }
     return [offset, viewLength];
@@ -719,9 +940,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
 
   function viewOver(arrayBuffer, byteOffset, length) {
     const bounds = pirArrayBufferArgs(arrayBuffer, byteOffset, length);
-    const view = new Uint8Array(arrayBuffer, bounds[0], bounds[1]);
-    Object.setPrototypeOf(view, Buffer.prototype);
-    return view;
+    return pirNewBufferView(arrayBuffer, bounds[0], bounds[1]);
   }
 
   // Numeric read/write family (real tier): DataView-backed LE/BE accessors
@@ -739,7 +958,10 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     if (typeof offset !== "number") {
       throw errInvalidArgType("offset", "of type number", offset);
     }
-    if (!Number.isInteger(offset)) {
+    // Node's `boundsError`: only NaN and finite fractional values take the
+    // "must be an integer" branch — ±Infinity falls through to the range
+    // message (Math.floor(Infinity) === Infinity).
+    if (Number.isNaN(offset) || (Number.isFinite(offset) && !Number.isInteger(offset))) {
       throw errValueOutOfRange("offset", "an integer", offset);
     }
     if (bound < 0) throw errBufferOutOfBoundsAccess();
@@ -767,18 +989,29 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // the 6-byte end (2 ** 48 / 2 ** 47 are out of range there).
   // ---------------------------------------------------------------------------
   function checkVariadicByteLength(byteLength) {
-    if (typeof byteLength !== "number" || !Number.isInteger(byteLength)) {
-      throw errValueOutOfRange("byteLength", "an integer", byteLength);
+    // Node's `checkReadInt`/`checkWriteInt`: validateNumber first (so
+    // '0'/null/undefined are ERR_INVALID_ARG_TYPE), then the [1, 6] range
+    // (`Infinity`/`-1` are ERR_OUT_OF_RANGE with the bounds text), then the
+    // integer check (`NaN`/`1.01` report "must be an integer"). The range
+    // check therefore precedes the integer check: a fractional value inside
+    // the window reaches the integer branch, an out-of-window value does not.
+    if (typeof byteLength !== "number") {
+      throw errInvalidArgType("byteLength", "of type number", byteLength);
     }
     if (byteLength < 1 || byteLength > 6) {
       throw errValueOutOfRange("byteLength", ">= 1 and <= 6", byteLength);
+    }
+    if (!Number.isInteger(byteLength)) {
+      throw errValueOutOfRange("byteLength", "an integer", byteLength);
     }
     return byteLength;
   }
 
   function checkVariadicOffset(buf, offset, byteLength) {
     if (typeof offset !== "number") throw errInvalidArgType("offset", "of type number", offset);
-    if (!Number.isInteger(offset)) throw errValueOutOfRange("offset", "an integer", offset);
+    if (Number.isNaN(offset) || (Number.isFinite(offset) && !Number.isInteger(offset))) {
+      throw errValueOutOfRange("offset", "an integer", offset);
+    }
     if (byteLength > buf.length) throw errBufferOutOfBoundsAccess();
     const max = buf.length - byteLength;
     if (offset < 0 || offset > max) {
@@ -789,9 +1022,13 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
 
   function checkVariadicUnsigned(value, byteLength) {
     const number = Number(value);
-    if (byteLength === 6) {
-      if (!(number >= 0) || number >= 281474976710656) {
-        throw errValueOutOfRange("value", ">= 0 and < 2 ** 48", value);
+    if (byteLength > 4) {
+      // Node's `checkInt` receives `byteLength - 1`, so the half-open
+      // `2 ** n` range text starts at a 5-byte write (40 bits); 4-byte writes
+      // keep the closed `<= 2 ** 32 - 1` text.
+      const limit = Math.pow(2, byteLength * 8);
+      if (!(number >= 0) || number >= limit) {
+        throw errValueOutOfRange("value", ">= 0 and < 2 ** " + (byteLength * 8), value);
       }
       return number;
     }
@@ -804,9 +1041,13 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
 
   function checkVariadicSigned(value, byteLength) {
     const number = Number(value);
-    if (byteLength === 6) {
-      if (!(number >= -140737488355328) || number >= 140737488355328) {
-        throw errValueOutOfRange("value", ">= -(2 ** 47) and < 2 ** 47", value);
+    if (byteLength > 4) {
+      const bits = byteLength * 8 - 1;
+      const bound = Math.pow(2, bits);
+      if (!(number >= -bound) || number >= bound) {
+        throw errValueOutOfRange(
+          "value", ">= -(2 ** " + bits + ") and < 2 ** " + bits, value,
+        );
       }
       return number;
     }
@@ -888,6 +1129,10 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // sourceEnd); the source-first grouping here is the same algorithm with the
   // two ranges kept next to their buffers.
   function pirCompareOffset(source, sourceStart, sourceEnd, target, targetStart, targetEnd) {
+    if (pirCompareKernel) {
+      const verdict = pirCompareKernel(source, sourceStart, sourceEnd, target, targetStart, targetEnd);
+      if (verdict !== undefined) return verdict;
+    }
     const sourceLength = sourceEnd - sourceStart;
     const targetLength = targetEnd - targetStart;
     const len = Math.min(sourceLength, targetLength);
@@ -932,9 +1177,32 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       let to = end === undefined || end > len ? len : Math.trunc(Number(end));
       if (to < 0) to = 0;
       if (!(to > from)) return "";
+      // Native fast path: the codec reads `[from, to)` straight off the
+      // receiver, so the whole buffer needs no `subarray` view at all and a
+      // ranged decode allocates no intermediate Buffer. Any native miss (an
+      // unreadable receiver, a lone-surrogate utf16le chunk) falls through to
+      // the JS state machine over the same range.
+      if (pirNativeCodec !== null) {
+        const op = enc === "utf8" ? "utf8Decode"
+          : enc === "latin1" ? "latin1Decode"
+          : enc === "hex" ? "hexEncode"
+          : enc === "base64" ? "base64Encode"
+          : enc === "base64url" ? "base64urlEncode"
+          : enc === "utf16le" ? "utf16leDecodeChunk" : null;
+        if (op !== null) {
+          try {
+            const text = pirNativeCodec(op, this, false, false, to, from);
+            if (typeof text === "string") return text;
+            if (op === "utf16leDecodeChunk" && text !== null && typeof text === "object") {
+              return text.text;
+            }
+          } catch (error) { /* fall through to the JS codec */ }
+        }
+      }
       const view = this.subarray(from, to);
       if (enc === "utf8") return utf8Decode(view);
       if (enc === "latin1") return latin1Decode(view);
+      if (enc === "ascii") return asciiDecode(view);
       if (enc === "utf16le") return utf16leDecode(view);
       if (enc === "hex") return hexEncode(view);
       if (enc === "base64url") return base64urlEncode(view);
@@ -976,29 +1244,37 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       const bytes = encodeToBytesWith(string, norm);
       const limit = Math.max(0, Math.min(max === undefined ? len - start : Math.trunc(Number(max)), bytes.length, len - start));
       const writable = writableByteCount(bytes, norm, limit);
-      for (let i = 0; i < writable; i++) this[start + i] = bytes[i];
+      pirCopyEncodedBytes(this, start, bytes, writable);
       return writable;
     }
 
     // Raw encoding kernels (Node's `*Write` family): same bounds contract, but
     // an out-of-range length is ERR_BUFFER_OUT_OF_BOUNDS rather than
-    // ERR_OUT_OF_RANGE, and no offset/length coercion beyond NaN -> 0.
-    pirRawWrite(string, offset, length, enc) {
-      const len = this.length;
-      let start = offset === undefined ? 0 : Number(offset);
-      if (Number.isNaN(start)) start = 0;
-      const count = length === undefined ? len - start : Number(length);
-      if (!(count >= 0) || start < 0 || start + count > len) throw errBufferOutOfBounds("length");
-      const bytes = encodeToBytesWith(String(string), enc);
-      const limit = Math.max(0, Math.min(count, bytes.length));
-      const writable = writableByteCount(bytes, enc, limit);
-      for (let i = 0; i < writable; i++) this[start + i] = bytes[i];
-      return writable;
-    }
-
-    asciiWrite(string, offset, length) { return this.pirRawWrite(string, offset, length, "latin1"); }
-    latin1Write(string, offset, length) { return this.pirRawWrite(string, offset, length, "latin1"); }
-    utf8Write(string, offset, length) { return this.pirRawWrite(string, offset, length, "utf8"); }
+    // ERR_OUT_OF_RANGE, and no offset/length coercion beyond NaN -> 0. The
+    // shared implementation is a closure (see pirRawWrite above) so it does
+    // not show up in `Object.getOwnPropertyNames(Buffer.prototype)`.
+    asciiWrite(string, offset, length) { return pirRawWrite(this, string, offset, length, "latin1"); }
+    latin1Write(string, offset, length) { return pirRawWrite(this, string, offset, length, "latin1"); }
+    utf8Write(string, offset, length) { return pirRawWrite(this, string, offset, length, "utf8"); }
+    // Node's remaining `*Write` kernels. `buffer_global` implements the
+    // conversions through `write`, so these are thin encoded entry points
+    // (Node's own raw kernels take the same positional arguments and return
+    // the byte count). They are part of Buffer.prototype's own-property
+    // surface (test-buffer-generic-methods enumerates it).
+    base64Write(string, offset, length) { return pirRawWrite(this, string, offset, length, "base64"); }
+    base64urlWrite(string, offset, length) { return pirRawWrite(this, string, offset, length, "base64url"); }
+    hexWrite(string, offset, length) { return pirRawWrite(this, string, offset, length, "hex"); }
+    ucs2Write(string, offset, length) { return pirRawWrite(this, string, offset, length, "utf16le"); }
+    // Node's internal slice family; each renders the requested byte window in
+    // its encoding. `toString` already owns the exact encode/decode rules
+    // (ascii high-bit masking included).
+    asciiSlice(start, end) { return this.toString("ascii", start, end); }
+    base64Slice(start, end) { return this.toString("base64", start, end); }
+    base64urlSlice(start, end) { return this.toString("base64url", start, end); }
+    latin1Slice(start, end) { return this.toString("latin1", start, end); }
+    hexSlice(start, end) { return this.toString("hex", start, end); }
+    ucs2Slice(start, end) { return this.toString("utf16le", start, end); }
+    utf8Slice(start, end) { return this.toString("utf8", start, end); }
 
     writeUInt8(value, offset) {
       offset = offset === undefined ? 0 : offset;
@@ -1288,6 +1564,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
         error.code = "ERR_INVALID_BUFFER_SIZE";
         throw error;
       }
+      if (pirSwapKernel && pirSwapKernel(this, 2)) return this;
       for (let i = 0; i < this.length; i += 2) {
         const hi = this[i];
         this[i] = this[i + 1];
@@ -1302,6 +1579,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
         error.code = "ERR_INVALID_BUFFER_SIZE";
         throw error;
       }
+      if (pirSwapKernel && pirSwapKernel(this, 4)) return this;
       for (let i = 0; i < this.length; i += 4) {
         const b0 = this[i], b1 = this[i + 1], b2 = this[i + 2];
         this[i] = this[i + 3];
@@ -1318,6 +1596,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
         error.code = "ERR_INVALID_BUFFER_SIZE";
         throw error;
       }
+      if (pirSwapKernel && pirSwapKernel(this, 8)) return this;
       for (let i = 0; i < this.length; i += 8) {
         for (let k = 0; k < 4; k++) {
           const a = this[i + k];
@@ -1331,7 +1610,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     // node's `Buffer.prototype.inspect` (== its util.inspect custom hook):
     // `<Buffer 81 a3 …>` with the 50-byte cap and the "N more bytes" tail.
     inspect() {
-      return pirInspectBufferLike(this, pirBufferInspectTag(this));
+      return pirInspectBufferLike(this, pirBufferInspectTag(this), pirInspectMaxBytes);
     }
 
     equals(otherBuffer) {
@@ -1373,12 +1652,16 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       return pirCompareOffset(this, sourceStart, sourceEnd, target, targetStart, targetEnd);
     }
 
-    indexOf(value, byteOffset, encoding) {
-      return pirBidirectionalIndexOf(this, value, byteOffset, encoding, 1);
+    indexOf(value, byteOffset, end, encoding) {
+      if (typeof end === "string") { encoding = end; end = this.length; }
+      else if (end === undefined) end = this.length;
+      return pirBidirectionalIndexOf(this, value, byteOffset, end, encoding, 1);
     }
 
-    includes(value, byteOffset, encoding) {
-      return this.indexOf(value, byteOffset, encoding) !== -1;
+    includes(value, byteOffset, end, encoding) {
+      if (typeof end === "string") { encoding = end; end = this.length; }
+      else if (end === undefined) end = this.length;
+      return pirBidirectionalIndexOf(this, value, byteOffset, end, encoding, 1) !== -1;
     }
 
     fill(value, start, end, encoding) {
@@ -1471,21 +1754,26 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       const sStart = sourceStart === undefined ? 0 : Math.trunc(sourceStart);
       const sEnd = sourceEnd === undefined ? len : Math.min(Math.trunc(sourceEnd), len);
       const count = Math.max(0, Math.min(sEnd - sStart, target.length - tStart));
-      for (let i = 0; i < count; i++) target[tStart + i] = this[sStart + i];
+      // One engine-native memcpy; `set` also handles overlapping ranges from
+      // the same ArrayBuffer like Node's memmove does.
+      if (count > 0) target.set(this.subarray(sStart, sStart + count), tStart);
       return count;
     }
 
     slice(start, end) {
-      // Buffer slice returns a view over the same memory (Node parity; unlike
+      // Buffer slice delegates through `this.subarray` (Node lib/buffer.js), so
+      // a generic call on a plain Uint8Array keeps the receiver's own subarray
+      // and does NOT turn the result into a Buffer (test-buffer-generic-methods).
+      return this.subarray(start, end);
+    }
+
+    subarray(start, end) {
+      // Buffer subarray returns a view over the same memory (Node parity; unlike
       // Uint8Array.prototype.slice, which copies).
       const len = this.length;
       const from = pirAdjustOffset(start, len);
       const to = end === undefined ? len : pirAdjustOffset(end, len);
       return viewOver(this.buffer, this.byteOffset + from, to > from ? to - from : 0);
-    }
-
-    subarray(start, end) {
-      return this.slice(start, end);
     }
 
     toJSON() {
@@ -1504,8 +1792,68 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
   // `Buffer(n)` are valid legacy constructors, and `Buffer.prototype` must stay
   // the very object the class methods (and the host numeric install) live on.
   // ---------------------------------------------------------------------------
+  // Node's DEP0005 (lib/buffer.js): the legacy constructor warns once per
+  // process, and only when deprecation warnings are enabled.
+  let pirBufferDeprecationEmitted = false;
+  let pirBufferDeprecationChecking = false;
+  function pirEmitBufferDeprecation() {
+    if (pirBufferDeprecationEmitted || pirBufferDeprecationChecking) return;
+    // Node's DEP0005 only warns when the call did not come from node_modules
+    // (test-buffer-constructor-outside-node-modules): the legacy constructor is
+    // still invoked by old packages, and warning there is noise. A suppressed
+    // call does not consume the once-per-process warning. The guard keeps a
+    // custom `Error.prepareStackTrace` that itself calls `new Buffer()` (the
+    // deprecation test) from recursing while the stack is captured.
+    pirBufferDeprecationChecking = true;
+    let stackText = "";
+    try { stackText = String(new Error().stack || ""); }
+    catch (error) { /* no stack: fall through and warn */ }
+    pirBufferDeprecationChecking = false;
+    // QuickJS names eval frames `<input>`; vm.runIn*Context publishes the
+    // caller-supplied filename for the duration of the run (see vm_shim), so
+    // the deprecation can tell a node_modules call site from a user one and
+    // report it in the warning stack like Node's frames do.
+    const vmFilename = typeof globalThis.__pirVmFilename === "string"
+      ? globalThis.__pirVmFilename
+      : "";
+    if (vmFilename.length > 0 && stackText.indexOf(vmFilename) === -1) {
+      stackText = stackText.length > 0
+        ? stackText + "\n    at " + vmFilename
+        : "    at " + vmFilename;
+    }
+    if (stackText.indexOf("node_modules") !== -1) return;
+    pirBufferDeprecationEmitted = true;
+    const proc = globalThis.process;
+    if (proc === undefined || proc === null || proc.noDeprecation) return;
+    if (typeof proc.emitWarning !== "function") return;
+    const message =
+      "Buffer() is deprecated due to security and usability issues. " +
+      "Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.";
+    // An Error carries the call-site stack into the warning object (Node's
+    // warning.stack). emitWarning keeps an Error instance as-is, so the name
+    // and code are set here.
+    const warning = new Error(message);
+    warning.name = "DeprecationWarning";
+    warning.stack = "DeprecationWarning: " + message +
+      (stackText.length > 0 ? "\n" + stackText : "");
+    proc.emitWarning(warning, "DeprecationWarning", "DEP0005");
+  }
+
+  // Callable facade. Node's Buffer function treats a NUMBER first argument as
+  // the legacy allocator (`new Buffer(3)` → Buffer.alloc(3), warning included)
+  // but rejects the ambiguous `(number, string)` shape; every other value goes
+  // through Buffer.from, which validates the argument. `new Buffer()` therefore
+  // throws "The first argument must be ..." exactly like Node.
   function Buffer(arg, byteOffset, length) {
-    return new BufferImpl(arg, byteOffset, length);
+    if (typeof arg === "number") {
+      if (typeof byteOffset === "string") {
+        throw errInvalidArgType("string", "of type string", arg);
+      }
+      pirEmitBufferDeprecation();
+      return BufferImpl.alloc(arg);
+    }
+    pirEmitBufferDeprecation();
+    return BufferImpl.from(arg, byteOffset, length);
   }
   Buffer.prototype = BufferImpl.prototype;
   Object.setPrototypeOf(Buffer, BufferImpl);
@@ -1568,9 +1916,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     // is built with the engine's own typed-array constructor (zero-filled and
     // native) — `fromBytes` would allocate twice and copy byte by byte, which
     // is minutes for the 512MiB+ sizes the official suite exercises.
-    const buffer = new Uint8Array(count);
-    Object.setPrototypeOf(buffer, Buffer.prototype);
-    return buffer;
+    return pirNewBuffer(count);
   }
 
   BufferImpl.alloc = function alloc(size, fill, encoding) {
@@ -1596,7 +1942,7 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
       const enc = lookupEncoding(encoding) || "utf8";
       if (enc === "hex") return value.length >>> 1;
       if (enc === "base64" || enc === "base64url") return base64ByteLength(value);
-      if (enc === "latin1") return value.length;
+      if (enc === "latin1" || enc === "ascii") return value.length;
       if (enc === "utf16le") return value.length * 2;
       return utf8Bytes(value).length;
     }
@@ -1654,7 +2000,14 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
         throw errInvalidArgType("list[" + i + "]", "an instance of Buffer or Uint8Array", part);
       }
       const take = Math.min(part.byteLength, total - offset);
-      for (let k = 0; k < take; k++) out[offset + k] = part[k];
+      // One engine-native memcpy per part instead of a per-byte JS loop. The
+      // common whole-part case copies the receiver directly; only a truncated
+      // tail needs a view — and that view is a raw Uint8Array (the Buffer
+      // `subarray` path would allocate a second Buffer just to read it).
+      if (take > 0) {
+        if (take === part.byteLength) out.set(part, offset);
+        else out.set(new Uint8Array(part.buffer, part.byteOffset, take), offset);
+      }
       offset += take;
     }
     return out;
@@ -1701,7 +2054,9 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
         throw pirError(TypeError, "ERR_INVALID_ARG_TYPE",
           'The "buffer" argument must be an instance of Buffer, TypedArray, or DataView.' + pirReceivedDetail(this));
       }
-      return pirBidirectionalIndexOf(this, value, byteOffset, encoding, -1);
+      // lastIndexOf has no `end` parameter (that is indexOf/includes v24
+      // shape), so the slot stays undefined and `encoding` lands in place.
+      return pirBidirectionalIndexOf(this, value, byteOffset, undefined, encoding, -1);
     },
   });
 
@@ -1760,5 +2115,273 @@ globalThis.Buffer ?? (globalThis.Buffer = (function () {
     delete globalThis.__pirInstallBufferOps;
   }
 
+  // Node keeps the historical lowercase-i spellings as THE SAME function
+  // objects (lib/internal/buffer.js: proto.readUint8 = proto.readUInt8, …,
+  // including read/writeBigUint64*); test-buffer-writeuint asserts the
+  // reference identity. The alias pass runs at the END of this IIFE: the
+  // native installer and the offset-guard wrappers below both replace method
+  // objects, so aliasing any earlier would point at stale functions.
+  function pirInstallUintAliases() {
+    for (const [alias, target] of [
+      ["readUintLE", "readUIntLE"], ["readUintBE", "readUIntBE"],
+      ["readUint8", "readUInt8"],
+      ["readUint16LE", "readUInt16LE"], ["readUint16BE", "readUInt16BE"],
+      ["readUint32LE", "readUInt32LE"], ["readUint32BE", "readUInt32BE"],
+      ["readBigUint64LE", "readBigUInt64LE"], ["readBigUint64BE", "readBigUInt64BE"],
+      ["writeUintLE", "writeUIntLE"], ["writeUintBE", "writeUIntBE"],
+      ["writeUint8", "writeUInt8"],
+      ["writeUint16LE", "writeUInt16LE"], ["writeUint16BE", "writeUInt16BE"],
+      ["writeUint32LE", "writeUInt32LE"], ["writeUint32BE", "writeUInt32BE"],
+      ["writeBigUint64LE", "writeBigUInt64LE"], ["writeBigUint64BE", "writeBigUInt64BE"],
+    ]) {
+      const fn = Buffer.prototype[target];
+      if (typeof fn === "function") {
+        Object.defineProperty(Buffer.prototype, alias, {
+          value: fn, writable: true, enumerable: false, configurable: true,
+        });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host fast-path offset guard. The native fixed-size kernels validate a
+  // missing offset and the finite cases with Node's messages, but their
+  // initial integer check also catches ±Infinity ("must be an integer"),
+  // whereas Node's `boundsError` only enters that branch for NaN and finite
+  // fractions and sends ±Infinity to the bounds message ("must be >= 0 and
+  // <= length - size"). Wrap only that case: the guard is a no-op for every
+  // other offset, so valid calls keep the native path unchanged.
+  // ---------------------------------------------------------------------------
+  function pirGuardInfiniteReadOffset(fn, size) {
+    return function (offset) {
+      if (typeof offset === "number" && !Number.isFinite(offset) && !Number.isNaN(offset)) {
+        checkNumericOffset(this, offset, size);
+      }
+      return fn.apply(this, arguments);
+    };
+  }
+
+  function pirGuardInfiniteWriteOffset(fn, size) {
+    return function (value, offset) {
+      if (typeof offset === "number" && !Number.isFinite(offset) && !Number.isNaN(offset)) {
+        checkNumericOffset(this, offset, size);
+      }
+      return fn.apply(this, arguments);
+    };
+  }
+
+  const PIR_FIXED_READ_SIZES = {
+    readUInt8: 1, readInt8: 1,
+    readUInt16LE: 2, readUInt16BE: 2, readInt16LE: 2, readInt16BE: 2,
+    readUInt32LE: 4, readUInt32BE: 4, readInt32LE: 4, readInt32BE: 4,
+    readFloatLE: 4, readFloatBE: 4,
+    readDoubleLE: 8, readDoubleBE: 8,
+    readBigUInt64LE: 8, readBigUInt64BE: 8,
+    readBigInt64LE: 8, readBigInt64BE: 8,
+  };
+  const PIR_FIXED_WRITE_SIZES = {
+    writeUInt8: 1, writeInt8: 1,
+    writeUInt16LE: 2, writeUInt16BE: 2, writeInt16LE: 2, writeInt16BE: 2,
+    writeUInt32LE: 4, writeUInt32BE: 4, writeInt32LE: 4, writeInt32BE: 4,
+    writeFloatLE: 4, writeFloatBE: 4,
+    writeDoubleLE: 8, writeDoubleBE: 8,
+    writeBigUInt64LE: 8, writeBigUInt64BE: 8,
+    writeBigInt64LE: 8, writeBigInt64BE: 8,
+  };
+  for (const name of Object.keys(PIR_FIXED_READ_SIZES)) {
+    const current = Buffer.prototype[name];
+    if (typeof current !== "function") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Buffer.prototype, name);
+    if (descriptor !== undefined && descriptor.configurable === false) continue;
+    Object.defineProperty(Buffer.prototype, name, {
+      value: pirGuardInfiniteReadOffset(current, PIR_FIXED_READ_SIZES[name]),
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  for (const name of Object.keys(PIR_FIXED_WRITE_SIZES)) {
+    const current = Buffer.prototype[name];
+    if (typeof current !== "function") continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Buffer.prototype, name);
+    if (descriptor !== undefined && descriptor.configurable === false) continue;
+    Object.defineProperty(Buffer.prototype, name, {
+      value: pirGuardInfiniteWriteOffset(current, PIR_FIXED_WRITE_SIZES[name]),
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // `require('buffer')` completion. The Rust-side buffer module object (see
+  // node_shims.rs BUFFER_SHIM) ships a static INSPECT_MAX_BYTES, a SlowBuffer
+  // without Node's validation/deprecation, and isAscii/isUtf8 helpers that
+  // only understand Buffer inputs. The CJS path materializes one plain,
+  // writable copy per builtin; that copy is the object every consumer shares,
+  // so the Node-exact exports are installed on it the first time it appears.
+  // ---------------------------------------------------------------------------
+
+  // The inputs Node's isUtf8/isAscii accept: any TypedArray or ArrayBuffer
+  // (not DataView, not strings). A detached backing store reads as empty.
+  function pirTestBufferView(value) {
+    if (isAnyArrayBufferLike(value)) {
+      try { return new Uint8Array(value); } catch (error) { return new Uint8Array(0); }
+    }
+    if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+      try {
+        return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      } catch (error) { return new Uint8Array(0); }
+    }
+    throw errInvalidArgType("input", "an instance of ArrayBuffer, Buffer, TypedArray", value);
+  }
+
+  function isAscii(value) {
+    const bytes = pirTestBufferView(value);
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] > 0x7f) return false;
+    }
+    return true;
+  }
+
+  // Strict UTF-8 validity (no overlongs, no surrogate code points, no 5/6-byte
+  // sequences) — the same grammar as Node's simdutf binding.
+  function isUtf8(value) {
+    const bytes = pirTestBufferView(value);
+    const length = bytes.length;
+    let i = 0;
+    while (i < length) {
+      const first = bytes[i];
+      if (first < 0x80) { i += 1; continue; }
+      let needed;
+      let lower = 0x80;
+      let upper = 0xbf;
+      if (first >= 0xc2 && first <= 0xdf) {
+        needed = 1;
+      } else if (first >= 0xe0 && first <= 0xef) {
+        needed = 2;
+        if (first === 0xe0) lower = 0xa0;
+        else if (first === 0xed) upper = 0x9f;
+      } else if (first >= 0xf0 && first <= 0xf4) {
+        needed = 3;
+        if (first === 0xf0) lower = 0x90;
+        else if (first === 0xf4) upper = 0x8f;
+      } else {
+        return false;
+      }
+      if (i + needed >= length) return false;
+      const second = bytes[i + 1];
+      if (second < lower || second > upper) return false;
+      for (let k = 2; k <= needed; k++) {
+        const next = bytes[i + k];
+        if (next < 0x80 || next > 0xbf) return false;
+      }
+      i += needed + 1;
+    }
+    return true;
+  }
+
+  // Node's deprecated SlowBuffer: validateNumber(size, 'size', 0, kMaxLength)
+  // plus the once-per-process DEP0030 warning.
+  let slowBufferDeprecationEmitted = false;
+  function SlowBuffer(size) {
+    if (!slowBufferDeprecationEmitted) {
+      slowBufferDeprecationEmitted = true;
+      const proc = globalThis.process;
+      if (proc !== undefined && proc !== null && !proc.noDeprecation &&
+          typeof proc.emitWarning === "function") {
+        proc.emitWarning(
+          "SlowBuffer() is deprecated. Please use Buffer.allocUnsafeSlow()",
+          "DeprecationWarning",
+          "DEP0030",
+        );
+      }
+    }
+    return allocUnsafeImpl(size);
+  }
+  // Node wires the legacy constructor into the Uint8Array family.
+  Object.setPrototypeOf(SlowBuffer.prototype, Uint8Array.prototype);
+  Object.setPrototypeOf(SlowBuffer, Uint8Array);
+
+  function pirInstallBufferModule(moduleObject) {
+    if (Object.prototype.hasOwnProperty.call(moduleObject, "__pirBufferModuleCompleted")) return;
+    Object.defineProperty(moduleObject, "__pirBufferModuleCompleted", {
+      value: true, writable: false, enumerable: false, configurable: true,
+    });
+    if (typeof moduleObject.INSPECT_MAX_BYTES === "number" &&
+        moduleObject.INSPECT_MAX_BYTES >= 0) {
+      pirInspectMaxBytes = moduleObject.INSPECT_MAX_BYTES;
+    }
+    Object.defineProperty(moduleObject, "INSPECT_MAX_BYTES", {
+      enumerable: true,
+      configurable: true,
+      get() { return pirInspectMaxBytes; },
+      set(value) {
+        // Node's setter is validateNumber(val, 'INSPECT_MAX_BYTES', 0).
+        if (typeof value !== "number") {
+          throw errInvalidArgType("INSPECT_MAX_BYTES", "of type number", value);
+        }
+        if (value < 0 || Number.isNaN(value)) {
+          throw errValueOutOfRange("INSPECT_MAX_BYTES", ">= 0", value);
+        }
+        pirInspectMaxBytes = value;
+      },
+    });
+    moduleObject.isAscii = isAscii;
+    moduleObject.isUtf8 = isUtf8;
+    moduleObject.SlowBuffer = SlowBuffer;
+  }
+
+  if (typeof globalThis.__pirRequireFrom === "function" &&
+      globalThis.__pirRequireFrom.__pirBufferModuleHook !== true) {
+    const pirBaseRequireFrom = globalThis.__pirRequireFrom;
+    const pirRequireFromHook = function (fromDir, spec) {
+      const result = pirBaseRequireFrom.apply(this, arguments);
+      try {
+        if (result !== null && typeof result === "object" && result.Buffer === Buffer) {
+          pirInstallBufferModule(result);
+        }
+      } catch (error) { /* module completion is best-effort */ }
+      return result;
+    };
+    Object.defineProperty(pirRequireFromHook, "__pirBufferModuleHook", {
+      value: true, enumerable: false, configurable: true,
+    });
+    globalThis.__pirRequireFrom = pirRequireFromHook;
+  }
+
+  // V8's 64-bit string representation caps a string at 2^29 - 24 UTF-16
+  // code units. QuickJS-ng permits a larger result from `String.prototype.repeat`,
+  // while Node's `buffer.constants.MAX_STRING_LENGTH` exposes the V8 limit.
+  // Install this alongside Buffer because this global shim is also available in
+  // source-override mode (the host prelude itself is embedded, not overrideable).
+  const nativeStringRepeat = String.prototype.repeat;
+  if (typeof nativeStringRepeat === "function" &&
+      nativeStringRepeat.__pirV8LengthCap !== true) {
+    const maxStringLength = 536870888;
+    const cappedStringRepeat = function repeat(count) {
+      if (this === null || this === undefined || typeof this === "symbol" ||
+          typeof count === "bigint") {
+        return nativeStringRepeat.call(this, count);
+      }
+      const numericCount = Number(count);
+      const text = typeof this === "string" ? this : String(this);
+      if (Number.isFinite(numericCount) && numericCount > 0 && text.length > 0) {
+        const integerCount = Math.floor(numericCount);
+        if (integerCount > maxStringLength / text.length) {
+          throw new RangeError("Invalid string length");
+        }
+      }
+      return nativeStringRepeat.call(text, numericCount);
+    };
+    Object.defineProperty(cappedStringRepeat, "__pirV8LengthCap", {
+      value: true, enumerable: false, configurable: false,
+    });
+    Object.defineProperty(String.prototype, "repeat", {
+      value: cappedStringRepeat, writable: true, enumerable: false, configurable: true,
+    });
+  }
+
+  pirInstallUintAliases();
   return Buffer;
 })());

@@ -886,18 +886,18 @@ impl ExtensionRuntime {
         tool_call_id: &str,
         params: &JsonValue,
     ) -> anyhow::Result<ToolResult> {
-        let params_json = serde_json::to_string(params)?;
         let token = self.arm_deadline();
-        let result = tokio::time::timeout(
-            self.call_timeout(),
-            self.invoke_str3(
-                "__pir_callTool",
-                tool_name.to_string(),
-                tool_call_id.to_string(),
-                params_json,
-            ),
-        )
-        .await;
+        let tool_name_value = serde_json::Value::String(tool_name.to_string());
+        let call_id_value = serde_json::Value::String(tool_call_id.to_string());
+        // Native value bridge: params object in, result object out — no
+        // `to_string(params)` / `from_str(reply)` at the boundary.
+        let call = self.invoke_native3(
+            "__pir_nativeCallTool",
+            &tool_name_value,
+            &call_id_value,
+            params,
+        );
+        let result = tokio::time::timeout(self.call_timeout(), call).await;
         // Probe the armed deadline BEFORE the recovery drain/disarm: the
         // QuickJS interrupt handler shares this budget and, on a synchronous
         // JS turn, usually returns its opaque exception just before the tokio
@@ -941,7 +941,7 @@ impl ExtensionRuntime {
         // continuation it drove) registers must be visible to the caller's
         // gates before this result reaches them.
         let _ = self.refresh_handler_counts().await;
-        let parsed: JsonValue = serde_json::from_str(&result_json)?;
+        let parsed: JsonValue = result_json;
         if parsed
             .get("ok")
             .and_then(JsonValue::as_bool)
@@ -1051,22 +1051,20 @@ impl ExtensionRuntime {
         budget: Duration,
         epoch: u64,
     ) -> anyhow::Result<EmitOutcome> {
-        // Iterative text, not `serde_json::to_string`: a payload can carry a
-        // session tree nested one level per entry (`session_tree`), and the
-        // derived serializer recurses one frame per level (a ~1400-entry
-        // session overran a 2 MiB thread). The encoding is byte-identical.
-        let payload_json = crate::session_manager::json_depth::write_value_iteratively(payload);
+        // Native value bridge: build the payload as a live QuickJS object and
+        // read the reply object back directly — no `write_value_iteratively`
+        // string, no `serde_json::from_str` of the reply. `session_tree` stays
+        // iterative inside `json_to_js`, so the deep-tree safety is preserved.
         let token = self.arm_deadline_for(budget);
-        let result = tokio::time::timeout(
-            budget,
-            self.invoke_str3(
-                "__pir_dispatchEvent",
-                event.to_string(),
-                payload_json,
-                epoch.to_string(),
-            ),
-        )
-        .await;
+        let epoch_value = serde_json::Value::Number(epoch.into());
+        let event_value = serde_json::Value::String(event.to_string());
+        let call = self.invoke_native3(
+            "__pir_nativeDispatchEvent",
+            &event_value,
+            payload,
+            &epoch_value,
+        );
+        let result = tokio::time::timeout(budget, call).await;
         // Probe the armed deadline BEFORE the recovery drain/disarm: a
         // synchronous JS turn interrupted by the QuickJS deadline usually
         // returns its opaque exception just before (or instead of) the tokio
@@ -1140,7 +1138,7 @@ impl ExtensionRuntime {
         // here. The caller-side in-place write-back still costs the one clone
         // it must (the value both lands in `payload` and rides
         // `EmitOutcome::payload`).
-        let mut parsed: JsonValue = serde_json::from_str(&result_json)?;
+        let mut parsed = result_json;
         let outcome = parsed
             .get_mut("outcome")
             .map(JsonValue::take)

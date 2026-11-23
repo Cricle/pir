@@ -18,6 +18,16 @@
 //   overrides `require('querystring').unescape` is honored (see the cache seed
 //   at the bottom, which keeps the CJS require bridge handing out THIS object).
 
+// Typed C-ABI entries (see host_functions/url_ops.rs): the default-decoder
+// parse state machine and the escaper run in Rust when available. Every other
+// branch — custom `decodeURIComponent`/`encodeURIComponent`, an overridden
+// `QueryString.unescape`, non-string input — stays in JS below, which also
+// keeps lone-surrogate `ERR_INVALID_URI` errors exact.
+const pirNativeQueryParse =
+  typeof globalThis.__pirQueryParse === "function" ? globalThis.__pirQueryParse : null;
+const pirNativeQueryStringify =
+  typeof globalThis.__pirQueryStringify === "function" ? globalThis.__pirQueryStringify : null;
+
 // ---------------------------------------------------------------------------
 // errors
 // ---------------------------------------------------------------------------
@@ -224,6 +234,9 @@ function qsUnescape(s, decodeSpaces) {
 function qsEscape(str) {
   if (typeof str !== "string") {
     if (typeof str === "object") str = String(str);
+    // Node's V8 `str += ''` throws this exact TypeError for a symbol; the
+    // QuickJS engine words its own conversion error differently.
+    else if (typeof str === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
     else str += "";
   }
 
@@ -258,6 +271,17 @@ function encodeStringifiedCustom(v, encode) {
   return encode(stringifyPrimitive(v));
 }
 
+// `encodeStringified` without the escaping step: the native entry applies
+// Node's table-driven escaper (and the join) in Rust. Numbers use the same
+// `"" + v` form, so 1e21 still reaches the escaper as "1e+21".
+function stringifyRaw(v) {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" && Number.isFinite(v)) return "" + v;
+  if (typeof v === "bigint") return "" + v;
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return "";
+}
+
 function stringify(obj, sep, eq, options) {
   sep ||= "&";
   eq ||= "=";
@@ -271,6 +295,29 @@ function stringify(obj, sep, eq, options) {
   if (obj !== null && typeof obj === "object") {
     const keys = Object.keys(obj);
     const len = keys.length;
+    // Native path: default escaper only (a custom encodeURIComponent must run
+    // in JS). An `undefined` result means an element could not cross the C-ABI
+    // (lone surrogate), so the JS loop below keeps the exact error/semantics.
+    if (encode === qsEscape && pirNativeQueryStringify !== null) {
+      const flat = [];
+      for (let i = 0; i < len; ++i) {
+        const k = keys[i];
+        const v = obj[k];
+        if (Array.isArray(v)) {
+          const vlen = v.length;
+          if (vlen === 0) continue;
+          for (let j = 0; j < vlen; ++j) {
+            flat.push(k);
+            flat.push(stringifyRaw(v[j]));
+          }
+        } else {
+          flat.push(k);
+          flat.push(stringifyRaw(v));
+        }
+      }
+      const nativeText = pirNativeQueryStringify(flat, sep, eq);
+      if (nativeText !== undefined) return nativeText;
+    }
     let fields = "";
     for (let i = 0; i < len; ++i) {
       const k = keys[i];
@@ -356,6 +403,33 @@ function parse(qs, sep, eq, options) {
     decode = options.decodeURIComponent;
   }
   const customDecode = decode !== qsUnescape;
+
+  // Native state machine (default decoder only). It applies Node's `maxKeys`
+  // accounting — including empty substrings between separators — and returns
+  // decoded pairs in order; the object/duplicate shape is built right here.
+  // A custom decoder or an overridden `QueryString.unescape` stays in JS.
+  if (!customDecode && pirNativeQueryParse !== null) {
+    const flat = pirNativeQueryParse(
+      qs,
+      !sep ? "&" : String(sep),
+      !eq ? "=" : String(eq),
+      pairs);
+    if (flat !== undefined) {
+      const nativeObj = { __proto__: null };
+      for (let i = 0; i < flat.length; i += 2) {
+        const key = flat[i];
+        const value = flat[i + 1];
+        if (nativeObj[key] === undefined) {
+          nativeObj[key] = value;
+        } else {
+          const curValue = nativeObj[key];
+          if (curValue.pop) curValue[curValue.length] = value;
+          else nativeObj[key] = [curValue, value];
+        }
+      }
+      return nativeObj;
+    }
+  }
 
   let lastPos = 0;
   let sepIdx = 0;

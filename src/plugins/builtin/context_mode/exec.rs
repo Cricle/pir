@@ -32,13 +32,13 @@ use super::{
 use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
 use crate::ai::types::AbortSignal;
-use crate::plugins::builtin::python_vm::{JobGlobal, PythonJob, PythonSession};
+use crate::plugins::builtin::js_vm::{JobGlobal, PythonJob, PythonSession};
 
 // ---------------------------------------------------------------------------
 // Shared execution path
 // ---------------------------------------------------------------------------
 
-/// A fresh-namespace Python job whose only model-facing output is stdout.
+/// A fresh-namespace JavaScript job whose only model-facing output is stdout.
 struct ExecuteRequest {
     job: PythonJob,
     timeout: Duration,
@@ -222,9 +222,9 @@ impl AgentTool for CtxExecuteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run Python in the embedded sandbox. Only stdout enters context — the data your code reads or derives stays inside the sandbox. \
+        "Run JavaScript in the embedded sandbox. Only stdout enters context — the data your code reads or derives stays inside the sandbox. \
 Think in code: write analysis code, not data dumps; filter, count, aggregate, parse and compare inside the script and print only the answer. \
-Every call runs in a fresh namespace (imports stay cached); an uncaught exception returns the Python traceback as an error. \
+Every call runs in a fresh namespace (imports stay cached); an uncaught exception returns the JavaScript error as an error. \
 stdout and stderr are each capped at 1 MiB; the default deadline is 30s, max 120s. \
 Pass intent when the output may be large: stdout over 5 KiB is indexed into the local knowledge base and only BM25-matched section titles + snippets come back; retrieve more with ctx_search. \
 Use this when you intend to derive an answer FROM data and the output shape is not known before execution. Not for file editing, navigation, or short observational commands whose entire output you will read anyway."
@@ -236,7 +236,7 @@ Use this when you intend to derive an answer FROM data and the output shape is n
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Python source to execute. Use print() for the findings that should enter context; everything else stays in the sandbox. Each call gets a fresh namespace."
+                    "description": "JavaScript source to execute. Use print() for the findings that should enter context; everything else stays in the sandbox. Each call gets a fresh namespace."
                 },
                 "timeout": {
                     "type": "number",
@@ -273,7 +273,7 @@ Use this when you intend to derive an answer FROM data and the output shape is n
         Box::pin(async move {
             let Some(code) = code else {
                 return ToolResult::error(
-                    "ctx_execute: the `code` parameter is required and must be non-empty Python source",
+                    "ctx_execute: the `code` parameter is required and must be non-empty JavaScript source",
                 );
             };
             let bytes_in = code.len();
@@ -321,10 +321,10 @@ impl AgentTool for CtxExecuteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read one file into the Python variable FILE_CONTENT (and its absolute path as FILE_PATH), then run code over it inside the embedded sandbox. Only what your code prints enters context — the raw bytes never do. \
+        "Read one file into the global FILE_CONTENT (and its absolute path as FILE_PATH), then run code over it inside the embedded sandbox. Only what your code prints enters context — the raw bytes never do. \
 Think in code: write analysis code, not data dumps. The path is resolved against the session cwd and must stay inside it; `..` escapes, symlink escapes, non-files and files over 32 MiB are rejected. \
 This is for analysis, not editing: use Read when you intend to edit the file or will consume all of it. \
-Every call runs in a fresh namespace; an uncaught exception returns the Python traceback as an error. stdout/stderr are each capped at 1 MiB; default deadline 30s, max 120s. \
+Every call runs in a fresh namespace; an uncaught exception returns the JavaScript error as an error. stdout/stderr are each capped at 1 MiB; default deadline 30s, max 120s. \
 Use this to know something ABOUT a file (line counts, matches, parsed structure, aggregates) without reading all of it. \
 Pass intent for a large derivation: stdout over 5 KiB is indexed and only matching section titles + snippets are returned; retrieve more with ctx_search."
     }
@@ -339,7 +339,7 @@ Pass intent for a large derivation: stdout over 5 KiB is indexed and only matchi
                 },
                 "code": {
                     "type": "string",
-                    "description": "Python source that processes FILE_CONTENT and prints the findings. Each call gets a fresh namespace."
+                    "description": "JavaScript source that processes FILE_CONTENT and prints the findings. Each call gets a fresh namespace."
                 },
                 "timeout": {
                     "type": "number",
@@ -383,7 +383,7 @@ Pass intent for a large derivation: stdout over 5 KiB is indexed and only matchi
             };
             let Some(code) = code else {
                 return ToolResult::error(
-                    "ctx_execute_file: the `code` parameter is required and must be non-empty Python source",
+                    "ctx_execute_file: the `code` parameter is required and must be non-empty JavaScript source",
                 );
             };
 
@@ -593,7 +593,7 @@ fn parse_batch_request(args: &serde_json::Value) -> Result<BatchRequest, String>
         };
         if code.trim().is_empty() {
             return Err(format!(
-                "ctx_batch_execute: script #{} has empty `code`; every script needs non-empty Python source",
+                "ctx_batch_execute: script #{} has empty `code`; every script needs non-empty JavaScript source",
                 index + 1
             ));
         }
@@ -684,7 +684,7 @@ fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-/// One-line failure preview. A Python traceback's first line is the generic
+/// One-line failure preview. A JavaScript error's first line is the generic
 /// `Traceback (most recent call last):` header, so that case uses the final
 /// exception line (the only informative one-line summary).
 fn error_preview(stderr: &str) -> Option<String> {
@@ -940,7 +940,7 @@ impl AgentTool for CtxBatchExecuteTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run MULTIPLE Python analyses in one call. Every script runs in the embedded sandbox on the shared interpreter, each in a fresh namespace; each script's stdout is auto-indexed into the local FTS5 knowledge base, one transaction per script. Optional queries run over just this batch's indexed outputs and return their top matching sections in the same round trip, so no follow-up search call is needed. \
+        "Run MULTIPLE JavaScript analyses in one call. Every script runs in the embedded sandbox on the shared runtime, each in a fresh namespace; each script's stdout is auto-indexed into the local FTS5 knowledge base, one transaction per script. Optional queries run over just this batch's indexed outputs and return their top matching sections in the same round trip, so no follow-up search call is needed. \
 Batch related analyses in one call instead of running ctx_execute repeatedly: multi-file scans, several greps/parses, or gather-and-query in one round trip. Only matched sections (title/source/snippet/line hints) and a one-line preview of failing scripts enter context; raw output stays in the sandbox and the database and is never echoed in full. \
 Scripts run sequentially, 1-16 per call; a failing script (uncaught exception or per-script timeout) does not abort the batch — its traceback is summarized as errorPreview and the next script still runs. stdout/stderr are each capped at 1 MiB, the default per-script deadline is 30s (max 120s). `queries` is optional: at most 32, each up to 512 bytes. Each script indexes under `<source>#<label>` (or `<source>` for a single-script batch), so `ctx_search(source: ...)` can address one script; `source` defaults to a stable `batch:<hash>` label. \
 Use this when you have several analyses that would otherwise be sequential tool calls, or when you want to gather and query in one round trip. Use ctx_execute for a single script; do not use this for short observational commands whose entire output you will read anyway."
@@ -963,13 +963,13 @@ Use this when you have several analyses that would otherwise be sequential tool 
                             },
                             "code": {
                                 "type": "string",
-                                "description": "Python source for this analysis. Each script gets a fresh namespace; use print() for the findings that matter."
+                                "description": "JavaScript source for this analysis. Each script gets a fresh namespace; use print() for the findings that matter."
                             }
                         },
                         "required": ["code"],
                         "additionalProperties": false
                     },
-                    "description": "1-16 independent Python analyses, run sequentially. Every non-empty stdout is auto-indexed; raw output is never echoed."
+                    "description": "1-16 independent JavaScript analyses, run sequentially. Every non-empty stdout is auto-indexed; raw output is never echoed."
                 },
                 "queries": {
                     "type": "array",

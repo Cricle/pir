@@ -68,15 +68,24 @@ pub fn default_extension_paths(
 }
 
 /// Synthetic QuickJS module name for an extension file path.
+///
+/// Callers that need one id per on-disk file pass the canonical path. Escape
+/// literal URL delimiters in the path so they cannot be mistaken for suffixes
+/// on lookup, including when the canonical target of a symlink contains one.
 pub fn module_name_for(path: &Path) -> String {
-    // Use forward slashes and lowercase the drive prefix for stable naming.
-    // One buffer: the prefix and the `\` -> `/` rewrite are written directly,
-    // where `replace` + `format!` would allocate the rewritten form and then
-    // the prefixed form.
-    let display = path.to_string_lossy();
+    let display = module_display_path(path);
     let mut name = String::with_capacity(EXT_MODULE_PREFIX.len() + display.len());
     name.push_str(EXT_MODULE_PREFIX);
-    name.extend(display.chars().map(|c| if c == '\\' { '/' } else { c }));
+    for c in display.chars() {
+        match c {
+            '%' => name.push_str("%25"),
+            '?' => name.push_str("%3F"),
+            '#' => name.push_str("%23"),
+            '\\' if cfg!(windows) || !path.is_absolute() => name.push('/'),
+            '\\' => name.push_str("%5C"),
+            _ => name.push(c),
+        }
+    }
     name
 }
 
@@ -158,8 +167,8 @@ pub fn script_entry_module_js(path: &Path) -> Option<String> {
 }
 
 /// Lexical scan for an `await` at script top level (depth 0 across
-/// `{}/()/[]` nesting, outside strings/templates/comments). An `await`
-/// directly after `=>` (async arrow expression body) is excluded — its await
+/// `{}/()/[]` nesting, outside strings/templates/comments). An `await` that is
+/// the expression body of an async arrow (`... => await x`) is excluded — it
 /// belongs to that arrow, not to the module top level. This is the
 /// script-entry classification heuristic only; imported modules are never
 /// classified through it.
@@ -183,6 +192,7 @@ pub(crate) fn source_has_top_level_await(source: &str) -> bool {
     let mut last_word = String::new();
     let mut depth = 0usize;
     let mut prev_char: Option<char> = None;
+    let mut prev_prev_char: Option<char> = None;
     let mut i = 0usize;
     while i < chars.len() {
         let c = chars[i];
@@ -234,25 +244,36 @@ pub(crate) fn source_has_top_level_await(source: &str) -> bool {
                             i += 2;
                             continue;
                         }
+                        prev_prev_char = prev_char;
                         prev_char = Some(c);
                         i += 1;
                     }
                     '"' | '\'' => {
                         mode = Mode::Str;
                         quote = c;
+                        // A string literal is an expression terminator: the
+                        // next token follows the closing quote, not whatever
+                        // preceded the literal (otherwise `x = "s"\nawait y`
+                        // would still see the `=` and look like `= await`).
+                        prev_prev_char = prev_char;
+                        prev_char = Some(c);
                         i += 1;
                     }
                     '`' => {
                         mode = Mode::Template;
+                        prev_prev_char = prev_char;
+                        prev_char = Some(c);
                         i += 1;
                     }
                     '{' | '(' | '[' => {
                         depth += 1;
+                        prev_prev_char = prev_char;
                         prev_char = Some(c);
                         i += 1;
                     }
                     '}' | ')' | ']' => {
                         depth = depth.saturating_sub(1);
+                        prev_prev_char = prev_char;
                         prev_char = Some(c);
                         i += 1;
                     }
@@ -264,16 +285,19 @@ pub(crate) fn source_has_top_level_await(source: &str) -> bool {
                         // Word boundary: decide on the completed keyword.
                         if !last_word.is_empty() {
                             let member_access = prev_char == Some('.');
-                            if last_word == "await" && depth == 0 && !member_access {
-                                // Exclude async arrow expression bodies
-                                // (`async () => await x`): the arrow's `=>`.
-                                if prev_char != Some('=') {
-                                    return true;
-                                }
+                            // `async () => await x`: the await belongs to the
+                            // arrow body, not the script top level (the two
+                            // significant characters before the word are
+                            // `=>`; a plain assignment `x = await y` is a
+                            // real top-level await and stays detected).
+                            let arrow_body = prev_char == Some('>') && prev_prev_char == Some('=');
+                            if last_word == "await" && depth == 0 && !member_access && !arrow_body {
+                                return true;
                             }
                             last_word.clear();
                         }
                         if !c.is_whitespace() {
+                            prev_prev_char = prev_char;
                             prev_char = Some(c);
                         }
                         i += 1;
@@ -684,50 +708,131 @@ pub fn scan_dependencies(source: &str) -> Vec<DependencyRef> {
     deps
 }
 
-/// Normalize a joined path lexically (resolve `.` and `..`), using `/`
-/// separators. Does not touch the filesystem. A root ("/", "C:/") is
-/// preserved: module ids are absolute paths, and trimming the leading
-/// separator would turn a POSIX absolute import target into a relative one
-/// that the allowed-roots check can never accept.
+/// Join a module specifier onto the importer's directory and normalize the
+/// result lexically (resolve `.` and `..`), using `/` separators.
+///
+/// Built on [`Path`] components rather than string splitting so the host's
+/// own path grammar decides what a root is: a Windows drive root (`C:/`), a
+/// UNC share (`//server/share`) and a POSIX root (`/`) are all preserved, and
+/// a `..` that would climb above a root is a no-op instead of deleting the
+/// root component. That is exactly Node's `URL`/`path.resolve` behavior, and
+/// it is what makes `import '../common/x.mjs'` from a `C:/…/parallel` module
+/// keep its drive (`C:/…/common/x.mjs`) instead of degrading to a
+/// root-relative spelling.
+///
+/// Lexical only: no filesystem access (existence, symlinks and case belong to
+/// [`canonical_module_path`]).
 fn normalize_joined(dir: &str, rel: &str) -> String {
-    let base = if rel.starts_with('/') {
-        String::new()
-    } else {
-        dir.to_string()
-    };
-    let combined = format!("{base}/{rel}");
-    let mut parts: Vec<&str> = Vec::new();
-    for seg in combined.split('/') {
-        match seg {
-            "" | "." => {
-                if parts.is_empty() && seg.is_empty() {
-                    parts.push("");
-                }
-            }
-            ".." => {
-                // Keep the leading "" (root) and a possible drive segment.
-                if parts.len() > 1 {
-                    parts.pop();
-                }
-            }
-            other => parts.push(other),
-        }
-    }
-    parts.join("/")
+    let joined = Path::new(dir).join(rel);
+    module_path_string(&normalize_lexically(&joined))
 }
 
-/// Extract the file path from a `pir-ext:` module name.
+/// `/`-separated spelling of a path for module ids and `module_dir`.
+fn module_path_string(path: &Path) -> String {
+    let display = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        display.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        display.into_owned()
+    }
+}
+
+/// Split a specifier into its filesystem path and its URL suffix
+/// (`?query`/`#fragment`).
+///
+/// Node's ESM cache identity is the resolved URL, so `./x.mjs` and
+/// `./x.mjs?v=1` are two module instances of the same file. The suffix is
+/// carried through resolution untouched and appended to the canonical module
+/// id; only the path part is decoded and resolved on disk.
+fn split_specifier_suffix(specifier: &str) -> (&str, &str) {
+    match specifier.find(['?', '#']) {
+        Some(index) => (&specifier[..index], &specifier[index..]),
+        None => (specifier, ""),
+    }
+}
+
+/// Whether a specifier is a relative path import (Node's rule: `./` or `../`;
+/// the bare `.`/`..` directory spellings are accepted by the extension loader
+/// too). A leading `.` on any other spelling (`..foo`) is a bare specifier,
+/// exactly as in Node.
+fn is_relative_specifier(name: &str) -> bool {
+    name.starts_with("./") || name.starts_with("../") || name == "." || name == ".."
+}
+
+/// Real path for containment and module identity. Never use a lexical
+/// fallback. Only keep paths we can represent losslessly in module ids.
+fn canonical_module_path(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    path.to_str()?;
+    #[cfg(windows)]
+    if !matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if matches!(
+            prefix.kind(),
+            std::path::Prefix::Disk(_)
+                | std::path::Prefix::VerbatimDisk(_)
+                | std::path::Prefix::UNC(..)
+                | std::path::Prefix::VerbatimUNC(..)
+        )
+    ) {
+        return None;
+    }
+    Some(path)
+}
+
+/// Convert a canonical path for module IDs and JS-facing fields only. Keep
+/// the original native path for containment and for filesystem access.
+pub(super) fn module_display_path(path: &Path) -> std::borrow::Cow<'_, str> {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}").into();
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_owned().into();
+        }
+    }
+    text
+}
+
+fn canonical_directory(path: &Path) -> Option<PathBuf> {
+    let path = canonical_module_path(path)?;
+    path.is_dir().then_some(path)
+}
+
+fn canonical_file(path: &Path) -> Option<PathBuf> {
+    let path = canonical_module_path(path)?;
+    path.is_file().then_some(path)
+}
+
+/// Test seam over the pure relative-resolution join (percent-decoding +
+/// lexical normalization), so the path table can be pinned without an engine.
+#[doc(hidden)]
+pub fn normalize_relative_for_test(dir: &str, specifier: &str) -> String {
+    let (path_part, _suffix) = split_specifier_suffix(specifier);
+    normalize_joined(dir, &percent_decode(path_part))
+}
+
+/// Test seam over [`split_specifier_suffix`].
+#[doc(hidden)]
+pub fn split_specifier_suffix_for_test(specifier: &str) -> (String, String) {
+    let (path, suffix) = split_specifier_suffix(specifier);
+    (path.to_string(), suffix.to_string())
+}
+
+/// Extract the encoded path (and any suffix) from a `pir-ext:` module name.
 pub fn module_name_to_path(module_name: &str) -> Option<&str> {
     module_name.strip_prefix(EXT_MODULE_PREFIX)
 }
 
-/// Directory containing an extension module (empty string for root-level).
-fn module_dir(module_name: &str) -> Option<String> {
-    let path = module_name_to_path(module_name)?;
-    match path.rfind('/') {
-        Some(idx) => Some(path[..idx].to_string()),
-        None => Some(String::new()),
-    }
+fn disk_module_path(module_name: &str) -> Option<(PathBuf, &str)> {
+    let (path, suffix) = split_specifier_suffix(module_name_to_path(module_name)?);
+    let path = PathBuf::from(percent_decode(path));
+    path.is_absolute().then_some((path, suffix))
 }
 
 /// Discover extension entry points under the given paths.
@@ -953,12 +1058,113 @@ fn resolve_subdir_entries(
     }
 }
 
+/// One module source, plus the bytecode-cache key it was produced from.
+///
+/// `key` is set for on-disk ESM modules (and seeded entry modules): it is
+/// `sha256(schema, module name, raw source)` — the raw bytes *before* SWC — so
+/// [`super::bytecode_cache`] can skip both the transpile and the QuickJS
+/// compile on a hit. Virtual shims, CJS interop wrappers and JSON wrappers
+/// carry no key (the shims have their own build-time blobs; the wrappers are
+/// tiny and only reference the real module, which is loaded elsewhere).
+#[derive(Debug, Clone)]
+pub struct CachedSource {
+    pub js: String,
+    pub key: Option<String>,
+}
+
 /// Shared module-source cache so the runtime can seed transpiled sources
 /// before importing an extension module.
-pub type SourceCache = std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>;
+pub type SourceCache = std::sync::Arc<std::sync::Mutex<HashMap<String, CachedSource>>>;
 
-/// Shared allow-list of root directories for on-disk relative imports.
+/// Shared allow-list of canonical directories for on-disk module loading.
 pub type AllowedRoots = std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>;
+
+/// Package root of a path that lives under a real `node_modules` install
+/// (`<install>/node_modules/name/...` or `<install>/node_modules/@scope/name/...`).
+///
+/// Installed packages are discovered by resource directory (for example
+/// `<pkg>/extensions`), and a directory entry only grants its own tree. The
+/// package's own helpers live next to it (`<pkg>/lib/...`), so the real
+/// package root must be granted too — otherwise every `../lib/x.ts` import
+/// fails with "outside the allowed extension roots".
+pub(super) fn installed_package_root(path: &Path) -> Option<PathBuf> {
+    let real = canonical_file(path).or_else(|| canonical_directory(path))?;
+    let node_modules = real
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    if cfg!(windows) {
+                        name.eq_ignore_ascii_case("node_modules")
+                    } else {
+                        name == "node_modules"
+                    }
+                })
+        })?;
+    let rest = real.strip_prefix(node_modules).ok()?;
+    let mut components = rest.components();
+    let first = components.next()?.as_os_str();
+    let root = if first.to_string_lossy().starts_with('@') {
+        node_modules.join(first).join(components.next()?.as_os_str())
+    } else {
+        node_modules.join(first)
+    };
+    if !root.join("package.json").is_file() {
+        return None;
+    }
+    canonical_directory(&root)
+}
+
+/// Register an existing directory by its real path, rather than retaining an
+/// alias that could later resolve to a different directory.
+pub(super) fn register_allowed_root(roots: &AllowedRoots, root: &Path) {
+    if let Some(root) = canonical_directory(root) {
+        insert_allowed_root(roots, root);
+    }
+}
+
+fn insert_allowed_root(roots: &AllowedRoots, root: PathBuf) -> bool {
+    let Ok(mut roots) = roots.lock() else {
+        return false;
+    };
+    // Keep the vector sorted (the type is shared with the host-function
+    // tables, so the representation stays a Vec): the membership check below
+    // binary-searches it, and registration is rare (once per extension path /
+    // resolved package root).
+    match roots.binary_search(&root) {
+        Ok(_) => true,
+        Err(position) => {
+            roots.insert(position, root);
+            true
+        }
+    }
+}
+
+fn is_within_allowed_roots(roots: &AllowedRoots, path: &Path) -> bool {
+    let Ok(roots) = roots.lock() else {
+        return false;
+    };
+    // Callers pass canonicalized paths and roots are canonical directories, so
+    // component-wise prefix containment (`path.starts_with(root)`) holds
+    // exactly when one of `path`'s ancestors IS a registered root. Walking the
+    // ancestors (a handful, bounded by path depth) and binary-searching the
+    // sorted roots makes every module resolution O(depth * log roots) instead
+    // of O(roots); with N extensions passed as N individual paths the old scan
+    // made loading quadratic in N.
+    path.ancestors().any(|ancestor| {
+        roots
+            .binary_search_by(|root| root.as_path().cmp(ancestor))
+            .is_ok()
+    })
+}
+
+/// Resolve a regular file and check the actual path against the pinned roots.
+pub(super) fn allowed_module_file(roots: &AllowedRoots, path: &Path) -> Option<PathBuf> {
+    let path = canonical_file(path)?;
+    is_within_allowed_roots(roots, &path).then_some(path)
+}
 
 /// QuickJS `Resolver` + `Loader` pair for the extension runtime.
 pub struct ExtensionModuleLoader {
@@ -975,99 +1181,123 @@ impl ExtensionModuleLoader {
         }
     }
 
-    fn load_source(&self, name: &str) -> Option<String> {
+    fn load_source(&self, name: &str) -> Option<CachedSource> {
         // Virtual modules (TypeBox shim, pi package shims).
         if let Some(canonical) = super::api::shims::canonical_virtual_name(name) {
-            if let Some(src) = super::api::shims::source_for(canonical) {
-                return Some(src);
+            if let Some(js) = super::api::shims::source_for(canonical) {
+                return Some(CachedSource { js, key: None });
             }
         }
+        // Check the exact file before looking at seeded or compiled sources.
+        // Probing belongs to the resolver, not to a load of an existing id.
+        let disk_path = if let Some((path, suffix)) = disk_module_path(name) {
+            let path = allowed_module_file(&self.allowed_roots, &path)?;
+            if format!("{}{suffix}", module_name_for(&path)) != name {
+                // The path no longer resolves to the id's original file.
+                return None;
+            }
+            Some(path)
+        } else if module_name_to_path(name).is_some() {
+            // Relative synthetic ids exist only for trusted, in-memory seeds.
+            // They never fall through to a filesystem lookup.
+            None
+        } else {
+            return None;
+        };
         if let Ok(cache) = self.cache.lock() {
-            if let Some(src) = cache.get(name) {
-                return Some(src.clone());
+            if let Some(source) = cache.get(name) {
+                return Some(source.clone());
             }
         }
-        // On-demand: resolve the file on disk, then dispatch on its kind.
-        if let Some(rel_path) = module_name_to_path(name) {
-            if let Some(path) = self.resolve_candidate(Path::new(rel_path)) {
-                match module_kind_and_source(&path) {
-                    (npm_resolve::ModuleKind::Json, _) => {
-                        let source = std::fs::read_to_string(&path).ok()?;
-                        return Some(json_default_wrapper(&source));
-                    }
-                    (npm_resolve::ModuleKind::Cjs, source) => {
-                        let actual = path.to_string_lossy().replace('\\', "/");
-                        // The lexer reads the file itself, except when the
-                        // classification above already did (ambiguous `.js`);
-                        // its re-export targets are always read by path.
-                        let names = match source {
-                            Some(source) => cjs_lexer::named_exports_with_source(&path, source),
-                            None => cjs_lexer::named_exports(&path),
-                        };
-                        return Some(cjs_interop_wrapper(&actual, &names));
-                    }
-                    (npm_resolve::ModuleKind::Native, _) => {
-                        // Resolver::resolve already rejects .node for bare
-                        // specifiers; a direct relative .node import still
-                        // reports the same clear error here.
-                        return Some(
-                            "throw new Error(\"native addons (.node) are not supported in this runtime\");"
+        let path = disk_path?;
+        match module_kind_and_source(&path) {
+            (npm_resolve::ModuleKind::Json, _) => {
+                let source = std::fs::read_to_string(&path).ok()?;
+                return Some(CachedSource {
+                    js: json_default_wrapper(&source),
+                    key: None,
+                });
+            }
+            (npm_resolve::ModuleKind::Cjs, source) => {
+                let actual = module_display_path(&path);
+                // The lexer reads the file itself, except when the
+                // classification above already did (ambiguous `.js`);
+                // its re-export targets are always read by path.
+                let names = match source {
+                    Some(source) => cjs_lexer::named_exports_with_source(&path, source),
+                    None => cjs_lexer::named_exports(&path),
+                };
+                return Some(CachedSource {
+                    js: cjs_interop_wrapper(&actual, &names),
+                    key: None,
+                });
+            }
+            (npm_resolve::ModuleKind::Native, _) => {
+                // Resolver::resolve already rejects .node for bare
+                // specifiers; a direct relative .node import still
+                // reports the same clear error here.
+                return Some(CachedSource {
+                            js: "throw new Error(\"native addons (.node) are not supported in this runtime\");"
                                 .to_string(),
-                        );
-                    }
-                    (npm_resolve::ModuleKind::Esm, source) => {
-                        // Same split as the CJS arm: classification's text for
-                        // an ambiguous `.js`, a read here for every other ESM
-                        // spelling.
-                        let source = match source {
-                            Some(source) => source,
-                            None => std::fs::read_to_string(&path).ok()?,
-                        };
-                        // Transpile must report the file that was actually read.
-                        let actual = path.to_string_lossy();
-                        return transpile(&actual, &source)
-                            .map_err(|e| {
-                                crate::ext_diag!("pir-ext: transpile failed for {name}: {e}")
-                            })
-                            .ok();
+                            key: None,
+                        });
+            }
+            (npm_resolve::ModuleKind::Esm, source) => {
+                // Same split as the CJS arm: classification's text for
+                // an ambiguous `.js`, a read here for every other ESM
+                // spelling.
+                let source = match source {
+                    Some(source) => source,
+                    None => std::fs::read_to_string(&path).ok()?,
+                };
+                // Compute the raw-source key and consult the persistent bytecode
+                // cache before SWC. A valid hit returns an empty `js` payload;
+                // `Loader::load` loads the precompiled module directly. On a
+                // corrupt hit it evicts and falls through to this source.
+                let key = super::bytecode_cache::enabled()
+                    .then(|| super::bytecode_cache::key(name, source.as_bytes()));
+                if let Some(key) = key.as_deref() {
+                    if let Some(_payload) = super::bytecode_cache::get(key) {
+                        // Do not retain the raw source when the cache is hit;
+                        // it is only needed if the precompiled blob is rejected.
+                        // A stale/corrupt blob falls back by rereading the file
+                        // below, preserving the best-effort cache contract.
+                        return Some(CachedSource {
+                            js: String::new(),
+                            key: Some(key.to_owned()),
+                        });
                     }
                 }
+                let source = sanitize_module_source(source);
+                // Transpile must report the file that was actually read.
+                let actual = path.to_string_lossy();
+                let js = transpile(&actual, &source)
+                    .map_err(|e| crate::ext_diag!("pir-ext: transpile failed for {name}: {e}"))
+                    .ok()?;
+                return Some(CachedSource { js, key });
             }
         }
-        None
     }
 
-    /// First loadable file among the on-disk resolution candidates: exact
-    /// path, the TS NodeNext rename (`./x.js` -> `x.ts`, `.mjs` -> `.mts`),
-    /// extensionless `+ .ts` / `+ .js`, then directory `index.ts` /
-    /// `index.js`. Every candidate passes the allowed-roots check.
-    fn resolve_candidate(&self, path: &Path) -> Option<PathBuf> {
-        candidate_paths(path)
-            .into_iter()
-            .find(|candidate| self.is_allowed_file(candidate))
-    }
-
-    /// A loadable on-disk file: it exists and stays under an allowed root.
-    ///
-    /// Both sides are anchored before the component-wise prefix test: the
-    /// roots are registered from the caller's raw paths (`runtime.load` takes
-    /// the CLI paths verbatim, so `-e ./ext` registers `./ext`) while `path`
-    /// arrives spelled inside a module name. Anchoring the pair is what makes
-    /// a relative entry usable at all — and it also covers the `pir js`
-    /// script runner, which registers a possibly-relative script directory.
-    fn is_allowed_file(&self, path: &Path) -> bool {
-        if !path.is_file() {
-            return false;
+    /// Probe an on-disk import without granting any new authority.
+    fn resolve_path(&self, target: &Path, name: &str, suffix: &str) -> JsResult<String> {
+        let mut outside = false;
+        for candidate in candidate_paths(target) {
+            if let Some(path) = canonical_file(&candidate) {
+                if is_within_allowed_roots(&self.allowed_roots, &path) {
+                    return Ok(format!("{}{suffix}", module_name_for(&path)));
+                }
+                outside = true;
+            }
         }
-        let candidate = absolute_path(path);
-        self.allowed_roots
-            .lock()
-            .map(|roots| {
-                roots
-                    .iter()
-                    .any(|root| candidate.starts_with(absolute_path(root)))
-            })
-            .unwrap_or(false)
+        Err(rquickjs::Error::new_loading_message(
+            name,
+            if outside {
+                "outside the allowed extension roots".to_string()
+            } else {
+                format!("Cannot find module '{name}'")
+            },
+        ))
     }
 }
 
@@ -1177,7 +1407,16 @@ fn candidate_paths(path: &Path) -> Vec<PathBuf> {
             js.push(".js");
             candidates.push(PathBuf::from(js));
         }
-        _ => {}
+        // A custom/legacy suffix can still be authored as TypeScript:
+        // `./page/live-value.page` -> `live-value.page.ts` (pi-browser-harness).
+        _ => {
+            let mut ts = path.as_os_str().to_owned();
+            ts.push(".ts");
+            candidates.push(PathBuf::from(ts));
+            let mut js = path.as_os_str().to_owned();
+            js.push(".js");
+            candidates.push(PathBuf::from(js));
+        }
     }
     // The directory index candidates are appended unconditionally: callers
     // probe the list lazily and stop at the first hit, so the common file case
@@ -1186,14 +1425,71 @@ fn candidate_paths(path: &Path) -> Vec<PathBuf> {
     // when `path` is a directory, so the candidate set is unchanged.
     candidates.push(path.join("index.ts"));
     candidates.push(path.join("index.js"));
+    // ESM directory imports (`import './dir/'`): Node refuses those, but the
+    // extension loader has always resolved a directory to its index; the ESM
+    // index completes the set for `.mjs` trees.
+    candidates.push(path.join("index.mjs"));
     candidates
 }
 
 /// `export default JSON.parse(<escaped text>)` wrapper for a `.json` module:
 /// the JSON text is embedded via a serde_json string literal (valid JS).
+///
+/// Top-level object keys that are valid identifiers are also exported by name:
+/// bundlers let author code write `import { version } from "../package.json"`,
+/// and real plugins rely on it (esbuild rewrites JSON imports that way).
 pub(crate) fn json_default_wrapper(source: &str) -> String {
     let literal = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".to_string());
-    format!("export default JSON.parse({literal});\n")
+    let mut out = format!(
+        "const __pir_json = JSON.parse({literal});\nexport default __pir_json;\n"
+    );
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(source) {
+        for key in map.keys() {
+            if is_js_identifier(key) {
+                let key_literal =
+                    serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
+                out.push_str(&format!(
+                    "export const {key} = __pir_json[{key_literal}];\n"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Identifier-safe JSON key (export names cannot be reserved words).
+fn is_js_identifier(key: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
+        "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
+        "function", "if", "implements", "import", "in", "instanceof", "interface", "let", "new",
+        "null", "package", "private", "protected", "public", "return", "static", "super",
+        "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
+        "yield",
+    ];
+    if RESERVED.contains(&key) {
+        return false;
+    }
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
+}
+
+/// QuickJS module sources are C strings: a raw NUL truncates the source at
+/// that byte. A JS string literal may legally contain U+0000, so escape it
+/// (`\u0000`, same value) instead of dropping the module. Only allocates when
+/// a NUL is actually present.
+pub(super) fn sanitize_module_source(source: String) -> String {
+    if source.contains('\0') {
+        source.replace('\0', "\\u0000")
+    } else {
+        source
+    }
 }
 
 /// CommonJS bridge: run the file through `globalThis.__pirCjsLoad` and expose
@@ -1401,6 +1697,60 @@ throw new Error("pir host peer stub: this package is provided by the pir host ru
     ]
 }
 
+/// A package name must contribute exactly one (or, for a scope, two)
+/// directory components to the node_modules walk. Package-private `#` names
+/// are resolved separately by npm_resolve and cannot register roots.
+fn is_bare_package_specifier(specifier: &str) -> bool {
+    if specifier.contains(['\\', ':', '\0']) {
+        return false;
+    }
+    if let Some(alias) = specifier.strip_prefix('#') {
+        return !alias.is_empty() && !alias.starts_with('/');
+    }
+    let valid_segment = |part: &str| !part.is_empty() && part != "." && part != "..";
+    let mut parts = specifier.split('/');
+    let Some(first) = parts.next().filter(|part| valid_segment(part)) else {
+        return false;
+    };
+    match first.strip_prefix('@') {
+        Some(scope) => valid_segment(scope) && parts.next().is_some_and(valid_segment),
+        None => true,
+    }
+}
+
+/// Accept package links within the real installation tree (e.g. pnpm's local
+/// store), but not links that would introduce an unrelated filesystem root.
+fn is_installed_package(resolved: &npm_resolve::Resolved, root: &Path) -> bool {
+    let components = if resolved.package_name.starts_with('@') {
+        2
+    } else {
+        1
+    };
+    let Some(install) = resolved.package_root.ancestors().nth(components) else {
+        return false;
+    };
+    let Some(parent) = install.parent().and_then(canonical_directory) else {
+        return false;
+    };
+    let Some(install) = canonical_directory(install) else {
+        return false;
+    };
+    let correct_name = install
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case("node_modules")
+            } else {
+                name == "node_modules"
+            }
+        });
+    correct_name
+        && install.parent() == Some(parent.as_path())
+        && root != install
+        && root.starts_with(install)
+}
+
 impl rquickjs::loader::Resolver for ExtensionModuleLoader {
     fn resolve<'js>(
         &mut self,
@@ -1416,86 +1766,75 @@ impl rquickjs::loader::Resolver for ExtensionModuleLoader {
             return Ok(canonical.to_string());
         }
 
-        if name.starts_with(EXT_MODULE_PREFIX) {
-            // Already-normalized extension module name.
-            return Ok(name.to_string());
-        }
-
-        if name.starts_with('.') {
-            // Relative import: resolve against the importing module's dir.
-            let dir = module_dir(base).ok_or_else(|| {
-                rquickjs::Error::new_loading_message(
-                    name,
-                    "relative import from a non-extension module",
-                )
-            })?;
-            let joined = normalize_joined(&dir, name);
-            return Ok(format!("{EXT_MODULE_PREFIX}{joined}"));
-        }
-
-        // Absolute path or `file:` URL: load the file directly, with the
-        // allowed-roots gate applied to the absolute target (upstream
-        // `import(pathToFileURL(entry).href)` — pi-subagents' host-SDK loader
-        // and child-session-factory imports).
-        if let Some(target) = path_specifier_to_local(name) {
-            let candidates = candidate_paths(&target);
-            if let Some(path) = candidates
-                .iter()
-                .find(|candidate| self.is_allowed_file(candidate))
-            {
-                return Ok(module_name_for(path));
+        let error = |message: &str| rquickjs::Error::new_loading_message(name, message);
+        if module_name_to_path(name).is_some() {
+            if let Some((target, suffix)) = disk_module_path(name) {
+                return self.resolve_path(&target, name, suffix);
             }
-            let exists = candidates.iter().find(|candidate| candidate.is_file());
-            return Err(rquickjs::Error::new_loading_message(
-                name,
-                match exists {
-                    // The reason leads and the name is left to the engine's
-                    // own `Error loading module '<name>'` wrapper: long load
-                    // messages are truncated.
-                    Some(path) => {
-                        format!("outside the allowed extension roots ({})", path.display())
-                    }
-                    None => format!("cannot find module '{name}'"),
-                },
-            ));
+            // Synthetic names are valid only for explicitly seeded sources.
+            return self
+                .cache
+                .lock()
+                .is_ok_and(|cache| cache.contains_key(name))
+                .then(|| name.to_string())
+                .ok_or_else(|| error("module source not found"));
         }
 
-        // `node:` outside the shimmed table keeps the original rejection.
-        if name.starts_with("node:") {
-            return Err(rquickjs::Error::new_loading_message(
-                name,
-                "cannot resolve module (only relative imports and known pi packages are supported)",
-            ));
+        // `#alias` is a package import, not an empty path plus a fragment.
+        let (path_part, suffix) = if let Some(alias) = name.strip_prefix('#') {
+            let (alias, suffix) = split_specifier_suffix(alias);
+            (&name[..alias.len() + 1], suffix)
+        } else {
+            split_specifier_suffix(name)
+        };
+        let importer = disk_module_path(base).map(|(path, _)| path);
+        let dir = importer.as_deref().and_then(Path::parent);
+
+        if is_relative_specifier(path_part) {
+            let dir = dir.ok_or_else(|| error("relative import from a non-file module"))?;
+            // Dot segments in relative specifiers have URL semantics. The
+            // resulting candidate still must pass real-path containment.
+            let target = normalize_lexically(&dir.join(percent_decode(path_part)));
+            return self.resolve_path(&target, name, suffix);
         }
 
-        // Bare specifier: npm-style resolution from the importing module's
-        // directory. The package root joins the allowed-roots list so the
-        // resolved file (and its siblings) pass the on-disk load check.
-        let dir = module_dir(base).ok_or_else(|| {
-            rquickjs::Error::new_loading_message(
-                name,
-                "bare import from a module without a directory",
-            )
-        })?;
-        match npm_resolve::resolve_bare_searching(
-            Path::new(&dir),
+        if let Some(target) = path_specifier_to_local(path_part).filter(|path| path.has_root()) {
+            return self.resolve_path(&target, name, suffix);
+        }
+        if path_part.starts_with("node:") {
+            return Err(error("cannot resolve unsupported node builtin"));
+        }
+
+        let dir = dir.ok_or_else(|| error("bare import from a module without a file path"))?;
+        if !is_bare_package_specifier(path_part) {
+            return Err(error("invalid bare package specifier"));
+        }
+        let resolved = npm_resolve::resolve_bare_searching(
+            dir,
             &bare_search_roots(),
-            name,
+            path_part,
             npm_resolve::ResolveMode::Esm,
-        ) {
-            Ok(resolved) => {
-                if let Ok(mut roots) = self.allowed_roots.lock() {
-                    if !roots.contains(&resolved.package_root) {
-                        roots.push(resolved.package_root.clone());
-                    }
-                }
-                Ok(module_name_for(&resolved.path))
-            }
-            Err(error) => Err(rquickjs::Error::new_loading_message(
-                name,
-                error.to_string(),
-            )),
+        )
+        .map_err(|err| rquickjs::Error::new_loading_message(name, err.to_string()))?;
+        let path = canonical_file(&resolved.path)
+            .ok_or_else(|| error("could not resolve the real package file"))?;
+        let root = canonical_directory(&resolved.package_root)
+            .ok_or_else(|| error("could not resolve the real package root"))?;
+        if !path.starts_with(&root) {
+            return Err(error("outside the resolved npm package root"));
         }
+        if !is_within_allowed_roots(&self.allowed_roots, &path) {
+            // Package-private aliases cannot grant roots. A bare package may
+            // grant its root only under the real node_modules installation
+            // directory, never an externally linked filesystem tree.
+            if path_part.starts_with('#') || !is_installed_package(&resolved, &root) {
+                return Err(error("outside the allowed extension roots"));
+            }
+            if !insert_allowed_root(&self.allowed_roots, root) {
+                return Err(error("could not register the resolved npm package root"));
+            }
+        }
+        Ok(format!("{}{suffix}", module_name_for(&path)))
     }
 }
 
@@ -1506,32 +1845,157 @@ impl rquickjs::loader::Loader for ExtensionModuleLoader {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> JsResult<Module<'js, rquickjs::module::Declared>> {
+        // Virtual shims with an ahead-of-time compiled blob skip QuickJS's
+        // parse/compile entirely; the guard header was validated when the
+        // payload was extracted.
+        if let Some(payload) = super::api::shims::bytecode_for(name) {
+            let module = load_precompiled(ctx, name, payload)?;
+            attach_module_meta(&module, name)?;
+            return Ok(module);
+        }
         let source = self
             .load_source(name)
             .ok_or_else(|| rquickjs::Error::new_loading_message(name, "module source not found"))?;
-        let module = Module::declare(ctx.clone(), name, source)?;
+        // On-disk ESM: a valid cached blob skips QuickJS parse/compile and
+        // the SWC work was skipped before `load_source` returned. A refusal
+        // from `Module::load` (engine upgrade, corrupt/partial blob) evicts
+        // the blob, clears QuickJS's pending exception, then retries the
+        // normal source path.
+        if let Some(key) = source.key.as_deref() {
+            if let Some(payload) = super::bytecode_cache::get(key) {
+                match load_precompiled(ctx, name, &payload) {
+                    Ok(module) => {
+                        attach_module_meta(&module, name)?;
+                        return Ok(module);
+                    }
+                    Err(_) => {
+                        super::bytecode_cache::evict(key);
+                        if ctx.has_exception() {
+                            let _ = ctx.catch();
+                        }
+                    }
+                }
+            }
+        }
+        let js = if source.js.is_empty() {
+            // The cache-hit record intentionally does not retain a second copy
+            // of the raw source. If the blob is rejected, reread the file and
+            // transpile it as the best-effort fallback.
+            let path = disk_module_path(name)
+                .map(|(path, _)| path)
+                .ok_or_else(|| rquickjs::Error::new_loading_message(name, "module source path unavailable"))?;
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?;
+            let sanitized = sanitize_module_source(raw);
+            let actual = path.to_string_lossy();
+            transpile(&actual, &sanitized)
+                .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?
+        } else {
+            source.js
+        };
+        let module = Module::declare(ctx.clone(), name, js)?;
+        // Compile once, then persist for the next start (best-effort: a
+        // read-only cache dir never fails a load).
+        if let Some(key) = source.key.as_deref() {
+            if let Ok(bytes) = module.write(rquickjs::WriteOptions {
+                endianness: rquickjs::WriteOptionsEndianness::Native,
+                // NOT `strip_debug`: that also drops the function filename,
+                // and QuickJS then rejects dynamic `import()` at run time with
+                // "no function filename for import()". The AOT generator keeps
+                // debug info for exactly this reason (see `pir_gen_bytecode`).
+                strip_debug: false,
+                // NOT `strip_source` either: extension code is user code, and
+                // a stripped blob makes `Function.prototype.toString()` (and
+                // therefore `util.format("%s", fn)`, `String(fn)`, source
+                // reflection in tooling) answer "[native code]". The embedded
+                // shims are ours and stay stripped.
+                strip_source: false,
+                ..Default::default()
+            }) {
+                super::bytecode_cache::put(key, &bytes);
+            }
+        }
         // QuickJS leaves `import.meta.url` unset for loader-declared modules;
         // populate the Node-shaped fields so extensions can compute sibling
         // paths via `new URL(rel, import.meta.url)` (pi-subagents pattern).
-        if let Some(path) = module_name_to_path(name).filter(|path| !path.is_empty()) {
-            let meta = module.meta()?;
-            meta.set("url", module_file_url(path))?;
-            meta.set("filename", path.to_string())?;
-            meta.set("dirname", module_dirname(path))?;
-        }
+        attach_module_meta(&module, name)?;
         Ok(module)
+    }
+}
+
+/// `Module::load` on a validated AOT blob.
+#[allow(unsafe_code)]
+fn load_precompiled<'js>(
+    ctx: &Ctx<'js>,
+    name: &str,
+    payload: &[u8],
+) -> JsResult<Module<'js, rquickjs::module::Declared>> {
+    // SAFETY: `payload` comes from [`super::api::bytecode::payload`], which
+    // checks the magic, format version and payload length of a blob generated
+    // by `pir-gen-bytecode` against the same QuickJS build.
+    unsafe { Module::load(ctx.clone(), payload) }
+        .map_err(|e| rquickjs::Error::new_loading_message(name, e.to_string()))
+}
+
+/// Populate the Node-shaped `import.meta` fields QuickJS leaves unset for
+/// loader-declared modules so extensions can compute sibling paths via
+/// `new URL(rel, import.meta.url)` (pi-subagents pattern).
+fn attach_module_meta(module: &Module<'_, rquickjs::module::Declared>, name: &str) -> JsResult<()> {
+    // Disk-backed modules use their canonical absolute path; the `?`/`#`
+    // suffix (if any) belongs to the URL, not to the native filename/dirname.
+    // Seeded/virtual `pir-ext:` modules (e.g. the `pir-ext:meta.ts` test
+    // fixtures and script entry modules) carry a relative or synthetic path,
+    // which must still get a `file:` URL: `createRequire(import.meta.url)` and
+    // `new URL(rel, import.meta.url)` in the Node shims depend on it. Before
+    // the bytecode-cache work this was an unconditional `module_name_to_path`
+    // check; keep that behaviour for non-disk names so those shims keep
+    // resolving their siblings.
+    let (url, filename, dirname) = if let Some((path, suffix)) = disk_module_path(name) {
+        let file_path = module_path_string(&path);
+        (
+            format!("{}{suffix}", module_file_url(&file_path)),
+            native_path_string(&path),
+            path.parent().map(native_path_string),
+        )
+    } else if let Some(raw) = module_name_to_path(name).filter(|p| !p.is_empty()) {
+        let (path_part, suffix) = split_specifier_suffix(raw);
+        let decoded = percent_decode(path_part);
+        let file = PathBuf::from(&decoded);
+        (
+            format!("{}{suffix}", module_file_url(&decoded)),
+            native_path_string(&file),
+            file.parent().map(native_path_string),
+        )
+    } else {
+        return Ok(());
+    };
+    let meta = module.meta()?;
+    meta.set("url", url)?;
+    meta.set("filename", filename)?;
+    if let Some(dir) = dirname {
+        meta.set("dirname", dir)?;
+    }
+    Ok(())
+}
+
+/// Native-separator spelling for Node's `import.meta.filename` and `dirname`.
+fn native_path_string(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.into_owned()
     }
 }
 
 /// `file://` URL of a disk-backed module path: forward slashes, a leading
 /// slash before drive letters, and minimal percent-encoding per UTF-8 byte.
 fn module_file_url(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
     let mut out = String::from("file://");
-    if !normalized.starts_with('/') {
+    if !path.starts_with('/') {
         out.push('/');
     }
-    for byte in normalized.bytes() {
+    for byte in path.bytes() {
         let keep =
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':');
         if keep {
@@ -1541,14 +2005,6 @@ fn module_file_url(path: &str) -> String {
         }
     }
     out
-}
-
-/// Directory part of a module path (empty for a bare file name).
-fn module_dirname(path: &str) -> String {
-    match path.rfind('/') {
-        Some(index) => path[..index].to_string(),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]

@@ -338,7 +338,7 @@ pub use super::codemode::{namespace_matches, script_reach, CODEMODE_TOOL_NAME};
 pub(crate) mod python;
 
 #[cfg(feature = "python")]
-pub(crate) mod python_vm;
+pub mod js_vm;
 
 #[cfg(feature = "context-mode")]
 pub(crate) mod context_mode;
@@ -412,6 +412,8 @@ fn new_memory_plugin() -> Arc<dyn AgentPlugin> {
 /// layer).
 #[cfg(feature = "python")]
 pub use python::{PythonPlugin, PythonTool, MAX_OUTPUT_CHARS, PYTHON_TOOL_NAME};
+#[cfg(feature = "python")]
+pub use js_vm::{ExecOutcome, PythonJob, PythonSession};
 
 #[cfg(feature = "python")]
 fn new_python_plugin() -> Arc<dyn AgentPlugin> {

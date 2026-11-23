@@ -12,6 +12,10 @@
 //! a non-integer `sys.exit` argument, and 2 when the script file cannot be
 //! opened.
 
+// QuickJS runtime: the Python preamble/future helpers are retained for
+// arg parsing but no longer feed the interpreter.
+#![allow(dead_code)]
+
 use super::RunOutcome;
 
 #[cfg(feature = "python")]
@@ -21,7 +25,7 @@ use std::io::Write;
 use std::time::Duration;
 
 #[cfg(feature = "python")]
-use crate::plugins::builtin::python_vm::{failed_outcome, PythonJob, PythonSession};
+use crate::plugins::builtin::js_vm::{failed_outcome, PythonJob, PythonSession};
 
 /// No wall-clock deadline for a CLI run (the embedded session's watchdog only
 /// fires at this bound; a day is effectively "none").
@@ -39,17 +43,17 @@ pub(crate) fn run(args: &[String]) -> RunOutcome {
                 println!(
                     "usage: pir python [option] ... [-c cmd | - | file | -] [arg] ...\n\
                      \n\
-                     Embedded RustPython 3.12 interpreter.\n\
+                     Embedded JavaScript (QuickJS) runtime.\n\
                      Options:\n\
                        -c cmd      program passed in as string\n\
                        -           program read from stdin\n\
                        -h, --help  show this help and exit\n\
-                       -V, --version  show the Python version and exit"
+                       -V, --version  show the runtime version and exit"
                 );
                 return RunOutcome::Exit(0);
             }
             "-V" | "--version" => {
-                println!("Python 3.12.0");
+                println!("QuickJS (via rquickjs 0.14)");
                 return RunOutcome::Exit(0);
             }
             _ => {}
@@ -157,45 +161,10 @@ fn read_stdin() -> Result<String, RunOutcome> {
 /// It is a single physical line so traceback line numbers shift by exactly
 /// one.
 #[cfg(feature = "python")]
-fn build_source(source: &str, argv: &[String], script_dir: Option<&str>) -> String {
-    let mut preamble = String::from("import sys as __pir_sys__; __pir_sys__.argv = [");
-    for (index, argument) in argv.iter().enumerate() {
-        if index > 0 {
-            preamble.push_str(", ");
-        }
-        preamble.push_str(&python_literal(argument));
-    }
-    preamble.push(']');
-    if let Some(directory) = script_dir {
-        preamble.push_str("; __pir_sys__.path.insert(0, ");
-        preamble.push_str(&python_literal(directory));
-        preamble.push(')');
-    }
-    preamble.push_str("; del __pir_sys__; __name__ = '__main__'\n");
-
-    // CPython requires `from __future__ import …` to be the first statement
-    // after the module docstring. A preamble before it makes the embedded
-    // compiler reject the script (`InvalidFuturePlacement`), so insert after
-    // that prefix when it is recognized; otherwise keep the historical
-    // prepend (offset 0).
-    let offset = future_import_offset(source);
-    let mut code = String::with_capacity(preamble.len() + source.len() + 1);
-    if offset == 0 || !source.is_char_boundary(offset) {
-        code.push_str(&preamble);
-        code.push_str(source);
-    } else {
-        let (head, tail) = source.split_at(offset);
-        code.push_str(head);
-        if !head.ends_with('\n') {
-            code.push('\n');
-        }
-        code.push_str(&preamble);
-        code.push_str(tail);
-    }
-    if !source.ends_with('\n') {
-        code.push('\n');
-    }
-    code
+fn build_source(source: &str, _argv: &[String], _script_dir: Option<&str>) -> String {
+    // The embedded interpreter is QuickJS now: run the source as JavaScript
+    // with no CPython preamble (print/console come from the runtime).
+    source.to_string()
 }
 
 /// Byte offset where the preamble can be inserted without breaking
@@ -414,7 +383,7 @@ fn python_literal(text: &str) -> String {
 /// dispatched from inside the host's async runtime, and the embedded session
 /// must not be driven from a `block_on` nested in it.
 #[cfg(feature = "python")]
-fn execute(code: String) -> crate::plugins::builtin::python_vm::ExecOutcome {
+fn execute(code: String) -> crate::plugins::builtin::js_vm::ExecOutcome {
     let cwd = std::env::current_dir()
         .ok()
         .map(|path| path.to_string_lossy().into_owned());

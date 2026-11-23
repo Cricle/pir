@@ -69,16 +69,15 @@ static NEXT_EXT_ID_BASE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 #[cfg(feature = "extensions")]
 const EXT_ID_RANGE: u64 = 1 << 20;
 
-/// Stable per-runtime generation key for the fs descriptor table.
+/// Stable per-runtime generation key for the generation-scoped host tables.
 ///
 /// `allowed_roots` is allocated once per [`ExtensionRuntime`] and kept alive
 /// by that runtime, so its address identifies the runtime while any of its
-/// descriptors can still exist. A reload can defer the old runtime's `Drop`
-/// (in-flight command tasks hold `Rc`s), and that `Drop` must release only
-/// the descriptors its own generation opened — see
-/// [`state::FdTable::clear_generation`]. Address reuse after a runtime is
-/// gone is safe: its own `Drop` already removed every entry tagged with the
-/// key.
+/// child processes / workers / fetches / watchers can still exist. A reload
+/// can defer the old runtime's `Drop` (in-flight command tasks hold `Rc`s),
+/// and that `Drop` must release only the resources its own generation
+/// created. Address reuse after a runtime is gone is safe: its own `Drop`
+/// already released every entry tagged with the key.
 #[cfg(feature = "extensions")]
 fn fd_generation(allowed_roots: &Arc<StdMutex<Vec<PathBuf>>>) -> u64 {
     Arc::as_ptr(allowed_roots) as usize as u64
@@ -168,6 +167,70 @@ impl std::future::Future for ParkOneWake {
             std::task::Poll::Pending
         }
     }
+}
+
+/// Evaluate a shim from precompiled QuickJS bytecode when available, falling
+/// back to source evaluation. The bytecode path skips QuickJS's parse/compile of
+/// the (large) prelude and the assembled boot bundles on every runtime
+/// construction. Any invalid/stale blob degrades to the known-good source path.
+///
+/// `source` is a thunk so the (large) bundle text is never assembled when the
+/// AOT blob is usable.
+#[allow(unsafe_code)]
+fn eval_shim_precompiled(
+    ctx: &rquickjs::Ctx<'_>,
+    name: &str,
+    mut source: impl FnMut() -> String,
+) -> rquickjs::Result<()> {
+    use rquickjs::Module;
+    let blob = if super::super::api::shims::bytecode_enabled() {
+        super::super::api::bytecode::bytecode_for(name)
+    } else {
+        None
+    };
+    if let Some(blob) = blob {
+        if let Some(payload) = super::super::api::bytecode::payload(blob) {
+            // SAFETY: the blob is a compile-time `include_bytes!` of a trusted
+            // generator; the guard header is validated above.
+            let result = (|| -> rquickjs::Result<()> {
+                let module = unsafe { Module::load(ctx.clone(), payload)? };
+                let (_, promise) = module.eval()?;
+                // `finish` drives the job queue synchronously; shims have no
+                // top-level await.
+                promise.finish::<()>()?;
+                Ok(())
+            })();
+            if result.is_ok() {
+                super::super::api::bytecode::note_aot_load();
+                return Ok(());
+            }
+            // A stale/incompatible blob: clear any pending exception and fall
+            // through to source evaluation.
+            if ctx.has_exception() {
+                let _ = ctx.catch();
+            }
+        }
+    }
+    // Source fallback: evaluate in the SAME module context as the AOT path.
+    // `ctx.eval` compiles a script, and a dynamic `import()` executed from a
+    // script has no function filename, so the two modes would otherwise
+    // diverge ("no function filename for import()"). Mirror the generator's
+    // declare strategy: raw module first, then a neutral-export wrapper.
+    let module = match Module::declare(ctx.clone(), name, source()) {
+        Ok(module) => Ok(module),
+        Err(_) => {
+            if ctx.has_exception() {
+                let _ = ctx.catch();
+            }
+            let wrapped = format!("{}\n;export default undefined;\n", source());
+            Module::declare(ctx.clone(), name, wrapped)
+        }
+    }
+    .map_err(|e| rquickjs::Error::new_loading_message(name, e.to_string()))?;
+    let (_, promise) = module.eval()?;
+    promise
+        .finish::<()>()
+        .map_err(|e| rquickjs::Error::new_loading_message(name, e.to_string()))
 }
 
 impl ExtensionRuntime {
@@ -321,7 +384,7 @@ impl ExtensionRuntime {
         // deliberately ignored — a repository must not loosen the host's own
         // engine limits). See `crate::extensions::limits`.
         let limits = ExtensionLimits::resolve(config.limits.clone());
-        let rt = AsyncRuntime::new()?;
+        let rt = qjs_alloc::new_runtime()?;
         // The default 1 MiB QuickJS stack RangeErrors far too early for real
         // workloads (acorn's recursive-descent parser over large sources,
         // deep JSON trees — the same motivation that gave workers 32 MiB).
@@ -454,24 +517,36 @@ impl ExtensionRuntime {
         ctx.async_with(async |ctx| {
             register_host_functions(&ctx, &state, &allowed_roots, generation)?;
             // Node-compat globals (`__pirPlatform`, `process`) must exist
-            // before any extension module body runs.
-            ctx.eval::<(), _>(crate::extensions::api::node_shims::globals_source())
+            // before any extension module body runs. The platform/arch values
+            // are the only dynamic part: install them as JSON literals, then
+            // run the (fully static, AOT-compiled) globals bundle.
+            ctx.eval::<(), _>(crate::extensions::api::node_shims::globals_constants_source())
                 .map_err(|e| {
                     rquickjs::Error::new_loading_message("pir-node-globals", e.to_string())
                 })?;
+            eval_shim_precompiled(
+                &ctx,
+                crate::extensions::api::node_shims::GLOBALS_BUNDLE,
+                crate::extensions::api::node_shims::globals_bundle_source,
+            )
+            .map_err(|e| {
+                rquickjs::Error::new_loading_message("pir-node-globals", e.to_string())
+            })?;
             // The prelude is embedded deflated: inflate (once per process,
-            // cached) here, at extension-host boot.
+            // cached) only on the source fallback; the AOT path skips it.
             if std::env::var_os("PIR_EXT_SKIP_PRELUDE").is_none() {
-                ctx.eval::<(), _>(HOST_PRELUDE.source()).map_err(|e| {
-                    rquickjs::Error::new_loading_message(HOST_PRELUDE_MODULE, e.to_string())
+                eval_shim_precompiled(&ctx, HOST_PRELUDE.name(), || {
+                    HOST_PRELUDE.source().to_owned()
                 })?;
             }
             // Pre-import every shimmed builtin into `__pirNodeModules` so the
             // synchronous CJS `require("path")` works without awaiting; the
             // dynamic import promise is awaited here (one boot-time sweep).
             if std::env::var_os("PIR_EXT_SKIP_NODE_BUILTINS").is_none() {
-                ctx.eval::<(), _>(
-                    crate::extensions::api::node_shims::node_modules_bootstrap_source(),
+                eval_shim_precompiled(
+                    &ctx,
+                    crate::extensions::api::node_shims::NODE_MODULES_BOOTSTRAP_BUNDLE,
+                    crate::extensions::api::node_shims::node_modules_bootstrap_source,
                 )
                 .map_err(|e| {
                     rquickjs::Error::new_loading_message("pir-node-builtins", e.to_string())
@@ -503,9 +578,7 @@ impl ExtensionRuntime {
                 &crate::coding_agent::context::agent_dir(),
             ) {
                 Ok(root) => {
-                    if let Ok(mut roots) = allowed_roots.lock() {
-                        roots.push(root.clone());
-                    }
+                    super::loader::register_allowed_root(&allowed_roots, &root);
                     let root_text = root.display().to_string();
                     let executable = std::env::current_exe()
                         .ok()
@@ -539,10 +612,10 @@ impl ExtensionRuntime {
             state.hook_timeout = state.limits.hook_timeout;
             state.memory_pressure_warned = false;
             state.memory_pressure_last_sample = None;
-            // No table-wide generation to claim: each descriptor carries the
-            // opening runtime's own key (see `state::FdTable`), passed to the
-            // host functions above, so a predecessor's deferred `Drop` can
-            // never close the successor's descriptors and vice versa.
+            // The generation key is this runtime's identity for the
+            // process-wide host tables (workers, children, fetches, watchers,
+            // sqlite handles): a predecessor's deferred `Drop` can only
+            // release resources tagged with its own key.
         }
 
         // `PI_TIMING=1`: the engine's own allocator view of the booted
@@ -597,7 +670,16 @@ impl ExtensionRuntime {
         self.cache
             .lock()
             .map_err(|_| "cache poisoned".to_string())?
-            .insert(module_name.to_string(), js);
+            .insert(
+                module_name.to_string(),
+                super::loader::CachedSource {
+                    js,
+                    key: Some(crate::extensions::bytecode_cache::key(
+                        module_name,
+                        ts_source.as_bytes(),
+                    )),
+                },
+            );
         Ok(())
     }
 
@@ -609,8 +691,33 @@ impl ExtensionRuntime {
         self.cache
             .lock()
             .map_err(|_| "cache poisoned".to_string())?
-            .insert(module_name.to_string(), js_source.to_string());
+            .insert(
+                module_name.to_string(),
+                super::loader::CachedSource {
+                    js: js_source.to_string(),
+                    // The raw pre-transpile source is not available here, so
+                    // there is no bytecode-cache key; `Module::declare` runs
+                    // once, exactly as before.
+                    key: None,
+                },
+            );
         Ok(())
+    }
+
+    /// Drop this runtime's Rust-side module seed for `module_name`.
+    ///
+    /// A seed exists only to feed [`ExtensionModuleLoader`] while the module is
+    /// declared/imported (or to make a transpile failure surface as a load
+    /// error). Once QuickJS holds the module record — or the load attempt is
+    /// over — the Rust copy is dead weight, up to the entry's own size (the
+    /// largest measured entry is ~1 MB), pinned for the runtime's lifetime.
+    /// Removing it never changes what executes: a later import of the same
+    /// name resolves through QuickJS's module cache, and a later `load()`
+    /// re-reads and re-seeds the file.
+    fn discard_seeded_source(&self, module_name: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(module_name);
+        }
     }
 
     /// Load an already-seeded module by name (test hook). Returns 1 on
@@ -712,6 +819,11 @@ impl ExtensionRuntime {
             })
             .await
             .map_err(|error| anyhow::anyhow!("script execution failed: {error}"))?;
+        // QuickJS now holds the entry module record, so the Rust-side seed
+        // installed by `seed_module_js` (the whole transpiled script text) is
+        // dead weight for the rest of the process — the same post-import
+        // release `load()` performs for an extension entry.
+        self.discard_seeded_source(module_name);
         let parsed: JsonValue = serde_json::from_str(&payload)
             .map_err(|error| anyhow::anyhow!("script outcome parse failed: {error}"))?;
         if parsed
@@ -815,11 +927,14 @@ impl ExtensionRuntime {
         Ok(code.trim().parse::<i32>().unwrap_or(0))
     }
 
-    /// Allow on-disk module loading below the given root directory.
+    /// Allow on-disk module loading below an existing directory's real path.
     pub fn allow_root(&self, root: PathBuf) {
-        if let Ok(mut roots) = self.allowed_roots.lock() {
-            roots.push(root);
-        }
+        super::loader::register_allowed_root(&self.allowed_roots, &root);
+    }
+
+    /// Check the exact entry file before reading or seeding its source.
+    pub fn allowed_entry_path(&self, path: &Path) -> Option<PathBuf> {
+        super::loader::allowed_module_file(&self.allowed_roots, path)
     }
 
     /// Load extensions from the given paths (files or directories).
@@ -834,6 +949,12 @@ impl ExtensionRuntime {
                 path.clone()
             };
             self.allow_root(root);
+            // A package resource can be a directory (`<pkg>/extensions`); also
+            // grant the installed package root so relative imports of the
+            // package's shared helpers outside that directory resolve.
+            if let Some(package_root) = super::loader::installed_package_root(path) {
+                self.allow_root(package_root);
+            }
         }
 
         let discovery = discover_extensions(paths);
@@ -842,7 +963,22 @@ impl ExtensionRuntime {
             errors: discovery.errors,
         };
 
-        'ext: for ext in &discovery.extensions {
+        let mut seen_entries = std::collections::BTreeSet::new();
+        'ext: for ext in discovery.extensions {
+            let Some(entry_path) = self.allowed_entry_path(&ext.path) else {
+                result.errors.push(ExtensionLoadError {
+                    path: ext.path,
+                    error: "entry is outside the allowed extension roots or not a real file".into(),
+                });
+                continue;
+            };
+            if !seen_entries.insert(entry_path.clone()) {
+                continue;
+            }
+            let ext = LoadedExtension {
+                module_name: super::loader::module_name_for(&entry_path),
+                path: entry_path,
+            };
             // Seed the entry module cache with a transpile up front so load
             // errors surface as `LoadResult.errors` rather than side-channel
             // logs. A CommonJS or JSON entry gets the same wrapper the loader
@@ -859,9 +995,21 @@ impl ExtensionRuntime {
             // spelling keeps the single seed read it always did.
             let (kind, classified) = super::loader::module_kind_and_source(&ext.path);
             if let Some(source) = classified.or_else(|| std::fs::read_to_string(&ext.path).ok()) {
+                // ESM entries key the bytecode cache on their raw bytes, the
+                // same key the loader computes for relative imports; the
+                // transpile below is only the cache-miss path.
+                let cache_key = matches!(
+                    kind,
+                    crate::extensions::loader::npm_resolve::ModuleKind::Esm
+                )
+                .then(|| {
+                    crate::extensions::bytecode_cache::enabled()
+                        .then(|| crate::extensions::bytecode_cache::key(&ext.module_name, source.as_bytes()))
+                })
+                .flatten();
                 let transpiled = match kind {
                     crate::extensions::loader::npm_resolve::ModuleKind::Cjs => {
-                        let actual = ext.path.to_string_lossy().replace('\\', "/");
+                        let actual = super::loader::module_display_path(&ext.path);
                         // The text in hand is the file's content (from the
                         // classification read or the seed read just above), so
                         // the lexer scans it directly; its re-export targets
@@ -874,7 +1022,10 @@ impl ExtensionRuntime {
                     crate::extensions::loader::npm_resolve::ModuleKind::Json => {
                         Ok(super::loader::json_default_wrapper(&source))
                     }
-                    _ => super::transpile::transpile(&ext.module_name, &source),
+                    _ => super::transpile::transpile(
+                        &ext.module_name,
+                        &super::loader::sanitize_module_source(source),
+                    ),
                 };
                 match transpiled {
                     Ok(js) => {
@@ -895,7 +1046,13 @@ impl ExtensionRuntime {
                             }
                         }
                         if let Ok(mut cache) = self.cache.lock() {
-                            cache.insert(ext.module_name.clone(), js);
+                            cache.insert(
+                                ext.module_name.clone(),
+                                super::loader::CachedSource {
+                                    js,
+                                    key: cache_key,
+                                },
+                            );
                         }
                     }
                     Err(e) => {
@@ -916,15 +1073,32 @@ impl ExtensionRuntime {
             lock_state(&self.state)
                 .ext_identities
                 .insert(ext_id, sanitized_extension_identity(&ext.path));
-            let payload = self
+            let payload = match self
                 .load_payload(
                     "__pir_loadExtension",
                     ext_id.to_string(),
                     ext.module_name.clone(),
-                    ext.path.display().to_string(),
+                    super::loader::module_display_path(&ext.path).to_string(),
                 )
-                .await?;
-            let parsed: JsonValue = serde_json::from_str(&payload)?;
+                .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    // The seed only feeds the loader for this attempt. Do not
+                    // keep the entry's source (the largest entries measure
+                    // ~1 MB) resident for the runtime's lifetime because the
+                    // load failed.
+                    self.discard_seeded_source(&ext.module_name);
+                    return Err(error);
+                }
+            };
+            let parsed: JsonValue = match serde_json::from_str(&payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.discard_seeded_source(&ext.module_name);
+                    return Err(error.into());
+                }
+            };
             if parsed
                 .get("ok")
                 .and_then(JsonValue::as_bool)
@@ -935,9 +1109,7 @@ impl ExtensionRuntime {
                 // loader; QuickJS caches the module record from here on, so
                 // keeping the Rust-side copy only costs memory (the largest
                 // entry measured ~1 MB). A reload re-seeds its own runtime.
-                if let Ok(mut cache) = self.cache.lock() {
-                    cache.remove(&ext.module_name);
-                }
+                self.discard_seeded_source(&ext.module_name);
             } else {
                 let error = parsed
                     .get("error")
@@ -948,6 +1120,9 @@ impl ExtensionRuntime {
                     path: ext.path.clone(),
                     error,
                 });
+                // The module never became usable, but its seed is no longer
+                // needed: a later load re-reads and re-seeds the file.
+                self.discard_seeded_source(&ext.module_name);
             }
         }
 
@@ -1162,9 +1337,9 @@ impl Drop for ExtensionRuntime {
 }
 
 impl ExtensionRuntime {
-    /// Release every resource this generation owns: its fs descriptors and the
-    /// process-level host tables (child processes, worker threads, in-flight
-    /// fetches, HTTP servers, net sockets and `fs.watch` threads).
+    /// Release every resource this generation owns: the process-level host
+    /// tables (child processes, worker threads, in-flight fetches, HTTP
+    /// servers, net sockets and `fs.watch` threads).
     ///
     /// Idempotent and generation-scoped: called from [`Drop`] and explicitly
     /// by the actor immediately before `Shutdown`, because in-flight command
@@ -1173,9 +1348,6 @@ impl ExtensionRuntime {
     /// `Drop`), so a late successor can never be released by mistake.
     pub(crate) fn release_host_resources(&self) {
         super::host_functions::release_host_generation(self.generation);
-        lock_state(&self.state)
-            .fd_table
-            .clear_generation(self.generation);
     }
 }
 

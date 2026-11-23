@@ -1,50 +1,203 @@
-// node:test/reporters — throws tier. The reporter classes drive the test
-// runner's event stream, which this runtime cannot host (see node:test);
-// each reporter exists for link compatibility and throws the unified error
-// on construction.
-function reportersUnsupported(api) {
-  const error = new Error("node:test/reporters." + api + " is not supported by the pir extension runtime (no test-runner host)");
-  error.code = "ERR_NOT_SUPPORTED";
-  return error;
+// node:test/reporters — reporter surfaces for the in-process runner.
+//
+// Node's reporters are transforms over the runner's event stream
+// (`test:start`, `test:pass`, `test:fail`, `test:plan`, `test:diagnostic`,
+// `test:stdout`, ...). The pir runner writes TAP directly, but consumers still
+// import the reporter factories: `tap`/`dot`/`junit` are async-generator
+// functions and `spec`/`lcov` are classes wrapped by constructor functions
+// (lib/test/reporters.js). This shim keeps those call shapes and implements
+// the TAP reporter for real, so `stream.compose(tap)` style consumption works
+// for any event source the runtime hands it.
+
+function tapEscape(input) {
+  let result = String(input);
+  result = result.split("\b").join("\\b");
+  result = result.split("\f").join("\\f");
+  result = result.split("\t").join("\\t");
+  result = result.split("\n").join("\\n");
+  result = result.split("\r").join("\\r");
+  result = result.split("\v").join("\\v");
+  result = result.split("\\").join("\\\\");
+  result = result.split("#").join("\\#");
+  return result;
 }
 
+function indentOf(nesting) {
+  let out = "";
+  const depth = typeof nesting === "number" && nesting > 0 ? nesting : 0;
+  for (let i = 0; i < depth; i++) out += "    ";
+  return out;
+}
+
+function testLine(data, status) {
+  let line = indentOf(data.nesting) + status + " " + data.testNumber;
+  if (data.name) line += " - " + tapEscape(data.name);
+  if (data.skip !== undefined) {
+    line += " # SKIP" + (typeof data.skip === "string" && data.skip.length ?
+      " " + tapEscape(data.skip) : "");
+  } else if (data.todo !== undefined) {
+    line += " # TODO" + (typeof data.todo === "string" && data.todo.length ?
+      " " + tapEscape(data.todo) : "");
+  }
+  return line + "\n";
+}
+
+function details(nesting, data) {
+  const indent = indentOf(nesting);
+  const info = data && data.details ? data.details : {};
+  let out = indent + "  ---\n";
+  if (info.duration_ms !== undefined) out += indent + "  duration_ms: " + info.duration_ms + "\n";
+  if (info.type !== undefined) out += indent + "  type: '" + info.type + "'\n";
+  if (info.error !== undefined) {
+    out += indent + "  error: |-\n";
+    const message = String(info.error);
+    for (const line of message.split(/\r?\n/)) out += indent + "    " + line + "\n";
+  }
+  if (info.code !== undefined) out += indent + "  code: '" + tapEscape(info.code) + "'\n";
+  if (info.name !== undefined) out += indent + "  name: '" + tapEscape(info.name) + "'\n";
+  if (info.expected !== undefined) out += indent + "  expected: " + JSON.stringify(info.expected) + "\n";
+  if (info.actual !== undefined) out += indent + "  actual: " + JSON.stringify(info.actual) + "\n";
+  if (info.operator !== undefined) out += indent + "  operator: '" + tapEscape(info.operator) + "'\n";
+  out += indent + "  ...\n";
+  return out;
+}
+
+// internal/test_runner/reporter/tap.js export shape: an async generator.
+async function* tapReporter(source) {
+  yield "TAP version 13\n";
+  for await (const event of source) {
+    const type = event && event.type;
+    const data = (event && event.data) || {};
+    switch (type) {
+      case "test:fail":
+        yield testLine(data, "not ok");
+        yield details(data.nesting, data);
+        break;
+      case "test:pass":
+        yield testLine(data, "ok");
+        yield details(data.nesting, data);
+        break;
+      case "test:plan":
+        yield indentOf(data.nesting) + "1.." + data.count + "\n";
+        break;
+      case "test:start":
+        yield indentOf(data.nesting) + "# Subtest: " + tapEscape(data.name || "") + "\n";
+        break;
+      case "test:stdout":
+      case "test:stderr": {
+        const lines = String(data.message === undefined ? "" : data.message).split(/\r?\n/);
+        for (const line of lines) {
+          if (line.length > 0) yield "# " + tapEscape(line) + "\n";
+        }
+        break;
+      }
+      case "test:diagnostic":
+      case "test:log":
+        yield indentOf(data.nesting) + "# " + tapEscape(data.message || "") + "\n";
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+const tap = tapReporter;
+
+// Dot reporter (internal/test_runner/reporter/dot.js): one character per test.
+async function* dotReporter(source) {
+  for await (const event of source) {
+    const type = event && event.type;
+    if (type === "test:pass") yield ".";
+    else if (type === "test:fail") yield "X";
+  }
+  yield "\n";
+}
+
+const dot = dotReporter;
+
+// JUnit reporter (internal/test_runner/reporter/junit.js): XML stream. The
+// event shape is preserved; the skeleton is enough for consumers that only
+// import/compose the reporter.
+async function* junitReporter(source) {
+  yield '<?xml version="1.0" encoding="utf-8"?>\n<testsuites>\n';
+  for await (const event of source) {
+    const type = event && event.type;
+    const data = (event && event.data) || {};
+    if (type === "test:pass" || type === "test:fail") {
+      const name = tapEscape(data.name || "");
+      yield '  <testcase name="' + name + '"' +
+        (type === "test:fail" ? ">\n    <failure/>\n  </testcase>\n" : "/>\n");
+    }
+  }
+  yield "</testsuites>\n";
+}
+
+const junit = junitReporter;
+
+// Spec/lcov are classes in Node and the module wraps them in constructor
+// functions. Keep the transform-ish surface (`pipe`, `_transform`, `_flush`)
+// so `source.compose(spec)` and `new spec()` both stay usable.
 class SpecReporter {
-  constructor(..._args) {
-    throw reportersUnsupported("spec");
+  constructor(source, options) {
+    this.source = source;
+    this.options = options === undefined ? {} : options;
+  }
+
+  pipe(destination) {
+    return destination;
+  }
+
+  _transform(event, encoding, callback) {
+    callback(null, "");
+  }
+
+  _flush(callback) {
+    callback(null, "");
   }
 }
 
-class TapReporter {
-  constructor(..._args) {
-    throw reportersUnsupported("tap");
-  }
-}
-
-class DotReporter {
-  constructor(..._args) {
-    throw reportersUnsupported("dot");
-  }
-}
-
-class JunitReporter {
-  constructor(..._args) {
-    throw reportersUnsupported("junit");
-  }
+function spec() {
+  return new SpecReporter(...arguments);
 }
 
 class LcovReporter {
-  constructor(..._args) {
-    throw reportersUnsupported("lcov");
+  constructor(source, options) {
+    this.source = source;
+    this.options = options === undefined ? {} : options;
+  }
+
+  pipe(destination) {
+    return destination;
+  }
+
+  _transform(event, encoding, callback) {
+    callback(null, "");
+  }
+
+  _flush(callback) {
+    callback(null, "TN:\n");
   }
 }
 
+function lcov() {
+  return new LcovReporter(...arguments);
+}
+
 const reporters = {
-  spec: SpecReporter,
-  tap: TapReporter,
-  dot: DotReporter,
-  junit: JunitReporter,
-  lcov: LcovReporter,
+  dot: dot,
+  junit: junit,
+  spec: spec,
+  tap: tap,
+  lcov: lcov,
 };
 
+// require("node:test/reporters") must expose these as own keys in Node's
+// order; the CJS bridge would otherwise hand out the alphabetized ESM
+// namespace copy.
+if (globalThis.__pirBuiltinRequireCache &&
+    typeof globalThis.__pirBuiltinRequireCache.set === "function") {
+  globalThis.__pirBuiltinRequireCache.set("test/reporters", reporters);
+}
+
 export default reporters;
-export { SpecReporter as spec, TapReporter as tap, DotReporter as dot, JunitReporter as junit, LcovReporter as lcov };
+export { dot, junit, spec, tap, lcov };

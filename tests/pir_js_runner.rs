@@ -81,6 +81,19 @@ impl Workspace {
         }
         cmd.output().expect("pir binary should start")
     }
+
+    /// [`Self::run`] without the `js` subcommand: Node's respawn shape
+    /// (`spawn(process.execPath, …)`) reaches the runner through the bare
+    /// command line instead.
+    fn run_raw(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_pir"))
+            .env("PIR_AGENT_DIR", &self._agent_dir.0)
+            .current_dir(&self.dir)
+            .args(args)
+            .env_remove("PIR_JS_MEMORY_MB")
+            .output()
+            .expect("pir binary should start")
+    }
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -785,6 +798,135 @@ console.log("esm:", tag);
     assert!(stdout_of(&esm_output).contains("esm: c.ts"));
 }
 
+#[test]
+fn node_test_snapshot_assertions_throw_before_counting_or_serializing() {
+    let ws = Workspace::new("test-snapshot-plan");
+    ws.write(
+        "snapshot.cjs",
+        r#"
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+assert.strictEqual(typeof test, 'function');
+assert.strictEqual(test.test, test);
+assert.deepStrictEqual(Object.keys(test.snapshot), [
+  'setDefaultSnapshotSerializers',
+  'setResolveSnapshotPath',
+  'setDefaultSnapshotResolver',
+]);
+assert.throws(() => test.snapshot.setDefaultSnapshotSerializers([null]), {
+  code: 'ERR_INVALID_ARG_TYPE',
+});
+assert.throws(() => test.snapshot.setResolveSnapshotPath(null), {
+  code: 'ERR_INVALID_ARG_TYPE',
+});
+let hookCalls = 0;
+const hook = () => { hookCalls++; throw new Error('snapshot hook must not run'); };
+test.snapshot.setDefaultSnapshotSerializers([hook]);
+test.snapshot.setResolveSnapshotPath(hook);
+test.snapshot.setDefaultSnapshotResolver(hook);
+
+test('unsupported snapshots leave the assertion plan unchanged', (t) => {
+  t.plan(0);
+  assert.throws(() => t.assert.snapshot({ value: 1 }, { serializers: [hook] }), {
+    code: 'ERR_NOT_SUPPORTED',
+    message: /node:test\.assert\.snapshot/,
+  });
+  assert.throws(() => t.assert.fileSnapshot('content', 'never-written.snap', { serializers: [hook] }), {
+    code: 'ERR_NOT_SUPPORTED',
+    message: /node:test\.assert\.fileSnapshot/,
+  });
+  assert.strictEqual(hookCalls, 0);
+});
+"#,
+    );
+    // The source shim is under test; the checked-in assets are not regenerated here.
+    let output = ws.run_with_env(
+        &["snapshot.cjs"],
+        &[("PIR_EXT_BYTECODE", "0"), ("PIR_EXT_SHIM_SRC", "1")],
+    );
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert!(
+        output.status.success(),
+        "stderr: {stderr}\nstdout: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "ok 1 - unsupported snapshots leave the assertion plan unchanged"),
+        "stdout: {stdout}"
+    );
+    assert!(!ws.dir.join("never-written.snap").exists());
+}
+
+#[test]
+fn node_test_unhandled_snapshot_assertions_fail_the_cli_run() {
+    let ws = Workspace::new("test-snapshot-failure");
+    ws.write(
+        "snapshot.mjs",
+        r#"
+import test from 'node:test';
+
+test.skip('unrelated skip');
+test('snapshot fails', (t) => t.assert.snapshot('value'));
+test('fileSnapshot fails', (t) => t.assert.fileSnapshot('value', 'never-written.snap'));
+"#,
+    );
+    let output = ws.run_with_env(
+        &["snapshot.mjs"],
+        &[("PIR_EXT_BYTECODE", "0"), ("PIR_EXT_SHIM_SRC", "1")],
+    );
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {stderr}\nstdout: {stdout}"
+    );
+    for line in [
+        "ok 1 - unrelated skip # SKIP",
+        "not ok 2 - snapshot fails",
+        "not ok 3 - fileSnapshot fails",
+        "# fail 2",
+    ] {
+        assert!(
+            stdout.lines().any(|actual| actual == line),
+            "stdout: {stdout}"
+        );
+    }
+    assert_eq!(
+        stdout.matches("code: 'ERR_NOT_SUPPORTED'").count(),
+        2,
+        "stdout: {stdout}"
+    );
+    assert!(!ws.dir.join("never-written.snap").exists());
+}
+
+#[test]
+fn node_suite_package_marker_allows_parallel_esm_to_import_common() {
+    let ws = Workspace::new("node-suite-package-root");
+    std::fs::create_dir_all(ws.dir.join("test/parallel")).expect("parallel fixture dir");
+    std::fs::create_dir_all(ws.dir.join("test/common")).expect("common fixture dir");
+    ws.write("test/package.json", r#"{"type":"commonjs"}"#);
+    ws.write(
+        "test/common/index.js",
+        "module.exports = 'sibling-common';\n",
+    );
+    ws.write(
+        "test/parallel/entry.mjs",
+        "import common from '../common/index.js';\nconsole.log(common);\n",
+    );
+    let output = ws.run(&["test/parallel/entry.mjs"]);
+    let stdout = stdout_of(&output);
+    let stderr = stderr_of(&output);
+    assert!(
+        output.status.success(),
+        "stderr: {stderr}\nstdout: {stdout}"
+    );
+    assert_eq!(stdout.trim(), "sibling-common");
+}
+
 // ---------------------------------------------------------------------------
 // Differential smoke seed (roadmap §11.3): run the same fixture under the
 // real Node when one is on PATH and compare the stdout lines. Ignored by
@@ -936,5 +1078,89 @@ try { null.x; } catch (error) { console.log("throw-frame:" + String(error.stack)
     assert!(
         stdout.contains(&format!("(<input>:{throw_line}:")),
         "frames must report source lines (throw is on line {throw_line}): {stdout}"
+    );
+}
+
+/// Node's respawn shape: `spawn(process.execPath, ["--no-warnings", file])`
+/// must run `file`, with the V8-only flag dropped and the rest passed
+/// verbatim. A bare `pir <file>` is the same run; a positional that is not an
+/// existing JS/TS file stays on the pi command line.
+#[test]
+fn node_respawn_shape_runs_script_and_drops_v8_flags() {
+    let ws = Workspace::new("node-shape");
+    ws.write(
+        "worker.js",
+        r#"console.log("worker:", JSON.stringify(process.argv.slice(1)));"#,
+    );
+
+    let output = ws.run_raw(&[
+        "--no-warnings",
+        "--max-old-space-size=128",
+        "worker.js",
+        "a",
+        "--b",
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains(r#""worker.js","a","--b""#),
+        "script + verbatim args expected, flags dropped: {stdout}"
+    );
+    assert!(!stdout.contains("--no-warnings"), "flag leaked into argv: {stdout}");
+
+    let bare = ws.run_raw(&["worker.js"]);
+    assert!(bare.status.success(), "stderr: {}", stderr_of(&bare));
+    assert!(
+        stdout_of(&bare).contains(r#""worker.js""#),
+        "bare `pir <file>` must run the script: {}",
+        stdout_of(&bare)
+    );
+
+    // No such file: the pi command line still owns this positional.
+    let prompt = ws.run_raw(&["worker"]);
+    assert!(
+        !stdout_of(&prompt).contains("worker.js"),
+        "a non-file positional must not become a script run: {}",
+        stdout_of(&prompt)
+    );
+}
+
+/// The stripped options must still be reported through `process.execArgv`:
+/// Node's `test/common` respawns `process.execPath` once per `// Flags:` entry
+/// and only stops when the flag is already in `execArgv`.
+#[test]
+fn node_respawn_reports_stripped_flags_in_exec_argv() {
+    let ws = Workspace::new("exec-argv");
+    ws.write(
+        "flags.js",
+        r#"console.log("execArgv:", JSON.stringify(process.execArgv));"#,
+    );
+    let output = ws.run_raw(&[
+        "--no-warnings",
+        "--max-old-space-size=128",
+        "flags.js",
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains(r#""--no-warnings""#),
+        "flag missing from execArgv: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""--max-old-space-size=128""#),
+        "value flag missing from execArgv: {stdout}"
+    );
+
+    // `pir js <file>` reports no flags, like `node <file>`.
+    let plain = ws.run_raw(&["flags.js"]);
+    assert!(plain.status.success(), "stderr: {}", stderr_of(&plain));
+    assert!(
+        stdout_of(&plain).contains("execArgv: []"),
+        "plain run must not invent execArgv entries: {}",
+        stdout_of(&plain)
     );
 }

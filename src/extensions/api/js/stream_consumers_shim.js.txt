@@ -1,75 +1,84 @@
-// node:stream/consumers — real tier (pure JS over the engine stream pad):
-// drain a Web ReadableStream / node-style readable into the common value
-// shapes. Node also accepts Blob/ArrayBuffer inputs directly — passed through
-// via the same conversion helpers.
+// node:stream/consumers — Node's lib/stream/consumers.js semantics over the
+// runtime's Blob and the stream pad. Consumers accept ReadableStream
+// (async-iterable), node Readable, and any (async) iterable; they drain with
+// `for await` and let Blob perform the BlobPart conversion (strings and
+// ArrayBufferViews keep their bytes, everything else becomes its USVString,
+// which is what object-mode streams produce: "[object Object]").
 import { Blob } from "@node/buffer";
 
-function isNodeReadable(value) {
-  return value !== undefined && value !== null && typeof value === "object" && typeof value.on === "function" && typeof value[Symbol.asyncIterator] === "function";
+function pirInvalidChunk(chunk) {
+  const name = chunk === null ? "null" :
+    typeof chunk === "object" && chunk.constructor && typeof chunk.constructor.name === "string"
+      ? "an instance of " + chunk.constructor.name
+      : "type " + typeof chunk;
+  const error = new TypeError(
+    "The \"chunk\" argument must be of type string or an instance of Buffer or Uint8Array. Received " +
+    name);
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
 }
 
-function isWebReadable(value) {
-  return value !== undefined && value !== null && typeof value === "object" && typeof value.getReader === "function";
+// The source shapes Node's consumers accept. Blob/ArrayBuffer/Buffer are
+// accepted by this pad as single-part sources.
+function pirSource(source) {
+  if (source !== null && source !== undefined &&
+      (typeof source[Symbol.asyncIterator] === "function" ||
+       typeof source[Symbol.iterator] === "function")) return source;
+  if (source instanceof Blob || source instanceof ArrayBuffer ||
+      ArrayBuffer.isView(source)) return [source];
+  throw new TypeError("The \"stream\" argument must be an instance of AsyncIterable, ReadableStream, or Readable");
 }
 
-// Collect chunks from either stream shape into the shared Buffer.
-async function collectChunks(source) {
-  const Buffer = globalThis.Buffer;
-  const chunks = [];
-  if (isWebReadable(source)) {
-    const reader = source.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-  } else if (isNodeReadable(source)) {
-    for await (const chunk of source) {
-      chunks.push(chunk);
-    }
-  } else if (source instanceof ArrayBuffer) {
-    chunks.push(new Uint8Array(source));
-  } else if (ArrayBuffer.isView(source)) {
-    chunks.push(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
-  } else if (source instanceof Blob) {
-    chunks.push(Buffer.from(await source.arrayBuffer()));
-  } else if (typeof source === "string") {
-    chunks.push(Buffer.from(source, "utf8"));
-  } else {
-    throw new TypeError("The stream argument must be a readable stream");
+async function blob(source) {
+  if (source instanceof Blob) {
+    return new Blob([await source.arrayBuffer()], { type: source.type });
   }
-  return Buffer.concat(chunks.map((chunk) => (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))));
+  const chunks = [];
+  for await (const chunk of pirSource(source)) chunks.push(chunk);
+  return new Blob(chunks);
 }
 
 async function arrayBuffer(source) {
-  const buffer = await collectChunks(source);
-  const copy = new ArrayBuffer(buffer.length);
-  new Uint8Array(copy).set(buffer);
-  return copy;
+  const result = await blob(source);
+  return result.arrayBuffer();
 }
 
-async function text(source) {
-  const buffer = await collectChunks(source);
-  return buffer.toString("utf8");
-}
-
-async function json(source) {
-  return JSON.parse(await text(source));
+async function bufferValue(source) {
+  return globalThis.Buffer.from(await arrayBuffer(source));
 }
 
 async function bytes(source) {
   return new Uint8Array(await arrayBuffer(source));
 }
 
-async function bufferValue(source) {
-  return collectChunks(source);
+async function text(source) {
+  let str = "";
+  let pending = [];
+  const flush = () => {
+    if (pending.length === 0) return;
+    str += globalThis.Buffer.concat(pending).toString("utf8");
+    pending = [];
+  };
+  for await (const chunk of pirSource(source)) {
+    if (typeof chunk === "string") {
+      flush();
+      str += chunk;
+    } else if (chunk instanceof ArrayBuffer) {
+      pending.push(globalThis.Buffer.from(new Uint8Array(chunk)));
+    } else if (ArrayBuffer.isView(chunk)) {
+      pending.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    } else {
+      // Node's TextDecoder.decode(chunk) rejects these with
+      // ERR_INVALID_ARG_TYPE (the text()/json() object-mode cases).
+      throw pirInvalidChunk(chunk);
+    }
+  }
+  flush();
+  return str;
 }
 
-async function blob(source) {
-  const buffer = await collectChunks(source);
-  const copy = new ArrayBuffer(buffer.length);
-  new Uint8Array(copy).set(buffer);
-  return new Blob([copy], { type: "text/plain" });
+async function json(source) {
+  return JSON.parse(await text(source));
 }
 
 const streamConsumers = {

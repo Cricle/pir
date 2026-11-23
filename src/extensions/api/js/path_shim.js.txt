@@ -10,15 +10,47 @@
 //   * `process.cwd()` / `process.env` are read through guards: the prelude can
 //     evaluate this module before `process` is fully booted;
 //   * `matchesGlob` keeps a local glob->regexp translation (upstream delegates
-//     to `internal/fs/glob`), same call shape and validation;
-//   * win32 `dirname()` canonicalises drive-rooted results to `\` separators
-//     (see the wrapper at the end) because pir injects `__filename` with
-//     forward slashes while Node always hands out a backslashed one.
+//     to `internal/fs/glob`), same call shape and validation.
 const __platform = typeof globalThis.__pirPlatform === "string" ? globalThis.__pirPlatform : "linux";
 const isWindows = __platform === "win32";
 
+// Rust kernels for the four char-scanning ops (`resolve`/`join`/`normalize`/
+// `relative` in both namespaces; see crates/pir-node/src/modules/path.rs).
+// The JS implementations below remain the fallback: a boot path without the
+// `__pirNode` tier, or any native miss, runs the ported JS algorithm instead.
+// Argument validation and Node's error shapes always stay on the JS side.
+// Op/flavor codes are integers (see `path_ops::path_native`): passing the
+// operation name as a JS string would allocate two Rust strings per call
+// just to match on them. The fast path also builds no wrapper object: the
+// native argument list is the real argument array.
+const PIR_PATH_JOIN = 0;
+const PIR_PATH_RESOLVE = 1;
+const PIR_PATH_NORMALIZE = 2;
+const PIR_PATH_RELATIVE = 3;
+const PIR_FLAVOR_WIN32 = 0;
+const PIR_FLAVOR_POSIX = 1;
+
+// The fast path inlines the `__pirPath` call in each method: a wrapper
+// function per op costs ~0.5 µs per call in this interpreter, which is more
+// than the kernel work. `pirPathInvoke` stays a function because it is only
+// reached on a miss.
+function pirPathInvoke(op, flavor, payload) {
+  const node = globalThis.__pirNode;
+  if (!node || typeof node.invoke !== "function") return undefined;
+  try {
+    const body = Object.assign({ flavor: flavor === PIR_FLAVOR_WIN32 ? "win32" : "posix" }, payload);
+    const res = node.invoke("path", op, body);
+    if (res && res.ok === true && typeof res.value === "string") return res.value;
+  } catch (_error) { /* fall through to JS */ }
+  return undefined;
+}
+
 // The cwd anchor for the resolve family; a missing/odd process (early boot)
-// falls back to the platform root like the old behavior did.
+// falls back to the platform root like the old behavior did. `process.chdir`
+// is unsupported and the runtime cwd is fixed at construction, so the first
+// answer is kept: resolve/relative then pass it to the kernel without a
+// host/state round trip per call.
+let pirCwdCache;
 function processCwd() {
   try {
     if (typeof process === "object" && process !== null && typeof process.cwd === "function") {
@@ -239,6 +271,25 @@ const win32 = {
    * @returns {string}
    */
   resolve(...args) {
+    // Fast path: the typed entry rejects any non-string argument (returns
+    // undefined), so the validation below runs only on a miss. That keeps the
+    // hot path free of the per-argument JS type loop while invalid inputs
+    // still get Node's exact error from the slow path.
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      const cwd = pirCwdCache !== undefined ? pirCwdCache : (pirCwdCache = processCwd());
+      try {
+        const nativeResolve = pirPath(PIR_PATH_RESOLVE, PIR_FLAVOR_WIN32, args, undefined, cwd);
+        if (typeof nativeResolve === "string") return nativeResolve;
+      } catch (_error) { /* fall through */ }
+    }
+    // Validate every entry (including empty ones, exactly like Node), so only
+    // strings reach the generic tier / JS implementation.
+    // Reverse order matches the loop below: Node reports the highest-index
+    // invalid argument first.
+    for (let i = args.length - 1; i >= 0; i--) validateString(args[i], `paths[${i}]`);
+    const genericResolve = pirPathInvoke("resolve", PIR_FLAVOR_WIN32, { args });
+    if (genericResolve !== undefined) return genericResolve;
     let resolvedDevice = '';
     let resolvedTail = '';
     let resolvedAbsolute = false;
@@ -399,7 +450,16 @@ const win32 = {
    * @returns {string}
    */
   normalize(path) {
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      try {
+        const nativeNormalize = pirPath(PIR_PATH_NORMALIZE, PIR_FLAVOR_WIN32, path, undefined, undefined);
+        if (typeof nativeNormalize === "string") return nativeNormalize;
+      } catch (_error) { /* fall through */ }
+    }
     validateString(path, 'path');
+    const genericNormalize = pirPathInvoke("normalize", PIR_FLAVOR_WIN32, { path });
+    if (genericNormalize !== undefined) return genericNormalize;
     const len = path.length;
     if (len === 0)
       return '.';
@@ -558,17 +618,34 @@ const win32 = {
     if (args.length === 0)
       return '.';
 
-    const path = [];
+    // The native kernel filters empty parts and rejects non-strings itself, so
+    // the fast path passes the real argument array straight through. Only a
+    // miss pays for the JS validation loop and the filtered copy.
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      try {
+        const nativeJoin = pirPath(PIR_PATH_JOIN, PIR_FLAVOR_WIN32, args, undefined, undefined);
+        if (typeof nativeJoin === "string") return nativeJoin;
+      } catch (_error) { /* fall through */ }
+    }
+
+    let nonEmpty = false;
     for (let i = 0; i < args.length; ++i) {
       const arg = args[i];
       validateString(arg, 'path');
-      if (arg.length > 0) {
-        path.push(arg);
-      }
+      if (arg.length > 0) nonEmpty = true;
     }
 
-    if (path.length === 0)
+    if (!nonEmpty)
       return '.';
+
+    const path = [];
+    for (let i = 0; i < args.length; ++i) {
+      if (args[i].length > 0) path.push(args[i]);
+    }
+
+    const genericJoin = pirPathInvoke("join", PIR_FLAVOR_WIN32, { args: path });
+    if (genericJoin !== undefined) return genericJoin;
 
     const firstPart = path[0];
     let joined = path.join('\\');
@@ -659,8 +736,19 @@ const win32 = {
    * @returns {string}
    */
   relative(from, to) {
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      const cwd = pirCwdCache !== undefined ? pirCwdCache : (pirCwdCache = processCwd());
+      try {
+        const nativeRelative = pirPath(PIR_PATH_RELATIVE, PIR_FLAVOR_WIN32, from, to, cwd);
+        if (typeof nativeRelative === "string") return nativeRelative;
+      } catch (_error) { /* fall through */ }
+    }
+
     validateString(from, 'from');
     validateString(to, 'to');
+    const genericRelative = pirPathInvoke("relative", PIR_FLAVOR_WIN32, { from, to });
+    if (genericRelative !== undefined) return genericRelative;
 
     if (from === to)
       return '';
@@ -1296,6 +1384,21 @@ const posix = {
    * @returns {string}
    */
   resolve(...args) {
+    // Fast path first; validation and the generic tier only on a miss (see
+    // win32.resolve).
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      const cwd = pirCwdCache !== undefined ? pirCwdCache : (pirCwdCache = processCwd());
+      try {
+        const nativeResolve = pirPath(PIR_PATH_RESOLVE, PIR_FLAVOR_POSIX, args, undefined, cwd);
+        if (typeof nativeResolve === "string") return nativeResolve;
+      } catch (_error) { /* fall through */ }
+    }
+    // Reverse order matches the loop below: Node reports the highest-index
+    // invalid argument first.
+    for (let i = args.length - 1; i >= 0; i--) validateString(args[i], `paths[${i}]`);
+    const genericResolve = pirPathInvoke("resolve", PIR_FLAVOR_POSIX, { args });
+    if (genericResolve !== undefined) return genericResolve;
     if (args.length === 0 || (args.length === 1 && (args[0] === '' || args[0] === '.'))) {
       const cwd = posixCwd();
       if (cwd.charCodeAt(0) === CHAR_FORWARD_SLASH) {
@@ -1344,7 +1447,17 @@ const posix = {
    * @returns {string}
    */
   normalize(path) {
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      try {
+        const nativeNormalize = pirPath(PIR_PATH_NORMALIZE, PIR_FLAVOR_POSIX, path, undefined, undefined);
+        if (typeof nativeNormalize === "string") return nativeNormalize;
+      } catch (_error) { /* fall through */ }
+    }
+
     validateString(path, 'path');
+    const genericNormalize = pirPathInvoke("normalize", PIR_FLAVOR_POSIX, { path });
+    if (genericNormalize !== undefined) return genericNormalize;
 
     if (path.length === 0)
       return '.';
@@ -1386,18 +1499,32 @@ const posix = {
     if (args.length === 0)
       return '.';
 
-    const path = [];
+    // Native filters empty parts and rejects non-strings; only a miss needs
+    // the validation loop and the filtered copy.
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      try {
+        const nativeJoin = pirPath(PIR_PATH_JOIN, PIR_FLAVOR_POSIX, args, undefined, undefined);
+        if (typeof nativeJoin === "string") return nativeJoin;
+      } catch (_error) { /* fall through */ }
+    }
+
+    let nonEmpty = false;
     for (let i = 0; i < args.length; ++i) {
       const arg = args[i];
       validateString(arg, 'path');
-      if (arg.length > 0) {
-        path.push(arg);
-      }
+      if (arg.length > 0) nonEmpty = true;
     }
 
-    if (path.length === 0)
+    if (!nonEmpty)
       return '.';
 
+    const path = [];
+    for (let i = 0; i < args.length; ++i) {
+      if (args[i].length > 0) path.push(args[i]);
+    }
+    const genericJoin = pirPathInvoke("join", PIR_FLAVOR_POSIX, { args: path });
+    if (genericJoin !== undefined) return genericJoin;
     return posix.normalize(path.join('/'));
   },
 
@@ -1407,8 +1534,19 @@ const posix = {
    * @returns {string}
    */
   relative(from, to) {
+    const pirPath = globalThis.__pirPath;
+    if (typeof pirPath === "function") {
+      const cwd = pirCwdCache !== undefined ? pirCwdCache : (pirCwdCache = processCwd());
+      try {
+        const nativeRelative = pirPath(PIR_PATH_RELATIVE, PIR_FLAVOR_POSIX, from, to, cwd);
+        if (typeof nativeRelative === "string") return nativeRelative;
+      } catch (_error) { /* fall through */ }
+    }
+
     validateString(from, 'from');
     validateString(to, 'to');
+    const genericRelative = pirPathInvoke("relative", PIR_FLAVOR_POSIX, { from, to });
+    if (genericRelative !== undefined) return genericRelative;
 
     if (from === to)
       return '';
@@ -2031,26 +2169,6 @@ function makeMatchesGlob(windows) {
   };
 }
 
-// `__filename`/`__dirname` reach this runtime as forward-slash paths (the
-// loader's synthetic module names use `/`), while Node always hands CJS
-// modules a backslashed Windows path. Real code therefore does
-// `path.dirname(__filename)` and expects a win32-shaped directory. Only
-// drive-rooted inputs are canonicalised, and only the separators: every other
-// win32 case (root-relative `/a/b`, UNC, mixed separators) keeps Node's
-// separator-preserving result. Node's own dirname is separator-preserving:
-// `path.win32.dirname('C:/a/b') === 'C:/a'`, pir answers `'C:\a'`.
-const win32Dirname = win32.dirname;
-win32.dirname = function dirname(path) {
-  const result = win32Dirname.call(this, path);
-  if (typeof path === "string" && result.indexOf("/") !== -1 &&
-      path.length > 2 && isWindowsDeviceRoot(path.charCodeAt(0)) &&
-      path.charCodeAt(1) === CHAR_COLON &&
-      (path.charCodeAt(2) === CHAR_FORWARD_SLASH || path.charCodeAt(2) === CHAR_BACKWARD_SLASH)) {
-    return result.replace(/\//g, "\\");
-  }
-  return result;
-};
-
 // Node's `module.exports` IS the active platform namespace (`path ===
 // path.win32` on Windows, `path === path.posix` elsewhere), so the default
 // export is that same object (the body above already wired
@@ -2058,6 +2176,23 @@ win32.dirname = function dirname(path) {
 const active = isWindows ? win32 : posix;
 const pathDefault = active;
 const _makeLong = active.toNamespacedPath;
+
+// Node identity: `require('path')` IS the active namespace object and
+// `require('path/posix')`/`require('path/win32')` are the same objects as
+// `path.posix`/`path.win32` (test-path-posix-exists / test-path-win32-exists).
+// The CJS require bridge otherwise hands out a copy of the ESM namespace
+// (which also adds a `default` key), so seed its per-builtin cache exactly
+// like the querystring shim does.
+if (globalThis.__pirBuiltinRequireCache &&
+    typeof globalThis.__pirBuiltinRequireCache.set === "function") {
+  const cache = globalThis.__pirBuiltinRequireCache;
+  cache.set("path", pathDefault);
+  cache.set("node:path", pathDefault);
+  cache.set("path/posix", posix);
+  cache.set("node:path/posix", posix);
+  cache.set("path/win32", win32);
+  cache.set("node:path/win32", win32);
+}
 
 // The named export mirrors the active namespace's method (Node's ESM named
 // exports are the properties of the default export). Declared here, not in

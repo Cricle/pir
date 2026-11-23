@@ -25,8 +25,8 @@ mod g11_skills_diagnostics;
 #[path = "suites/prompt_loadout_w22.rs"]
 mod prompt_loadout_w22;
 #[cfg(feature = "python")]
-#[path = "suites/python_vm_lock.rs"]
-mod python_vm_lock;
+#[path = "suites/js_vm_lock.rs"]
+mod js_vm_lock;
 #[path = "suites/read_image_tool.rs"]
 mod read_image_tool;
 #[path = "suites/shell_tools.rs"]

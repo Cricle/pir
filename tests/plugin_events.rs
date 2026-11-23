@@ -49,7 +49,7 @@ use pir::ai::types::{
     ToolCall,
 };
 use pir::extensions::Notification;
-use pir::extensions::{ExtensionConfig, ExtensionHandle, ExtensionLimits};
+use pir::extensions::{ExtensionConfig, ExtensionHandle, ExtensionLimits, ExtensionRuntime};
 use pir::plugins::{
     AgentPlugin, EventInterest, PluginEvent, PluginEventOutcome, PluginFuture, PluginHost,
     PluginInfo,
@@ -1609,4 +1609,404 @@ export default function (pi) {
         entered, 2,
         "an ordinary error mentioning a timeout must not close the dispatcher"
     );
+}
+
+// ---------------------------------------------------------------------------
+// events shim parity with node v24.22.1
+// ---------------------------------------------------------------------------
+// The read-only differential audit found the module-level async helpers
+// (`events.once` ignoring AbortSignal, `events.on` returning an immediately
+// done iterator), the `newListener`/`removeListener` meta events, the
+// `errorMonitor` symbol, the MaxListenersExceededWarning path and
+// `captureRejections` missing or wrong. Every expected value below was
+// captured from node v24.22.1 running the same script.
+const EVENTS_PARITY_TS: &str = r#"
+import { EventEmitter, once, on, errorMonitor, getEventListeners } from "@node/events";
+
+export default (pi: any) => {
+  pi.on("session_start", async () => {
+    const out: any = {};
+
+    // --- events.once: resolve, error, abort, reason, ordering --------------
+    {
+      const e = new EventEmitter();
+      const p = once(e, "go");
+      e.emit("go", 1, undefined, null, 0, false, "");
+      out.onceArgs = await p;
+      out.onceCleanup = [e.listenerCount("go"), e.listenerCount("error")];
+    }
+    {
+      const e = new EventEmitter();
+      const p = once(e, "ready");
+      e.emit("ready", "first");
+      out.onceResolveWins = await p;
+    }
+    {
+      const e = new EventEmitter();
+      const ac = new AbortController();
+      const p = once(e, "never", { signal: ac.signal });
+      ac.abort();
+      try { await p; } catch (err: any) { out.onceAbort = [err.name, err.code, err.message, err instanceof Error]; }
+      out.onceAbortCleanup = [e.listenerCount("never"), e.listenerCount("error")];
+    }
+    {
+      const e = new EventEmitter();
+      const ac = new AbortController();
+      ac.abort(new Error("custom"));
+      try { await once(e, "never", { signal: ac.signal }); } catch (err: any) { out.oncePreAbort = [err.message, err.cause.message]; }
+    }
+    {
+      let sync = true;
+      const bad = once(new EventEmitter(), "x", { signal: 5 });
+      sync = false;
+      try { await bad; } catch (err: any) { out.onceBadSignal = [sync, err.code, err.message]; }
+    }
+
+    // --- events.on: async iterator, queue, cleanup, error, abort ----------
+    {
+      const e = new EventEmitter();
+      const it = on(e, "data");
+      e.emit("data", "a");
+      e.emit("data", "b");
+      out.onQueue = [await it.next(), await it.next()];
+      const pending = it.next();
+      e.emit("data", "late");
+      out.onPending = await pending;
+      out.onReturn = await it.return();
+      out.onReturnCleanup = [e.listenerCount("data"), e.listenerCount("error")];
+      out.onAfterReturn = await it.next();
+      out.onIsAsyncIterable = typeof it[Symbol.asyncIterator] === "function" && it[Symbol.asyncIterator]() === it;
+    }
+    {
+      const e = new EventEmitter();
+      const it = on(e, "x");
+      const q = it.next();
+      e.emit("error", new Error("iterator-error"));
+      try { await q; } catch (err: any) { out.onError = err.message; }
+      out.onErrorCleanup = [e.listenerCount("x"), e.listenerCount("error")];
+    }
+    {
+      const e = new EventEmitter();
+      const ac = new AbortController();
+      const it = on(e, "x", { signal: ac.signal });
+      const q = it.next();
+      ac.abort();
+      try { await q; } catch (err: any) { out.onAbort = [err.name, err.code]; }
+      out.onAbortCleanup = e.listenerCount("x");
+    }
+    {
+      try { on(new EventEmitter(), "x", { highWaterMark: 0 }); } catch (err: any) { out.onBadHighWaterMark = [true, err.name, err.code, err.message]; }
+      try { on(new EventEmitter(), "x", { highWaterMark: 1.5 }); } catch (err: any) { out.onBadHighWaterMarkFloat = [err.name, err.code, err.message]; }
+      try { on(new EventEmitter(), "x", null); } catch (err: any) { out.onNullOptions = [err.name, err.code, err.message]; }
+    }
+    {
+      const e = new EventEmitter();
+      const it = on(e, "z", { highWaterMark: 1 });
+      const n1 = it.next();
+      e.emit("z", "v1");
+      e.emit("z", "v2");
+      out.onHighWaterMark = [await n1, await it.next()];
+      await it.return();
+    }
+    {
+      const e = new EventEmitter();
+      const it = on(e, "z", { close: ["end"] });
+      e.emit("end");
+      out.onClose = await it.next();
+    }
+
+    // --- newListener / removeListener -------------------------------------
+    {
+      const e = new EventEmitter();
+      const log: any[] = [];
+      e.on("newListener", (n: any, fn: any) => log.push("new:" + n + ":" + fn.name));
+      e.on("removeListener", (n: any, fn: any) => log.push("rem:" + n + ":" + fn.name));
+      function alpha() {}
+      function beta() {}
+      e.on("x", alpha);
+      e.once("x", beta);
+      e.emit("x");
+      e.removeListener("x", alpha);
+      out.meta = log;
+    }
+    {
+      const e = new EventEmitter();
+      const seen: any[] = [];
+      e.on("newListener", (n: any) => seen.push(n));
+      e.on("q", () => {});
+      e.on("r", () => {});
+      out.newListener = seen;
+    }
+
+    // --- errorMonitor -----------------------------------------------------
+    {
+      const e = new EventEmitter();
+      const seq: any[] = [];
+      e.on(errorMonitor, (err: any) => seq.push("monitor:" + err.message));
+      e.on("error", (err: any) => seq.push("error:" + err.message));
+      e.emit("error", new Error("m1"));
+      out.errorMonitor = seq;
+    }
+    {
+      const e = new EventEmitter();
+      let saw: any = null;
+      let threw: any = null;
+      e.on(errorMonitor, (err: any) => { saw = err.message; });
+      try { e.emit("error", new Error("only")); } catch (err: any) { threw = err.code; }
+      out.errorMonitorOnly = [saw, threw];
+    }
+    {
+      const e = new EventEmitter();
+      let message: any = null;
+      e.on(errorMonitor, () => { throw new Error("monitor-threw"); });
+      try { e.emit("error", new Error("orig")); } catch (err: any) { message = err.message; }
+      out.errorMonitorThrows = message;
+    }
+
+    // --- listener introspection -------------------------------------------
+    {
+      const e = new EventEmitter();
+      function one() {}
+      function two() {}
+      e.on("x", one);
+      e.once("x", two);
+      const got = getEventListeners(e, "x");
+      out.getEventListeners = [got.length, got[0] === one, got[1] === two, e.rawListeners("x")[1] !== two];
+      out.listenerCount = [e.listenerCount("x", one), e.listenerCount("x", two), e.listenerCount("x", () => {})];
+    }
+
+    // --- MaxListenersExceededWarning / setMaxListeners --------------------
+    {
+      const warnings: any[] = [];
+      process.on("warning", (w: any) => warnings.push([w.name, w.type, w.count]));
+      const e = new EventEmitter();
+      for (let i = 0; i < 11; i++) e.on("leak", () => {});
+      const e2 = new EventEmitter();
+      e2.setMaxListeners(0);
+      for (let i = 0; i < 15; i++) e2.on("x", () => {});
+      const e3 = new EventEmitter();
+      e3.setMaxListeners(3);
+      for (let i = 0; i < 4; i++) e3.on("y", () => {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      out.warnings = warnings;
+      out.maxValidation = [];
+      for (const value of [-1, "3", NaN]) {
+        try { new EventEmitter().setMaxListeners(value as any); } catch (err: any) { out.maxValidation.push([err.name, err.code, err.message]); }
+      }
+      out.maxFloat = new EventEmitter().setMaxListeners(1.5).getMaxListeners();
+      out.maxZero = (() => {
+        const x = new EventEmitter();
+        x.setMaxListeners(0);
+        for (let i = 0; i < 15; i++) x.on("x", () => {});
+        return x.listenerCount("x");
+      })();
+    }
+
+    // --- captureRejections ------------------------------------------------
+    {
+      const e = new EventEmitter({ captureRejections: true });
+      let captured: any = null;
+      e.on("error", (err: any) => { captured = err.message; });
+      e.on("reject", async () => { throw new Error("async-fail"); });
+      e.emit("reject");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      out.captureCaught = captured;
+      out.defaultCapture = new EventEmitter().captureRejections;
+      EventEmitter.captureRejections = true;
+      out.staticCapture = EventEmitter.captureRejections;
+      EventEmitter.captureRejections = false;
+      out.staticRestored = [EventEmitter.captureRejections, new EventEmitter().captureRejections];
+    }
+
+    globalThis.__eventsParity = out;
+  });
+};
+"#;
+
+async fn run_events_parity_fixture(name: &str) -> (TempDir, ExtensionRuntime, Value) {
+    let temp = TempDir::new(name);
+    let rt = ExtensionRuntime::new(extension_config(&temp.0))
+        .await
+        .expect("events parity runtime construction");
+    rt.allow_root(temp.0.clone());
+    let module = format!("pir-ext:{name}.ts");
+    rt.seed_module(&module, EVENTS_PARITY_TS).expect("seed events fixture");
+    let loaded = rt.seeded_load(&module).await;
+    assert_eq!(loaded.expect("seeded load"), 1, "events fixture must load");
+    let mut payload = json!({ "reason": "startup" });
+    let outcome = rt
+        .emit("session_start", &mut payload)
+        .await
+        .expect("emit session_start");
+    assert!(
+        outcome.errors.is_empty(),
+        "handler errors in {name}: {:?}",
+        outcome.errors
+    );
+    let value = rt
+        .eval_json("JSON.stringify(globalThis.__eventsParity)")
+        .await
+        .expect("read events parity results");
+    (temp, rt, value)
+}
+
+#[tokio::test]
+async fn events_shim_once_and_on_iterator_parity() {
+    let (_temp, _rt, v) = run_events_parity_fixture("events-parity-iter").await;
+
+    // events.once resolves with the exact arguments array (undefined -> null
+    // in JSON) and removes both its event and error listeners.
+    assert_eq!(v["onceArgs"], json!([1, null, null, 0, false, ""]), "{v}");
+    assert_eq!(v["onceCleanup"], json!([0, 0]), "{v}");
+    assert_eq!(v["onceResolveWins"], json!(["first"]), "{v}");
+
+    // Abort settles the promise with Node's AbortError and cleans up.
+    assert_eq!(
+        v["onceAbort"],
+        json!(["AbortError", "ABORT_ERR", "The operation was aborted", true]),
+        "{v}"
+    );
+    assert_eq!(v["onceAbortCleanup"], json!([0, 0]), "{v}");
+    assert_eq!(
+        v["oncePreAbort"],
+        json!(["The operation was aborted", "custom"]),
+        "an already-aborted signal rejects with AbortError({{ cause: reason }}): {v}"
+    );
+    assert_eq!(
+        v["onceBadSignal"],
+        json!([
+            false,
+            "ERR_INVALID_ARG_TYPE",
+            "The \"options.signal\" property must be an instance of AbortSignal. Received type number (5)"
+        ]),
+        "validation is deferred into the returned promise: {v}"
+    );
+
+    // events.on is a real queueing iterator.
+    assert_eq!(
+        v["onQueue"],
+        json!([
+            { "value": ["a"], "done": false },
+            { "value": ["b"], "done": false }
+        ]),
+        "{v}"
+    );
+    assert_eq!(v["onPending"], json!({ "value": ["late"], "done": false }), "{v}");
+    assert_eq!(v["onReturn"], json!({ "done": true }), "{v}");
+    assert_eq!(v["onReturnCleanup"], json!([0, 0]), "{v}");
+    assert_eq!(v["onAfterReturn"], json!({ "done": true }), "{v}");
+    assert_eq!(v["onIsAsyncIterable"], true, "{v}");
+    assert_eq!(v["onError"], "iterator-error", "{v}");
+    assert_eq!(v["onErrorCleanup"], json!([0, 0]), "{v}");
+    assert_eq!(v["onAbort"], json!(["AbortError", "ABORT_ERR"]), "{v}");
+    assert_eq!(v["onAbortCleanup"], 0, "{v}");
+    assert_eq!(
+        v["onBadHighWaterMark"],
+        json!([
+            true,
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            "The value of \"options.highWaterMark\" is out of range. It must be >= 1 && <= 9007199254740991. Received 0"
+        ]),
+        "{v}"
+    );
+    assert_eq!(
+        v["onBadHighWaterMarkFloat"],
+        json!([
+            "RangeError",
+            "ERR_OUT_OF_RANGE",
+            "The value of \"options.highWaterMark\" is out of range. It must be an integer. Received 1.5"
+        ]),
+        "{v}"
+    );
+    assert_eq!(
+        v["onNullOptions"],
+        json!([
+            "TypeError",
+            "ERR_INVALID_ARG_TYPE",
+            "The \"options\" argument must be of type object. Received null"
+        ]),
+        "{v}"
+    );
+    assert_eq!(
+        v["onHighWaterMark"],
+        json!([
+            { "value": ["v1"], "done": false },
+            { "value": ["v2"], "done": false }
+        ]),
+        "{v}"
+    );
+    assert_eq!(v["onClose"], json!({ "done": true }), "{v}");
+}
+
+#[tokio::test]
+async fn events_shim_meta_monitor_warning_capture_parity() {
+    let (_temp, _rt, v) = run_events_parity_fixture("events-parity-meta").await;
+
+    // newListener fires before installation, removeListener after removal;
+    // a once wrapper's original function is reported.
+    assert_eq!(
+        v["meta"],
+        json!([
+            "new:removeListener:",
+            "new:x:alpha",
+            "new:x:beta",
+            "rem:x:wrapper",
+            "rem:x:alpha"
+        ]),
+        "{v}"
+    );
+    assert_eq!(v["newListener"], json!(["q", "r"]), "{v}");
+
+    // errorMonitor runs before the 'error' listeners and does not suppress
+    // the unhandled-error throw when no 'error' listener exists.
+    assert_eq!(v["errorMonitor"], json!(["monitor:m1", "error:m1"]), "{v}");
+    assert_eq!(v["errorMonitorOnly"], json!(["only", null]), "{v}");
+    assert_eq!(v["errorMonitorThrows"], "monitor-threw", "{v}");
+
+    // getEventListeners unwraps once wrappers; listenerCount(type, fn)
+    // matches only that listener.
+    assert_eq!(v["getEventListeners"], json!([2, true, true, true]), "{v}");
+    assert_eq!(v["listenerCount"], json!([1, 1, 0]), "{v}");
+
+    // Leak warnings reach process 'warning' exactly like Node's
+    // MaxListenersExceededWarning (name/type/count); max 0 disables them.
+    assert_eq!(
+        v["warnings"],
+        json!([
+            ["MaxListenersExceededWarning", "leak", 11],
+            ["MaxListenersExceededWarning", "y", 4]
+        ]),
+        "{v}"
+    );
+    assert_eq!(
+        v["maxValidation"],
+        json!([
+            [
+                "RangeError",
+                "ERR_OUT_OF_RANGE",
+                "The value of \"setMaxListeners\" is out of range. It must be >= 0. Received -1"
+            ],
+            [
+                "TypeError",
+                "ERR_INVALID_ARG_TYPE",
+                "The \"setMaxListeners\" argument must be of type number. Received type string ('3')"
+            ],
+            [
+                "RangeError",
+                "ERR_OUT_OF_RANGE",
+                "The value of \"setMaxListeners\" is out of range. It must be >= 0. Received NaN"
+            ]
+        ]),
+        "{v}"
+    );
+    assert_eq!(v["maxFloat"], 1.5, "{v}");
+    assert_eq!(v["maxZero"], 15, "{v}");
+
+    // captureRejections routes the async rejection to 'error' instead of the
+    // process-level unhandled rejection; the static flag is an on/off switch.
+    assert_eq!(v["captureCaught"], "async-fail", "{v}");
+    assert_eq!(v["defaultCapture"], Value::Null, "{v}");
+    assert_eq!(v["staticCapture"], true, "{v}");
+    assert_eq!(v["staticRestored"], json!([false, null]), "{v}");
 }

@@ -1,7 +1,8 @@
-// node:v8 load-compatible surface: the engine exposes no V8 introspection
-// host, so the heap/snapshot/serialization entries throw one clear error
-// each; the small value surfaces (cachedDataVersionTag, flags no-op,
-// getHeapStatistics skeleton) report zeros rather than fabricated data.
+// node:v8 load-compatible surface backed by QuickJS, not V8. Only
+// getHeapStatistics samples the live QuickJS heap; no heap snapshots,
+// serialization, or actual GC profiling are provided.
+
+const v8DiagnosticHost = globalThis.__pir_host;
 
 class Serializer {
   constructor() {
@@ -23,19 +24,18 @@ class Deserializer {
 
 class DefaultDeserializer extends Deserializer {}
 
+function v8Unsupported(api) {
+  const error = new Error("v8." + api + " is not supported by the pir extension runtime");
+  error.code = "ERR_NOT_SUPPORTED";
+  return error;
+}
+
 class GCProfiler {
-  constructor() {
-    this._started = false;
-  }
   start() {
-    this._started = true;
+    throw v8Unsupported("GCProfiler.start");
   }
   stop() {
-    this._started = false;
-    return {
-      endTime: Date.now(),
-      statistics: [],
-    };
+    throw v8Unsupported("GCProfiler.stop");
   }
 }
 
@@ -62,24 +62,61 @@ const startupSnapshot = Object.freeze({
   },
 });
 
+// V8 derives this tag from its version, CLI flags and CPU features; embedders
+// use it as a code-cache key. There is no V8 code cache here, but the contract
+// that matters is: a stable non-zero number per (runtime, flag set) pair, so
+// data cached under one flag set is not read back under another. The seed is
+// the runtime identity, and every setFlagsFromString call folds its argument
+// in, which is exactly the "changes when flags change" property callers rely
+// on. A plain zero would read as "uninitialised" to such callers.
+let v8VersionTag = 0x811c9dc5;
+function v8MixTag(text) {
+  let hash = v8VersionTag;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  // FNV-1a never leaves 0 for ASCII input, but keep the non-zero contract
+  // unconditional.
+  v8VersionTag = hash || 1;
+}
+v8MixTag(
+  "pir/quickjs-ng/" +
+    (globalThis.process
+      ? process.platform + "/" + process.arch + "/node-" + process.versions.node
+      : "unknown"),
+);
+
 function cachedDataVersionTag() {
-  // No V8 code-cache exists; a stable zero is the honest constant.
-  return 0;
+  return v8VersionTag;
 }
 
-function setFlagsFromString(_flags) {
-  // No V8 flag host: a no-op keeps the call shape.
+function setFlagsFromString(flags) {
+  // This is a runtime-local VM opt-in, not a general V8 flag parser.
+  // Other flags stay inert; no property is added to the main global object.
+  if (typeof flags !== "string") return;
+  v8MixTag(flags);
+  if (/(?:^|\s)--expose-gc(?:\s|$)/.test(flags)) {
+    v8DiagnosticHost.enableVmGc();
+  }
 }
 
 function getHeapStatistics() {
+  const { mallocSize, memoryUsedSize, mallocLimit } = v8DiagnosticHost.v8HeapStatistics();
+  // Byte counts for the entire current QuickJS runtime, not V8 heap spaces
+  // or process RSS. QuickJS reports allocator bytes (including overhead) and
+  // an estimate of used bytes from its heap walk. Available size is allocator
+  // headroom under a configured cap, not a guarantee that an allocation fits.
+  // QuickJS uses a zero cap for unlimited; headroom is then unavailable (0).
+  // All unmapped V8-only fields are zero placeholders, not measurements.
   return {
-    total_heap_size: 0,
+    total_heap_size: mallocSize,
     total_heap_size_executable: 0,
     total_physical_size: 0,
-    total_available_size: 0,
-    used_heap_size: 0,
-    heap_size_limit: 0,
-    malloced_memory: 0,
+    total_available_size: mallocLimit > 0 ? Math.max(0, mallocLimit - mallocSize) : 0,
+    used_heap_size: memoryUsedSize,
+    heap_size_limit: mallocLimit,
+    malloced_memory: mallocSize,
     peak_malloced_memory: 0,
     does_zap_garbage: 0,
     number_of_native_contexts: 0,
@@ -87,7 +124,6 @@ function getHeapStatistics() {
     total_global_handles_size: 0,
     used_global_handles_size: 0,
     external_memory: 0,
-    external_memory_high_water_mark: 0,
   };
 }
 
