@@ -215,7 +215,9 @@ fn within(candidate: &Path, root: &Path) -> bool {
 
 fn cwd_allowed(runtime: &NodeRuntime, cwd: &Path) -> bool {
     let key = sandbox_key(cwd);
-    effective_roots(runtime).iter().any(|root| within(&key, root))
+    effective_roots(runtime)
+        .iter()
+        .any(|root| within(&key, root))
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,8 +1209,16 @@ fn spawn_start(payload: &JsonValue, runtime: &NodeRuntime) -> NodeResult {
 
     let id = NEXT_CHILD_ID.fetch_add(1, Ordering::SeqCst);
     let diag = diag_callback(runtime);
-    let stdout_sink = StreamSink::new(format!("{id} stdout"), SinkMode::Backpressure, Arc::clone(&diag));
-    let stderr_sink = StreamSink::new(format!("{id} stderr"), SinkMode::Backpressure, Arc::clone(&diag));
+    let stdout_sink = StreamSink::new(
+        format!("{id} stdout"),
+        SinkMode::Backpressure,
+        Arc::clone(&diag),
+    );
+    let stderr_sink = StreamSink::new(
+        format!("{id} stderr"),
+        SinkMode::Backpressure,
+        Arc::clone(&diag),
+    );
     let status: Arc<StdMutex<Option<ExitInfo>>> = Arc::new(StdMutex::new(None));
     let activity = ActivitySignal::new();
     start_reader(
@@ -1401,8 +1411,7 @@ fn spawn_sync(payload: &JsonValue, runtime: &NodeRuntime) -> NodeResult {
     let signal_requested = payload_bool(payload, "signal");
     // Node reports an already-aborted signal in-band (never a throw from
     // spawnSync itself).
-    if signal_requested
-        && (payload_bool(payload, "signalAborted") || runtime.context.is_aborted())
+    if signal_requested && (payload_bool(payload, "signalAborted") || runtime.context.is_aborted())
     {
         return Ok(json!({
             "pid": 0,
@@ -1482,10 +1491,9 @@ fn spawn_sync(payload: &JsonValue, runtime: &NodeRuntime) -> NodeResult {
     let timeout_at = timeout.map(|timeout| Instant::now() + timeout);
     let mut forced_failure: Option<(&'static str, String)> = None;
     let status = 'wait: loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| NodeError::new("EIO", format!("waiting for `{cmd}` failed: {error}")))?
-        {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            NodeError::new("EIO", format!("waiting for `{cmd}` failed: {error}"))
+        })? {
             break status;
         }
         let aborted = signal_requested && runtime.context.is_aborted();
@@ -1673,7 +1681,7 @@ pub fn zlib_op(op: &str, payload: &JsonValue) -> NodeResult {
                 max_output,
                 payload_bool(payload, "rejectGarbageAfterEnd"),
             )?
-        },
+        }
         "zstdCompress" => (
             zlib_zstd_compress(&data, payload, dictionary.as_deref(), max_output)?,
             data.len(),
@@ -2030,7 +2038,6 @@ fn zlib_inflate(
     let mut decoder = flate2::Decompress::new_with_window_bits(zlib_header, window_bits);
     let limit = zlib_output_limit(max_output);
     let mut out = Vec::with_capacity(zlib_inflate_hint(data.len(), limit));
-    let mut finished = false;
     if let Some(dictionary) = dictionary {
         if zlib_header {
             // RFC 1950 carries the dictionary's Adler-32 in a DICTID field;
@@ -2047,7 +2054,7 @@ fn zlib_inflate(
                         .map_err(|_| NodeError::new("Z_NEED_DICT", "Bad dictionary"))?;
                 }
                 Err(error) => return Err(zlib_decompress_error(&error)),
-                Ok(status) => finished = status == flate2::Status::StreamEnd,
+                Ok(_) => {}
             }
         } else {
             // Raw DEFLATE has no header, so the dictionary installs up front.
@@ -2056,7 +2063,7 @@ fn zlib_inflate(
                 .map_err(|error| zlib_decompress_error(&error))?;
         }
     }
-    while !finished {
+    loop {
         let consumed = usize::try_from(decoder.total_in()).unwrap_or(usize::MAX);
         let before_out = out.len();
         let status = decoder
@@ -2197,10 +2204,7 @@ fn zlib_gunzip(
             }
             // Non-finalizing flush: a truncated member returns the decoded
             // prefix instead of the Z_BUF_ERROR.
-            if finish_flush.unwrap_or(4) != 4
-                && error.code == "Z_BUF_ERROR"
-                && !out.is_empty()
-            {
+            if finish_flush.unwrap_or(4) != 4 && error.code == "Z_BUF_ERROR" && !out.is_empty() {
                 break;
             }
             return Err(error);
@@ -2278,11 +2282,12 @@ fn zlib_brotli_compress(
             let mut input_buffer = [0u8; 4096];
             let mut output_buffer = [0u8; 4096];
             // Brotli's metablock-hook signature; nothing is logged here.
-            let mut nop =
-                |_pm: &mut brotli::interface::PredictionModeContextMap<brotli::InputReferenceMut>,
-                 _cmds: &mut [brotli::interface::StaticCommand],
-                 _mb: brotli::InputPair,
-                 _alloc: &mut brotli::enc::StandardAlloc| {};
+            let mut nop = |_pm: &mut brotli::interface::PredictionModeContextMap<
+                brotli::InputReferenceMut,
+            >,
+                           _cmds: &mut [brotli::interface::StaticCommand],
+                           _mb: brotli::InputPair,
+                           _alloc: &mut brotli::enc::StandardAlloc| {};
             brotli::BrotliCompressCustomIoCustomDict(
                 &mut brotli::IoReaderWrapper(&mut &data[..]),
                 &mut brotli::IoWriterWrapper(&mut out),
@@ -2336,14 +2341,14 @@ fn zlib_brotli_decompress(
             );
             cell.slice_mut().copy_from_slice(dictionary);
             brotli::BrotliState::new_with_custom_dictionary(
-                alloc_u8.clone(),
+                alloc_u8,
                 brotli::enc::StandardAlloc::default(),
                 brotli::enc::StandardAlloc::default(),
                 cell,
             )
         }
         _ => brotli::BrotliState::new(
-            alloc_u8.clone(),
+            alloc_u8,
             brotli::enc::StandardAlloc::default(),
             brotli::enc::StandardAlloc::default(),
         ),
@@ -2516,7 +2521,7 @@ fn zlib_zstd_compress(
                     NodeError::new("Z_BUF_ERROR", format!("zstd compression failed: {error}"))
                 })?
             }
-        },
+        }
     };
     zlib_check_output_limit(out, max_output)
 }
@@ -2584,36 +2589,36 @@ fn zlib_zstd_decompress(
             break;
         }
         let frame_size = match zstd::zstd_safe::find_frame_compressed_size(rest) {
-            Ok(size) => size as usize,
+            Ok(size) => size,
             Err(_error) => {
                 if finish_flush.unwrap_or(4) != 4 {
                     return Ok(out);
                 }
-                return Err(NodeError::new(
-                    "Z_BUF_ERROR",
-                    "unexpected end of file",
-                ));
+                return Err(NodeError::new("Z_BUF_ERROR", "unexpected end of file"));
             }
         };
         if frame_size == 0 || frame_size > rest.len() {
             return Err(NodeError::new("Z_BUF_ERROR", "unexpected end of file"));
         }
         let frame = &rest[..frame_size];
-        let mut frame_decoder = zstd::stream::read::Decoder::with_dictionary(
-            frame,
-            dictionary.unwrap_or(&[]),
-        )
-        .map_err(|error| {
-            NodeError::new(
-                "Z_DATA_ERROR",
-                format!("Z_DATA_ERROR: zstd decompression failed: {error}"),
-            )
-        })?;
+        let mut frame_decoder =
+            zstd::stream::read::Decoder::with_dictionary(frame, dictionary.unwrap_or(&[]))
+                .map_err(|error| {
+                    NodeError::new(
+                        "Z_DATA_ERROR",
+                        format!("Z_DATA_ERROR: zstd decompression failed: {error}"),
+                    )
+                })?;
         if let Some(params) = params.and_then(|value| value.as_object()) {
             if let Some(window) = params.get("100").and_then(JsonValue::as_i64) {
-                frame_decoder.window_log_max(window as u32).map_err(|error| {
-                    NodeError::new("ZSTD_error_frameParameter_windowTooLarge", error.to_string())
-                })?;
+                frame_decoder
+                    .window_log_max(window as u32)
+                    .map_err(|error| {
+                        NodeError::new(
+                            "ZSTD_error_frameParameter_windowTooLarge",
+                            error.to_string(),
+                        )
+                    })?;
             }
         }
         frame_decoder.read_to_end(&mut out).map_err(|error| {
@@ -2623,7 +2628,10 @@ fn zlib_zstd_decompress(
             } else if text.to_ascii_lowercase().contains("checksum") {
                 NodeError::new("ZSTD_error_checksum_wrong", text)
             } else {
-                NodeError::new("Z_DATA_ERROR", format!("Z_DATA_ERROR: decompression failed: {text}"))
+                NodeError::new(
+                    "Z_DATA_ERROR",
+                    format!("Z_DATA_ERROR: decompression failed: {text}"),
+                )
             }
         })?;
         if out.len() as u64 > limit {

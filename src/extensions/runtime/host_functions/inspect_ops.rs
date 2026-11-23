@@ -304,7 +304,7 @@ fn atom_to_key(ctx: &Ctx<'_>, atom: qjs::JSAtom) -> Option<Key> {
             clear_error(ctx);
             return None;
         }
-        if qjs::JS_VALUE_GET_TAG(value) == qjs::JS_TAG_SYMBOL as i32 {
+        if qjs::JS_VALUE_GET_TAG(value) == qjs::JS_TAG_SYMBOL {
             qjs::JS_FreeValue(raw_ctx, value);
             // For a symbol atom, `JS_AtomToString` returns the description.
             let description = qjs::JS_AtomToString(raw_ctx, atom);
@@ -437,11 +437,7 @@ fn call_method<'js>(
 }
 
 /// Own keys (strings then symbols), optionally enumerable-only.
-fn enum_keys(
-    ctx: &Ctx<'_>,
-    object: qjs::JSValue,
-    enumerable_only: bool,
-) -> Option<Vec<AtomGuard>> {
+fn enum_keys(ctx: &Ctx<'_>, object: qjs::JSValue, enumerable_only: bool) -> Option<Vec<AtomGuard>> {
     // SAFETY: `JS_GetOwnPropertyNames` returns a table of atoms owned by the
     // table; each atom is duplicated into an `AtomGuard` and the table is
     // released before returning. No JS runs.
@@ -721,12 +717,14 @@ impl<'js> Renderer<'js> {
         let keys = enum_keys(&self.ctx, options.as_raw(), true)?;
         let mut depth = 2i64;
         for key in &keys {
+            #[allow(clippy::question_mark)]
             let Some(name) = atom_to_key(&self.ctx, key.atom) else {
                 return None;
             };
             let Key::Str(name) = name else {
                 continue;
             };
+            #[allow(clippy::question_mark)]
             let Some(prop) = own_prop_atom(&self.ctx, options.as_raw(), key.atom) else {
                 return None;
             };
@@ -930,23 +928,22 @@ impl<'js> Renderer<'js> {
                 Prop::Accessor => return None,
                 Prop::Data(constructor) => {
                     if constructor.is_function() {
-                        let name =
-                            match own_prop_atom(
-                                &self.ctx,
-                                constructor.as_raw(),
-                                PredefinedAtom::Name as qjs::JSAtom,
-                            ) {
-                                Some(Prop::Data(raw_name)) => {
-                                    let units = if raw_name.is_string() {
-                                        read_units(&self.ctx, &raw_name)
-                                    } else {
-                                        None
-                                    };
-                                    units.and_then(|units| String::from_utf16(&units).ok())
-                                }
-                                // Accessor / missing `name`: nothing to report.
-                                _ => None,
-                            };
+                        let name = match own_prop_atom(
+                            &self.ctx,
+                            constructor.as_raw(),
+                            PredefinedAtom::Name as qjs::JSAtom,
+                        ) {
+                            Some(Prop::Data(raw_name)) => {
+                                let units = if raw_name.is_string() {
+                                    read_units(&self.ctx, &raw_name)
+                                } else {
+                                    None
+                                };
+                                units.and_then(|units| String::from_utf16(&units).ok())
+                            }
+                            // Accessor / missing `name`: nothing to report.
+                            _ => None,
+                        };
                         if let Some(name) = name.filter(|name| !name.is_empty()) {
                             let candidate = match own_prop_atom(
                                 &self.ctx,
@@ -963,7 +960,9 @@ impl<'js> Renderer<'js> {
                     }
                 }
             }
-            let Some(proto) = prototype_of(&self.ctx, &current)? else {
+            #[allow(clippy::question_mark)]
+            let Some(proto) = prototype_of(&self.ctx, &current)?
+            else {
                 return None;
             };
             current = proto;
@@ -1055,10 +1054,7 @@ impl<'js> Renderer<'js> {
             return None;
         }
 
-        let length_value = match value
-            .as_object()?
-            .get::<_, Value>(PredefinedAtom::Length)
-        {
+        let length_value = match value.as_object()?.get::<_, Value>(PredefinedAtom::Length) {
             Ok(value) => value,
             Err(_) => {
                 clear_error(&self.ctx);
@@ -1100,9 +1096,7 @@ impl<'js> Renderer<'js> {
                     return None;
                 };
                 all_numeric = all_numeric
-                    && (entry_value.is_int()
-                        || entry_value.is_float()
-                        || entry_value.is_big_int());
+                    && (entry_value.is_int() || entry_value.is_float() || entry_value.is_big_int());
                 self.indent += 2;
                 let rendered = self.render(&entry_value, crt);
                 self.indent -= 2;
@@ -1488,16 +1482,17 @@ impl<'js> Renderer<'js> {
         }
 
         let mut max_line_length = vec![0i64; columns as usize];
-        for column in 0..columns as usize {
+        let stride = columns as usize;
+        for (column, max_len) in max_line_length.iter_mut().enumerate() {
             let mut line_max = 0i64;
             let mut index = column;
             while index < output.len() {
                 if data_len[index] > line_max {
                     line_max = data_len[index];
                 }
-                index += columns as usize;
+                index += stride;
             }
-            max_line_length[column] = line_max + 2;
+            *max_len = line_max + 2;
         }
 
         let mut result = Vec::new();
@@ -1697,6 +1692,7 @@ impl<'js> Formatter<'js> {
         renderer.render(value, 0)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_string_value(&mut self, value: &Value<'js>) -> Option<String> {
         if value.is_string() {
             return read_string_fast(&self.ctx, value);

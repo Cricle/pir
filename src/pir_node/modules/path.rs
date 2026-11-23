@@ -31,9 +31,34 @@ impl Flavor {
 }
 
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "COM\u{b9}",
-    "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b2}", "LPT\u{b3}",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 #[inline]
@@ -185,7 +210,7 @@ pub fn win32_normalize(path: &str) -> String {
                                 root_end = 4 + possible_device.len();
                             }
                         } else if j == len {
-                            return format!("\\\\{first_part}\\{}\\" , &path[last..]);
+                            return format!("\\\\{first_part}\\{}\\", &path[last..]);
                         } else {
                             device = Some(format!("\\\\{first_part}\\{}", &path[last..j]));
                             root_end = j;
@@ -229,10 +254,7 @@ pub fn win32_normalize(path: &str) -> String {
 
     if !is_absolute && device.is_none() && path.contains(':') {
         let tail_bytes = tail.as_bytes();
-        if tail_bytes.len() >= 2
-            && is_windows_device_root(tail_bytes[0])
-            && tail_bytes[1] == b':'
-        {
+        if tail_bytes.len() >= 2 && is_windows_device_root(tail_bytes[0]) && tail_bytes[1] == b':' {
             return format!(".\\{tail}");
         }
         let mut search = 0usize;
@@ -311,7 +333,11 @@ pub fn win32_resolve<S: AsRef<str>>(parts: &[S], cwd: &str) -> String {
     // and `insert_str` only shifts bytes (the capacity covers every part plus
     // the cwd anchor, so it never reallocates).
     let mut resolved_tail = String::with_capacity(
-        cwd.len() + parts.iter().map(|part| part.as_ref().len() + 1).sum::<usize>(),
+        cwd.len()
+            + parts
+                .iter()
+                .map(|part| part.as_ref().len() + 1)
+                .sum::<usize>(),
     );
     let mut resolved_absolute = false;
 
@@ -436,7 +462,7 @@ pub fn win32_resolve<S: AsRef<str>>(parts: &[S], cwd: &str) -> String {
                 if resolved_tail.is_empty() {
                     resolved_tail.push_str(tail_rest);
                 } else {
-                    resolved_tail.insert_str(0, "\\");
+                    resolved_tail.insert(0, '\\');
                     resolved_tail.insert_str(0, tail_rest);
                 }
             }
@@ -889,7 +915,6 @@ pub fn posix_relative(from: &str, to: &str, cwd: &str) -> String {
     }
 
     let tail_start = (to_start as isize + last_common_sep) as usize;
-    let mut out = out;
     out.push_str(&to[tail_start..]);
     out
 }
@@ -925,4 +950,3 @@ pub fn relative(flavor: Flavor, from: &str, to: &str, cwd: &str) -> String {
         Flavor::Posix => posix_relative(from, to, cwd),
     }
 }
-

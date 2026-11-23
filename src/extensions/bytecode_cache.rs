@@ -93,7 +93,11 @@ struct MemoryCache {
 
 impl MemoryCache {
     fn new() -> Self {
-        Self { entries: HashMap::new(), order: VecDeque::new(), bytes: 0 }
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
     }
 
     fn get(&mut self, key: &str) -> Option<Arc<Vec<u8>>> {
@@ -117,7 +121,9 @@ impl MemoryCache {
         while self.entries.len() >= MAX_MEMORY_ENTRIES
             || self.bytes.saturating_add(size) > MAX_MEMORY_BYTES
         {
-            let Some(old_key) = self.order.pop_front() else { break };
+            let Some(old_key) = self.order.pop_front() else {
+                break;
+            };
             if let Some(old) = self.entries.remove(&old_key) {
                 self.bytes = self.bytes.saturating_sub(old.len());
             }

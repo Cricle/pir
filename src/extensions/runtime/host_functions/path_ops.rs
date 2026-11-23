@@ -91,7 +91,9 @@ pub(super) fn path_native<'js>(
     let result: Option<String> = match op {
         OP_NORMALIZE => cstring_arg(&a)
             .map(|path| crate::pir_node::modules::path::normalize(flavor, path.as_str())),
-        OP_JOIN => cstring_list(&a).map(|parts| crate::pir_node::modules::path::join(flavor, &parts)),
+        OP_JOIN => {
+            cstring_list(&a).map(|parts| crate::pir_node::modules::path::join(flavor, &parts))
+        }
         OP_RESOLVE => {
             let provided = cstring_arg(&c);
             let fallback = if provided.is_none() {
@@ -122,12 +124,14 @@ pub(super) fn path_native<'js>(
                 .map(CString::as_str)
                 .or(fallback.as_deref());
             match (cstring_arg(&a), cstring_arg(&b), cwd) {
-                (Some(from), Some(to), Some(cwd)) => Some(crate::pir_node::modules::path::relative(
-                    flavor,
-                    from.as_str(),
-                    to.as_str(),
-                    cwd,
-                )),
+                (Some(from), Some(to), Some(cwd)) => {
+                    Some(crate::pir_node::modules::path::relative(
+                        flavor,
+                        from.as_str(),
+                        to.as_str(),
+                        cwd,
+                    ))
+                }
                 _ => None,
             }
         }

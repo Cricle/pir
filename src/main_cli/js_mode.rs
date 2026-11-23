@@ -552,7 +552,12 @@ async fn run_script(
 /// `exports` / `__filename` ("[eval]") / `__dirname` (".") defined the way
 /// Node's eval scope defines them. `process.argv` is the injected
 /// `[execPath, ...args]`.
-async fn run_eval(code: String, argv: Vec<String>, exec_path: String, exec_argv: Vec<String>) -> i32 {
+async fn run_eval(
+    code: String,
+    argv: Vec<String>,
+    exec_path: String,
+    exec_argv: Vec<String>,
+) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = ExtensionConfig {
         cwd: cwd.clone(),

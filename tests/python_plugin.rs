@@ -163,11 +163,7 @@ async fn uncaught_exception_returns_traceback() {
 #[tokio::test]
 async fn syntax_error_reports_python_error() {
     let tool = python_tool();
-    let result = run(
-        &tool,
-        serde_json::json!({ "code": "function broken(" }),
-    )
-    .await;
+    let result = run(&tool, serde_json::json!({ "code": "function broken(" })).await;
     assert!(result.is_error);
     assert!(
         !result.content.is_empty(),

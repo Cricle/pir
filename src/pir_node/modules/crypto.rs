@@ -2,8 +2,6 @@
 //! block (hash/HMAC/PBKDF2/scrypt/AES-GCM/RSA sign+verify, zlib raw). The
 //! op semantics and error codes are unchanged; only the crate imports differ.
 
-use std::borrow::Cow;
-use std::io::Read as _;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use base64::engine::general_purpose::STANDARD;
@@ -16,6 +14,8 @@ use sha1::Sha1;
 use sha2::{Digest as _, Sha224, Sha256, Sha384, Sha512};
 use sha3::digest::{ExtendableOutput, XofReader};
 use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
+use std::borrow::Cow;
+use std::io::Read as _;
 
 use crate::pir_node::bridge::{payload_bool, payload_text};
 use crate::pir_node::error::{NodeError, NodeResult};
@@ -377,7 +377,6 @@ pub fn encode_base64url(bytes: &[u8]) -> String {
 pub fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
-
 
 /// `n` bytes from the OS entropy source (1 GiB cap: an extension asking for
 /// more is a bug, not a request).
@@ -1137,7 +1136,9 @@ fn parse_sign_digest(alg: &str) -> Result<SignDigest, NodeError> {
                 .collect(),
         )
     };
-    let digest = normalized.strip_prefix("rsa").unwrap_or(normalized.as_ref());
+    let digest = normalized
+        .strip_prefix("rsa")
+        .unwrap_or(normalized.as_ref());
     Ok(match digest {
         "sha256" | "sha2256" => SignDigest::Sha256,
         "sha384" | "sha2384" => SignDigest::Sha384,

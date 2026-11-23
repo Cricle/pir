@@ -1134,7 +1134,10 @@ export default (pi: any) => {
     assert_eq!(value["allRangeGuard"], "ERR_OUT_OF_RANGE");
     // Audit B2: INSERT ... RETURNING <big int> must not run twice.
     assert_eq!(value["insertRange"], "ERR_OUT_OF_RANGE");
-    assert_eq!(value["insertCount"], 1, "statement must execute exactly once");
+    assert_eq!(
+        value["insertCount"], 1,
+        "statement must execute exactly once"
+    );
     assert_eq!(value["named"], json!({"a": 7, "b": 8}));
     assert_eq!(value["namedPrefixed"], json!({"a": 7, "b": 8}));
     assert_eq!(

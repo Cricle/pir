@@ -518,7 +518,8 @@ export default (pi: any) => {
     let payload_big = json!({ "data": encoded_big });
     let deflated_small =
         pir::pir_node::modules::child::zlib_op("deflate", &payload_small).expect("deflate");
-    let deflated_big = pir::pir_node::modules::child::zlib_op("deflate", &payload_big).expect("deflate");
+    let deflated_big =
+        pir::pir_node::modules::child::zlib_op("deflate", &payload_big).expect("deflate");
     let deflated_small = deflated_small.as_str().expect("base64");
     let deflated_big = deflated_big.as_str().expect("base64");
     let inflate_small_payload = json!({ "data": deflated_small });
@@ -535,7 +536,8 @@ export default (pi: any) => {
         "op inflate 4KB",
         2000,
         Box::new(|| {
-            pir::pir_node::modules::child::zlib_op("inflate", &inflate_small_payload).expect("inflate");
+            pir::pir_node::modules::child::zlib_op("inflate", &inflate_small_payload)
+                .expect("inflate");
         }),
     );
     rust_time(
@@ -549,7 +551,8 @@ export default (pi: any) => {
         "op inflate 1MB",
         100,
         Box::new(|| {
-            pir::pir_node::modules::child::zlib_op("inflate", &inflate_big_payload).expect("inflate");
+            pir::pir_node::modules::child::zlib_op("inflate", &inflate_big_payload)
+                .expect("inflate");
         }),
     );
     // The zlib module dispatch calls `crypto::zlib_raw_op` first for every

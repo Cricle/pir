@@ -929,8 +929,7 @@ fn buffer_codec_entry<'js>(
             let bytes = codec_bytes(arg, &ctx)?;
             // SAFETY: as above.
             let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
-            let (units, consumed) =
-                crate::pir_node::modules::buffer::utf16le_decode_units(raw);
+            let (units, consumed) = crate::pir_node::modules::buffer::utf16le_decode_units(raw);
             // Unpaired surrogates are legal JS string content, so this no
             // longer answers `undefined` for them (the JS tier used to take
             // those chunks byte by byte).
@@ -1204,11 +1203,7 @@ fn js_string_from_utf16<'js>(ctx: &Ctx<'js>, units: &[u16]) -> Option<Value<'js>
     // returned value is owned (refcount 1), exactly the contract `from_raw`
     // expects. No JS runs between the constructor call and the wrap.
     unsafe {
-        let raw = qjs::JS_NewStringUTF16(
-            ctx.as_raw().as_ptr(),
-            units.as_ptr(),
-            units.len() as _,
-        );
+        let raw = qjs::JS_NewStringUTF16(ctx.as_raw().as_ptr(), units.as_ptr(), units.len() as _);
         if raw.tag == qjs::JS_TAG_EXCEPTION as i64 {
             let error = qjs::JS_GetException(ctx.as_raw().as_ptr());
             qjs::JS_FreeValue(ctx.as_raw().as_ptr(), error);

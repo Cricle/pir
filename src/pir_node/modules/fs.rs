@@ -117,7 +117,6 @@ fn io_message(code: &str, message: String, syscall: &str, path: &Path) -> NodeEr
     error
 }
 
-
 // ---------------------------------------------------------------------------
 // Path resolution + write sandbox
 // ---------------------------------------------------------------------------
@@ -572,7 +571,9 @@ fn write_at(path: &Path, bytes: &[u8], flag: &WriteFlag<'_>, mode: u32) -> Resul
             errno: fs_errno("EISDIR"),
         });
     }
-    let mut file = options.open(path).map_err(|error| fs_io(&error, "open", path))?;
+    let mut file = options
+        .open(path)
+        .map_err(|error| fs_io(&error, "open", path))?;
     if !flag.write_access() {
         // Node opens successfully with O_RDONLY and only then fails the data
         // write: `EBADF: bad file descriptor, write` (no `path` field).
@@ -630,7 +631,6 @@ impl StatParts {
         self.birthtime_ns as f64 / 1_000_000.0
     }
 }
-
 
 /// `stat`/`lstat` for the typed `fs.statSync` fast path. Reads are not
 /// root-fenced (same as the `stat` op, which uses `read_path`).
@@ -789,8 +789,8 @@ pub(crate) fn fs_op(
             let path = read_path(runtime, payload, "path")?;
             #[cfg(windows)]
             {
-                let (bsize, blocks, free) = windows_disk_space(&path)
-                    .map_err(|error| fs_io(&error, "statfs", &path))?;
+                let (bsize, blocks, free) =
+                    windows_disk_space(&path).map_err(|error| fs_io(&error, "statfs", &path))?;
                 Ok(serde_json::json!({
                     "type": 0u64,
                     "bsize": bsize,
@@ -805,7 +805,10 @@ pub(crate) fn fs_op(
             }
             #[cfg(not(windows))]
             {
-                Err(NodeError::new("ENOSYS", "statfs is not implemented on this platform"))
+                Err(NodeError::new(
+                    "ENOSYS",
+                    "statfs is not implemented on this platform",
+                ))
             }
         }
         "stat" | "lstat" => {
@@ -835,8 +838,8 @@ pub(crate) fn fs_op(
         "readdir" => {
             let path = read_path(runtime, payload, "path")?;
             let dirents = payload_bool(payload, "dirents");
-            let entries = std::fs::read_dir(&path)
-                .map_err(|error| fs_io(&error, "scandir", &path))?;
+            let entries =
+                std::fs::read_dir(&path).map_err(|error| fs_io(&error, "scandir", &path))?;
             let mut names: Vec<JsonValue> = Vec::new();
             let mut typed: Vec<JsonValue> = Vec::new();
             for entry in entries {
@@ -889,8 +892,7 @@ pub(crate) fn fs_op(
                 // A junction is a directory object; removing the directory
                 // entry is Node's `unlink` of a directory symlink.
                 Err(error) if cfg!(windows) && is_directory_symlink(&path) => {
-                    std::fs::remove_dir(&path)
-                        .map_err(|_| fs_io(&error, "unlink", &path))?;
+                    std::fs::remove_dir(&path).map_err(|_| fs_io(&error, "unlink", &path))?;
                     Ok(JsonValue::Null)
                 }
                 Err(error) => Err(fs_io(&error, "unlink", &path)),
@@ -916,8 +918,8 @@ pub(crate) fn fs_op(
             let path = read_path(runtime, payload, "path")?;
             // libuv resolves through lstat; Node reports `syscall: "lstat"`
             // for a missing target.
-            let canonical = std::fs::canonicalize(&path)
-                .map_err(|error| fs_io(&error, "lstat", &path))?;
+            let canonical =
+                std::fs::canonicalize(&path).map_err(|error| fs_io(&error, "lstat", &path))?;
             Ok(JsonValue::String(
                 strip_extended_prefix(canonical)
                     .to_string_lossy()
@@ -949,7 +951,10 @@ pub(crate) fn fs_op(
                 if mapped.code == "EIO" {
                     return io_message(
                         "EINVAL",
-                        format!("EINVAL: invalid argument, readlink '{}'", path.to_string_lossy()),
+                        format!(
+                            "EINVAL: invalid argument, readlink '{}'",
+                            path.to_string_lossy()
+                        ),
                         "readlink",
                         &path,
                     );
@@ -975,8 +980,7 @@ pub(crate) fn fs_op(
         "cp" => {
             let from = read_path(runtime, payload, "from")?;
             let to = check_write(runtime, payload, "to", "cp")?;
-            let meta =
-                std::fs::metadata(&from).map_err(|error| fs_io(&error, "cp", &from))?;
+            let meta = std::fs::metadata(&from).map_err(|error| fs_io(&error, "cp", &from))?;
             if meta.is_dir() {
                 if !payload_bool(payload, "recursive") {
                     // Node refuses a directory copy without {recursive:true}.
@@ -1021,7 +1025,10 @@ pub(crate) fn fs_op(
                 if !recursive && mapped.code == "ENOTDIR" {
                     return io_message(
                         "ENOENT",
-                        format!("ENOENT: no such file or directory, rmdir '{}'", path.to_string_lossy()),
+                        format!(
+                            "ENOENT: no such file or directory, rmdir '{}'",
+                            path.to_string_lossy()
+                        ),
                         "rmdir",
                         &path,
                     );
@@ -1053,8 +1060,7 @@ pub(crate) fn fs_op(
             };
             let atime = to_time(payload.get("atimeMs").and_then(JsonValue::as_f64));
             let mtime = to_time(payload.get("mtimeMs").and_then(JsonValue::as_f64));
-            utimes_path(&path, atime, mtime)
-                .map_err(|error| fs_io(&error, "utime", &path))?;
+            utimes_path(&path, atime, mtime).map_err(|error| fs_io(&error, "utime", &path))?;
             Ok(JsonValue::Null)
         }
         "lutimes" => {
@@ -1066,8 +1072,7 @@ pub(crate) fn fs_op(
             };
             let atime = to_time(payload.get("atimeMs").and_then(JsonValue::as_f64));
             let mtime = to_time(payload.get("mtimeMs").and_then(JsonValue::as_f64));
-            lutimes_path(&path, atime, mtime)
-                .map_err(|error| fs_io(&error, "lutime", &path))?;
+            lutimes_path(&path, atime, mtime).map_err(|error| fs_io(&error, "lutime", &path))?;
             Ok(JsonValue::Null)
         }
         "futimes" => {
@@ -1100,8 +1105,7 @@ pub(crate) fn fs_op(
                 .get("kind")
                 .and_then(JsonValue::as_str)
                 .unwrap_or("file");
-            symlink_impl(target, &path, kind)
-                .map_err(|error| fs_io(&error, "symlink", &path))?;
+            symlink_impl(target, &path, kind).map_err(|error| fs_io(&error, "symlink", &path))?;
             Ok(JsonValue::Null)
         }
         // fd family: `open` fences every write-capable descriptor; later ops
@@ -1126,14 +1130,11 @@ pub(crate) fn fs_op(
             }
             .map_err(|error| fs_io(&error, "open", &path))?;
             let fd = fd_guard(runtime)
-                                .insert(file, path, append, generation)
+                .insert(file, path, append, generation)
                 .map_err(|()| {
                     NodeError::new(
                         "EMFILE",
-                        format!(
-                            "EMFILE: too many open files, open (limit {})",
-                            MAX_OPEN_FDS
-                        ),
+                        format!("EMFILE: too many open files, open (limit {})", MAX_OPEN_FDS),
                     )
                 })?;
             Ok(serde_json::json!(fd))
@@ -1203,8 +1204,7 @@ pub(crate) fn fs_op(
             let mode = payload_mode(payload);
             let mut guard = fd_guard(runtime);
             let entry = guard.get_mut(fd).ok_or_else(|| fd_error(fd, "fchmod"))?;
-            chmod_file(&entry.file, mode)
-                .map_err(|error| fs_io(&error, "fchmod", &entry.path))?;
+            chmod_file(&entry.file, mode).map_err(|error| fs_io(&error, "fchmod", &entry.path))?;
             Ok(JsonValue::Null)
         }
         "ftruncate" => {
@@ -1231,7 +1231,7 @@ pub(crate) fn fs_op(
         "close" => {
             let fd = payload_fd(payload)?;
             fd_guard(runtime)
-                                .remove(fd)
+                .remove(fd)
                 .ok_or_else(|| fd_error(fd, "close"))?;
             Ok(JsonValue::Null)
         }
@@ -1417,7 +1417,8 @@ fn open_directory_readwrite(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
-fn open_options_bits(    bits: i64,
+fn open_options_bits(
+    bits: i64,
     mode: u32,
     path: &Path,
 ) -> Result<(std::fs::OpenOptions, bool), NodeError> {
@@ -1622,11 +1623,21 @@ fn copy_file(from: &Path, to: &Path, mode: u32) -> Result<(), NodeError> {
     // destination also fails (or EXCL is set).
     let meta = std::fs::metadata(from).map_err(|error| copyfile_io(&error, from, to))?;
     if meta.is_dir() {
-        return Err(copyfile_message("EPERM", "operation not permitted", from, to));
+        return Err(copyfile_message(
+            "EPERM",
+            "operation not permitted",
+            from,
+            to,
+        ));
     }
     if mode & 4 != 0 {
         #[cfg(windows)]
-        return Err(copyfile_message("ENOSYS", "function not implemented", from, to));
+        return Err(copyfile_message(
+            "ENOSYS",
+            "function not implemented",
+            from,
+            to,
+        ));
         // POSIX: no portable reflink probe; a normal copy is the documented
         // fallback (`COPYFILE_FICLONE` behaviour) rather than a hard failure.
     }
@@ -1642,7 +1653,8 @@ fn copy_file(from: &Path, to: &Path, mode: u32) -> Result<(), NodeError> {
                     copyfile_io(&error, from, to)
                 }
             })?;
-        let mut source = std::fs::File::open(from).map_err(|error| copyfile_io(&error, from, to))?;
+        let mut source =
+            std::fs::File::open(from).map_err(|error| copyfile_io(&error, from, to))?;
         std::io::copy(&mut source, &mut dest).map_err(|error| copyfile_io(&error, from, to))?;
         let _ = dest.set_permissions(meta.permissions());
         return Ok(());
@@ -1988,9 +2000,7 @@ fn create_junction(target: &str, path: &Path) -> std::io::Result<()> {
     };
     let substitute = format!(r"\??\{}", absolute.display());
     let print = absolute.display().to_string();
-    let substitute: Vec<u16> = std::ffi::OsStr::new(&substitute)
-        .encode_wide()
-        .collect();
+    let substitute: Vec<u16> = std::ffi::OsStr::new(&substitute).encode_wide().collect();
     let print: Vec<u16> = std::ffi::OsStr::new(&print).encode_wide().collect();
     let substitute_bytes: Vec<u8> = substitute.iter().flat_map(|u| u.to_le_bytes()).collect();
     let print_bytes: Vec<u8> = print.iter().flat_map(|u| u.to_le_bytes()).collect();
@@ -2002,8 +2012,7 @@ fn create_junction(target: &str, path: &Path) -> std::io::Result<()> {
     let mut offset = 8;
     buffer[offset..offset + 2].copy_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
     offset += 2;
-    buffer[offset..offset + 2]
-        .copy_from_slice(&(substitute_bytes.len() as u16).to_le_bytes());
+    buffer[offset..offset + 2].copy_from_slice(&(substitute_bytes.len() as u16).to_le_bytes());
     offset += 2;
     buffer[offset..offset + 2]
         .copy_from_slice(&((substitute_bytes.len() + 2) as u16).to_le_bytes());
@@ -2135,11 +2144,7 @@ fn stat_parts_of(meta: &std::fs::Metadata, symlink: bool) -> StatParts {
 fn stat_parts_of(meta: &std::fs::Metadata, symlink: bool) -> StatParts {
     use std::os::unix::fs::MetadataExt as _;
 
-    let ns = |seconds: i64, nanos: i64| {
-        seconds
-            .saturating_mul(1_000_000_000)
-            .saturating_add(nanos)
-    };
+    let ns = |seconds: i64, nanos: i64| seconds.saturating_mul(1_000_000_000).saturating_add(nanos);
     StatParts {
         is_file: meta.is_file(),
         is_directory: meta.is_dir(),
@@ -2236,4 +2241,3 @@ fn access_check(path: &Path, mode: u32) -> std::io::Result<()> {
     }
     Ok(())
 }
-

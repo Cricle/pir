@@ -15,8 +15,8 @@ pub mod runtime;
 
 pub use error::{NodeError, NodeResult};
 pub use runtime::{
-    ExecOutcome, NodeContext, NodeHooks, NodeRuntime, NpmLookup, NpmSource, NullContext,
-    NullHooks, SessionConfig,
+    ExecOutcome, NodeContext, NodeHooks, NodeRuntime, NpmLookup, NpmSource, NullContext, NullHooks,
+    SessionConfig,
 };
 
 use serde_json::{json, Value as JsonValue};

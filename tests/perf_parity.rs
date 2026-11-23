@@ -198,7 +198,9 @@ fn run(engine: &mut Command, runs: u32, label: &str) -> BTreeMap<String, f64> {
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
     for run in 0..runs {
         let started = Instant::now();
-        let output = engine.output().unwrap_or_else(|e| panic!("{label} should start: {e}"));
+        let output = engine
+            .output()
+            .unwrap_or_else(|e| panic!("{label} should start: {e}"));
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -225,7 +227,10 @@ fn run(engine: &mut Command, runs: u32, label: &str) -> BTreeMap<String, f64> {
                 .and_modify(|slot| *slot = slot.min(ns))
                 .or_insert(ns);
         }
-        assert!(seen > 0, "{label} produced no PERF lines:\n{stdout}\n{stderr}");
+        assert!(
+            seen > 0,
+            "{label} produced no PERF lines:\n{stdout}\n{stderr}"
+        );
         println!(
             "[{label}] run {} in {:.1}s, {} ops",
             run + 1,
@@ -280,13 +285,23 @@ fn hot_paths_are_not_slower_than_node() {
     let mut rows: Vec<(String, f64, f64)> = pir_ns
         .iter()
         .filter(|(name, _)| filter.is_empty() || name.contains(&filter))
-        .map(|(name, ns)| (name.clone(), *ns, node_ns.get(name).copied().unwrap_or(f64::NAN)))
+        .map(|(name, ns)| {
+            (
+                name.clone(),
+                *ns,
+                node_ns.get(name).copied().unwrap_or(f64::NAN),
+            )
+        })
         .collect();
     assert!(
         !rows.is_empty(),
         "no operations matched PIR_PERF_ONLY={filter:?}"
     );
-    rows.sort_by(|a, b| (b.1 / b.2).partial_cmp(&(a.1 / a.2)).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        (b.1 / b.2)
+            .partial_cmp(&(a.1 / a.2))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     println!();
     println!(
@@ -318,7 +333,10 @@ fn hot_paths_are_not_slower_than_node() {
         share * 100.0
     );
     for bound in [1.0f64, 2.0, 4.0, 10.0, 100.0] {
-        let within = rows.iter().filter(|(_, pir_ns, node_ns)| pir_ns / node_ns <= bound).count();
+        let within = rows
+            .iter()
+            .filter(|(_, pir_ns, node_ns)| pir_ns / node_ns <= bound)
+            .count();
         println!(
             "  within {:.0}x of node: {}/{} ({:.1}%)",
             bound,
@@ -367,8 +385,17 @@ fn corpus_declares_every_benchmark_once() {
     assert!(total >= 40, "corpus shrank to {total} operations");
     // Keep the gate honest about the modules it covers.
     for needed in [
-        "url/", "querystring/", "path/", "fs/", "crypto/", "buffer/", "json/", "util/", "events/",
-        "text/", "zlib/",
+        "url/",
+        "querystring/",
+        "path/",
+        "fs/",
+        "crypto/",
+        "buffer/",
+        "json/",
+        "util/",
+        "events/",
+        "text/",
+        "zlib/",
     ] {
         assert!(
             names.iter().any(|name| name.starts_with(needed)),

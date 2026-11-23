@@ -302,8 +302,7 @@ impl PythonSession {
                 // exception text (which is locale/version dependent and may
                 // be empty). A job that failed before the deadline is a real
                 // script error, not a timeout.
-                let timed_out =
-                    Instant::now() >= deadline || abort.load(Ordering::Acquire);
+                let timed_out = Instant::now() >= deadline || abort.load(Ordering::Acquire);
                 if timed_out {
                     stderr.push_str(&format!("{}: execution timed out\n{}", label, TIMEOUT_HINT));
                     // Drop the context so a timed-out job cannot taint the next.

@@ -1830,7 +1830,8 @@ async fn run_events_parity_fixture(name: &str) -> (TempDir, ExtensionRuntime, Va
         .expect("events parity runtime construction");
     rt.allow_root(temp.0.clone());
     let module = format!("pir-ext:{name}.ts");
-    rt.seed_module(&module, EVENTS_PARITY_TS).expect("seed events fixture");
+    rt.seed_module(&module, EVENTS_PARITY_TS)
+        .expect("seed events fixture");
     let loaded = rt.seeded_load(&module).await;
     assert_eq!(loaded.expect("seeded load"), 1, "events fixture must load");
     let mut payload = json!({ "reason": "startup" });
@@ -1891,7 +1892,11 @@ async fn events_shim_once_and_on_iterator_parity() {
         ]),
         "{v}"
     );
-    assert_eq!(v["onPending"], json!({ "value": ["late"], "done": false }), "{v}");
+    assert_eq!(
+        v["onPending"],
+        json!({ "value": ["late"], "done": false }),
+        "{v}"
+    );
     assert_eq!(v["onReturn"], json!({ "done": true }), "{v}");
     assert_eq!(v["onReturnCleanup"], json!([0, 0]), "{v}");
     assert_eq!(v["onAfterReturn"], json!({ "done": true }), "{v}");

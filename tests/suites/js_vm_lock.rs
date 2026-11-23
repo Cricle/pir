@@ -4,8 +4,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pir::plugins::builtin::PythonSession;
 use pir::plugins::builtin::js_vm::PythonJob;
+use pir::plugins::builtin::PythonSession;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn js_session_concurrent_exec_is_safe() {

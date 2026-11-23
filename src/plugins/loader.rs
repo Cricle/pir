@@ -607,4 +607,3 @@ pub fn native_precedence_len_for_tests() -> usize {
 pub fn is_js_package_path_for_tests(path: &Path, package: &str) -> bool {
     is_js_package_path(path, package)
 }
-

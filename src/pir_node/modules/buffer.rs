@@ -366,7 +366,8 @@ pub fn utf16le_decode_units(bytes: &[u8]) -> (Vec<u16>, usize) {
 /// `Buffer#compare`/`compareOffset` verdict (`-1` / `0` / `1`): the first
 /// differing byte decides, and an equal common prefix leaves the verdict to
 /// the range lengths (the shorter range sorts first).
-pub fn compare_ranges(source: &[u8], target: &[u8]) -> i32 {    let common = source.len().min(target.len());
+pub fn compare_ranges(source: &[u8], target: &[u8]) -> i32 {
+    let common = source.len().min(target.len());
     for i in 0..common {
         if source[i] != target[i] {
             return if source[i] < target[i] { -1 } else { 1 };
@@ -388,5 +389,3 @@ pub fn swap_in_place(bytes: &mut [u8], size: usize) {
         group.reverse();
     }
 }
-
-

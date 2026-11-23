@@ -67,7 +67,12 @@ pub fn path_op(
                 &cwd.to_string_lossy()
             ))
         }
-        other => return Err(NodeError::new("ENOSYS", format!("unknown path op `{other}`"))),
+        other => {
+            return Err(NodeError::new(
+                "ENOSYS",
+                format!("unknown path op `{other}`"),
+            ))
+        }
     };
     Ok(value)
 }

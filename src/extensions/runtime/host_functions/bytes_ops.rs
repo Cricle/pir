@@ -122,7 +122,12 @@ pub(super) fn fs_write<'js>(
     let Some(runtime) = runtime_of(&ctx) else {
         return Ok(Value::new_undefined(ctx));
     };
-    match crate::pir_node::modules::fs::write_file(&runtime, &path, bytes, append.0.unwrap_or(false)) {
+    match crate::pir_node::modules::fs::write_file(
+        &runtime,
+        &path,
+        bytes,
+        append.0.unwrap_or(false),
+    ) {
         Ok(()) => Ok(Value::new_float(ctx, bytes.len() as f64)),
         Err(error) => Err(raise(&ctx, &error)),
     }
@@ -132,12 +137,15 @@ pub(super) fn fs_write<'js>(
 /// validated it (Node's 0..=2^32-1 integer window); a shape this tier cannot
 /// read is treated as absent so the digest's own default applies.
 fn output_length_arg(value: Opt<f64>) -> Option<usize> {
-    value.0.filter(|length| {
-        length.is_finite()
-            && *length >= 0.0
-            && length.fract() == 0.0
-            && *length <= 4_294_967_295.0
-    }).map(|length| length as usize)
+    value
+        .0
+        .filter(|length| {
+            length.is_finite()
+                && *length >= 0.0
+                && length.fract() == 0.0
+                && *length <= 4_294_967_295.0
+        })
+        .map(|length| length as usize)
 }
 
 /// `__pirCryptoDigest(algo, bytes[, outputLength])` → `Uint8Array` or
@@ -151,7 +159,11 @@ pub(super) fn crypto_digest<'js>(
     let (Some(algo), Some(bytes)) = (string_arg(&algo), view_bytes(&data)) else {
         return Ok(Value::new_undefined(ctx));
     };
-    match crate::pir_node::modules::crypto::hash_bytes(&algo, bytes, output_length_arg(output_length)) {
+    match crate::pir_node::modules::crypto::hash_bytes(
+        &algo,
+        bytes,
+        output_length_arg(output_length),
+    ) {
         Ok(digest) => bytes_value(ctx, digest),
         // The shim only calls this for the host-backed algorithms; anything
         // else is its own JS implementation's job (and its own error text).
@@ -179,15 +191,17 @@ pub(super) fn crypto_hmac<'js>(
 
 /// Render a finished digest for `digest(encoding)`. The three text encodings
 /// become a JS string host-side; all else is the raw `Uint8Array`.
-fn digest_value<'js>(
-    ctx: Ctx<'js>,
-    bytes: Vec<u8>,
-    encoding: Option<&str>,
-) -> Result<Value<'js>> {
+fn digest_value<'js>(ctx: Ctx<'js>, bytes: Vec<u8>, encoding: Option<&str>) -> Result<Value<'js>> {
     match encoding {
         Some("hex") => js_text(&ctx, crate::pir_node::modules::crypto::encode_hex(&bytes)),
-        Some("base64") => js_text(&ctx, crate::pir_node::modules::crypto::encode_base64(&bytes)),
-        Some("base64url") => js_text(&ctx, crate::pir_node::modules::crypto::encode_base64url(&bytes)),
+        Some("base64") => js_text(
+            &ctx,
+            crate::pir_node::modules::crypto::encode_base64(&bytes),
+        ),
+        Some("base64url") => js_text(
+            &ctx,
+            crate::pir_node::modules::crypto::encode_base64url(&bytes),
+        ),
         _ => bytes_value(ctx, bytes),
     }
 }
@@ -206,7 +220,11 @@ pub(super) fn crypto_digest_enc<'js>(
     let (Some(algo), Some(bytes)) = (string_arg(&algo), view_bytes(&data)) else {
         return Ok(Value::new_undefined(ctx));
     };
-    match crate::pir_node::modules::crypto::hash_bytes(&algo, bytes, output_length_arg(output_length)) {
+    match crate::pir_node::modules::crypto::hash_bytes(
+        &algo,
+        bytes,
+        output_length_arg(output_length),
+    ) {
         Ok(digest) => digest_value(ctx, digest, encoding.0.as_deref()),
         Err(_) => Ok(Value::new_undefined(ctx)),
     }
@@ -231,7 +249,6 @@ pub(super) fn crypto_hmac_enc<'js>(
         Err(_) => Ok(Value::new_undefined(ctx)),
     }
 }
-
 
 /// `__pirCryptoRandom(n)` → `Uint8Array` or `undefined`.
 pub(super) fn crypto_random<'js>(ctx: Ctx<'js>, n: f64) -> Result<Value<'js>> {
@@ -299,10 +316,7 @@ unsafe impl<'js> rquickjs::JsLifetime<'js> for HashRegistry {
 /// Handles cross as JS numbers; only non-negative safe integers address a
 /// session.
 fn parse_handle(handle: f64) -> Option<u64> {
-    if handle.is_finite()
-        && handle >= 0.0
-        && handle.fract() == 0.0
-        && handle <= 9007199254740991.0
+    if handle.is_finite() && handle >= 0.0 && handle.fract() == 0.0 && handle <= 9007199254740991.0
     {
         Some(handle as u64)
     } else {
@@ -429,8 +443,14 @@ pub(super) fn crypto_hash_final<'js>(
     let bytes = session.finish(output_length_arg(output_length));
     match encoding.0.as_deref() {
         Some("hex") => js_text(&ctx, crate::pir_node::modules::crypto::encode_hex(&bytes)),
-        Some("base64") => js_text(&ctx, crate::pir_node::modules::crypto::encode_base64(&bytes)),
-        Some("base64url") => js_text(&ctx, crate::pir_node::modules::crypto::encode_base64url(&bytes)),
+        Some("base64") => js_text(
+            &ctx,
+            crate::pir_node::modules::crypto::encode_base64(&bytes),
+        ),
+        Some("base64url") => js_text(
+            &ctx,
+            crate::pir_node::modules::crypto::encode_base64url(&bytes),
+        ),
         _ => bytes_value(ctx, bytes),
     }
 }
@@ -618,7 +638,10 @@ pub(super) fn register_bytes_ops(ctx: &Ctx<'_>) -> Result<()> {
         "__pirCryptoDigest",
         rquickjs::prelude::Func::from(crypto_digest),
     )?;
-    globals.set("__pirCryptoHmac", rquickjs::prelude::Func::from(crypto_hmac))?;
+    globals.set(
+        "__pirCryptoHmac",
+        rquickjs::prelude::Func::from(crypto_hmac),
+    )?;
     globals.set(
         "__pirCryptoRandom",
         rquickjs::prelude::Func::from(crypto_random),

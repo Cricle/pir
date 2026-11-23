@@ -844,7 +844,10 @@ async fn typebox_shim_produces_valid_json_schema() {
     assert_eq!(schema["properties"]["undefinedValue"]["type"], "undefined");
     // Optional properties are excluded from `required`; the shim marker is
     // stripped.
-    assert_eq!(schema["required"], json!(["required", "tags", "enabled", "undefinedValue"]));
+    assert_eq!(
+        schema["required"],
+        json!(["required", "tags", "enabled", "undefinedValue"])
+    );
     assert!(
         serde_json::to_string(&schema).unwrap().is_ascii(),
         "schema must be JSON-serializable"
@@ -1880,7 +1883,10 @@ export function helper(value: number): number {
         .emit("session_start", &mut payload)
         .await
         .expect("first emit");
-    assert!(bytecode_cache::get(&key).is_some(), "the entry blob is stored");
+    assert!(
+        bytecode_cache::get(&key).is_some(),
+        "the entry blob is stored"
+    );
 
     // Second runtime: the same modules must load again (memory/disk hit or a
     // transparent miss-and-recompile) and still execute the imported helper.
@@ -2038,8 +2044,8 @@ async fn boot_bundles_are_aot_compiled_and_toggle_boots_identically() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual boot-cost measurement"]
 async fn boot_cost_measurement() {
-    use std::time::{Duration, Instant};
     use pir::extensions::api::node_shims;
+    use std::time::{Duration, Instant};
 
     const WARMUP: usize = 3;
     const ITERS: usize = 20;

@@ -35,8 +35,8 @@ use base64::Engine as _;
 use serde_json::{json, Value as JsonValue};
 
 use super::{
-    brotli_decoder_error, payload_bool, payload_i32, payload_str, zlib_dictionary, zlib_limit_error,
-    zlib_max_output, zlib_output_limit, zlib_window_bits, NodeError, NodeResult,
+    brotli_decoder_error, payload_bool, payload_i32, payload_str, zlib_dictionary,
+    zlib_limit_error, zlib_max_output, zlib_output_limit, zlib_window_bits, NodeError, NodeResult,
 };
 
 /// Default per-call output budget. Node's zlib chunk size is 16 KiB; the JS
@@ -53,6 +53,7 @@ struct PushResult {
     ended: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Session {
     Inflate(InflateSession),
     Brotli(BrotliSession),
@@ -129,30 +130,31 @@ impl InflateSession {
             let mut scratch = vec![0u8; room];
             let before_in = self.decoder.total_in();
             let before_out = self.decoder.total_out();
-            let status = match self
-                .decoder
-                .decompress(&self.input[self.in_pos..], &mut scratch, flush)
-            {
-                Ok(status) => status,
-                Err(error) => {
-                    let used = (self.decoder.total_in() - before_in) as usize;
-                    self.in_pos += used;
-                    self.consumed_total = self.decoder.total_in();
-                    if error.needs_dictionary().is_some() {
-                        if let Some(dictionary) = self.dictionary.as_deref() {
-                            // RFC 1950: the header's DICTID must be read before
-                            // the dictionary is installed (zlib's contract). A
-                            // dictionary whose Adler-32 does not match the
-                            // header's DICTID is Node's "Bad dictionary".
-                            self.decoder
-                                .set_dictionary(dictionary)
-                                .map_err(|_| NodeError::new("Z_NEED_DICT", "Bad dictionary"))?;
-                            continue;
+            let status =
+                match self
+                    .decoder
+                    .decompress(&self.input[self.in_pos..], &mut scratch, flush)
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let used = (self.decoder.total_in() - before_in) as usize;
+                        self.in_pos += used;
+                        self.consumed_total = self.decoder.total_in();
+                        if error.needs_dictionary().is_some() {
+                            if let Some(dictionary) = self.dictionary.as_deref() {
+                                // RFC 1950: the header's DICTID must be read before
+                                // the dictionary is installed (zlib's contract). A
+                                // dictionary whose Adler-32 does not match the
+                                // header's DICTID is Node's "Bad dictionary".
+                                self.decoder
+                                    .set_dictionary(dictionary)
+                                    .map_err(|_| NodeError::new("Z_NEED_DICT", "Bad dictionary"))?;
+                                continue;
+                            }
                         }
+                        return Err(super::zlib_decompress_error(&error));
                     }
-                    return Err(super::zlib_decompress_error(&error));
-                }
-            };
+                };
             let used = (self.decoder.total_in() - before_in) as usize;
             let produced = (self.decoder.total_out() - before_out) as usize;
             self.in_pos += used;
@@ -201,7 +203,11 @@ impl InflateSession {
 
     fn push(&mut self, data: &[u8], max_out: usize) -> NodeResult<PushResult> {
         if self.ended {
-            return Ok(PushResult { out: Vec::new(), consumed: 0, ended: true });
+            return Ok(PushResult {
+                out: Vec::new(),
+                consumed: 0,
+                ended: true,
+            });
         }
         if !data.is_empty() {
             self.input.extend_from_slice(data);
@@ -218,7 +224,11 @@ impl InflateSession {
 
     fn finish(&mut self, max_out: usize) -> NodeResult<PushResult> {
         if self.ended {
-            return Ok(PushResult { out: Vec::new(), consumed: 0, ended: true });
+            return Ok(PushResult {
+                out: Vec::new(),
+                consumed: 0,
+                ended: true,
+            });
         }
         let before = self.consumed_total;
         let mut out = Vec::new();
@@ -276,14 +286,14 @@ impl BrotliSession {
                 );
                 cell.slice_mut().copy_from_slice(&dictionary);
                 brotli::BrotliState::new_with_custom_dictionary(
-                    alloc_u8.clone(),
+                    alloc_u8,
                     brotli::enc::StandardAlloc::default(),
                     brotli::enc::StandardAlloc::default(),
                     cell,
                 )
             }
             _ => brotli::BrotliState::new(
-                alloc_u8.clone(),
+                alloc_u8,
                 brotli::enc::StandardAlloc::default(),
                 brotli::enc::StandardAlloc::default(),
             ),
@@ -377,7 +387,11 @@ impl BrotliSession {
 
     fn push(&mut self, data: &[u8], max_out: usize) -> NodeResult<PushResult> {
         if self.ended {
-            return Ok(PushResult { out: Vec::new(), consumed: 0, ended: true });
+            return Ok(PushResult {
+                out: Vec::new(),
+                consumed: 0,
+                ended: true,
+            });
         }
         if !data.is_empty() {
             self.input.extend_from_slice(data);
@@ -395,7 +409,11 @@ impl BrotliSession {
 
     fn finish(&mut self, max_out: usize) -> NodeResult<PushResult> {
         if self.ended {
-            return Ok(PushResult { out: Vec::new(), consumed: 0, ended: true });
+            return Ok(PushResult {
+                out: Vec::new(),
+                consumed: 0,
+                ended: true,
+            });
         }
         let before = self.consumed_total;
         let mut out = Vec::new();
@@ -425,9 +443,10 @@ fn lock_sessions() -> std::sync::MutexGuard<'static, std::collections::HashMap<u
 }
 
 fn payload_id(payload: &JsonValue) -> NodeResult<u64> {
-    payload.get("id").and_then(JsonValue::as_u64).ok_or_else(|| {
-        NodeError::new("EINVAL", "zlib stream call requires a numeric `id`")
-    })
+    payload
+        .get("id")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| NodeError::new("EINVAL", "zlib stream call requires a numeric `id`"))
 }
 
 fn payload_max_out(payload: &JsonValue) -> usize {
@@ -439,10 +458,13 @@ fn payload_max_out(payload: &JsonValue) -> usize {
 }
 
 fn payload_data(payload: &JsonValue) -> NodeResult<Vec<u8>> {
-    let text = payload.get("data").and_then(JsonValue::as_str).unwrap_or("");
-    STANDARD.decode(text.as_bytes()).map_err(|error| {
-        NodeError::new("EINVAL", format!("invalid base64 payload: {error}"))
-    })
+    let text = payload
+        .get("data")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    STANDARD
+        .decode(text.as_bytes())
+        .map_err(|error| NodeError::new("EINVAL", format!("invalid base64 payload: {error}")))
 }
 
 fn reply(result: PushResult) -> JsonValue {

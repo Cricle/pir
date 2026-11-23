@@ -1349,7 +1349,6 @@ mod shim_deflate {
         });
     }
 
-
     /// (`script_boot.js.txt`, `include_str!`, no deflate), and `assets/shims`
     /// holds exactly one blob per embedded shim (no missing or orphan blobs).
     #[test]

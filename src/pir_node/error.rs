@@ -318,4 +318,3 @@ fn io_errno(error: &std::io::Error, code: &str) -> Option<i32> {
         _ => code_errno(code),
     }
 }
-

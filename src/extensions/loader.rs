@@ -1089,25 +1089,25 @@ pub type AllowedRoots = std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>;
 /// fails with "outside the allowed extension roots".
 pub(super) fn installed_package_root(path: &Path) -> Option<PathBuf> {
     let real = canonical_file(path).or_else(|| canonical_directory(path))?;
-    let node_modules = real
-        .ancestors()
-        .find(|ancestor| {
-            ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    if cfg!(windows) {
-                        name.eq_ignore_ascii_case("node_modules")
-                    } else {
-                        name == "node_modules"
-                    }
-                })
-        })?;
+    let node_modules = real.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case("node_modules")
+                } else {
+                    name == "node_modules"
+                }
+            })
+    })?;
     let rest = real.strip_prefix(node_modules).ok()?;
     let mut components = rest.components();
     let first = components.next()?.as_os_str();
     let root = if first.to_string_lossy().starts_with('@') {
-        node_modules.join(first).join(components.next()?.as_os_str())
+        node_modules
+            .join(first)
+            .join(components.next()?.as_os_str())
     } else {
         node_modules.join(first)
     };
@@ -1181,6 +1181,7 @@ impl ExtensionModuleLoader {
         }
     }
 
+    #[allow(clippy::needless_return)]
     fn load_source(&self, name: &str) -> Option<CachedSource> {
         // Virtual modules (TypeBox shim, pi package shims).
         if let Some(canonical) = super::api::shims::canonical_virtual_name(name) {
@@ -1440,9 +1441,8 @@ fn candidate_paths(path: &Path) -> Vec<PathBuf> {
 /// and real plugins rely on it (esbuild rewrites JSON imports that way).
 pub(crate) fn json_default_wrapper(source: &str) -> String {
     let literal = serde_json::to_string(source).unwrap_or_else(|_| "\"\"".to_string());
-    let mut out = format!(
-        "const __pir_json = JSON.parse({literal});\nexport default __pir_json;\n"
-    );
+    let mut out =
+        format!("const __pir_json = JSON.parse({literal});\nexport default __pir_json;\n");
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(source) {
         for key in map.keys() {
             if is_js_identifier(key) {
@@ -1460,11 +1460,51 @@ pub(crate) fn json_default_wrapper(source: &str) -> String {
 /// Identifier-safe JSON key (export names cannot be reserved words).
 fn is_js_identifier(key: &str) -> bool {
     const RESERVED: &[&str] = &[
-        "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
-        "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
-        "function", "if", "implements", "import", "in", "instanceof", "interface", "let", "new",
-        "null", "package", "private", "protected", "public", "return", "static", "super",
-        "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "new",
+        "null",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
         "yield",
     ];
     if RESERVED.contains(&key) {
@@ -1883,7 +1923,9 @@ impl rquickjs::loader::Loader for ExtensionModuleLoader {
             // transpile it as the best-effort fallback.
             let path = disk_module_path(name)
                 .map(|(path, _)| path)
-                .ok_or_else(|| rquickjs::Error::new_loading_message(name, "module source path unavailable"))?;
+                .ok_or_else(|| {
+                    rquickjs::Error::new_loading_message(name, "module source path unavailable")
+                })?;
             let raw = std::fs::read_to_string(&path)
                 .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?;
             let sanitized = sanitize_module_source(raw);

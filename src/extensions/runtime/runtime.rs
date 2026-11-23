@@ -529,9 +529,7 @@ impl ExtensionRuntime {
                 crate::extensions::api::node_shims::GLOBALS_BUNDLE,
                 crate::extensions::api::node_shims::globals_bundle_source,
             )
-            .map_err(|e| {
-                rquickjs::Error::new_loading_message("pir-node-globals", e.to_string())
-            })?;
+            .map_err(|e| rquickjs::Error::new_loading_message("pir-node-globals", e.to_string()))?;
             // The prelude is embedded deflated: inflate (once per process,
             // cached) only on the source fallback; the AOT path skips it.
             if std::env::var_os("PIR_EXT_SKIP_PRELUDE").is_none() {
@@ -1003,8 +1001,9 @@ impl ExtensionRuntime {
                     crate::extensions::loader::npm_resolve::ModuleKind::Esm
                 )
                 .then(|| {
-                    crate::extensions::bytecode_cache::enabled()
-                        .then(|| crate::extensions::bytecode_cache::key(&ext.module_name, source.as_bytes()))
+                    crate::extensions::bytecode_cache::enabled().then(|| {
+                        crate::extensions::bytecode_cache::key(&ext.module_name, source.as_bytes())
+                    })
                 })
                 .flatten();
                 let transpiled = match kind {
@@ -1048,10 +1047,7 @@ impl ExtensionRuntime {
                         if let Ok(mut cache) = self.cache.lock() {
                             cache.insert(
                                 ext.module_name.clone(),
-                                super::loader::CachedSource {
-                                    js,
-                                    key: cache_key,
-                                },
+                                super::loader::CachedSource { js, key: cache_key },
                             );
                         }
                     }

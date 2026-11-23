@@ -1100,17 +1100,16 @@ fn node_respawn_shape_runs_script_and_drops_v8_flags() {
         "a",
         "--b",
     ]);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        stderr_of(&output)
-    );
+    assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     let stdout = stdout_of(&output);
     assert!(
         stdout.contains(r#""worker.js","a","--b""#),
         "script + verbatim args expected, flags dropped: {stdout}"
     );
-    assert!(!stdout.contains("--no-warnings"), "flag leaked into argv: {stdout}");
+    assert!(
+        !stdout.contains("--no-warnings"),
+        "flag leaked into argv: {stdout}"
+    );
 
     let bare = ws.run_raw(&["worker.js"]);
     assert!(bare.status.success(), "stderr: {}", stderr_of(&bare));
@@ -1139,11 +1138,7 @@ fn node_respawn_reports_stripped_flags_in_exec_argv() {
         "flags.js",
         r#"console.log("execArgv:", JSON.stringify(process.execArgv));"#,
     );
-    let output = ws.run_raw(&[
-        "--no-warnings",
-        "--max-old-space-size=128",
-        "flags.js",
-    ]);
+    let output = ws.run_raw(&["--no-warnings", "--max-old-space-size=128", "flags.js"]);
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
     let stdout = stdout_of(&output);
     assert!(

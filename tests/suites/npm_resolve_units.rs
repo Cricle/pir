@@ -457,7 +457,9 @@ fn module_syntax_scan_rejects_non_esm_keyword_uses() {
     ));
     // Object keys and class method names spelled with the keywords.
     assert!(!has_module_syntax("const t = { import: 1, export: 2 };\n"));
-    assert!(!has_module_syntax("class C { export(value) { return value; } }\n"));
+    assert!(!has_module_syntax(
+        "class C { export(value) { return value; } }\n"
+    ));
     // `import x = require(...)` is TS-only (erased before this scan).
     assert!(!has_module_syntax("const mod = { load };\n"));
     // Real module syntax still detected.

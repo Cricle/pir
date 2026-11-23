@@ -761,24 +761,108 @@ async fn crypto_hot_path_bench() {
         std::hint::black_box(value);
     }
 
-    measure(&rt, "sha256-4k-hex", "sink += crypto.createHash(\"sha256\").update(small).digest(\"hex\").length;", 20_000).await;
-    measure(&rt, "sha256-4k-raw", "sink += crypto.createHash(\"sha256\").update(small).digest().length;", 20_000).await;
-    measure(&rt, "hmac-4k-b64", "sink += crypto.createHmac(\"sha256\", \"key\").update(small).digest(\"base64\").length;", 20_000).await;
-    measure(&rt, "hmac-4k-raw", "sink += crypto.createHmac(\"sha256\", \"key\").update(small).digest().length;", 20_000).await;
+    measure(
+        &rt,
+        "sha256-4k-hex",
+        "sink += crypto.createHash(\"sha256\").update(small).digest(\"hex\").length;",
+        20_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "sha256-4k-raw",
+        "sink += crypto.createHash(\"sha256\").update(small).digest().length;",
+        20_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "hmac-4k-b64",
+        "sink += crypto.createHmac(\"sha256\", \"key\").update(small).digest(\"base64\").length;",
+        20_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "hmac-4k-raw",
+        "sink += crypto.createHmac(\"sha256\", \"key\").update(small).digest().length;",
+        20_000,
+    )
+    .await;
     measure(&rt, "uuid", "sink += crypto.randomUUID().length;", 50_000).await;
-    measure(&rt, "random-32", "sink += crypto.randomBytes(32).length;", 50_000).await;
-    measure(&rt, "sha256-1m", "sink += crypto.createHash(\"sha256\").update(big).digest().length;", 200).await;
+    measure(
+        &rt,
+        "random-32",
+        "sink += crypto.randomBytes(32).length;",
+        50_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "sha256-1m",
+        "sink += crypto.createHash(\"sha256\").update(big).digest().length;",
+        200,
+    )
+    .await;
     // Component probes (same-profile attribution for the fixed cost).
-    measure(&rt, "probe-buffer-from-4k", "sink += Buffer.from(small).length;", 40_000).await;
-    measure(&rt, "probe-concat-4k", "sink += Buffer.concat([small]).length;", 40_000).await;
-    measure(&rt, "probe-hex32", "sink += Buffer.alloc(32).toString(\"hex\").length;", 40_000).await;
-    measure(&rt, "probe-hash-ctor", "sink += crypto.createHash(\"sha256\") === null ? 1 : 0;", 40_000).await;
+    measure(
+        &rt,
+        "probe-buffer-from-4k",
+        "sink += Buffer.from(small).length;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-concat-4k",
+        "sink += Buffer.concat([small]).length;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-hex32",
+        "sink += Buffer.alloc(32).toString(\"hex\").length;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-hash-ctor",
+        "sink += crypto.createHash(\"sha256\") === null ? 1 : 0;",
+        40_000,
+    )
+    .await;
     measure(&rt, "probe-hash-ctor-update", "const h = crypto.createHash(\"sha256\"); h.update(small); sink += h._handle === null ? 1 : 0;", 40_000).await;
-    measure(&rt, "probe-native-digest", "sink += globalThis.__pirCryptoDigest(\"sha256\", small).byteLength;", 40_000).await;
-    measure(&rt, "probe-native-random", "sink += globalThis.__pirCryptoRandom(32).byteLength;", 40_000).await;
+    measure(
+        &rt,
+        "probe-native-digest",
+        "sink += globalThis.__pirCryptoDigest(\"sha256\", small).byteLength;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-native-random",
+        "sink += globalThis.__pirCryptoRandom(32).byteLength;",
+        40_000,
+    )
+    .await;
     measure(&rt, "probe-native-new", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); sink += h; globalThis.__pirCryptoHashRelease(h);", 40_000).await;
-    measure(&rt, "probe-copy-4k", "sink += new Uint8Array(small).byteLength;", 40_000).await;
-    measure(&rt, "probe-slice-4k", "sink += small.slice().byteLength;", 40_000).await;
+    measure(
+        &rt,
+        "probe-copy-4k",
+        "sink += new Uint8Array(small).byteLength;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-slice-4k",
+        "sink += small.slice().byteLength;",
+        40_000,
+    )
+    .await;
     measure(&rt, "probe-native-new-update", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); globalThis.__pirCryptoHashUpdate(h, small); globalThis.__pirCryptoHashRelease(h); sink += h;", 40_000).await;
     measure(&rt, "probe-native-final-raw", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); globalThis.__pirCryptoHashUpdate(h, small); sink += globalThis.__pirCryptoHashFinal(h).byteLength;", 40_000).await;
     measure(&rt, "probe-native-final-hex", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); globalThis.__pirCryptoHashUpdate(h, small); sink += globalThis.__pirCryptoHashFinal(h, \"hex\").length;", 40_000).await;
@@ -813,8 +897,14 @@ async fn crypto_digests_hmac_streams_and_subtle_contract() {
         "{v}"
     );
     // Node's encodings for SHA-256("abc") and the streaming/copy contracts.
-    assert_eq!(v["digestBase64"], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=", "{v}");
-    assert_eq!(v["digestBase64url"], "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", "{v}");
+    assert_eq!(
+        v["digestBase64"], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+        "{v}"
+    );
+    assert_eq!(
+        v["digestBase64url"], "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0",
+        "{v}"
+    );
     assert_eq!(v["digestBufferIsBuffer"], true, "{v}");
     assert_eq!(
         v["multiChunk"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -1239,7 +1329,10 @@ async fn crypto_shim_view_encoding_and_oneshot_hash_parity() {
     // One-shot hash defaults to hex; "buffer"/an options object keep bytes.
     assert_eq!(
         v["hashDefault"],
-        json!(["string", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"]),
+        json!([
+            "string",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        ]),
         "crypto.hash() must default to hex: {v}"
     );
     assert_eq!(v["hashBuffer"], true, "{v}");
@@ -1308,8 +1401,15 @@ async fn crypto_shim_view_encoding_and_oneshot_hash_parity() {
     assert_eq!(v["timingSafeView"], true, "{v}");
 
     // Existing streaming/copy behaviour must remain intact.
-    assert_eq!(v["hmacStream"], "UDH+PZicbRU3oBP6bnOdojRj/a7DtwE32Cjjas4iG9A=", "{v}");
-    assert_eq!(v["hashStream"], json!({ "chunk": true, "afterEnd": true }), "{v}");
+    assert_eq!(
+        v["hmacStream"], "UDH+PZicbRU3oBP6bnOdojRj/a7DtwE32Cjjas4iG9A=",
+        "{v}"
+    );
+    assert_eq!(
+        v["hashStream"],
+        json!({ "chunk": true, "afterEnd": true }),
+        "{v}"
+    );
     assert_eq!(
         v["copyState"],
         json!({
@@ -1338,12 +1438,8 @@ async fn crypto_shim_random_int_and_rng_validation_parity() {
     assert_eq!(v["intRange"], json!({ "ok": true }), "{v}");
     assert_eq!(v["intMaxSafe"], json!({ "ok": true }), "{v}");
 
-    let type_error = |message: &str| {
-        json!({ "name": "TypeError", "code": "ERR_INVALID_ARG_TYPE", "message": message })
-    };
-    let out_of_range = |message: &str| {
-        json!({ "name": "RangeError", "code": "ERR_OUT_OF_RANGE", "message": message })
-    };
+    let type_error = |message: &str| json!({ "name": "TypeError", "code": "ERR_INVALID_ARG_TYPE", "message": message });
+    let out_of_range = |message: &str| json!({ "name": "RangeError", "code": "ERR_OUT_OF_RANGE", "message": message });
     assert_eq!(
         v["intFloat"],
         type_error("The \"min\" argument must be a safe integer. Received type number (1.5)"),
@@ -1409,12 +1505,16 @@ async fn crypto_shim_random_int_and_rng_validation_parity() {
 
     assert_eq!(
         v["rfOffset"],
-        out_of_range("The value of \"offset\" is out of range. It must be >= 0 && <= 2. Received 3"),
+        out_of_range(
+            "The value of \"offset\" is out of range. It must be >= 0 && <= 2. Received 3"
+        ),
         "{v}"
     );
     assert_eq!(
         v["rfNegOffset"],
-        out_of_range("The value of \"offset\" is out of range. It must be >= 0 && <= 4. Received -1"),
+        out_of_range(
+            "The value of \"offset\" is out of range. It must be >= 0 && <= 4. Received -1"
+        ),
         "{v}"
     );
     assert_eq!(
@@ -1424,7 +1524,9 @@ async fn crypto_shim_random_int_and_rng_validation_parity() {
     );
     assert_eq!(
         v["rfU16Size"],
-        out_of_range("The value of \"size + offset\" is out of range. It must be <= 8. Received 10"),
+        out_of_range(
+            "The value of \"size + offset\" is out of range. It must be <= 8. Received 10"
+        ),
         "elementSize applies to the Uint16Array bounds: {v}"
     );
     assert_eq!(v["rfArrayBuffer"], json!({ "ok": true }), "{v}");
@@ -1432,7 +1534,9 @@ async fn crypto_shim_random_int_and_rng_validation_parity() {
     assert_eq!(v["rfDataView"], json!({ "ok": true }), "{v}");
     assert_eq!(
         v["rfNaN"],
-        out_of_range("The value of \"offset\" is out of range. It must be >= 0 && <= 4. Received NaN"),
+        out_of_range(
+            "The value of \"offset\" is out of range. It must be >= 0 && <= 4. Received NaN"
+        ),
         "{v}"
     );
     assert_eq!(

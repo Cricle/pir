@@ -291,8 +291,12 @@ pub(super) fn register_worker_host_fns(host: &Object) -> rquickjs::Result<()> {
         "workerRecvPoll",
         Func::from(JsAsync(
             move |id: f64, wait_ms: f64, role: String| async move {
-                crate::pir_node::modules::worker::recv_poll(worker_id_arg(id), wait_ms_arg(wait_ms), &role)
-                    .await
+                crate::pir_node::modules::worker::recv_poll(
+                    worker_id_arg(id),
+                    wait_ms_arg(wait_ms),
+                    &role,
+                )
+                .await
             },
         )),
     )?;

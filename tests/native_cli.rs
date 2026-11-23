@@ -500,4 +500,3 @@ fn python_native_command_outputs_result() {
     assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output), "2\n");
 }
-

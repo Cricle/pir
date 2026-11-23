@@ -4464,7 +4464,7 @@ async fn explicit_system_prompt_override_is_not_replaced_by_the_base_prompt() {
     }));
     let mut tools = ToolRegistry::new();
     pir::coding_agent::register_core_tools(&mut tools);
-    let mut session = AgentSession::new(AgentSessionConfig {
+    let session = AgentSession::new(AgentSessionConfig {
         performance: Default::default(),
         provider_registry: Arc::clone(&registry),
         model: fake_model(),

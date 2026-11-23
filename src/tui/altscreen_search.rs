@@ -2072,7 +2072,10 @@ pub fn finish_search_walk_check(
     let matches = {
         let frame = core.last_frame_lines();
         let dock = dock_height.min(frame.len());
-        find_search_matches(&frame[..frame.len().saturating_sub(dock)], &state.search.query)
+        find_search_matches(
+            &frame[..frame.len().saturating_sub(dock)],
+            &state.search.query,
+        )
     };
     if matches.is_empty() {
         // The probe's page did not survive the band render (the probes are a

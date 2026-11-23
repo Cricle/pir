@@ -33,7 +33,11 @@ use tokio_util::sync::CancellationToken;
 use crate::pir_node::error::{NodeError, NodeResult};
 
 /// `http`/`net` op table entry.
-pub fn http_op(runtime: &crate::pir_node::NodeRuntime, op: &str, payload: &JsonValue) -> NodeResult {
+pub fn http_op(
+    runtime: &crate::pir_node::NodeRuntime,
+    op: &str,
+    payload: &JsonValue,
+) -> NodeResult {
     let generation = runtime.context.generation();
     let result = match op {
         "fetchStart" => fetch_start(payload, generation),
@@ -72,7 +76,6 @@ impl FnError {
             message: message.into(),
         }
     }
-
 }
 
 type OpResult = Result<JsonValue, FnError>;

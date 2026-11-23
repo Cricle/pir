@@ -188,7 +188,10 @@ pub fn fs_watch_op(op: &str, payload: &JsonValue, runtime: &NodeRuntime) -> Node
         // adaptive-cadence behaviour is observable (tests use it as the
         // counter seam).
         "watchStats" => watch_stats(payload),
-        other => Err(NodeError::new("ENOSYS", format!("unknown fsWatch op `{other}`"))),
+        other => Err(NodeError::new(
+            "ENOSYS",
+            format!("unknown fsWatch op `{other}`"),
+        )),
     }
 }
 

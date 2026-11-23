@@ -18,10 +18,7 @@ pub fn payload_text<'a>(payload: &'a JsonValue, name: &str) -> NodeResult<&'a st
 
 /// Read a string field from an op payload, defaulting to empty string.
 pub fn payload_str<'a>(payload: &'a JsonValue, name: &str) -> &'a str {
-    payload
-        .get(name)
-        .and_then(JsonValue::as_str)
-        .unwrap_or("")
+    payload.get(name).and_then(JsonValue::as_str).unwrap_or("")
 }
 
 /// Read an optional string field.
@@ -31,7 +28,10 @@ pub fn payload_opt_str<'a>(payload: &'a JsonValue, name: &str) -> Option<&'a str
 
 /// Read a boolean field, defaulting to false.
 pub fn payload_bool(payload: &JsonValue, name: &str) -> bool {
-    payload.get(name).and_then(JsonValue::as_bool).unwrap_or(false)
+    payload
+        .get(name)
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
 }
 
 /// Decode a payload data field: either a base64 string (`encoding:"base64"`)
@@ -165,4 +165,3 @@ fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
         left.as_ref() == right.as_ref()
     }
 }
-

@@ -207,8 +207,11 @@ pub(super) fn register_system_ops(ctx: &Ctx<'_>) -> Result<()> {
     use rquickjs::prelude::Func;
     ctx.globals().set("__pirFsStat", Func::from(fs_stat))?;
     ctx.globals().set("__pirFsExists", Func::from(fs_exists))?;
-    ctx.globals().set("__pirFsReaddir", Func::from(fs_readdir))?;
-    ctx.globals().set("__pirFsWriteFlags", Func::from(fs_write_flags))?;
-    ctx.globals().set("__pirProcessCwd", Func::from(process_cwd))?;
+    ctx.globals()
+        .set("__pirFsReaddir", Func::from(fs_readdir))?;
+    ctx.globals()
+        .set("__pirFsWriteFlags", Func::from(fs_write_flags))?;
+    ctx.globals()
+        .set("__pirProcessCwd", Func::from(process_cwd))?;
     Ok(())
 }

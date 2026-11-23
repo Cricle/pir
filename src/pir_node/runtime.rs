@@ -103,7 +103,11 @@ pub trait NodeHooks: Send + Sync {
 
     /// Read + transpile one on-disk module source for the CJS runtime. The
     /// caller has already sandbox-checked `path`.
-    fn npm_source(&self, _path: &Path, _as_cjs: bool) -> Result<NpmSource, crate::pir_node::error::NodeError> {
+    fn npm_source(
+        &self,
+        _path: &Path,
+        _as_cjs: bool,
+    ) -> Result<NpmSource, crate::pir_node::error::NodeError> {
         Err(crate::pir_node::error::NodeError::new(
             "ENOSYS",
             "module source reading is not available in this pir-node host",

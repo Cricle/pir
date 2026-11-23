@@ -32,11 +32,7 @@ fn js_err(kind: &'static str) -> JsError {
 /// carry that key (a SQLite column alias, for instance), so the rare case is
 /// routed through `Object.defineProperty`, which always creates a data
 /// property. Every other key keeps the direct setter fast path.
-fn set_own<'js, V: rquickjs::IntoJs<'js>>(
-    obj: &Object<'js>,
-    key: &str,
-    value: V,
-) -> JsResult<()> {
+fn set_own<'js, V: rquickjs::IntoJs<'js>>(obj: &Object<'js>, key: &str, value: V) -> JsResult<()> {
     if key != "__proto__" {
         return obj.set(key, value);
     }
@@ -302,13 +298,13 @@ pub fn js_to_json(value: &Value<'_>) -> JsResult<JsonValue> {
 fn js_to_json_at(value: &Value<'_>, depth: usize) -> JsResult<JsonValue> {
     if depth > JS_TO_JSON_MAX_DEPTH {
         let ctx = value.ctx();
-        return Err(match rquickjs::Exception::from_message(
-            ctx.clone(),
-            "Maximum call stack size exceeded",
-        ) {
-            Ok(exception) => ctx.throw(exception.into_value()),
-            Err(error) => error,
-        });
+        return Err(
+            match rquickjs::Exception::from_message(ctx.clone(), "Maximum call stack size exceeded")
+            {
+                Ok(exception) => ctx.throw(exception.into_value()),
+                Err(error) => error,
+            },
+        );
     }
     Ok(match value.type_of() {
         Type::Array => {
@@ -340,4 +336,3 @@ fn js_to_json_at(value: &Value<'_>, depth: usize) -> JsResult<JsonValue> {
 /// `globalThis.__pir_native` — installed by `register_host_functions` alongside
 /// the `__pir_host` string table.
 pub const NATIVE_GLOBAL: &str = "__pir_native";
-

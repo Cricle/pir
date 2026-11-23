@@ -49,14 +49,17 @@ fn path_within_respects_roots() {
     let roots = vec![root.clone()];
     assert!(bridge::path_within(&root.join("a").join("b"), &roots));
     assert!(!bridge::path_within(&elsewhere, &roots));
-    assert!(!bridge::path_within(&PathBuf::from(&root).join("..").join("sibling"), &roots));
+    assert!(!bridge::path_within(
+        &PathBuf::from(&root).join("..").join("sibling"),
+        &roots
+    ));
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn system_module_dispatch_works() {
-    use pir::pir_node::{NullContext, NullHooks, NodeRuntime, SessionConfig};
+    use pir::pir_node::{NodeRuntime, NullContext, NullHooks, SessionConfig};
     use std::sync::{Arc, Mutex};
 
     let runtime = NodeRuntime::new(
@@ -110,7 +113,10 @@ fn path_kernels_match_node_semantics() {
 
     // win32: drive roots, UNC, device roots, reserved names and the trailing
     // separator rule (verified byte-for-byte against Node v24).
-    assert_eq!(path::normalize(Flavor::Win32, "C:\\a\\..\\b\\\\c\\"), "C:\\b\\c\\");
+    assert_eq!(
+        path::normalize(Flavor::Win32, "C:\\a\\..\\b\\\\c\\"),
+        "C:\\b\\c\\"
+    );
     assert_eq!(
         path::normalize(Flavor::Win32, "\\\\server\\share\\x\\..\\y"),
         "\\\\server\\share\\y"
@@ -128,10 +134,7 @@ fn path_kernels_match_node_semantics() {
     // posix: the same operations under forward slashes.
     assert_eq!(path::normalize(Flavor::Posix, "/a//b/../c/"), "/a/c/");
     assert_eq!(path::normalize(Flavor::Posix, "../a"), "../a");
-    assert_eq!(
-        path::join(Flavor::Posix, &["a/", "/b", "//c"]),
-        "a/b/c"
-    );
+    assert_eq!(path::join(Flavor::Posix, &["a/", "/b", "//c"]), "a/b/c");
     assert_eq!(
         path::relative(Flavor::Posix, "/a/b/c", "/a/b/d/e", "/"),
         "../d/e"

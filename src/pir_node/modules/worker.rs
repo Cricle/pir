@@ -610,7 +610,11 @@ impl OpError {
 }
 
 /// `worker` op table entry.
-pub fn worker_op(runtime: &crate::pir_node::NodeRuntime, op: &str, payload: &JsonValue) -> NodeResult {
+pub fn worker_op(
+    runtime: &crate::pir_node::NodeRuntime,
+    op: &str,
+    payload: &JsonValue,
+) -> NodeResult {
     let result = match op {
         "start" => op_start(runtime, payload),
         "parentSend" => op_send(payload, "inbound").map_err(OpError::from),
@@ -630,7 +634,10 @@ pub fn worker_op(runtime: &crate::pir_node::NodeRuntime, op: &str, payload: &Jso
 // Ops
 // ---------------------------------------------------------------------------
 
-fn op_start(runtime: &crate::pir_node::NodeRuntime, payload: &JsonValue) -> Result<JsonValue, OpError> {
+fn op_start(
+    runtime: &crate::pir_node::NodeRuntime,
+    payload: &JsonValue,
+) -> Result<JsonValue, OpError> {
     if workers()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -678,15 +685,16 @@ fn op_start(runtime: &crate::pir_node::NodeRuntime, payload: &JsonValue) -> Resu
         // Worker entry sources share `fs.readFile`'s 32 MiB cap: a Worker is
         // one more QuickJS runtime in this process, so an unbounded entry
         // read is an unbounded host-heap allocation.
-        let source = crate::pir_node::modules::fs::read_text_capped(Path::new(&filename), "open", &filename)
-            .map_err(|error| {
-                let message = if error.code == "ENOENT" {
-                    format!("Cannot find module '{filename}': {}", error.message)
-                } else {
-                    error.message
-                };
-                OpError::coded(error.code, message)
-            })?;
+        let source =
+            crate::pir_node::modules::fs::read_text_capped(Path::new(&filename), "open", &filename)
+                .map_err(|error| {
+                    let message = if error.code == "ENOENT" {
+                        format!("Cannot find module '{filename}': {}", error.message)
+                    } else {
+                        error.message
+                    };
+                    OpError::coded(error.code, message)
+                })?;
         let dir = Path::new(&filename)
             .parent()
             .map(|dir| dir.display().to_string())
@@ -1118,7 +1126,8 @@ pub async fn recv_poll(id: u64, wait_ms: u64, role: &str) -> String {
             // names (no map keys), into an in-memory writer. `expect` replaces
             // the `GONE_POLL` fallback, whose hypothetical path would silently
             // discard the messages just drained and answer `stop/done`.
-            serde_json::to_string(&envelope).unwrap_or_else(|e| panic!("PollEnvelope serialization failed: {e}"))
+            serde_json::to_string(&envelope)
+                .unwrap_or_else(|e| panic!("PollEnvelope serialization failed: {e}"))
         }
     }
 }

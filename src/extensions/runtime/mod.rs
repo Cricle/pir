@@ -202,6 +202,12 @@ pub use ext_stdio::{ext_stdio_route, ExtStdioRoute, MAX_ROUTED_WRITE_BYTES};
 // a standalone script entry that `load` seeds for extension entries. The
 // bounded rejection log is public so its eviction invariant is testable
 // without a live QuickJS runtime.
+/// A child wait's condvar park probe (blocking-host wakeup regression).
+#[doc(hidden)]
+#[cfg(feature = "extensions")]
+pub use crate::pir_node::modules::child::{
+    activity_park_probe_for_tests, append_base64_chunk_for_tests, sync_drain_wait_slice_for_tests,
+};
 /// Test seams for the idle drain backoff (integration tests live in
 /// `tests/`; inline test modules are forbidden in `src/`).
 #[doc(hidden)]
@@ -209,12 +215,6 @@ pub use ext_stdio::{ext_stdio_route, ExtStdioRoute, MAX_ROUTED_WRITE_BYTES};
 pub use engine::{next_park_slice_for_tests, park_slice_bounds_for_tests};
 #[cfg(feature = "extensions")]
 pub use engine::{package_entry_root, RejectionLog};
-/// A child wait's condvar park probe (blocking-host wakeup regression).
-#[doc(hidden)]
-#[cfg(feature = "extensions")]
-pub use crate::pir_node::modules::child::{
-    activity_park_probe_for_tests, append_base64_chunk_for_tests, sync_drain_wait_slice_for_tests,
-};
 /// Test seams for the adaptive `workerRecvPoll` fallback and its idle-wait
 /// probe (the worker registry/runtime stay private).
 #[doc(hidden)]

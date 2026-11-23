@@ -291,9 +291,8 @@ pub(super) async fn run() -> Result<()> {
     // ("Service initialized as client", "task cancelled") off every
     // `mcp list` / prompt invocation unless the user opts into RUST_LOG.
     // Warnings and errors still surface in both cases.
-    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,rmcp=warn")
-    });
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rmcp=warn"));
     if app_mode_tui {
         let log_path = pir::coding_agent::context::agent_dir().join("pir.log");
         rotate_tui_trace_log(&log_path, TUI_TRACE_LOG_MAX_BYTES);

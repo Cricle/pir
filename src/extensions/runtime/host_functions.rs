@@ -118,7 +118,10 @@ impl crate::pir_node::NodeContext for PirNodeContext {
         lock_state(&self.state).config.cwd.clone()
     }
     fn allowed_roots(&self) -> Vec<PathBuf> {
-        self.allowed_roots.lock().map(|g| g.clone()).unwrap_or_default()
+        self.allowed_roots
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
     fn is_aborted(&self) -> bool {
         lock_state(&self.state).tool_call_aborted
@@ -175,7 +178,10 @@ impl crate::pir_node::NodeHooks for PirNodeHooks {
             .spawn(move || worker_fns::worker_thread_main(spec, handle))
             .map(|_| ())
             .map_err(|error| {
-                crate::pir_node::NodeError::new("EIO", format!("failed to spawn worker thread: {error}"))
+                crate::pir_node::NodeError::new(
+                    "EIO",
+                    format!("failed to spawn worker thread: {error}"),
+                )
             })
     }
 
@@ -233,8 +239,8 @@ impl crate::pir_node::NodeHooks for PirNodeHooks {
         path: &std::path::Path,
         as_cjs: bool,
     ) -> Result<crate::pir_node::NpmSource, crate::pir_node::NodeError> {
-        let value = node_fns::npm_source_value(path, as_cjs)
-            .map_err(node_fns::into_pir_node_error)?;
+        let value =
+            node_fns::npm_source_value(path, as_cjs).map_err(node_fns::into_pir_node_error)?;
         Ok(crate::pir_node::NpmSource {
             kind: value
                 .get("kind")
@@ -469,8 +475,10 @@ pub(super) fn register_host_functions(
         // The sandbox fence must see the same root set the legacy string path
         // used: configured allowed roots plus the pi config/data root, the
         // agent dir, the OS temp scratch area and the session cwd.
-        let effective_roots =
-            Arc::new(StdMutex::new(node_fns::effective_roots(state, allowed_roots)));
+        let effective_roots = Arc::new(StdMutex::new(node_fns::effective_roots(
+            state,
+            allowed_roots,
+        )));
         let node_runtime = Arc::new(crate::pir_node::NodeRuntime::new(
             effective_roots,
             cfg,
@@ -481,10 +489,7 @@ pub(super) fn register_host_functions(
             .map_err(|_| native_state_error())?;
         let node = Object::new(ctx.clone())?;
         globals.set("__pirNode", node.clone())?;
-        node.set(
-            "invoke",
-            rquickjs::prelude::Func::from(node_invoke_native),
-        )?;
+        node.set("invoke", rquickjs::prelude::Func::from(node_invoke_native))?;
         node_runtime
     };
 

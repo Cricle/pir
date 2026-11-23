@@ -311,12 +311,12 @@ pub fn form_escape(text: &str) -> String {
 /// Serialize flat `[k1, v1, ...]` pairs the way `URLSearchParams.toString`
 /// does. `None` for an odd pair count (the shim never produces one).
 pub fn form_stringify(pairs: &[String]) -> Option<String> {
-    if pairs.len() % 2 != 0 {
+    if !pairs.len().is_multiple_of(2) {
         return None;
     }
     let mut out = String::new();
     let mut first = true;
-    for chunk in pairs.chunks_exact(2) {
+    for chunk in pairs.as_chunks::<2>().0 {
         if !first {
             out.push('&');
         }
@@ -657,12 +657,12 @@ pub fn query_parse(text: &str, sep: &str, eq: &str, mut max_keys: f64) -> Vec<(S
 /// `encodeStringified`) with Node's escaper and join them. `None` for an odd
 /// pair count (the shim never produces one).
 pub fn query_stringify(pairs: &[String], sep: &str, eq: &str) -> Option<String> {
-    if pairs.len() % 2 != 0 {
+    if !pairs.len().is_multiple_of(2) {
         return None;
     }
     let mut out = String::new();
     let mut first = true;
-    for chunk in pairs.chunks_exact(2) {
+    for chunk in pairs.as_chunks::<2>().0 {
         if !first {
             out.push_str(sep);
         }
@@ -673,4 +673,3 @@ pub fn query_stringify(pairs: &[String], sep: &str, eq: &str) -> Option<String> 
     }
     Some(out)
 }
-

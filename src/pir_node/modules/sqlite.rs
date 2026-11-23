@@ -593,7 +593,11 @@ fn encode_query_row(
     read_bigints: bool,
 ) -> Result<JsonValue, NodeError> {
     if return_arrays {
-        return Ok(JsonValue::Array(encode_cells(row, column_count, read_bigints)?));
+        return Ok(JsonValue::Array(encode_cells(
+            row,
+            column_count,
+            read_bigints,
+        )?));
     }
     // One row object with exactly one key per column: pre-size so the map does
     // not grow (and rehash) while the row is assembled.
@@ -647,17 +651,25 @@ fn query(payload: &JsonValue, first_row_only: bool) -> NodeResult {
         if columnar {
             if first_row_only {
                 let row = match first {
-                    Some(row) => JsonValue::Array(encode_cells(&row, column_count, read_bigints)?),
+                    Some(row) => JsonValue::Array(encode_cells(row, column_count, read_bigints)?),
                     None => JsonValue::Null,
                 };
                 return query_result(json!({ "columns": names, "row": row }), json_text);
             }
             let mut collected: Vec<JsonValue> = Vec::new();
             if let Some(row) = first {
-                collected.push(JsonValue::Array(encode_cells(&row, column_count, read_bigints)?));
+                collected.push(JsonValue::Array(encode_cells(
+                    row,
+                    column_count,
+                    read_bigints,
+                )?));
             }
             while let Some(row) = rows.next().map_err(|error| sqlite_error(&error))? {
-                collected.push(JsonValue::Array(encode_cells(&row, column_count, read_bigints)?));
+                collected.push(JsonValue::Array(encode_cells(
+                    row,
+                    column_count,
+                    read_bigints,
+                )?));
             }
             return query_result(json!({ "columns": names, "rows": collected }), json_text);
         }
@@ -666,20 +678,16 @@ fn query(payload: &JsonValue, first_row_only: bool) -> NodeResult {
         // pushing it into a one-element `Vec` that is immediately unwrapped.
         if first_row_only {
             return Ok(match first {
-                Some(row) => encode_query_row(
-                    &row,
-                    column_count,
-                    &names,
-                    return_arrays,
-                    read_bigints,
-                )?,
+                Some(row) => {
+                    encode_query_row(row, column_count, &names, return_arrays, read_bigints)?
+                }
                 None => JsonValue::Null,
             });
         }
         let mut collected: Vec<JsonValue> = Vec::new();
         if let Some(row) = first {
             collected.push(encode_query_row(
-                &row,
+                row,
                 column_count,
                 &names,
                 return_arrays,
@@ -688,7 +696,7 @@ fn query(payload: &JsonValue, first_row_only: bool) -> NodeResult {
         }
         while let Some(row) = rows.next().map_err(|error| sqlite_error(&error))? {
             collected.push(encode_query_row(
-                &row,
+                row,
                 column_count,
                 &names,
                 return_arrays,
@@ -951,11 +959,11 @@ where
     // `.get` knows its row width up front; `.all` grows amortically.
     let mut cells: Vec<SqlCell> = Vec::with_capacity(if single { column_count } else { 0 });
     if let Some(row) = first {
-        encode_typed_row(&row, column_count, flags.safe_integers, &mut cells)?;
+        encode_typed_row(row, column_count, flags.safe_integers, &mut cells)?;
     }
     if !single {
         while let Some(row) = rows.next().map_err(|error| sqlite_error(&error))? {
-            encode_typed_row(&row, column_count, flags.safe_integers, &mut cells)?;
+            encode_typed_row(row, column_count, flags.safe_integers, &mut cells)?;
         }
     }
     Ok(Some(QueryOutcome::Rows(QueryRows {

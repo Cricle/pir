@@ -71,12 +71,15 @@ pub fn process_op(op: &str, payload: &JsonValue, runtime: &NodeRuntime) -> NodeR
         // config, and never the host process's own cwd). Relative fs paths in
         // every later op resolve through `NodeRuntime::cwd`.
         "chdir" => {
-            let raw = payload.get("path").and_then(JsonValue::as_str).ok_or_else(|| {
-                NodeError::new(
-                    "ERR_INVALID_ARG_TYPE",
-                    "The \"directory\" argument must be of type string",
-                )
-            })?;
+            let raw = payload
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    NodeError::new(
+                        "ERR_INVALID_ARG_TYPE",
+                        "The \"directory\" argument must be of type string",
+                    )
+                })?;
             if raw.is_empty() {
                 return Err(NodeError::new(
                     "ENOENT",
@@ -127,8 +130,12 @@ pub fn process_op(op: &str, payload: &JsonValue, runtime: &NodeRuntime) -> NodeR
         }
         "pid" => json!(std::process::id()),
         "cpu_usage" => json!({ "user": 0u64, "system": 0u64 }),
-        other => return Err(NodeError::new("ENOSYS", format!("unknown process op `{other}`"))),
+        other => {
+            return Err(NodeError::new(
+                "ENOSYS",
+                format!("unknown process op `{other}`"),
+            ))
+        }
     };
     Ok(value)
 }
-

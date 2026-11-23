@@ -619,8 +619,6 @@ pub(super) fn register_sqlite_ops(ctx: &Ctx<'_>) -> Result<()> {
     // Positional `run` only: the common write shape gets a 4-argument entry
     // (no `flags` object, no `status` property writes). Shims probe it and
     // fall back to `__pirSqliteQuery` when it is absent.
-    ctx.globals().set(
-        "__pirSqliteRun",
-        rquickjs::prelude::Func::from(sqlite_run),
-    )
+    ctx.globals()
+        .set("__pirSqliteRun", rquickjs::prelude::Func::from(sqlite_run))
 }

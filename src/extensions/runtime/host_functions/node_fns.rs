@@ -564,7 +564,6 @@ pub(super) fn into_pir_node_error(error: NodeError) -> crate::pir_node::NodeErro
     out
 }
 
-
 pub(super) fn npm_resolve_op(payload: &JsonValue) -> NodeResult {
     use crate::extensions::api::node_shims::canonical_node_name;
     use crate::extensions::loader::npm_resolve::{
@@ -695,4 +694,3 @@ pub(super) fn npm_source_value(path: &Path, as_cjs: bool) -> NodeResult {
         )),
     }
 }
-

@@ -67,7 +67,10 @@ fn profiles_map_to_the_documented_thresholds() {
     for name in GcProfile::NAMES {
         let parsed = GcProfile::parse(name).expect("canonical name parses");
         assert_eq!(parsed.as_str(), name);
-        assert_eq!(GcProfile::parse(&format!("  {}  ", name.to_uppercase())), Some(parsed));
+        assert_eq!(
+            GcProfile::parse(&format!("  {}  ", name.to_uppercase())),
+            Some(parsed)
+        );
     }
 
     // Unknown / empty values are rejected rather than silently defaulted.
@@ -149,7 +152,7 @@ fn profile_is_only_the_base_default_settings_and_env_win() {
     // An explicit injection wins verbatim: `resolve(Some(..))` never reads
     // env or settings (this is the SDK/embedder/test seam).
     let explicit = ExtensionLimits {
-        gc_threshold_bytes: Some(1 * MB),
+        gc_threshold_bytes: Some(MB),
         ..ExtensionLimits::default()
     };
     assert_eq!(
@@ -178,17 +181,20 @@ fn profile_is_not_a_pi_ext_override() {
 #[test]
 fn gc_threshold_env_boundaries_are_pinned() {
     // Positive MiB converts to bytes.
-    let (limits, diagnostics) = ExtensionLimits::default().apply_env(&[("PI_EXT_GC_THRESHOLD_MB", "4")]);
+    let (limits, diagnostics) =
+        ExtensionLimits::default().apply_env(&[("PI_EXT_GC_THRESHOLD_MB", "4")]);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     assert_eq!(limits.gc_threshold_bytes, Some(4 * MB));
 
     // `0` = no threshold (QuickJS default pacing), no diagnostic.
-    let (limits, diagnostics) = ExtensionLimits::default().apply_env(&[("PI_EXT_GC_THRESHOLD_MB", "0")]);
+    let (limits, diagnostics) =
+        ExtensionLimits::default().apply_env(&[("PI_EXT_GC_THRESHOLD_MB", "0")]);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     assert_eq!(limits.gc_threshold_bytes, None);
 
     // Whitespace around a valid number is tolerated.
-    let (limits, diagnostics) = ExtensionLimits::default().apply_env(&[("PI_EXT_GC_THRESHOLD_MB", " 7 ")]);
+    let (limits, diagnostics) =
+        ExtensionLimits::default().apply_env(&[("PI_EXT_GC_THRESHOLD_MB", " 7 ")]);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     assert_eq!(limits.gc_threshold_bytes, Some(7 * MB));
 

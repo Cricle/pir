@@ -450,10 +450,7 @@ async fn context_mode_timeout_errors_name_ctx_execute() {
     assert!(!warm.is_error, "{}", warm.content);
 
     let result = tool
-        .run(
-            &json!({ "code": "while (true) {}", "timeout": 1 }),
-            &ctx,
-        )
+        .run(&json!({ "code": "while (true) {}", "timeout": 1 }), &ctx)
         .await;
     assert!(result.is_error, "expected a timeout error");
     assert!(

@@ -77,85 +77,157 @@ pub fn virtual_blob(canonical: &str) -> Option<&'static [u8]> {
         "typebox" => include_bytes!("../../../assets/bytecode/v/typebox.qc"),
         "typebox/compile" => include_bytes!("../../../assets/bytecode/v/typebox-compile.qc"),
         "typebox/value" => include_bytes!("../../../assets/bytecode/v/typebox-value.qc"),
-        "@earendil-works/pi-coding-agent" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-coding-agent.qc"),
-        "@earendil-works/pi-agent-core" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-agent-core.qc"),
-        "@earendil-works/pi-ai" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-ai.qc"),
-        "@earendil-works/pi-ai/oauth" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-ai-oauth.qc"),
-        "@earendil-works/pi-ai/providers/all" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-ai-providers-all.qc"),
-        "@earendil-works/pi-tui" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-tui.qc"),
-        "@earendil-works/pi-codemode" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-codemode.qc"),
+        "@earendil-works/pi-coding-agent" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-coding-agent.qc")
+        }
+        "@earendil-works/pi-agent-core" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-agent-core.qc")
+        }
+        "@earendil-works/pi-ai" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-ai.qc")
+        }
+        "@earendil-works/pi-ai/oauth" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-ai-oauth.qc")
+        }
+        "@earendil-works/pi-ai/providers/all" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-ai-providers-all.qc")
+        }
+        "@earendil-works/pi-tui" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-tui.qc")
+        }
+        "@earendil-works/pi-codemode" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-codemode.qc")
+        }
         "better-sqlite3" => include_bytes!("../../../assets/bytecode/v/better-sqlite3.qc"),
         "sqlite3" => include_bytes!("../../../assets/bytecode/v/sqlite3.qc"),
         "bcrypt" => include_bytes!("../../../assets/bytecode/v/bcrypt.qc"),
-        "@earendil-works/pi-env" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-env.qc"),
-        "@earendil-works/chord" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-chord.qc"),
-        "@earendil-works/chord/node" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-chord-node.qc"),
-        "@earendil-works/pi-durable" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-durable.qc"),
-        "@earendil-works/pi-durable/env" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-durable-env.qc"),
-        "@earendil-works/pi-durable/throws" => include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-durable-throws.qc"),
+        "@earendil-works/pi-env" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-env.qc")
+        }
+        "@earendil-works/chord" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-chord.qc")
+        }
+        "@earendil-works/chord/node" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-chord-node.qc")
+        }
+        "@earendil-works/pi-durable" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-durable.qc")
+        }
+        "@earendil-works/pi-durable/env" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-durable-env.qc")
+        }
+        "@earendil-works/pi-durable/throws" => {
+            include_bytes!("../../../assets/bytecode/v/at-earendil-works-pi-durable-throws.qc")
+        }
         "@node/path" => include_bytes!("../../../assets/bytecode/v/at-node-path.qc"),
         "@node/url" => include_bytes!("../../../assets/bytecode/v/at-node-url.qc"),
         "@node/util" => include_bytes!("../../../assets/bytecode/v/at-node-util.qc"),
         "@node/util/types" => include_bytes!("../../../assets/bytecode/v/at-node-util-types.qc"),
         "@node/events" => include_bytes!("../../../assets/bytecode/v/at-node-events.qc"),
         "@node/querystring" => include_bytes!("../../../assets/bytecode/v/at-node-querystring.qc"),
-        "@node/string_decoder" => include_bytes!("../../../assets/bytecode/v/at-node-string_decoder.qc"),
+        "@node/string_decoder" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-string_decoder.qc")
+        }
         "@node/assert" => include_bytes!("../../../assets/bytecode/v/at-node-assert.qc"),
-        "@node/assert/strict" => include_bytes!("../../../assets/bytecode/v/at-node-assert-strict.qc"),
+        "@node/assert/strict" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-assert-strict.qc")
+        }
         "@node/process" => include_bytes!("../../../assets/bytecode/v/at-node-process.qc"),
         "@node/fs" => include_bytes!("../../../assets/bytecode/v/at-node-fs.qc"),
         "@node/fs/promises" => include_bytes!("../../../assets/bytecode/v/at-node-fs-promises.qc"),
         "@node/os" => include_bytes!("../../../assets/bytecode/v/at-node-os.qc"),
         "@node/crypto" => include_bytes!("../../../assets/bytecode/v/at-node-crypto.qc"),
-        "@node/child_process" => include_bytes!("../../../assets/bytecode/v/at-node-child_process.qc"),
+        "@node/child_process" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-child_process.qc")
+        }
         "@node/stream" => include_bytes!("../../../assets/bytecode/v/at-node-stream.qc"),
-        "@node/stream/promises" => include_bytes!("../../../assets/bytecode/v/at-node-stream-promises.qc"),
+        "@node/stream/promises" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-stream-promises.qc")
+        }
         "@node/zlib" => include_bytes!("../../../assets/bytecode/v/at-node-zlib.qc"),
         "@node/module" => include_bytes!("../../../assets/bytecode/v/at-node-module.qc"),
-        "@node/worker_threads" => include_bytes!("../../../assets/bytecode/v/at-node-worker_threads.qc"),
+        "@node/worker_threads" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-worker_threads.qc")
+        }
         "@node/net" => include_bytes!("../../../assets/bytecode/v/at-node-net.qc"),
         "@node/dns" => include_bytes!("../../../assets/bytecode/v/at-node-dns.qc"),
-        "@node/dns/promises" => include_bytes!("../../../assets/bytecode/v/at-node-dns-promises.qc"),
+        "@node/dns/promises" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-dns-promises.qc")
+        }
         "@node/http" => include_bytes!("../../../assets/bytecode/v/at-node-http.qc"),
         "@node/https" => include_bytes!("../../../assets/bytecode/v/at-node-https.qc"),
         "@node/sqlite" => include_bytes!("../../../assets/bytecode/v/at-node-sqlite.qc"),
         "@node/async_hooks" => include_bytes!("../../../assets/bytecode/v/at-node-async_hooks.qc"),
         "@node/tty" => include_bytes!("../../../assets/bytecode/v/at-node-tty.qc"),
         "@node/readline" => include_bytes!("../../../assets/bytecode/v/at-node-readline.qc"),
-        "@node/readline/promises" => include_bytes!("../../../assets/bytecode/v/at-node-readline-promises.qc"),
+        "@node/readline/promises" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-readline-promises.qc")
+        }
         "@node/v8" => include_bytes!("../../../assets/bytecode/v/at-node-v8.qc"),
         "@node/vm" => include_bytes!("../../../assets/bytecode/v/at-node-vm.qc"),
         "@node/constants" => include_bytes!("../../../assets/bytecode/v/at-node-constants.qc"),
         "@node/punycode" => include_bytes!("../../../assets/bytecode/v/at-node-punycode.qc"),
         "@node/console" => include_bytes!("../../../assets/bytecode/v/at-node-console.qc"),
         "@node/sys" => include_bytes!("../../../assets/bytecode/v/at-node-sys.qc"),
-        "@node/diagnostics_channel" => include_bytes!("../../../assets/bytecode/v/at-node-diagnostics_channel.qc"),
+        "@node/diagnostics_channel" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-diagnostics_channel.qc")
+        }
         "@node/stream/web" => include_bytes!("../../../assets/bytecode/v/at-node-stream-web.qc"),
-        "@node/stream/consumers" => include_bytes!("../../../assets/bytecode/v/at-node-stream-consumers.qc"),
+        "@node/stream/consumers" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-stream-consumers.qc")
+        }
         "@node/inspector" => include_bytes!("../../../assets/bytecode/v/at-node-inspector.qc"),
-        "@node/inspector/promises" => include_bytes!("../../../assets/bytecode/v/at-node-inspector-promises.qc"),
+        "@node/inspector/promises" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-inspector-promises.qc")
+        }
         "@node/http2" => include_bytes!("../../../assets/bytecode/v/at-node-http2.qc"),
         "@node/cluster" => include_bytes!("../../../assets/bytecode/v/at-node-cluster.qc"),
         "@node/dgram" => include_bytes!("../../../assets/bytecode/v/at-node-dgram.qc"),
         "@node/repl" => include_bytes!("../../../assets/bytecode/v/at-node-repl.qc"),
-        "@node/trace_events" => include_bytes!("../../../assets/bytecode/v/at-node-trace_events.qc"),
+        "@node/trace_events" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-trace_events.qc")
+        }
         "@node/domain" => include_bytes!("../../../assets/bytecode/v/at-node-domain.qc"),
         "@node/wasi" => include_bytes!("../../../assets/bytecode/v/at-node-wasi.qc"),
         "@node/test" => include_bytes!("../../../assets/bytecode/v/at-node-test.qc"),
-        "@node/test/reporters" => include_bytes!("../../../assets/bytecode/v/at-node-test-reporters.qc"),
+        "@node/test/reporters" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-test-reporters.qc")
+        }
         "@node/sea" => include_bytes!("../../../assets/bytecode/v/at-node-sea.qc"),
         "@node/_http_agent" => include_bytes!("../../../assets/bytecode/v/at-node-_http_agent.qc"),
-        "@node/_http_client" => include_bytes!("../../../assets/bytecode/v/at-node-_http_client.qc"),
-        "@node/_http_common" => include_bytes!("../../../assets/bytecode/v/at-node-_http_common.qc"),
-        "@node/_http_incoming" => include_bytes!("../../../assets/bytecode/v/at-node-_http_incoming.qc"),
-        "@node/_http_outgoing" => include_bytes!("../../../assets/bytecode/v/at-node-_http_outgoing.qc"),
-        "@node/_http_server" => include_bytes!("../../../assets/bytecode/v/at-node-_http_server.qc"),
-        "@node/_stream_duplex" => include_bytes!("../../../assets/bytecode/v/at-node-_stream_duplex.qc"),
-        "@node/_stream_passthrough" => include_bytes!("../../../assets/bytecode/v/at-node-_stream_passthrough.qc"),
-        "@node/_stream_readable" => include_bytes!("../../../assets/bytecode/v/at-node-_stream_readable.qc"),
-        "@node/_stream_transform" => include_bytes!("../../../assets/bytecode/v/at-node-_stream_transform.qc"),
-        "@node/_stream_wrap" => include_bytes!("../../../assets/bytecode/v/at-node-_stream_wrap.qc"),
-        "@node/_stream_writable" => include_bytes!("../../../assets/bytecode/v/at-node-_stream_writable.qc"),
+        "@node/_http_client" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_http_client.qc")
+        }
+        "@node/_http_common" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_http_common.qc")
+        }
+        "@node/_http_incoming" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_http_incoming.qc")
+        }
+        "@node/_http_outgoing" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_http_outgoing.qc")
+        }
+        "@node/_http_server" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_http_server.qc")
+        }
+        "@node/_stream_duplex" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_stream_duplex.qc")
+        }
+        "@node/_stream_passthrough" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_stream_passthrough.qc")
+        }
+        "@node/_stream_readable" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_stream_readable.qc")
+        }
+        "@node/_stream_transform" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_stream_transform.qc")
+        }
+        "@node/_stream_wrap" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_stream_wrap.qc")
+        }
+        "@node/_stream_writable" => {
+            include_bytes!("../../../assets/bytecode/v/at-node-_stream_writable.qc")
+        }
         "@node/_tls_common" => include_bytes!("../../../assets/bytecode/v/at-node-_tls_common.qc"),
         "@node/_tls_wrap" => include_bytes!("../../../assets/bytecode/v/at-node-_tls_wrap.qc"),
         _ => return None,
