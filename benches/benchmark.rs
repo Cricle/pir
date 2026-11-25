@@ -729,6 +729,9 @@ fn extension_tool_bridge(c: &mut Criterion) {
             // `None`: the runtime resolves the limits from the global settings
             // + `PI_EXT_*` env, like every host construction path.
             limits: None,
+            // A benchmark harness must never exit the process through the raw
+            // host bridge.
+            allow_process_exit: false,
         })
         .await
         {

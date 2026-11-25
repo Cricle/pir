@@ -1,0 +1,19 @@
+[package]
+name = "pir-builtin-tool-search"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "BM25 ranking for the pir deferred-tool search builtin (tokenization, document text, deterministic ordering)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+serde_json = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13"

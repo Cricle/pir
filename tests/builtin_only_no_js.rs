@@ -61,6 +61,7 @@ fn config(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: None,
+        allow_process_exit: false,
     }
 }
 
@@ -78,13 +79,16 @@ async fn builtin_only_plan_skips_quickjs_but_js_extensions_still_run() {
         .collect();
 
     // --- 1. Builtin-only plan: no QuickJS runtime -------------------------
-    let baseline = pir::extensions::runtime::js_runtime_build_count();
+    // The ATTRIBUTABLE per-cwd watch, not the process-wide counter: any
+    // sibling suite in `zz_merged_4` that builds an unrelated runtime bumps the
+    // global count between the two reads and would fail this assertion.
+    let builds = pir::extensions::runtime::watch_js_runtime_builds(&temp.0);
     let handle = pir::agent_session::load_extension_runtime(&paths, config(&temp.0))
         .await
         .expect("a builtin-only plan still yields a runtime handle");
     assert_eq!(
-        pir::extensions::runtime::js_runtime_build_count(),
-        baseline,
+        builds.count(),
+        0,
         "a builtin-only extension plan must not construct the QuickJS runtime"
     );
     assert!(
@@ -160,7 +164,7 @@ export default function (pi) {
         )
         .expect("write extension fixture");
 
-        let before = pir::extensions::runtime::js_runtime_build_count();
+        let builds = pir::extensions::runtime::watch_js_runtime_builds(&temp.0);
         let js_paths = vec![PathBuf::from(format!("builtin:{}", names[0])), entry];
         let js_handle = pir::agent_session::load_extension_runtime(&js_paths, config(&temp.0))
             .await
@@ -170,7 +174,7 @@ export default function (pi) {
             "an on-disk JS extension must keep the QuickJS runtime"
         );
         assert!(
-            pir::extensions::runtime::js_runtime_build_count() > before,
+            builds.count() > 0,
             "a JS extension must construct the QuickJS runtime"
         );
 

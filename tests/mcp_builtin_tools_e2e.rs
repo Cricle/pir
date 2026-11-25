@@ -31,15 +31,15 @@ use pir::plugins::{AgentPlugin, PluginHost, ToolBackend};
 // ---------------------------------------------------------------------------
 
 /// `PIR_AGENT_DIR` is process-wide; the MCP plugin reads it in `register()`.
-/// Every env-mutating test in this binary serializes on this lock.
+///
+/// Delegates to `crate::common::agent_dir_env_lock()`, the shared per-binary
+/// lock. A `OnceCell<Mutex>` declared here is a PRIVATE lock: it serializes
+/// this file's tests against each other and nothing else, even though the
+/// variable it guards is process-wide — the same defect TEST-2 records for the
+/// other suites in this binary (a sibling suite re-pointing `PIR_AGENT_DIR`
+/// mid-test is what made `codemode_exposure`'s `/reload` count assertion fail).
 async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    use tokio::sync::OnceCell;
-    static ENV_LOCK: OnceCell<tokio::sync::Mutex<()>> = OnceCell::const_new();
-    ENV_LOCK
-        .get_or_init(|| async { tokio::sync::Mutex::new(()) })
-        .await
-        .lock()
-        .await
+    crate::common::agent_dir_env_lock().lock().await
 }
 
 struct TempDir(PathBuf);

@@ -1,0 +1,19 @@
+<!doctype html>
+<title>Foreman startup regression: uninitialized particles</title>
+<script>
+let particles;
+
+function startGame() {
+  particles = [];
+}
+
+function menuFrame() {
+  // The menu loop runs before startGame can initialize the array.
+  for (let i = particles.length - 1; i >= 0; i--) {
+    particles[i].age++;
+  }
+  requestAnimationFrame(menuFrame);
+}
+
+requestAnimationFrame(menuFrame);
+</script>

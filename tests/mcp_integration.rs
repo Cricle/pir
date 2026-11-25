@@ -52,13 +52,12 @@ mod mock_mcp_helper;
 // Environment serialization (env-var-dependent tests share one process)
 // ---------------------------------------------------------------------------
 
-static ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-
+/// The SHARED per-binary agent-dir lock, not a `static` declared here: the env
+/// is process-global, so a file-local mutex only serializes this file's tests
+/// and leaves them racing every other suite in `zz_merged_1` that pins
+/// `PIR_AGENT_DIR`.
 async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
+    crate::common::agent_dir_env_lock().lock().await
 }
 
 struct TempDir(PathBuf);
@@ -3219,6 +3218,7 @@ async fn js_extension_registers_servers_and_receives_change_events() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     };
     let js = pir::extensions::ExtensionHandle::start(config).expect("runtime");
     let result = js
@@ -3352,6 +3352,7 @@ fn flush_timing_extension_config(cwd: &Path, session: &str) -> pir::extensions::
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 

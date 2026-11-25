@@ -5,13 +5,16 @@
 seams:
 
 1. **`message_end` repair** — a dedicated native hook (`LoopDeps.message_end_repair`, wired in
-   `src/agent_session/tool_repair.rs` and `src/coding_agent/print.rs`) that mutates the finalized
+   `crates/pir-core/src/agent_session/tool_repair.rs` and `crates/pir-core/src/coding_agent/print.rs`) that mutates the finalized
    assistant message before it is persisted and resent.
 2. **`before_provider_request` schema sanitizer** — Phase 0 anchor-bleed repair on the unified
    plugin event dispatch, gated by model id.
 
-- Implementation: `src/plugins/tool_repair.rs`, `src/plugins/tool_repair/{repair,aliases,config,grammar}.rs`;
-  feature `tool-repair`; entry `src/plugins/builtin.rs` (`name: "tool-repair"`, `replaceable: true`,
+- Pure logic: `crates/pir-builtin-tool-repair/src/{repair,aliases,config,grammar,types}.rs`
+  (published, engine-free; the message DTO round-trips losslessly through the host adapter).
+  Runtime half: `crates/pir-core/src/plugins/tool_repair.rs` (the plugin, the `message_end` hook,
+  the Phase 0 handler and the engine-message shims); feature `tool-repair`; entry
+  `crates/pir-core/src/plugins/builtin.rs` (`name: "tool-repair"`, `replaceable: true`,
   default-enabled).
 - Upstream truth: package `src/index.ts:111-134` (Phase 0), `:136-231` (strip passes), `:400-434`
   (phantom normalization), `:709-963` (live-schema repair), `src/grammar-repair.ts` (ten families),

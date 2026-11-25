@@ -306,7 +306,7 @@ async fn finish_turn_runs_before_turn_end_and_receives_turn_state() {
             let seen = Arc::clone(&seen_for_hook);
             Box::pin(async move {
                 order.lock().unwrap().push("finish_turn".into());
-                for result in &turn.tool_results {
+                for result in turn.tool_results.iter() {
                     seen.lock()
                         .unwrap()
                         .push(text_of(&Message::ToolResult(result.clone())));
@@ -885,6 +885,7 @@ async fn nested_calls_flow_through_the_extension_gates_with_parent_attribution()
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     };
     let runtime = ExtensionHandle::start(config).expect("runtime");
     let loaded = runtime
@@ -1304,6 +1305,7 @@ async fn load_extension(temp: &std::path::Path, source: &str) -> ExtensionHandle
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     };
     let runtime = ExtensionHandle::start(config).expect("runtime");
     let loaded = runtime

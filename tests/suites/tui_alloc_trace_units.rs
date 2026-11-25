@@ -22,11 +22,10 @@ fn disabled_by_default_and_tracks_when_enabled() {
     }
 }
 
-/// PIR-BIN-022: `alloc::alloc(Layout{size: 0})` does reach a global
-/// allocator in practice (RustPython `BoxVec::new(0)` for frozen modules
-/// with `max_stackdepth == 0`), and forwarding that layout to `System`
-/// trips the core blanket `GlobalAlloc` impl's `assert_unchecked(size !=
-/// 0)` (debug: panic_nounwind → abort; release: `assume` → ud2). Every
+/// PIR-BIN-022: `alloc::alloc(Layout{size: 0})` is a legal request that can
+/// reach a global allocator in practice, and forwarding that layout to
+/// `System` trips the core blanket `GlobalAlloc` impl's `assert_unchecked(size
+/// != 0)` (debug: panic_nounwind → abort; release: `assume` → ud2). Every
 /// forwarding path must answer with the same dangling pointer `System`
 /// would, without touching the system allocator or the counters.
 #[test]

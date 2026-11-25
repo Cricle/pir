@@ -1125,10 +1125,10 @@ async fn unknown_builtin_name_fails_build_with_upstream_error() {
 }
 
 /// P2-K: `.builtin(...)` must obey the agent directory's settings gates
-/// (`pythonTool: false` / `disabledBuiltinExtensions`), exactly like the
+/// (`disabledBuiltinExtensions`), exactly like the
 /// extension plan does. A requested builtin that settings disable fails
 /// `build()` naming the setting — never a silently absent plugin.
-#[cfg(any(feature = "subagent", feature = "python"))]
+#[cfg(any(feature = "subagent", feature = "context-mode"))]
 #[tokio::test]
 async fn builtin_by_name_obeys_settings_gates() {
     let temp = TempDir::new("builtin-settings-gate");
@@ -1166,21 +1166,24 @@ async fn builtin_by_name_obeys_settings_gates() {
         );
     }
 
-    #[cfg(feature = "python")]
+    #[cfg(feature = "context-mode")]
     {
-        std::fs::write(temp.0.join("settings.json"), r#"{ "pythonTool": false }"#)
-            .expect("write settings.json");
+        std::fs::write(
+            temp.0.join("settings.json"),
+            r#"{ "disabledBuiltinExtensions": ["context-mode"] }"#,
+        )
+        .expect("write settings.json");
         let error = AgentBuilder::new()
             .with_registry(Arc::clone(&registry), fake_model())
             .agent_dir(temp.0.clone())
             .no_session()
-            .builtin("python")
+            .builtin("context-mode")
             .build()
             .await
-            .expect_err("pythonTool: false must fail an explicit .builtin(\"python\")");
+            .expect_err("a settings-disabled builtin must fail the explicit .builtin(..)");
         let message = error.to_string();
         assert!(
-            message.contains("builtin:python") && message.contains("disabled by settings"),
+            message.contains("builtin:context-mode") && message.contains("disabled by settings"),
             "the diagnostic must name the builtin and the setting: {message}"
         );
     }
@@ -1213,7 +1216,6 @@ fn builtin_feature_diagnostics_are_pinned() {
         ("tool-repair", "tool-repair"),
         ("tool-search", "tool-search"),
         ("mcp", "mcp"),
-        ("python", "python"),
         ("codemode", "extensions"),
         ("todo", "todo"),
         ("memory", "memory"),

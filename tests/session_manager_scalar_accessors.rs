@@ -54,6 +54,7 @@ fn extension_config(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -70,6 +71,7 @@ export default function (pi) {
     const baseline = {
       sessionId: parsed.sessionId ?? undefined,
       sessionPath: parsed.sessionPath ?? undefined,
+      sessionDir: parsed.sessionDir ?? undefined,
       cwd: parsed.cwd ?? undefined,
       header: parsed.header ?? undefined,
       leafId: parsed.leafId ?? undefined,
@@ -85,6 +87,7 @@ export default function (pi) {
     const actual = {
       sessionId: sm.getSessionId(),
       sessionPath: sm.getSessionPath(),
+      sessionDir: sm.getSessionDir(),
       sessionFile: sm.getSessionFile(),
       cwd: sm.getCwd(),
       header: sm.getHeader(),
@@ -106,9 +109,11 @@ export default function (pi) {
       labelMatches: Object.is(actual.label, baseline.label),
       missingLabelMatches:
         actual.missingLabel === undefined && baseline.missingLabel === undefined,
+      sessionDirMatches: Object.is(actual.sessionDir, baseline.sessionDir),
       values: {
         sessionId: actual.sessionId === undefined ? null : actual.sessionId,
         sessionPath: actual.sessionPath === undefined ? null : actual.sessionPath,
+        sessionDir: actual.sessionDir === undefined ? null : actual.sessionDir,
         cwd: actual.cwd === undefined ? null : actual.cwd,
         leafId: actual.leafId === undefined ? null : actual.leafId,
         label: actual.label === undefined ? null : actual.label,
@@ -147,6 +152,7 @@ fn full_snapshot() -> SessionContextSnapshot {
         sessions: json!([{ "id": "sess-1", "path": "C:/sessions/sess-1.jsonl" }]),
         session_id: Some("sess-1".into()),
         session_path: Some("C:/sessions/sess-1.jsonl".into()),
+        session_dir: Some("C:/sessions".into()),
         context_tokens: Some(10),
         context_window: Some(4096),
         has_pending_messages: false,
@@ -157,7 +163,7 @@ fn full_snapshot() -> SessionContextSnapshot {
         tree_json: "[]".into(),
         leaf_id: Some("entry-2".into()),
         labels: json!({ "entry-1": "checkpoint" }),
-        projection_json: json!({ "entries": [], "messages": [] }).to_string(),
+        projection_json: json!({ "entries": [], "messages": [] }).to_string().into(),
         // A file-backed snapshot (session_path is set above).
         session_persisted: Some(true),
     }
@@ -172,6 +178,7 @@ async fn scalar_getters_match_the_full_snapshot_without_parsing_it() {
     for key in [
         "sessionIdMatches",
         "sessionPathMatches",
+        "sessionDirMatches",
         "sessionFileMatches",
         "cwdMatches",
         "headerMatches",
@@ -186,6 +193,7 @@ async fn scalar_getters_match_the_full_snapshot_without_parsing_it() {
         json!({
             "sessionId": "sess-1",
             "sessionPath": "C:/sessions/sess-1.jsonl",
+            "sessionDir": "C:/sessions",
             "cwd": "C:/repo",
             "leafId": "entry-2",
             "label": "checkpoint",
@@ -214,6 +222,7 @@ async fn scalar_getters_preserve_undefined_for_absent_cells() {
     for key in [
         "sessionIdMatches",
         "sessionPathMatches",
+        "sessionDirMatches",
         "sessionFileMatches",
         "cwdMatches",
         "headerMatches",
@@ -228,6 +237,7 @@ async fn scalar_getters_preserve_undefined_for_absent_cells() {
         json!({
             "sessionId": null,
             "sessionPath": null,
+            "sessionDir": null,
             "cwd": null,
             "leafId": null,
             "label": null,

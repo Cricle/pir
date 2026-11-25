@@ -414,6 +414,7 @@ fn plan_only_handle(cwd: &Path) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
 }
 

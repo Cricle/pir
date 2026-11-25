@@ -32,7 +32,7 @@ const CLASSIFIER_APIS: &[&str] = &[
 ];
 
 fn catalog_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/ai/providers/catalog")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/pir-core/src/ai/providers/catalog")
 }
 
 fn read_catalog(file: &str) -> (String, Value) {

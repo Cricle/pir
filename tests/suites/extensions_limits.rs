@@ -84,6 +84,7 @@ fn injected_config(cwd: &Path, limits: ExtensionLimits) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(limits),
+        allow_process_exit: false,
     }
 }
 

@@ -22,11 +22,12 @@ The release gate is green on 2026-11-15 (`v0.3.2`): the full local battery on
 the release commit is 16/16 EXIT 0 — `cargo fmt --all -- --check`, the version
 consistency gate, `cargo clippy --all-targets --all-features --locked -- -D
 warnings`, the lib/bins target, all 8 merged nextest harnesses, the standalone
-and profiling targets (7501 tests, 0 failed, 46 skipped), doctests (33 passed /
-0 failed / 7 ignored), and `cargo check --no-default-features --features sdk`
-(`RUST_MIN_STACK=8388608`) — and the release workflow re-runs the full CI suite
-on the tag. Evidence: `.play/evidence/release-v032/` (`summary.txt`,
-`gates.log`).
+and profiling targets, doctests, and `cargo check --no-default-features
+--features sdk` (`RUST_MIN_STACK=8388608`) — and the release workflow re-runs
+the full CI suite on the tag. Release-commit counts: 7501 tests (0 failed, 46
+skipped) and 33 doctests (0 failed, 7 ignored); both grow as tests are added.
+Evidence: `.play/evidence/release-v032/` (`summary.txt`, `gates.log`; local
+working material, not tracked).
 
 ## Building
 
@@ -39,6 +40,15 @@ cargo build          # debug build (default)
 The crate is a library first. `pir::sdk` (`features = ["sdk"]`) embeds the
 agent loop without the CLI; the bare core (`default-features = false`) keeps
 providers, sessions, config, prompt/skills and the plugin framework.
+
+The workspace splits the engine (`pir-core`, no terminal dependency), the
+terminal front end (`pir-tui`), and this single-crate facade (`pir-sdk`).
+Consumers keep depending on one crate and `use pir::...`; another UI is another
+crate that depends on `pir-core`. The builtins are published support crates too
+(`pir-plugin-api` for the engine-free protocol, one `pir-builtin-*` per builtin,
+`pir-builtins` for the catalog), so the engine consumes one implementation
+instead of carrying duplicates while embedders still see the same historical
+`pir::plugins::...` paths. See [`docs/architecture.md`](docs/architecture.md).
 
 ```toml
 # Package name `pir-sdk`; the library is still imported as `pir`.
@@ -59,10 +69,10 @@ pir print --mode json "<prompt>"
 pir rpc                # JSON-lines RPC over stdin/stdout
 pir server / pir client
 pir auth / pir models list / pir session / pir jobs / pir config / pir version
-pir grep|sed|python <args>
+pir grep|sed <args>
 ```
 
-`pir grep|sed|python` forward argv, fall back to the system tool, and keep GNU
+`pir grep|sed` forward argv, fall back to the system tool, and keep GNU
 exit codes; `--no-fallback` / `PIR_NATIVE_FALLBACK=0` disables that.
 
 ### Remote server security
@@ -124,7 +134,7 @@ the command after `--`.
 ### Providers
 
 `pir auth status|login|logout|check|print-api-key`. Ships a frozen catalog
-(**42 providers / 1,756 model entries**, pinned by
+(**43 providers / 1,767 model entries**, pinned by
 `tests/suites/ai_catalog_full_w10.rs`) plus OAuth flows; credentials live in
 `~/.pi/agent/auth.json` (stored OAuth > stored API key > environment).
 `~/.pi/agent/models.json` overrides the catalog. Details:
@@ -151,7 +161,11 @@ and routes messages without retaining transcripts or images. Details:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+powershell -NoProfile -File scripts/test_select.ps1 -Files src/ai/api/openai/mod.rs  # changed-area loop
 powershell -NoProfile -File scripts/test_fast.ps1 -UseNextest   # full suite, nextest runner
+# Full merged-harness builds disable Cargo incremental state to avoid low-value
+# multi-gigabyte caches; targeted test_select/test_fast -Tests loops keep the
+# existing incremental setting for fast edit-test cycles.
 # `autotests = false` merges tests/*.rs into the generated zz_merged_N harnesses;
 # a merged binary shares ONE process across its tests, so the whole suite must run
 # under nextest (process per test): `cargo nextest run --profile local`.

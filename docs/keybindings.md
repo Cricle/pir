@@ -25,5 +25,6 @@ Id groups: `tui.*` covers submit/newline and tab, editor movement and kill-ring,
 autocomplete accept and the alt-screen search/scroll family; `app.*` covers interrupt/clear/exit, thinking,
 model cycling/selection, message follow-up/dequeue/copy, clipboard paste, the external editor, and the
 `models.*`/`tree.*`/`session.*` families. `tui.altScreen.*` ids resolve like the rest (settings override →
-platform-resolved default → the upstream-verbatim table in `src/tui/altscreen_search.rs`). `/hotkeys` renders
+platform-resolved default → the upstream-verbatim table in
+`crates/pir-tui/src/altscreen_search.rs`). `/hotkeys` renders
 the full live table (registry rows overridden by settings).

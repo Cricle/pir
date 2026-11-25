@@ -162,47 +162,94 @@ pub fn origin_allowed(headers: &HeaderMap, allowed_origins: &[String]) -> bool {
 }
 
 #[derive(Debug, Clone)]
+pub struct TicketIdentity {
+    pub user_id: String,
+    pub token_id: String,
+}
+
+#[derive(Debug, Clone)]
 struct Ticket {
     user_id: String,
+    token_id: String,
     expires_at: Instant,
+}
+
+const MAX_LIVE_TICKETS: usize = 4_096;
+const MAX_TICKETS_PER_USER: usize = 4;
+
+#[derive(Default)]
+struct TicketState {
+    tickets: HashMap<String, Ticket>,
+    per_user: HashMap<String, usize>,
 }
 
 /// One-use WebSocket tickets for clients that cannot send a bearer
 /// subprotocol. Tickets are intentionally short-lived and memory-only.
 #[derive(Default)]
 pub struct TicketStore {
-    inner: Mutex<HashMap<String, Ticket>>,
+    inner: Mutex<TicketState>,
 }
 
 impl TicketStore {
-    pub fn issue(&self, user_id: &str) -> String {
+    /// Issue one single-use ticket; `None` when a live-ticket quota is full
+    /// (the caller answers 429 — the only failure this can have).
+    pub fn issue(&self, user_id: &str, token_id: &str) -> Option<String> {
         let ticket = generate_token();
-        let mut inner = self
+        let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let now = Instant::now();
-        inner.retain(|_, entry| entry.expires_at > now);
-        inner.insert(
+        let mut expired = Vec::new();
+        state.tickets.retain(|key, entry| {
+            let live = entry.expires_at > now;
+            if !live {
+                expired.push((key.clone(), entry.user_id.clone()));
+            }
+            live
+        });
+        for (_, expired_user) in expired {
+            decrement_ticket_count(&mut state.per_user, &expired_user);
+        }
+        if state.tickets.len() >= MAX_LIVE_TICKETS
+            || state.per_user.get(user_id).copied().unwrap_or(0) >= MAX_TICKETS_PER_USER
+        {
+            return None;
+        }
+        state.tickets.insert(
             ticket.clone(),
             Ticket {
                 user_id: user_id.to_owned(),
+                token_id: token_id.to_owned(),
                 expires_at: now + Duration::from_secs(30),
             },
         );
-        ticket
+        *state.per_user.entry(user_id.to_owned()).or_default() += 1;
+        Some(ticket)
     }
 
-    pub fn redeem(&self, ticket: &str) -> Option<String> {
-        let mut inner = self
+    pub fn redeem(&self, ticket: &str) -> Option<TicketIdentity> {
+        let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let now = Instant::now();
-        let entry = inner.remove(ticket)?;
-        if entry.expires_at <= now {
+        let entry = state.tickets.remove(ticket)?;
+        decrement_ticket_count(&mut state.per_user, &entry.user_id);
+        if entry.expires_at <= Instant::now() {
             return None;
         }
-        Some(entry.user_id)
+        Some(TicketIdentity {
+            user_id: entry.user_id,
+            token_id: entry.token_id,
+        })
+    }
+}
+
+fn decrement_ticket_count(counts: &mut HashMap<String, usize>, user_id: &str) {
+    if let Some(count) = counts.get_mut(user_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(user_id);
+        }
     }
 }

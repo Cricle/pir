@@ -121,22 +121,18 @@ quoted strong ETag (`"<16 hex FNV-1a>"`).
 ### 2.2 `GET /api/health`
 
 Client: `app/transport.js:233-239` (`fetch(apiUrl("/api/health"), { cache: "no-store" })`).
-No query, no body. Response JSON becomes both `state.health` and
-`state.status` (`:236-237`). Fields read by the client:
+No query, no body. Response JSON becomes both `state.health` and `state.status` (`:236-237`).
+The relay-compatible fields currently used from this response are:
 
 | Field | Use |
 |---|---|
 | `hasToken: boolean` | decides token modal vs. connect (`transport.js:254`) |
-| `isStreaming: boolean` | connection/composer state (`ui.js:319,337`; `handlers.js:241`) |
-| `cwd: string` | directory display (`ui.js:248,359`) |
-| `controlOwner: "cli"\|"phone"` | state line (`ui.js:363-364`) |
-| `host: string`, `port: number` | server line (`ui.js:365`) |
-| `theme: { name?: string, colors?: { mdCode?, mdCodeBlock?, mdCodeBlockBorder? } }` | CSS variables (`ui.js:25-37,347`; `constants.js:23-27`) |
-| `pendingMessages: PendingMessage[]` | queued-chip display (`handlers.js:537-545`) |
+| `serverUrl: string|null` | displays the selected relay URL (`ui.js:373`) |
+| `ok`, `version`, `protocolVersion` | liveness and version information |
 
-The baseline server also returns `isRunning`, `pid`, `sessionCount`,
-`idleTimeoutMs`; the client ignores extras. Method handling is server-side;
-the client only sends GET.
+The richer `isStreaming`, `cwd`, `controlOwner`, `theme`, and
+`pendingMessages` fields come from authenticated WebSocket status frames, not
+from the anonymous health response.
 
 ### 2.3 `GET /api/quota`
 

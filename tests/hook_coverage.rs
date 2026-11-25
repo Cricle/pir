@@ -628,7 +628,7 @@ fn has_dispatch_for_literal(
 /// record a registry (follow-up if one is ever added).
 #[test]
 fn every_wired_event_has_a_static_emit_site() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/pir-core/src");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
     files.sort();
@@ -835,6 +835,7 @@ fn extension_config(cwd: &Path, has_ui: bool) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -1775,19 +1776,31 @@ async fn native_tools_expanded_reads_and_writes_the_shared_cell() {
 
 /// Isolate the global agent dir (where `mcp.json` lives) for one test and
 /// restore the previous value on drop.
-struct AgentDirGuard(Option<std::ffi::OsString>);
+///
+/// It holds the SHARED per-binary agent-dir lock for the test's lifetime:
+/// `PIR_AGENT_DIR` is process-global, so without it a sibling suite in
+/// `zz_merged_1` sees this test's scratch directory (and can pin its own over
+/// it) between this test's `set_var` and the assertion that reads it.
+struct AgentDirGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
 
 impl AgentDirGuard {
-    fn isolate(path: &Path) -> Self {
+    async fn isolate(path: &Path) -> Self {
+        let lock = crate::common::agent_dir_env_lock().lock().await;
         let previous = std::env::var_os("PIR_AGENT_DIR");
         std::env::set_var("PIR_AGENT_DIR", path);
-        Self(previous)
+        Self {
+            previous,
+            _lock: lock,
+        }
     }
 }
 
 impl Drop for AgentDirGuard {
     fn drop(&mut self) {
-        match self.0.take() {
+        match self.previous.take() {
             Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
             None => std::env::remove_var("PIR_AGENT_DIR"),
         }
@@ -1804,7 +1817,7 @@ async fn mcp_servers_change_reaches_the_native_face_once_per_registry_change() {
     use pir::plugins::builtin::McpPlugin;
 
     let temp = TempDir::new("mcp-native-change");
-    let _agent_dir = AgentDirGuard::isolate(&temp.0);
+    let _agent_dir = AgentDirGuard::isolate(&temp.0).await;
     let extension_path = temp.0.join("mcp_ext.ts");
     std::fs::write(
         &extension_path,
@@ -2551,7 +2564,7 @@ async fn native_project_trust_observes_on_init_first_on_a_multi_thread_runtime()
     }
 
     let temp = TempDir::new("project-trust-init-order");
-    let _agent_dir = AgentDirGuard::isolate(&temp.0);
+    let _agent_dir = AgentDirGuard::isolate(&temp.0).await;
     let handle = ExtensionHandle::start_plan_only(extension_config(&temp.0, false));
     let trace = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::new(InitOrderRecorder {

@@ -218,17 +218,17 @@ fn agent_thread_stack_budgets_are_wired() {
     // Sensitivity guard: these assertions fail if the `.stack_size(..)`
     // application is deleted from any agent-hosting spawn site, which the
     // behavioral cases cannot detect (they run on their own test threads).
-    let terminal = include_str!("../src/tui/terminal.rs");
+    let terminal = include_str!("../crates/pir-tui/src/terminal.rs");
     assert!(
         terminal.contains(".stack_size(WORKER_THREAD_STACK_BYTES)"),
         "pir-tui-worker spawn lost its explicit stack_size"
     );
-    let server = include_str!("../src/server/session.rs");
+    let server = include_str!("../crates/pir-core/src/server/session.rs");
     assert!(
         server.contains(".stack_size(SERVER_AGENT_TASK_STACK_BYTES)"),
         "server agent task lost its explicit stack_size"
     );
-    let sdk = include_str!("../src/sdk/agent.rs");
+    let sdk = include_str!("../crates/pir-core/src/sdk/agent.rs");
     assert!(
         sdk.contains(".stack_size(SDK_AGENT_TASK_STACK_BYTES)"),
         "SDK agent task lost its explicit stack_size"

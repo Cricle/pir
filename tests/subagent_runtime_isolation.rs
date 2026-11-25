@@ -215,6 +215,7 @@ fn session_env(
     user_agents_dir: Option<PathBuf>,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -261,6 +262,7 @@ async fn start_parent_runtime(cwd: &Path, ext_path: &Path) -> pir::extensions::E
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime start");
     handle.set_path_plan(vec![ext_path.to_path_buf()]);
@@ -316,9 +318,6 @@ fn first_text_of(result: &pir::extensions::ToolResult) -> String {
 /// reached the parent's JS handlers.
 #[tokio::test(flavor = "current_thread")]
 async fn child_session_start_lands_on_the_child_runtime_not_the_parent() {
-    // The runtime build counter is process-global: serialize the tests that
-    // spawn child runtimes so no concurrent build can move it mid-assertion.
-    let _build_guard = BUILD_COUNT_LOCK.lock().await;
     let temp = TempDir::new("session-start");
     temp.write_agent(
         "scout.md",
@@ -371,7 +370,7 @@ async fn child_session_start_lands_on_the_child_runtime_not_the_parent() {
     let tool = subagent_tool_with_handle(parent.clone());
     let env = session_env(registry, Some(temp.0.join("agents")));
     let tool_ctx = tool_context(&temp.0, env);
-    let builds_before_child = pir::extensions::runtime::js_runtime_build_count();
+    let builds_before_child = pir::extensions::runtime::watch_js_runtime_builds(&temp.0);
     let result = tool
         .run(
             &serde_json::json!({ "agent": "scout", "task": "run the probe" }),
@@ -388,9 +387,11 @@ async fn child_session_start_lands_on_the_child_runtime_not_the_parent() {
         result.content
     );
     // The parent plan carries an on-disk JS extension, so the child spawn
-    // must still construct a fresh QuickJS runtime.
+    // must still construct a fresh QuickJS runtime. Reads the ATTRIBUTABLE
+    // per-cwd counter, so a concurrent unrelated runtime build elsewhere in
+    // the merged harness cannot make this pass spuriously.
     assert!(
-        pir::extensions::runtime::js_runtime_build_count() > builds_before_child,
+        builds_before_child.count() > 0,
         "an on-disk JS extension must start a QuickJS runtime for the child"
     );
 
@@ -407,18 +408,21 @@ async fn child_session_start_lands_on_the_child_runtime_not_the_parent() {
 // 2. Child cwd settings snapshot never replaces the parent's getSettings
 // ---------------------------------------------------------------------------
 
-/// Serialize env mutation (process-global) within this test binary.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// `js_runtime_build_count()` is process-global: tests that assert on it must
-/// not run concurrently with another test that builds a child runtime.
-static BUILD_COUNT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serialize env mutation across the WHOLE test binary, not just this file.
+///
+/// `PIR_AGENT_DIR` is process-global: a `static` mutex declared here only
+/// excludes this file's tests, so a sibling suite in `zz_merged_1` can pin the
+/// directory mid-test (`crate::common::agent_dir_env_lock` is included once per
+/// test binary, so every suite that takes it excludes the others).
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    crate::common::agent_dir_env_lock()
+}
 
 /// Restores the redirected env vars on drop (panic-safe).
 struct EnvGuard {
     agent_dir: Option<std::ffi::OsString>,
     trust: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for EnvGuard {
@@ -442,13 +446,8 @@ impl Drop for EnvGuard {
 /// replace the parent's snapshot).
 #[tokio::test(flavor = "current_thread")]
 async fn child_cwd_settings_snapshot_does_not_touch_the_parent_runtime() {
-    // The runtime build counter is process-global: serialize the tests that
-    // spawn child runtimes so no concurrent build can move it mid-assertion.
-    let _build_guard = BUILD_COUNT_LOCK.lock().await;
     let _env = {
-        let lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = env_lock().lock().await;
         let agent_dir = std::env::var_os("PIR_AGENT_DIR");
         let trust = std::env::var_os("PIR_TRUST_PROJECT");
         EnvGuard {
@@ -467,7 +466,14 @@ async fn child_cwd_settings_snapshot_does_not_touch_the_parent_runtime() {
     )
     .expect("global settings");
     let parent_cwd = temp.0.join("parent");
-    let child_cwd = temp.0.join("child");
+    // The child cwd override must stay INSIDE the parent workspace
+    // (`resolve_child_cwd` refuses an escape), so it is a subdirectory rather
+    // than a sibling: the test is about whose settings snapshot each runtime
+    // sees, not about escaping the workspace.
+    let child_cwd = parent_cwd.join("child");
+    // `resolve_child_cwd` canonicalizes the parent to prove containment, so
+    // the parent must exist on disk.
+    std::fs::create_dir_all(&parent_cwd).expect("parent project dir");
     std::fs::create_dir_all(child_cwd.join(".pi")).expect("child project dir");
     std::fs::write(
         child_cwd.join(".pi").join("settings.json"),
@@ -572,9 +578,6 @@ async fn child_cwd_settings_snapshot_does_not_touch_the_parent_runtime() {
 /// `COUNT:2`. Both runtimes stay usable afterwards.
 #[tokio::test(flavor = "current_thread")]
 async fn child_extension_tool_runs_through_the_new_child_runtime() {
-    // The runtime build counter is process-global: serialize the tests that
-    // spawn child runtimes so no concurrent build can move it mid-assertion.
-    let _build_guard = BUILD_COUNT_LOCK.lock().await;
     let temp = TempDir::new("new-actor-tool");
     temp.write_agent(
         "scout.md",
@@ -654,9 +657,6 @@ async fn child_extension_tool_runs_through_the_new_child_runtime() {
 /// extension tool still executes (pre-isolation behavior preserved).
 #[tokio::test(flavor = "current_thread")]
 async fn parent_without_path_plan_falls_back_to_the_shared_handle() {
-    // The runtime build counter is process-global: serialize the tests that
-    // spawn child runtimes so no concurrent build can move it mid-assertion.
-    let _build_guard = BUILD_COUNT_LOCK.lock().await;
     let temp = TempDir::new("fallback");
     temp.write_agent(
         "scout.md",
@@ -691,6 +691,7 @@ async fn parent_without_path_plan_falls_back_to_the_shared_handle() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime start");
     let load = parent.load(&[ext_path]).await.expect("load extension");
@@ -738,7 +739,6 @@ async fn parent_without_path_plan_falls_back_to_the_shared_handle() {
 /// tool still executes), only event dispatch is muted.
 #[tokio::test(flavor = "current_thread")]
 async fn shared_handle_fallback_does_not_deliver_child_events_to_parent_handlers() {
-    let _build_guard = BUILD_COUNT_LOCK.lock().await;
     let temp = TempDir::new("fallback-events");
     temp.write_agent(
         "scout.md",
@@ -794,6 +794,7 @@ async fn shared_handle_fallback_does_not_deliver_child_events_to_parent_handlers
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime start");
     let load = parent.load(&[ext_path]).await.expect("load extension");
@@ -855,9 +856,12 @@ async fn shared_handle_fallback_does_not_deliver_child_events_to_parent_handlers
 /// was empty.
 #[tokio::test(flavor = "current_thread")]
 async fn builtin_only_parent_does_not_build_quickjs_for_the_child_runtime() {
-    // The runtime build counter is process-global: serialize the tests that
-    // spawn child runtimes so no concurrent build can move it mid-assertion.
-    let _build_guard = BUILD_COUNT_LOCK.lock().await;
+    // No harness-wide lock: the assertion reads the ATTRIBUTABLE counter, which
+    // only `spawn_child_runtime`'s full-runtime branch moves. The process-wide
+    // `extensions::runtime::js_runtime_build_count` was racy here — every other
+    // suite in `zz_merged_1` that builds any runtime bumps it (the observed
+    // failure was `left: 82, right: 81`), and no file-local mutex can exclude
+    // those suites.
     let temp = TempDir::new("builtin-only-plan");
     temp.write_agent(
         "scout.md",
@@ -875,6 +879,7 @@ async fn builtin_only_parent_does_not_build_quickjs_for_the_child_runtime() {
             system_prompt: String::new(),
             is_idle: true,
             limits: Some(Default::default()),
+            allow_process_exit: false,
         });
     assert!(
         !parent.has_js_runtime(),
@@ -890,7 +895,7 @@ async fn builtin_only_parent_does_not_build_quickjs_for_the_child_runtime() {
     let tool_ctx = tool_context(&temp.0, env);
     let tool = subagent_tool_with_handle(parent.clone());
 
-    let builds_before = pir::extensions::runtime::js_runtime_build_count();
+    let builds = pir::extensions::runtime::watch_js_runtime_builds(&temp.0);
     let result = tool
         .run(
             &serde_json::json!({ "agent": "scout", "task": "no quickjs please" }),
@@ -900,8 +905,8 @@ async fn builtin_only_parent_does_not_build_quickjs_for_the_child_runtime() {
     assert!(!result.is_error, "{}", result.content);
     assert_eq!(result.content, "CHILD_OK");
     assert_eq!(
-        pir::extensions::runtime::js_runtime_build_count(),
-        builds_before,
+        builds.count(),
+        0,
         "a builtin-only child plan must not construct the QuickJS runtime"
     );
 }

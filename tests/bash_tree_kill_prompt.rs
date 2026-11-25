@@ -16,13 +16,17 @@ use pir::ai::types::AbortSignal;
 use pir::coding_agent::register_core_tools;
 use pir::coding_agent::tools::resolve_shell_config;
 
-/// Serializes the process-global `PIR_AGENT_DIR` pin (only this file's test
-/// uses it, but the env is process-wide).
-static AGENT_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Pin `PIR_AGENT_DIR` at a scratch directory with `shellPool: false`, so the
 /// bash tool takes its per-call spawn path (the `terminate` call under test)
 /// and no ambient `~/.pi/agent/settings.json` changes the shell.
+///
+/// The guard holds `crate::common::agent_dir_env_lock` — the SHARED per-binary
+/// lock, not a private `static` in this file. A private lock would exclude
+/// nothing outside this module even though the pin is process-wide:
+/// `codemode_exposure::settings_load_once_per_construction_and_once_more_on_reload`
+/// (same `zz_merged_4` binary) failed with `/reload` resolving settings once
+/// instead of twice precisely because a sibling suite re-pointed the variable
+/// mid-test.
 struct HermeticAgentDir {
     _lock: tokio::sync::MutexGuard<'static, ()>,
     previous: Option<OsString>,
@@ -31,7 +35,7 @@ struct HermeticAgentDir {
 
 impl HermeticAgentDir {
     async fn new(label: &str) -> Self {
-        let lock = AGENT_DIR_ENV_LOCK.lock().await;
+        let lock = crate::common::agent_dir_env_lock().lock().await;
         let dir = std::env::temp_dir().join(format!(
             "pir-bash-tree-kill-{label}-{}-{}",
             std::process::id(),

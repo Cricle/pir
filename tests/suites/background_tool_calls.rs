@@ -1822,6 +1822,7 @@ async fn ctx_execute_tool_background_option_detaches_the_nested_call() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime start");
     let source = dir.join("nested-background.ts");
@@ -2425,6 +2426,7 @@ async fn nested_background_via_the_real_session_sink_persists_and_reports() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime start");
     let source = dir.join("nested-background-session.ts");

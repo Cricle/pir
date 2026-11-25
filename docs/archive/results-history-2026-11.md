@@ -1,9 +1,32 @@
 # Results history archive (2026-11)
 
-This file preserves the release-by-release chronology and the 2026-11-03
-profiling/test-closure notes removed from the current `RESULTS.md` during
-the 2026-11-17 documentation slim-down. Current status and the latest A/B
-matrices live in [`RESULTS.md`](../../RESULTS.md).
+This file preserves material removed from the current `RESULTS.md`: the
+release-by-release chronology with its per-release gate numbers and checksums,
+the 2026-11-03 profiling/test-closure notes, and the superseded A/B runs
+(2026-11-16 N=5 and 2026-11-17 N=3 old fixtures). Prose change lists live in
+`CHANGELOG.md`; only the measurements and evidence paths that exist nowhere
+else are kept here. Current status and the live matrices:
+[`RESULTS.md`](../../RESULTS.md).
+
+## 2026-11-17 真机 A/B（N=3，旧 fixtures，superseded）
+
+旧 fixtures（q1–q3、c1–c3）的默认配置对照：pir 18/18，150 轮、206 工具、
+2,204,273 tokens、554.5s；pi 18/18，176 轮、266 工具、2,542,088 tokens、
+642.3s。pir 相对 pi：轮次 −14.8%、工具 −22.6%、tokens −13.3%、耗时 −13.7%；
+QA 引用无效率 10.9% vs 14.6%。限制：单模型、N=3，q1 token 方向与上一轮相反。
+原始数据：`.play/ab/results/runs-real-n3-20261117.jsonl`。
+已被 2026-11-17 四类任务矩阵（仍保留在 `RESULTS.md`）与 2026-11-20 三模式
+运行取代。
+
+## 2026-11-16 A/B vs pi v1.5.2（N=5，旧 fixtures，superseded）
+
+同一网关/模型，Q&A 以关键词与 `file:line` 计分，编码以 fixture 测试通过且
+未改测试为成功。汇总：q1 两臂中位耗时接近（75.5 vs 75.7s），pir tokens 更低；
+q2 pir 4/5（一次网关 `error sending request`），tokens 更低；q3 pi tokens
+更低；c1–c3 pir 15/15，pi 14/15（c1 rep4 改了 `tests/`）。原始数据：
+`.play/ab/results/runs-ab-n5-qa-final5.jsonl`、`runs-ab-n5-coding-final5.jsonl`。
+详细逐 run 解释在 git 历史与本文件归档前的版本中；结论是旧 fixtures 上
+pir 的少轮次/少工具收益存在，但不能直接推广到新任务矩阵。
 
 ## 2026-11-15 post-0.3.2 backlog closure
 
@@ -275,7 +298,7 @@ parity 闭合（drift 15/16 → Landed），TUI resume 首帧延迟从 1 s 降�
   聚合总数仍标记 pending re-measure，由全量 lane 写入
   `.play/evidence/release-prep/final/REPORT.md`；本文件不写聚合总数。
 
-## 7. 2026-11-03 收尾实测（本机，debug profile，--quick）
+### 7. 2026-11-03 收尾实测（本机，debug profile，--quick）
 
 本轮关闭/暴露的项：TUI `/model <ref>:<level>`（thinking 后缀）、原生插件 SessionService
 的 new_session/fork/navigate_tree/switch_session（改为记录 SessionCommandAction）、
@@ -325,7 +348,7 @@ http_poll_pacing 的连接上限回归、phone 父会话图片断言、mcp 阻�
 `cargo test --test mcp_integration`：**70 passed / 0 failed / 0 ignored**。
 
 
-## 8. 2026-11-03 上游漂移收口（代码核实）
+### 8. 2026-11-03 上游漂移收口（代码核实）
 
 `docs/upstream-drift-status.md` 的 9 项 Open/Partial 已全部关闭并按代码证据
 修正：handoff 后的 postTools 续跑、deferred 节流提交与 partial append、
@@ -363,7 +386,7 @@ Windows PowerShell 安装目录回退（`61060ddf8`）、Unix 剪贴板 helper �
 
 ## 2026-11-02 status/performance/event sections (superseded)
 
-## 1. 交付状态
+### 1. 交付状态
 
 - `test_fast` final7（RSS/hook 多线合并前）：**6705 passed / 0 failed /
   0 real failures / 306 suites**
@@ -381,9 +404,9 @@ Windows PowerShell 安装目录回退（`61060ddf8`）、Unix 剪贴板 helper �
   RSS/hook 轮新增：`paged_prompt_context` 3/0、`tui_session_event_frames`
   9/0、`hook_coverage` 22/0、`session_listing_single_read` 8/0。
 
-## 2. 性能
+### 2. 性能
 
-### Release（criterion，2026-11-01）
+#### Release（criterion，2026-11-01）
 
 | bench | baseline median | current median | Δ |
 |---|---:|---:|---:|
@@ -398,7 +421,7 @@ Windows PowerShell 安装目录回退（`61060ddf8`）、Unix 剪贴板 helper �
 **5.62 ms**、T2-1 `durable_document_commit_no_observer` **9.34 ms**。
 唯一严格 BLOCK 是 `tool_bash_spawn`，疑同机 Defender/环境漂移，待同机 baseline A/B。
 
-### Debug（dev profile，2026-11-02，10 samples）
+#### Debug（dev profile，2026-11-02，10 samples）
 
 | bench | mean | median |
 |---|---:|---:|
@@ -412,7 +435,7 @@ Windows PowerShell 安装目录回退（`61060ddf8`）、Unix 剪贴板 helper �
 | `session_search_keystroke_1k` (B8) | 52.95 ms | 52.60 ms |
 | `durable_document_commit_no_observer` (T2-1) | 67.57 ms | 67.65 ms |
 
-### Debug 内存
+#### Debug 内存
 
 | 指标 | before | after | Δ |
 |---|---:|---:|---:|
@@ -426,7 +449,7 @@ Windows PowerShell 安装目录回退（`61060ddf8`）、Unix 剪贴板 helper �
 
 heap-only 探针；B1 的 0.96 MB 是调用线程峰值，line thread 仍保留一份解析记录。
 
-### Lazy session 打开（tail-first mmap + 上翻分页）
+#### Lazy session 打开（tail-first mmap + 上翻分页）
 
 | 场景 | 打开峰值增量 | 打开后 live | 打开耗时 | resident entries |
 |---|---:|---:|---:|---:|
@@ -438,7 +461,7 @@ heap-only 探针；B1 的 0.96 MB 是调用线程峰值，line thread 仍保留�
 100 MB 与 10 MB 的 paged 峰值相同（约 1.24 MB）；上翻由 `read_older_page`
 按页加载，TUI 在距顶部 5 个视口时后台预取到 4 页 / 8 MiB 有界 LRU。
 
-### Debug RSS（2026-11-02，process-tree working set）
+#### Debug RSS（2026-11-02，process-tree working set）
 
 | 场景 | before | after | Δ |
 |---|---:|---:|---:|
@@ -482,7 +505,7 @@ QuickJS 解释器/运行时代码页进 working set + actor 线程栈，debug �
 （`Shim::inflate` 改精确大小）。无 JS 场景 QuickJS 零消耗（不创建
 runtime）。数据：`logs/js-ab/{nojs,withjs}/summary.json`。
 
-### SDK 基准（debug，`benches/sdk_benchmark.rs`）
+#### SDK 基准（debug，`benches/sdk_benchmark.rs`）
 
 | bench | median |
 |---|---:|
@@ -505,7 +528,7 @@ SDK attach 4,002,637 → **2,853,475 B/op**（−28.7%）；实现上 transcript
 按文件大小选择。基准为离线 in-process provider，session fixture 走真实
 `SessionManager` append 路径。
 
-### SDK examples（10 个，全部可跑）
+#### SDK examples（10 个，全部可跑）
 
 `examples/` 已整理为 10 个可直接运行的示例 + 共享 `common/mod.rs` + README
 特性矩阵：quickstart / streaming / tools / sessions / plugin / control /
@@ -518,7 +541,7 @@ debug 下 tool 往返的异步 future 更深（`plugin.rs` 修复前会栈溢出
 的 lib 构建也已修复（`tail_page` 的 `session` feature 门控 + print-only
 辅助函数门控），所有 feature 组合 0 警告。
 
-## 3. 事件 / Hook / 插件
+### 3. 事件 / Hook / 插件
 
 - `WIRED_NATIVE_EVENTS` **49 个**，`UNSUPPORTED_NATIVE_EVENTS` 为空；
   JS `pi.on` 与 native `AgentPlugin::on_event` 均已注册并被 `hook_coverage` 校验。
@@ -551,7 +574,7 @@ debug 下 tool 往返的异步 future 更深（`plugin.rs` 修复前会栈溢出
   hosted walk 跳过 JS adapter。新增回归：registry union/无重复、49 个
   wired 名逐一通过真实 `pi.on`、init/reload/shutdown exactly-once。
 
-## 4. 剩余边界
+### 4. 剩余边界
 
 - `message_update` 保留 JS/native 两条独立有界队列（per-delta 性能路径），
   不参与 result-contract 的统一 walk；两者都在 `message_end` 前 drain。
@@ -583,7 +606,7 @@ debug 下 tool 往返的异步 future 更深（`plugin.rs` 修复前会栈溢出
   `reload_native_w14` 10/10、`plugin_events_w16` 19/19、`hook_coverage`
   26/26、`plugins_unified`(模块) 21/21。
 
-## 5. 复现
+### 5. 复现
 
 ```bash
 export PATH=/c/wp/empty/tools/mingw/mingw64/bin:$PATH
@@ -596,7 +619,7 @@ cargo test --doc --locked
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_fast.ps1 -Concurrency 8 -Threads 4
 ```
 
-## 6. 证据
+### 6. 证据
 
 - 全量测试：`.audit/verify/test-fast-final7.log`
 - Release 性能：`.audit/perf/perf-run-2026-11-01.md`

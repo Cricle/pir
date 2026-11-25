@@ -355,6 +355,7 @@ fn test_config_at(cwd: &Path, label: &str) -> ExtensionConfig {
         system_prompt: "base system prompt".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -1166,21 +1167,32 @@ fn fake_model() -> Model {
     }
 }
 
-/// Serializes the tests that redirect process-global env vars (cargo runs the
-/// tests of one binary in threads). Async so the guard can outlive the awaited
-/// shutdowns without holding a `std::sync` guard across an `.await`.
+/// Serializes the tests that redirect process-global env vars.
+///
+/// Delegates to `crate::common::agent_dir_env_lock()`, the shared per-binary
+/// lock. A private `static` here (what this used to be) only serializes this
+/// file's tests against each other even though `PIR_AGENT_DIR` is process-wide:
+/// `EnvVars::set` below re-pointed it while `codemode_exposure`'s
+/// `/reload`-count test was running in the same `zz_merged_4` binary, so that
+/// test observed THIS file's temp agent dir and saw one settings read instead
+/// of two. Async so the guard can outlive the awaited shutdowns without
+/// holding a `std::sync` guard across an `.await`.
 async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    LOCK.lock().await
+    crate::common::agent_dir_env_lock().lock().await
 }
 
 /// Sets env vars for the guard's lifetime, restoring the previous values on
 /// drop.
+///
+/// The CALLER must already hold [`env_lock`] and keep it for the guard's
+/// lifetime — every call site does (`let _env = env_lock().await;` precedes
+/// it). Taking the lock here as well would self-deadlock: `tokio::sync::Mutex`
+/// is not reentrant.
 struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
 impl EnvVars {
     fn set(pairs: &[(&'static str, &str)]) -> Self {
-        let mut previous = Vec::new();
+        let mut previous = Vec::with_capacity(pairs.len());
         for (key, value) in pairs {
             previous.push((*key, std::env::var_os(key)));
             std::env::set_var(key, value);

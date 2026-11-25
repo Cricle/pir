@@ -72,6 +72,7 @@ fn handle_config(cwd: &Path, has_ui: bool) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -1221,13 +1222,18 @@ async fn notification_queue_is_capped_and_coalesces_tool_updates() {
 // Audit §4 #2: the extension `project_trust` decision actually applies
 // ---------------------------------------------------------------------------
 
-/// Serializes the process env pins of this suite (g_extensions has no shared
-/// `common` module, so the lock is local and only this test mutates these
-/// variables).
-/// Serializes tests that mutate `PIR_TRUST_PROJECT`. These tests hold the
-/// guard across their async body on purpose (the environment must stay pinned
-/// for the whole scenario), hence the per-test `await_holding_lock` allow.
-static TRUST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes tests that mutate `PIR_TRUST_PROJECT` / `PIR_AGENT_DIR`. These
+/// tests hold the guard across their async body on purpose (the environment
+/// must stay pinned for the whole scenario).
+///
+/// The SHARED per-binary lock ([`crate::common::agent_dir_env_lock`]), not a
+/// `static` declared here: both variables are process-global, so a file-local
+/// mutex only serializes this suite and leaves it racing every other suite in
+/// `zz_merged_3` that pins `PIR_AGENT_DIR` — which surfaced as a trust-store
+/// lock collision on another suite's `trust.json.lock`.
+fn trust_env_lock() -> &'static tokio::sync::Mutex<()> {
+    crate::common::agent_dir_env_lock()
+}
 
 /// Panic-safe pin of `PIR_AGENT_DIR` with `PIR_TRUST_PROJECT` unset.
 struct TrustEnvGuard {
@@ -1262,7 +1268,6 @@ impl Drop for TrustEnvGuard {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn project_trust_extension_decision_changes_the_trust_result() {
     let dir = fixture_dir("project-trust-effect");
     let agent_dir = dir.join("agent");
@@ -1276,9 +1281,7 @@ async fn project_trust_extension_decision_changes_the_trust_result() {
     )
     .expect("project settings");
 
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
@@ -1348,7 +1351,6 @@ async fn project_trust_extension_decision_changes_the_trust_result() {
 /// §2 #12: a grant is usable by the run gate without persisting anything when
 /// the handler omits `remember` (a session-only extension decision).
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn project_trust_extension_grant_without_remember_is_session_only() {
     let dir = fixture_dir("project-trust-grant-session");
     let agent_dir = dir.join("agent");
@@ -1360,9 +1362,7 @@ async fn project_trust_extension_grant_without_remember_is_session_only() {
     )
     .expect("project settings");
 
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     assert_eq!(
@@ -1408,7 +1408,6 @@ async fn project_trust_extension_grant_without_remember_is_session_only() {
 
 /// §2 #12: an extension denial beats a stored `yes`.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn project_trust_extension_denial_overrides_a_stored_grant() {
     let dir = fixture_dir("project-trust-deny-store");
     let agent_dir = dir.join("agent");
@@ -1416,9 +1415,7 @@ async fn project_trust_extension_denial_overrides_a_stored_grant() {
     std::fs::create_dir_all(dir.join(".pi")).expect("project dir");
     std::fs::write(dir.join(".pi/settings.json"), "{}").expect("project settings");
 
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     let store = ProjectTrustStore::new(&agent_dir);
@@ -1459,7 +1456,6 @@ async fn project_trust_extension_denial_overrides_a_stored_grant() {
 /// §2 #12: with no extension decision (no extension, or every handler
 /// undecided) the store/policy decides exactly as before.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn project_trust_without_an_extension_falls_back_to_store_and_policy() {
     let dir = fixture_dir("project-trust-no-extension");
     let agent_dir = dir.join("agent");
@@ -1469,9 +1465,7 @@ async fn project_trust_without_an_extension_falls_back_to_store_and_policy() {
     // trusted and the store is never consulted.
     std::fs::write(dir.join(".pi/settings.json"), "{}").expect("project settings");
 
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     assert_eq!(override_or_extension_decision(&dir), None);
@@ -1497,15 +1491,12 @@ async fn project_trust_without_an_extension_falls_back_to_store_and_policy() {
 /// (the final plan, which can include project extensions) cannot flip it.
 /// This is what makes `--no-approve` / a session-only "do not trust" stick.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn project_trust_pinned_run_decision_survives_a_later_dispatch() {
     let dir = fixture_dir("project-trust-pinned");
     let agent_dir = dir.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     pin_decision(&dir, false);
@@ -1567,12 +1558,9 @@ fn print_environment_project(test_name: &str) -> (PathBuf, PathBuf) {
 /// the startup trust pass got an extension grant (the grant need not be
 /// remembered: the pin carries the run's decision).
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn print_model_environment_reads_project_settings_after_an_extension_grant() {
     let (dir, agent_dir) = print_environment_project("print-env-grant");
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
@@ -1601,12 +1589,9 @@ async fn print_model_environment_reads_project_settings_after_an_extension_grant
 /// An extension denial beats a stored grant for the print/json model
 /// environment too: no project settings are read without `remember`.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn print_model_environment_skips_project_settings_after_an_extension_denial() {
     let (dir, agent_dir) = print_environment_project("print-env-deny");
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     let store = ProjectTrustStore::new(&agent_dir);
@@ -1644,12 +1629,9 @@ async fn print_model_environment_skips_project_settings_after_an_extension_denia
 /// model environment must honor it even when an extension granted trust first
 /// and `PIR_TRUST_PROJECT=1` would otherwise re-open it.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn print_model_environment_honors_a_pinned_no_approve_over_an_extension_grant() {
     let (dir, agent_dir) = print_environment_project("print-env-no-approve");
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
@@ -1685,12 +1667,9 @@ async fn print_model_environment_honors_a_pinned_no_approve_over_an_extension_gr
 /// With no extension decision the print/json model environment falls back to
 /// exactly the old order: the trust store, then `defaultProjectTrust`.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)]
 async fn print_model_environment_without_an_extension_decision_keeps_store_and_policy_fallback() {
     let (dir, agent_dir) = print_environment_project("print-env-fallback");
-    let _lock = TRUST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = trust_env_lock().lock().await;
     let _guard = TrustEnvGuard::new(&agent_dir);
 
     // No decision + the headless `ask` default => untrusted.
@@ -1839,7 +1818,7 @@ async fn send_user_message_preserves_images_and_expands_prompt_templates() {
         contexts: Arc::clone(&contexts),
         calls: AtomicUsize::new(0),
     }));
-    let mut session = AgentSession::new(AgentSessionConfig {
+    let session = AgentSession::new(AgentSessionConfig {
         performance: Default::default(),
         provider_registry: Arc::new(registry),
         model: capture_model(),

@@ -64,6 +64,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -1336,9 +1337,9 @@ fn builtin_paths_partition_filter_and_order() {
     // file paths (upstream `package-manager.ts:986-1001` adds the builtin loop
     // after every file resource, so a file extension wins first-wins
     // conflicts). `builtin:subagent` in the list above is the real builtin;
-    // the factory order is subagent, mode, mcp, codemode, python,
+    // the factory order is subagent, mode, mcp, codemode,
     // context-mode, tool-search, tool-repair, todo — mode is the foreman
-    // companion, python and context-mode are pir-only, `todo` is the npm
+    // companion, context-mode is the Code Mode port, `todo` is the npm
     // `@juicesharp/rpiv-todo` port appended last, and `phone` stays
     // default-disabled (not inserted), see `src/plugins/builtin.rs` and
     // `docs/todo-builtin.md`.
@@ -1357,7 +1358,6 @@ fn builtin_paths_partition_filter_and_order() {
             PathBuf::from("builtin:mode"),
             PathBuf::from("builtin:mcp"),
             PathBuf::from("builtin:codemode"),
-            PathBuf::from("builtin:python"),
             PathBuf::from("builtin:context-mode"),
             PathBuf::from("builtin:tool-search"),
             PathBuf::from("builtin:tool-repair"),

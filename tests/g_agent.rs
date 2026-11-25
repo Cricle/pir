@@ -38,6 +38,10 @@ mod agent_tools;
 mod background_tool_calls;
 #[path = "suites/branch_summarization.rs"]
 mod branch_summarization;
+#[path = "suites/builtin_bridge.rs"]
+mod builtin_bridge;
+#[path = "suites/builtin_catalog_agreement.rs"]
+mod builtin_catalog_agreement;
 #[path = "suites/cache_warmer.rs"]
 mod cache_warmer;
 #[path = "suites/compaction.rs"]

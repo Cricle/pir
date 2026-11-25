@@ -341,6 +341,9 @@ fn heavy_tool_entry(index: usize, tag: &str) -> ChatEntry {
 /// of being copied into the frame.
 #[test]
 fn cursor_only_dirty_frame_reuses_the_512_entry_band() {
+    // The frame counters are process-global atomics; hold the shared lock so a
+    // sibling suite's frame cannot land between this test's reset and snapshot.
+    let _guard = crate::common::tui_frame_counter_lock();
     let entries: Vec<ChatEntry> = (0..100_000)
         .map(|index| ChatEntry::User(format!("row {index:06}")))
         .collect();

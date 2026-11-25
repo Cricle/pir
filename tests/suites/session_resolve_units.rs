@@ -8,6 +8,28 @@ use pir::ai::types::{ContentBlock, TextContent, UserMessage, UserRole};
 use pir::coding_agent::session_resolve::{resolve_session_plan, SessionFlags, SessionPlan};
 use pir::session_manager::{FileEntry, MessageEntry, SessionHeader, SessionManager, StoredMessage};
 
+/// Serializes the tests in this file that assert on
+/// `session_list_file_reads`, a PROCESS-GLOBAL counter.
+///
+/// `continue_takes_newest_matching_without_listing` deliberately calls
+/// `list_sessions` at its end (to prove the cheap path differs from the
+/// listing path), so it bumps the same counter
+/// `headless_resume_takes_newest_matching_without_listing` resets and then
+/// asserts is exactly `0`. Under the default parallel harness that is a real
+/// race — observed as `left: 4, right: 0` — not a hypothetical one.
+///
+/// Not promoted to `tests/common/mod.rs`: `session_listing_single_read` (in
+/// `zz_merged_5`) and `tui_snapshot_refresh_w16` (only a doc mention) live in
+/// other test binaries, which are separate processes with their own copy of
+/// the counter, so a cross-file lock would buy nothing.
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pir-session-resolve-{label}-{}-{}",
@@ -81,6 +103,10 @@ fn write_session(
 /// `list_sessions(..).first()`.
 #[test]
 fn continue_takes_newest_matching_without_listing() {
+    // `session_list_file_reads` is PROCESS-GLOBAL and this test bumps it on
+    // purpose at the end, so it must not overlap the `== 0` assertion in
+    // `headless_resume_...` below. See `TEST_LOCK`.
+    let _reads = test_lock();
     let dir = temp_dir("continue");
     let cwd = dir.join("project");
     std::fs::create_dir_all(&cwd).unwrap();
@@ -126,6 +152,9 @@ fn continue_takes_newest_matching_without_listing() {
 /// Headless `-r` resolves to the same default row as `--continue`.
 #[test]
 fn headless_resume_takes_newest_matching_without_listing() {
+    // Same process-global counter as the test above; hold `TEST_LOCK` so the
+    // `== 0` assertion cannot observe that test's deliberate `list_sessions`.
+    let _reads = test_lock();
     let dir = temp_dir("headless-resume");
     let cwd = dir.join("project");
     std::fs::create_dir_all(&cwd).unwrap();

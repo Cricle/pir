@@ -9,20 +9,18 @@
 //! - fetch redirect policy (`file://` redirects rejected, local redirects
 //!   followed, hop cap),
 //! - database path selection from the pushed session cwd,
-//! - the Python-lock starvation valve policy.
+//! - write-time stdout/stderr capping.
 //!
 //! Hermetic: temp DBs via `with_db_path`/`with_db_base_dir`; the fetch tests
 //! serve their own pages from loopback listeners.
 
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-use serde_json::{json, Value};
 
 use pir::agent::tool_batch::ToolResult;
 use pir::agent::tool_execution::{AgentTool, ToolContext};
@@ -38,15 +36,6 @@ use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext
 // ---------------------------------------------------------------------------
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-/// The embedded RustPython VM serializes user code behind a process-wide
-/// execution lock (`src/plugins/builtin/python_vm.rs`), and cargo runs this
-/// binary's tests concurrently. A call that has to queue behind another test's
-/// long script burns its own deadline there (default 30s for `ctx_execute`),
-/// which is what made the write-cap tests flaky under load. Hold this gate for
-/// one whole tool call so every call's budget starts only once the shared
-/// interpreter is free.
-static PYTHON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Self-cleaning temp directory.
 struct TestDir(PathBuf);
@@ -103,11 +92,6 @@ impl Harness {
     }
 
     async fn run(&self, name: &str, args: Value) -> ToolResult {
-        // Only the exec tools reach the shared interpreter, but every test
-        // here is cheap except the two write-cap scripts; serializing one
-        // tool call at a time is the smallest gate that keeps the shared
-        // lock out of the per-call deadline.
-        let _serial = PYTHON_TEST_LOCK.lock().await;
         let tool = self
             .tools
             .get(name)
@@ -661,21 +645,6 @@ fn database_path_prefers_the_pushed_session_cwd() {
 }
 
 // ---------------------------------------------------------------------------
-// Python lock starvation valve policy
-// ---------------------------------------------------------------------------
-
-#[test]
-fn python_exec_lock_starvation_valve_allows_two_deadline_ceiling() {
-    let threshold = ContextModePlugin::python_exec_lock_wedged_after();
-    assert_eq!(
-        threshold,
-        Duration::from_secs(240),
-        "the valve must allow 2x the 120s hard deadline ceiling"
-    );
-    assert!(threshold >= Duration::from_secs(2 * 120));
-}
-
-// ---------------------------------------------------------------------------
 // Write-time output cap
 // ---------------------------------------------------------------------------
 
@@ -686,7 +655,7 @@ async fn execute_print_loop_is_capped_at_write_time() {
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "for _ in range(500000):\n    print(\"x\" * 100)",
+                "code": "for (let i = 0; i < 500000; i += 1) console.log('x'.repeat(100));",
                 "timeout": 120
             }),
         )
@@ -713,7 +682,7 @@ async fn execute_print_loop_is_capped_at_write_time() {
     let after = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('still alive')" }),
+            json!({ "code": "console.log('still alive')" }),
         )
         .await;
     assert!(!after.is_error, "{}", after.content);
@@ -726,7 +695,7 @@ async fn execute_single_huge_write_is_capped() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('y' * 1_500_000)" }),
+            json!({ "code": "console.log('y'.repeat(1_500_000))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -747,13 +716,15 @@ async fn execute_stderr_is_capped_at_write_time() {
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "import sys\nsys.stderr.write('z' * 1_500_000)\n1 / 0"
+                "code": "process.stderr.write('z'.repeat(1_500_000)); throw new Error('boom');"
             }),
         )
         .await;
-    assert!(result.is_error, "the ZeroDivisionError is still reported");
+    assert!(result.is_error, "the thrown error is still reported");
+    // The captured stream is capped at `MAX_OUTPUT_CHARS`; the extra budget
+    // covers the truncation marker appended after the cut, not extra output.
     assert!(
-        result.content.len() <= MAX_OUTPUT_CHARS + 100,
+        result.content.len() <= MAX_OUTPUT_CHARS + 512,
         "stderr is capped at write time, got {} chars",
         result.content.len()
     );

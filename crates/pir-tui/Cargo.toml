@@ -1,0 +1,85 @@
+[package]
+name = "pir-tui"
+# Library crate name; consumers import it as `pir_tui`. The `pir-sdk` facade
+# re-exports it as `pir::tui`, which is the supported embedding path.
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Terminal UI for the pi coding agent (crossterm event loop, renderers, themes, clipboard)"
+license = "MIT OR Apache-2.0"
+authors = ["Earendil Works <team@earendil.works>"]
+repository = "https://github.com/Cricle/pir"
+
+include = ["/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/src/**"]
+
+[lib]
+name = "pir_tui"
+
+# A UI crate, not a second engine: everything it renders comes from
+# `pir-core`. Adding another front end (web, GUI, remote) means another crate
+# that depends on `pir-core` the same way — core never depends on a UI.
+[dependencies]
+pir-core = { path = "../pir-core", version = "0.3.2", default-features = false, features = [
+    # The TUI always renders `/export` and reuses the compaction settings
+    # helpers print mode owns, plus the engine-side pieces of the live edit
+    # preview and image protocol.
+    "export-html",
+    "print",
+    "image-resize",
+    "ui-support",
+] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "fs", "process", "signal"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+regex = "1.13.1"
+base64 = "0.23"
+semver = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "native-tls"] }
+uuid = { version = "1", features = ["v4"] }
+crossterm = "0.29.0"
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13"
+unicode-normalization = "0.1"
+similar = "2"
+memchr = "2"
+memmap2 = { version = "0.9", optional = true }
+textwrap = { version = "0.15", default-features = false, features = ["unicode-width", "unicode-linebreak"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+mermaid-text = "0.57"
+notify = "8.2"
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+
+[target.'cfg(unix)'.dependencies]
+# termios/osc11 raw-mode probe + SIGTSTP suspend (same libc the engine uses).
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[features]
+# The TUI's own compile-time toggles. The engine features it follows are
+# forwarded to `pir-core`; the facade forwards the user-facing names here.
+default = []
+# Halfblocks / Kitty / iTerm2 image previews inside the transcript.
+image-protocol = []
+# Session persistence helpers used by the spill preview.
+session = ["pir-core/session", "dep:memmap2"]
+# Live extension renderer/widget/footer callbacks.
+extensions = ["pir-core/extensions"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+disallowed_methods = "warn"
+disallowed_types = "warn"
+wildcard_dependencies = "warn"
+negative_feature_names = "warn"
+missing_const_for_thread_local = "allow"

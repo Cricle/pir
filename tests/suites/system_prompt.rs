@@ -1811,6 +1811,27 @@ fn mcp_servers_section_lists_each_state() {
     assert!(render_mcp_servers_section(&[]).is_none());
 }
 
+/// A hyphenated server name renders through the same `mcpNamespace` rule the
+/// MCP registry uses. The prompt module keeps a literal fallback for builds
+/// without the `mcp` feature, so this pins the two spellings equal: a drifted
+/// fallback would advertise a tool namespace the registry never registers.
+#[test]
+fn mcp_servers_section_namespace_matches_the_registry_rule() {
+    use pir::system_prompt::{render_mcp_servers_section, McpServerListing, McpServerState};
+
+    let servers = vec![McpServerListing {
+        name: "my-server".to_owned(),
+        reach: "direct",
+        state: McpServerState::Ready { tool_count: 1 },
+    }];
+    let section = render_mcp_servers_section(&servers).expect("one server renders");
+    assert!(
+        section.contains("- mcp__my_server ("),
+        "a hyphen becomes an underscore in the namespace: {section}"
+    );
+    assert!(!section.contains("mcp__my-server"), "{section}");
+}
+
 /// A failure reason is bounded to one line (CL24's `bounded_reason` rule):
 /// the first line survives, later lines and an overlong tail do not.
 #[test]

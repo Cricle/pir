@@ -102,8 +102,8 @@ fn stream_end(usage: Usage) -> AgentEvent {
 fn turn_end() -> AgentEvent {
     AgentEvent::TurnEnd {
         turn: 1,
-        message: AssistantMessage::default(),
-        tool_results: Vec::new(),
+        message: std::sync::Arc::new(AssistantMessage::default()),
+        tool_results: std::sync::Arc::from([]),
     }
 }
 

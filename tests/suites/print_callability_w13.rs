@@ -6,7 +6,7 @@
 //! base was core-only (`CORE_TOOL_NAMES` plus `DEFAULT_TOOL_NAMES`; it is now
 //! every available tool that activates on registration,
 //! `tool_selection.rs:318-339`), so every plugin tool the print host merges
-//! (`ctx_*`, `python`, `todo`, ...) was removed from the registry and became
+//! (`ctx_*`, `todo`, ...) was removed from the registry and became
 //! un-callable — absent from the scheduler's lookup, from `ctx.executeTool`
 //! and from `tool_search`'s search space — while the exact same selection left
 //! them registered (hence callable) in a session.
@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 /// A tool with the given exposure, mirroring a merged plugin/builtin tool
-/// (`ctx_*`, `todo`, `python` are `direct`; MCP servers may be configured
+/// (`ctx_*`, `todo` are `direct`; MCP servers may be configured
 /// `codemode`/`deferred`; `hidden` tools are registered-but-unreachable).
 struct PluginTool {
     name: &'static str,

@@ -71,6 +71,7 @@ fn test_config(cwd: &Path) -> ExtensionConfig {
         is_idle: true,
         // Some(...) keeps limit resolution hermetic (no ambient agent dir).
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 

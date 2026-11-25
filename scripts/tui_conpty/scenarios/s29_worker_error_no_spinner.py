@@ -15,6 +15,6 @@ OPS = [
     ("snap", "p24_after_error"),
 ]
 CHECKS = [
-    ("screen_contains", "p24_after_error", "No pi model configured"),
+    ("screen_contains", "p24_after_error", "No model selected"),
     ("screen_not_contains", "p24_after_error", "Working"),
 ]

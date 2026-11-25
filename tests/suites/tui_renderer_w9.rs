@@ -512,6 +512,7 @@ fn factory_widget_shape_exposes_the_generation_key() {
         width: 80,
         theme_generation: 3,
         dirty: false,
+        revision: 0,
     };
     assert_eq!(widget.theme_generation, 3);
     assert!(!widget.dirty);

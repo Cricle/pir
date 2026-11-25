@@ -1,0 +1,17 @@
+[package]
+name = "pir-builtin-context-mode"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Host-neutral pure core of the pir context-mode builtin: batch validation, fetch normalization, document chunking, journal shaping"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+serde_json = "1"

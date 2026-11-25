@@ -588,24 +588,42 @@ impl WriteOperations for FakeWrite {
 /// Upstream `write.ts:11-14`: the parameter descriptions are model-facing
 /// schema text, so they are pinned byte-for-byte (a wording drift is a wire
 /// change, not a comment change).
+///
+/// `append` is a pir extension for chunked large-file writes; upstream
+/// `write.ts` has only `path` and `content`. It is optional (`required` stays
+/// upstream's exact list), so the upstream call shape is unchanged.
 #[test]
 fn write_declares_the_upstream_parameter_schema() {
     let tool = WriteTool::new();
-    assert_eq!(
-        tool.parameters().expect("write schema"),
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
+    let schema = tool.parameters().expect("write schema");
+    let expected = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to write (relative or absolute)"
             },
-            "required": ["path", "content"]
+            "content": {
+                "type": "string",
+                "description": "Content to write to the file"
+            }
+        },
+        "required": ["path", "content"]
+    });
+    assert_eq!(schema["type"], expected["type"]);
+    assert_eq!(schema["properties"]["path"], expected["properties"]["path"]);
+    assert_eq!(
+        schema["properties"]["content"],
+        expected["properties"]["content"]
+    );
+    assert_eq!(schema["required"], expected["required"]);
+    let properties = schema["properties"].as_object().expect("properties");
+    assert_eq!(properties.len(), 3, "unexpected write parameters: {schema}");
+    assert_eq!(
+        properties["append"],
+        serde_json::json!({
+            "type": "boolean",
+            "description": "Append to the existing file instead of replacing it (creates the file when missing)"
         })
     );
 }
@@ -723,6 +741,7 @@ fn bash_context(root: &Path, session: Option<(String, PathBuf)>) -> ToolContext 
     let mut context = ToolContext::new(root);
     if let Some((session_id, session_file)) = session {
         context.session_env = Some(Arc::new(ToolSessionEnv {
+            performance: pir::config::settings::PerformanceSettings::default(),
             live_model: None,
             live_thinking: None,
             read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),

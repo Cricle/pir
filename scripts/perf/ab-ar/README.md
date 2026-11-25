@@ -9,7 +9,7 @@ Pins an A/B campaign to **one** provider/model. Two campaigns are committed;
 | `openai` | `openai` | `https://api.openai.com` | `anthropic-messages` | `authHeader: true` (Bearer) | `gpt-5` | 1 000 000 / 65 536 |
 
 - Credential: `models.json` template **`${PIR_AB_API_KEY}`**, resolved by the
-  CLI at request time (pir: `src/ai/providers/config_value.rs`). The key is
+  CLI at request time (pir: `crates/pir-core/src/ai/providers/config_value.rs`). The key is
   never written to disk and never printed by `run_ab` (it reports only
   `PIR_AB_API_KEY: PRESENT`).
 - Each campaign is one committed template. `--campaign <name>` selects

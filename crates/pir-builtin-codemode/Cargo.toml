@@ -1,0 +1,16 @@
+[package]
+name = "pir-builtin-codemode"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Host-neutral pure core of the pir codemode builtin: script identifier normalization and budget truncation"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }

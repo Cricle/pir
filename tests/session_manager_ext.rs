@@ -99,6 +99,7 @@ fn script_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -423,6 +424,12 @@ globalThis.__casResult = out;
 
 #[tokio::test(flavor = "current_thread")]
 async fn create_agent_session_child_round_trip() {
+    // `PIR_AGENT_DIR` / `PIR_EXECUTABLE` below are process-global and the
+    // spawned child inherits them, so hold the shared per-binary lock for the
+    // whole test: a sibling suite in this `zz_merged_4` binary re-pointing the
+    // variable between the `set_var` and the spawn would hand the child the
+    // wrong agent dir.
+    let _env = crate::common::agent_dir_env_lock().lock().await;
     let dir = TempDir::new("cas");
     let agent_dir = TempDir::new("cas-agent");
     let session_dir = dir.path().join("sessions");

@@ -42,6 +42,7 @@ fn handle_config(cwd: &std::path::Path, has_ui: bool) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -156,7 +157,11 @@ async fn reload_releases_the_previous_generations_children_workers_and_servers()
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime start");
     seed_and_load(&handle, &dir, "hold.ts", HOLD_RESOURCES_TS).await;
 
-    let baseline = pir::extensions::runtime::host_resource_counts_for_tests();
+    // GENERATION-scoped: the host tables are process-wide, so a concurrent
+    // runtime in `zz_merged_3` holding its own fetch/server would otherwise
+    // appear as a leak here (observed as a stray `fetches: 1`).
+    let generation = handle.generation();
+    let baseline = pir::extensions::runtime::host_resource_counts_for_generation(generation);
     let result = handle
         .call_tool("hold_resources", "call-1", &serde_json::json!({}))
         .await
@@ -176,9 +181,9 @@ async fn reload_releases_the_previous_generations_children_workers_and_servers()
         "the HTTP server holds its port before the reload"
     );
     assert!(
-        !pir::extensions::runtime::host_resource_counts_for_tests().is_empty(),
+        !pir::extensions::runtime::host_resource_counts_for_generation(generation).is_empty(),
         "the runtime registered its host handles: {:?}",
-        pir::extensions::runtime::host_resource_counts_for_tests()
+        pir::extensions::runtime::host_resource_counts_for_generation(generation)
     );
 
     handle.reload().await.expect("reload");
@@ -209,7 +214,7 @@ async fn reload_releases_the_previous_generations_children_workers_and_servers()
     );
 
     assert_eq!(
-        pir::extensions::runtime::host_resource_counts_for_tests(),
+        pir::extensions::runtime::host_resource_counts_for_generation(generation),
         baseline,
         "reload must release the previous generation's host tables"
     );

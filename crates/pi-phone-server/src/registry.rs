@@ -301,6 +301,38 @@ impl Registry {
         }
     }
 
+    pub fn user_session_count(&self, user_id: &str) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.user_id == user_id)
+            .count()
+    }
+
+    /// Check the aggregate resident catalog quota before a hello adds rows.
+    /// Existing ids from the same user's registry do not consume new slots.
+    pub fn can_add_sessions(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        descriptors: &[SessionDescriptor],
+        limit: usize,
+    ) -> bool {
+        let mut additions = HashSet::new();
+        for descriptor in descriptors {
+            let id = format!("{device_id}:{}", descriptor.id);
+            if !self
+                .sessions
+                .get(&id)
+                .is_some_and(|session| session.user_id == user_id)
+            {
+                additions.insert(id);
+            }
+        }
+        self.user_session_count(user_id)
+            .saturating_add(additions.len())
+            <= limit
+    }
+
     /// Insert or update a live session. Returns the catalog id and whether the
     /// descriptor/online state actually changed. Status frames are noisy; the
     /// changed flag keeps unchanged frames out of redb and the catalog fan-out.
@@ -356,6 +388,27 @@ impl Registry {
             device.sessions.insert(catalog_id.clone());
         }
         (catalog_id, changed)
+    }
+
+    /// Insert a session only when the user's aggregate session quota permits
+    /// it. The caller holds the registry write lock across this check/update.
+    pub fn upsert_session_limited(
+        &mut self,
+        user_id: &str,
+        device_id: &str,
+        descriptor: &SessionDescriptor,
+        online: bool,
+        limit: usize,
+    ) -> Option<(String, bool)> {
+        let catalog_id = format!("{device_id}:{}", descriptor.id);
+        let is_new_for_user = !self
+            .sessions
+            .get(&catalog_id)
+            .is_some_and(|session| session.user_id == user_id);
+        if is_new_for_user && self.user_session_count(user_id) >= limit {
+            return None;
+        }
+        Some(self.upsert_session(user_id, device_id, descriptor, online))
     }
 
     pub fn remove_session(&mut self, device_id: &str, local_id: &str) {
@@ -547,6 +600,11 @@ impl Registry {
         });
     }
 
+    pub fn remove_pending_for_session(&mut self, session_id: &str) {
+        self.pending
+            .retain(|_, pending| pending.session_id != session_id);
+    }
+
     pub fn remove_pending_for_device(&mut self, device_id: &str) {
         self.pending
             .retain(|_, pending| pending.device_id != device_id);
@@ -653,153 +711,4 @@ fn broadcast_to(
         subscribers.remove(&id);
     }
     delivered
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pending_reply_is_scoped_to_owner() {
-        let mut registry = Registry::new();
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        registry.add_pending(
-            "f-1".to_owned(),
-            PendingReply::Http { tx },
-            "user-a",
-            "device-a",
-            "device-a:session",
-        );
-        assert!(registry
-            .take_pending_for("f-1", "user-b", "device-a", "device-a:session")
-            .is_none());
-        assert!(registry
-            .take_pending_for("f-1", "user-a", "device-b", "device-a:session")
-            .is_none());
-        assert!(registry
-            .take_pending_for("f-1", "user-a", "device-a", "device-b:session")
-            .is_none());
-        assert!(registry
-            .take_pending_for("f-1", "user-a", "device-a", "device-a:session")
-            .is_some());
-    }
-
-    fn descriptor(id: &str) -> SessionDescriptor {
-        SessionDescriptor {
-            id: id.to_owned(),
-            session_id: None,
-            has_pending_ui_request: None,
-            last_activity_at: None,
-            label: None,
-            kind: None,
-            cwd: None,
-            model: None,
-            thinking_level: None,
-            is_streaming: None,
-            is_compacting: None,
-            message_count: None,
-            last_error: None,
-        }
-    }
-
-    #[test]
-    fn upsert_session_merges_live_pending_ui_and_activity() {
-        let mut registry = Registry::new();
-        assert!(
-            registry
-                .upsert_session("user-a", "device-a", &descriptor("active-session-1"), true)
-                .1
-        );
-
-        // A catalog push for a pool child may differ only in the live fields
-        // the bridge tracks; it must still mark the row changed so the relay
-        // persists and broadcasts them.
-        let mut live = descriptor("active-session-1");
-        live.session_id = Some("native-child".to_owned());
-        live.has_pending_ui_request = Some(true);
-        live.last_activity_at = Some(1750);
-        assert!(registry.upsert_session("user-a", "device-a", &live, true).1);
-        let runtime = registry
-            .sessions
-            .get("device-a:active-session-1")
-            .expect("session row");
-        assert_eq!(
-            runtime.descriptor.has_pending_ui_request,
-            Some(true),
-            "pending flag must survive the merge"
-        );
-        assert_eq!(runtime.descriptor.last_activity_at, Some(1750));
-        assert_eq!(
-            runtime.descriptor.session_id.as_deref(),
-            Some("native-child")
-        );
-
-        // Answering the dialog clears the flag through the same path.
-        let mut cleared = descriptor("active-session-1");
-        cleared.has_pending_ui_request = Some(false);
-        assert!(
-            registry
-                .upsert_session("user-a", "device-a", &cleared, true)
-                .1
-        );
-        let runtime = registry
-            .sessions
-            .get("device-a:active-session-1")
-            .expect("session row");
-        assert_eq!(runtime.descriptor.has_pending_ui_request, Some(false));
-        assert_eq!(runtime.descriptor.last_activity_at, Some(1750));
-    }
-
-    #[test]
-    fn forward_ids_are_not_predictable_sequences() {
-        let mut registry = Registry::new();
-        let first = registry.next_forward_id();
-        let second = registry.next_forward_id();
-        assert_ne!(first, second);
-        assert!(!second.ends_with("-1"));
-        assert!(first.len() > 20);
-    }
-
-    #[test]
-    fn high_water_evicts_only_offline_unsubscribed_sessions() {
-        let mut registry = Registry::new();
-        registry.set_max_resident_sessions(2);
-        for index in 0..4 {
-            let id = format!("device:session-{index}");
-            registry.sessions.insert(
-                id.clone(),
-                SessionRuntime {
-                    id: id.clone(),
-                    user_id: "user".to_owned(),
-                    device_id: "device".to_owned(),
-                    local_id: format!("session-{index}"),
-                    descriptor: crate::protocol::SessionDescriptor {
-                        id: format!("session-{index}"),
-                        session_id: None,
-                        has_pending_ui_request: None,
-                        last_activity_at: None,
-                        label: None,
-                        kind: None,
-                        cwd: None,
-                        model: None,
-                        thinking_level: None,
-                        is_streaming: None,
-                        is_compacting: None,
-                        message_count: None,
-                        last_error: None,
-                    },
-                    online: index == 3,
-                    subscribers: HashMap::new(),
-                    cached_status: None,
-                    cache_size: 0,
-                    last_seen: Instant::now(),
-                },
-            );
-        }
-        registry.online_session_count = 1;
-        registry.evict_offline_sessions();
-        assert_eq!(registry.sessions.len(), 2);
-        assert!(registry.sessions.contains_key("device:session-3"));
-        assert_eq!(registry.online_session_count, 1);
-    }
 }

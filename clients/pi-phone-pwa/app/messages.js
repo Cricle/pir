@@ -33,12 +33,26 @@ function userContentDisplayText(content) {
 
 function imageSource(part) {
   if (!part || part.type !== "image") return "";
-  if (typeof part.previewUrl === "string" && part.previewUrl) return part.previewUrl;
-  if (typeof part.url === "string" && part.url) return part.url;
-  if (typeof part.data === "string" && part.data && typeof part.mimeType === "string" && part.mimeType) {
-    return `data:${escapeAttribute(part.mimeType)};base64,${escapeAttribute(part.data)}`;
+  let source = "";
+  if (typeof part.previewUrl === "string" && part.previewUrl) source = part.previewUrl;
+  else if (typeof part.url === "string" && part.url) source = part.url;
+  else if (
+    typeof part.data === "string" &&
+    part.data &&
+    typeof part.mimeType === "string" &&
+    /^image\/(?:png|jpeg|gif|webp|avif|svg\+xml)$/i.test(part.mimeType)
+  ) {
+    source = `data:${part.mimeType};base64,${part.data}`;
   }
-  return "";
+  if (!source) return "";
+  try {
+    const url = new URL(source, window.location.href);
+    const allowed = url.protocol === "https:" || url.protocol === "blob:" ||
+      (url.protocol === "data:" && url.pathname.toLowerCase().startsWith("image/"));
+    return allowed ? source : "";
+  } catch {
+    return "";
+  }
 }
 
 function renderUserContent(content, fallbackText = "") {

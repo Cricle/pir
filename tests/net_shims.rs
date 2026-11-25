@@ -44,6 +44,7 @@ fn test_config() -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 

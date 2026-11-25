@@ -27,6 +27,7 @@ fn test_config(cwd: PathBuf) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -265,5 +266,99 @@ export default (pi: any) => {
     let _ = rt
         .eval_json("JSON.stringify({ stopped: globalThis.__pir_host.fsWatch(\"watchStop\", JSON.stringify({ id: globalThis.__watchId })) })")
         .await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Loop-control surface: `unref()` drops the watcher's claim on process
+// lifetime, `ref()` restores it.
+//
+// Both were no-ops in the original shim: an extension that called
+// `fs.watch(...).unref()` kept the host timer armed forever, which kept the
+// process alive (`watchFile().unref` in the async-hooks test suite is the real
+// usage that exposed it — P3-1). The pump is this shim's own `setInterval`, so
+// the observable state is whether that timer is armed; `close()` must still
+// release the host watcher afterwards.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn fs_watch_unref_disarms_the_pump_and_ref_rearms_it() {
+    let dir = std::env::temp_dir().join(format!("pir-fs-watch-unref-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create watch dir");
+
+    let ts = r#"
+import fs from "node:fs";
+
+export default (pi: any) => {
+  pi.on("session_start", async () => {
+    const watcher = fs.watch("__PIR_WATCH_DIR__", () => {});
+    const armed = (w: any) => w._timer !== undefined;
+    const before = { armed: armed(watcher), id: watcher._id };
+    watcher.unref();
+    const afterUnref = { armed: armed(watcher), id: watcher._id };
+    watcher.ref();
+    const afterRef = { armed: armed(watcher), id: watcher._id };
+    // unref must NOT release the host watch: the id stays valid so a later
+    // ref()/poll can still deliver queued events, and close() remains the one
+    // operation that releases it.
+    const closed = watcher.close()._id === 0 && watcher.closed === true;
+    globalThis.__pirUnref = { before, afterUnref, afterRef, closed };
+  });
+};
+"#
+    .replace(
+        "__PIR_WATCH_DIR__",
+        &dir.to_string_lossy().replace('\\', "\\\\"),
+    );
+
+    let rt = ExtensionRuntime::new(test_config(dir.clone()))
+        .await
+        .expect("runtime");
+    rt.allow_root(dir.clone());
+    let module = "pir-ext:watch_unref_fixture.ts";
+    rt.seed_module(module, &ts).expect("seed fixture");
+    rt.seeded_load(module).await.expect("seeded load");
+
+    let outcome = rt
+        .emit("session_start", &mut json!({ "reason": "startup" }))
+        .await
+        .expect("emit session_start");
+    assert!(
+        outcome.errors.is_empty(),
+        "handler errors: {:?}",
+        outcome.errors
+    );
+
+    let state: Value = rt
+        .eval_json("JSON.stringify(globalThis.__pirUnref)")
+        .await
+        .expect("read unref state");
+
+    assert_eq!(
+        state["before"]["armed"], true,
+        "the pump starts armed: {state}"
+    );
+    assert!(
+        state["before"]["id"].as_u64().unwrap_or(0) > 0,
+        "a live host watch id: {state}"
+    );
+    assert_eq!(
+        state["afterUnref"]["armed"], false,
+        "unref() disarms the poll timer so it stops keeping the process alive: {state}"
+    );
+    assert_eq!(
+        state["afterUnref"]["id"], state["before"]["id"],
+        "unref() keeps the host watch registered: {state}"
+    );
+    assert_eq!(
+        state["afterRef"]["armed"], true,
+        "ref() re-arms the pump: {state}"
+    );
+    assert_eq!(
+        state["closed"], true,
+        "close() still releases the host watch and marks the watcher closed: {state}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

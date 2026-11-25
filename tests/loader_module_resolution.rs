@@ -27,6 +27,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -372,8 +373,17 @@ fn host_pi_package_provisioning_is_idempotent_and_discoverable() {
 /// The runtime publishes the provisioning to extensions: after boot, the host
 /// package root env is set, and importing that package's entry by `file:` URL
 /// is the same module as the bare host-SDK specifier.
+///
+/// NOTE: the published root comes from the process-global agent dir
+/// (`runtime.rs` provisions `<agent_dir>/pir/host-pi-package`, and
+/// `agent_dir()` honors `PIR_AGENT_DIR`), so this test must hold the shared
+/// per-binary lock. Without it another suite in `zz_merged_1` can re-point
+/// `PIR_AGENT_DIR` at its own scratch dir (and delete it) between this test's
+/// runtime boot and its probe, which then reads a root under somebody else's
+/// temp dir — observed as `pir-hook-coverage-mcp-native-change-…`.
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_publishes_the_host_pi_package_root() {
+    let _env = crate::common::AgentDirEnvGuard::scratch("loader-host-pi-root", None).await;
     let dir = temp_dir("host-pi-root-env");
     let rt = runtime_at(&dir).await;
     let probe = r#"

@@ -4464,7 +4464,7 @@ async fn explicit_system_prompt_override_is_not_replaced_by_the_base_prompt() {
     }));
     let mut tools = ToolRegistry::new();
     pir::coding_agent::register_core_tools(&mut tools);
-    let mut session = AgentSession::new(AgentSessionConfig {
+    let session = AgentSession::new(AgentSessionConfig {
         performance: Default::default(),
         provider_registry: Arc::clone(&registry),
         model: fake_model(),
@@ -4556,6 +4556,7 @@ async fn model_complete_json_payload_never_carries_the_retry_class() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime");
     let loaded = handle
@@ -4710,6 +4711,7 @@ async fn model_complete_host_op_does_not_emit_provider_stream_events() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime");
     let loaded = handle
@@ -4851,6 +4853,7 @@ async fn load_message_lifecycle_extension(
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime");
     let loaded = handle
@@ -5071,6 +5074,7 @@ async fn prompt_with_extension_builds_one_projection_for_snapshot_and_gate() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("extension runtime");
     let agent = Arc::new(AgentSession::new_with_plugins(
@@ -5408,6 +5412,7 @@ async fn before_agent_start_append_invalidates_the_reused_projection() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     });
     // A large window keeps the threshold hook idle: the gate must BUILD and
     // then REUSE its projection on prompt 2 (a compaction would rebuild it

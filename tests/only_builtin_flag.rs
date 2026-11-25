@@ -63,6 +63,7 @@ fn extension_config(cwd: &Path) -> pir::extensions::ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: None,
+        allow_process_exit: false,
     }
 }
 
@@ -197,13 +198,16 @@ async fn plan_only_handle_registers_native_builtins() {
     assert_eq!(ignored.len(), 1);
     assert!(!plan.is_empty());
 
-    let baseline = pir::extensions::runtime::js_runtime_build_count();
+    // ATTRIBUTABLE per-cwd watch rather than the process-wide counter: a
+    // sibling suite in `zz_merged_4` building any runtime would otherwise move
+    // the global count between the two reads.
+    let builds = pir::extensions::runtime::watch_js_runtime_builds(&temp.0);
     let handle = pir::agent_session::load_extension_runtime(&plan, extension_config(&temp.0))
         .await
         .expect("a builtin-only plan still yields a handle");
     assert_eq!(
-        pir::extensions::runtime::js_runtime_build_count(),
-        baseline,
+        builds.count(),
+        0,
         "--only-builtin must not construct the QuickJS runtime"
     );
     assert!(

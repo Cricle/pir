@@ -153,7 +153,7 @@ pub(super) async fn run() -> Result<()> {
     if raw_args.first().map(String::as_str) == Some("__brush") {
         return Err(missing_feature("pir __brush", "brush"));
     }
-    // Native `grep`/`sed`/`python`: standalone commands that own their argv
+    // Native `grep`/`sed`: standalone commands that own their argv
     // and stdio (see `native_cli`). Intercept them on the RAW argv — like
     // `js`/`env-daemon` — so a grep invocation neither parses the 60+ flag
     // CLI surface nor runs migrations/settings/trust/package discovery before
@@ -163,7 +163,6 @@ pub(super) async fn run() -> Result<()> {
         let native = match command {
             "grep" => Some(pir::native_cli::run_grep as fn(&[String]) -> pir::Result<()>),
             "sed" => Some(pir::native_cli::run_sed as fn(&[String]) -> pir::Result<()>),
-            "python" => Some(pir::native_cli::run_python as fn(&[String]) -> pir::Result<()>),
             _ => None,
         };
         if let Some(run) = native {
@@ -273,16 +272,12 @@ pub(super) async fn run() -> Result<()> {
         cli.entry_plan(stdin_tty, stdout_tty).app_mode
             == pir::coding_agent::cli::AppMode::Interactive
     };
-    // `rustpython_vm=warn`: the embedded interpreter logs every caught
-    // exception at INFO (`Exception raised: PyBaseException`) — normal
-    // control flow inside the frozen stdlib, and pure noise on the CLI's
-    // stderr. `rmcp=warn` likewise keeps the MCP client's expected lifecycle
-    // ("Service initialized as client", "task cancelled") off every
-    // `mcp list` / prompt invocation unless the user opts into RUST_LOG.
-    // Warnings and errors still surface in both cases.
-    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,rustpython_vm=warn,rmcp=warn")
-    });
+    // `rmcp=warn` keeps the MCP client's expected lifecycle ("Service
+    // initialized as client", "task cancelled") off every `mcp list` /
+    // prompt invocation unless the user opts into RUST_LOG. Warnings and
+    // errors still surface.
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rmcp=warn"));
     if app_mode_tui {
         let log_path = pir::coding_agent::context::agent_dir().join("pir.log");
         rotate_tui_trace_log(&log_path, TUI_TRACE_LOG_MAX_BYTES);
@@ -316,6 +311,12 @@ pub(super) async fn run() -> Result<()> {
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(log_filter)
+            // Headless/CLI stderr is read by users and CI: plain records, no
+            // ANSI escapes (captured logs), no timestamp noise, no module
+            // target. The TUI's file log keeps the full format.
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
             // See the TUI fallback above: never let a closed stderr turn a
             // diagnostic into a panic inside tracing-subscriber.
             .with_writer(pir::coding_agent::output::lossy_stderr_writer)
@@ -1382,7 +1383,6 @@ pub(super) async fn run() -> Result<()> {
         },
         Some(Command::Grep { args }) => pir::native_cli::run_grep(&args),
         Some(Command::Sed { args }) => pir::native_cli::run_sed(&args),
-        Some(Command::Python { args }) => pir::native_cli::run_python(&args),
         Some(Command::Session) => {
             let path = std::path::Path::new(&config.session_dir);
             let exists = path.is_dir();
@@ -1555,19 +1555,14 @@ pub(super) async fn run() -> Result<()> {
 /// the agent-dir files (`auth.json` / `models-store.json`).
 ///
 /// `--export` exits before the upstream runtime (`main.ts:640-652`), and the
-/// native helper subcommands (`version`, `grep`, `sed`, `python`) are pir-only
+/// native helper subcommands (`version`, `grep`, `sed`) are pir-only
 /// surfaces that never read the pi config. `--version`/`-v` exit in clap
 /// before this module runs at all.
 fn bootstraps_agent_dir(cli: &Cli) -> bool {
     cli.export.is_none()
         && !matches!(
             cli.command,
-            Some(
-                Command::Version
-                    | Command::Grep { .. }
-                    | Command::Sed { .. }
-                    | Command::Python { .. }
-            )
+            Some(Command::Version | Command::Grep { .. } | Command::Sed { .. })
         )
 }
 
@@ -1820,12 +1815,16 @@ fn run_jobs_command(command: pir::coding_agent::cli::JobsCommand) -> Result<()> 
                     "the selected shell uses stdin transport; `pir jobs start` requires a `-c` shell"
                 ));
             }
+            let (spawn_program, spawn_path) =
+                pir::coding_agent::tools::shell_spawn_target(config.program());
             let spec = JobSpec {
                 command: pir::jobs::shell_command_from_argv(&command),
                 cwd,
-                program: config.program().to_owned(),
+                program: spawn_program,
                 args: config.args().iter().map(|arg| (*arg).to_owned()).collect(),
-                env: Vec::new(),
+                env: spawn_path
+                    .map(|path| vec![("PATH".to_owned(), path)])
+                    .unwrap_or_default(),
             };
             let meta = store.spawn(&spec).map_err(|error| anyhow::anyhow!(error))?;
             println!("{}", meta.id);

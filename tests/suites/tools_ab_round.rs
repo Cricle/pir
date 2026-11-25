@@ -325,6 +325,44 @@ async fn advertised_spill_file_is_readable_through_read() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// SPILL-1: re-creating a file at a registered spill's exact name must NOT be
+/// admitted by the outside-workspace exception.
+///
+/// The registration is keyed on the file's OS identity, not its spelling. The
+/// old Windows arm of the check returned `true` unconditionally, which reduced
+/// the whole predicate to a canonical-path comparison — so deleting the
+/// registered file and writing a new one at the same path kept passing, even
+/// though the registered inode was gone. That turned a spill footer into a read
+/// of an attacker-chosen file outside the workspace.
+///
+/// Drives the predicate directly (no shell, no truncation), so it holds on
+/// every platform: the file `create_spill_file` produced passes, and the same
+/// spelling pointing at a replacement does not.
+#[test]
+fn a_recreated_file_at_a_registered_spill_name_is_refused() {
+    let Some(spill_file) = spill::create_spill_file() else {
+        // No temp dir available in this environment; nothing to assert.
+        return;
+    };
+    let path = spill_file.path().to_path_buf();
+    assert!(
+        spill::is_registered_spill(&path),
+        "the file `create_spill_file` just registered is admitted"
+    );
+
+    // Replace it: same path, different file. The length deliberately differs
+    // from the original so a size-based check could not pass by accident.
+    drop(spill_file);
+    std::fs::remove_file(&path).expect("remove the registered spill file");
+    std::fs::write(&path, "attacker replacement\n").expect("write the replacement");
+    assert!(
+        !spill::is_registered_spill(&path),
+        "a file re-created at a registered name must not inherit the registration"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// PIR-BIN-033: reading a directory is a deterministic refusal on every
 /// platform. Before the fix the Windows arm surfaced the localized
 /// `拒绝访问。 (os error 5)` (an os error 5 from the read itself), the Unix arm

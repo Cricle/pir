@@ -161,6 +161,7 @@ export default function (pi) {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(limits),
+        allow_process_exit: false,
     })
     .expect("start the extension actor");
     handle
@@ -221,6 +222,7 @@ fn test_config(cwd: &std::path::Path) -> ExtensionConfig {
             call_timeout: Duration::from_millis(200),
             ..ExtensionLimits::default()
         }),
+        allow_process_exit: false,
     }
 }
 

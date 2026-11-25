@@ -79,7 +79,7 @@ fn full_render_cache_for_test(forest: Vec<TreeNode>) -> CachedTree {
             entry_count: 0,
             leaf_id: None,
         },
-        text: String::new(),
+        text: std::sync::Arc::<str>::from(""),
         arena: Vec::new(),
         roots: Vec::new(),
         by_id: HashMap::new(),
@@ -328,7 +328,8 @@ fn projection_text_matches_the_value_form_byte_for_byte() {
         );
         let oracle_text = serde_json::to_string(&serde_json::Value::Object(oracle)).unwrap();
         assert_eq!(
-            text2, oracle_text,
+            text2.as_ref(),
+            oracle_text.as_str(),
             "the appended splice must match a fresh full serialization"
         );
     }
@@ -370,7 +371,8 @@ fn projection_text_matches_the_value_form_byte_for_byte() {
     let oracle_text = serde_json::to_string(&serde_json::Value::Object(oracle)).unwrap();
 
     assert_eq!(
-        projection_json, oracle_text,
+        projection_json.as_ref(),
+        oracle_text.as_str(),
         "the spliced projection text must match the Value form byte for byte"
     );
     assert_eq!(

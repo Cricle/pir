@@ -339,7 +339,15 @@ fn pool_test_model_dir() -> Option<String> {
 
 /// Point the pool child at the isolated agent dir and the just-built `pir`
 /// binary. Same wiring the single-child pool branch uses.
-fn install_pool_test_env(model_dir: &str) {
+///
+/// Takes and returns the process-wide `crate::common::agent_dir_env_lock()`
+/// guard so a call site cannot forget it: the two variables written here are
+/// process-global, so a file-local lock would only exclude this file's tests
+/// from each other while the rest of the merged harness keeps racing them.
+/// The caller must bind the guard (`let _env = …`) so the pin outlives the
+/// whole test — the pool children resolve `PIR_AGENT_DIR` when they spawn.
+async fn install_pool_test_env(model_dir: &str) -> tokio::sync::MutexGuard<'static, ()> {
+    let guard = crate::common::agent_dir_env_lock().lock().await;
     std::env::set_var("PIR_AGENT_DIR", model_dir);
     if std::env::var_os("PI_PHONE_SESSION_POOL_EXECUTABLE").is_none() {
         let pir_binary = std::env::current_exe()
@@ -352,6 +360,7 @@ fn install_pool_test_env(model_dir: &str) {
             .expect("target debug directory");
         std::env::set_var("PI_PHONE_SESSION_POOL_EXECUTABLE", pir_binary);
     }
+    guard
 }
 
 /// Send one rpc command to the selected session and return its raw response
@@ -608,21 +617,13 @@ async fn phone_plugin_connects_to_central_relay() {
         let _ = phone_http::serve(listener, server_state).await;
     });
 
+    // The pool child resolves `PIR_AGENT_DIR` when it spawns, so the pin must be
+    // taken here (before the connect below) and held for the rest of the test.
     let real_pool_model_dir = std::env::var("PIR_PHONE_TEST_MODEL_DIR").ok();
-    if let Some(model_dir) = &real_pool_model_dir {
-        std::env::set_var("PIR_AGENT_DIR", model_dir);
-        if std::env::var_os("PI_PHONE_SESSION_POOL_EXECUTABLE").is_none() {
-            let pir_binary = std::env::current_exe()
-                .ok()
-                .and_then(|exe| {
-                    exe.parent()
-                        .and_then(|deps| deps.parent())
-                        .map(|debug| debug.join("pir"))
-                })
-                .expect("target debug directory");
-            std::env::set_var("PI_PHONE_SESSION_POOL_EXECUTABLE", pir_binary);
-        }
-    }
+    let _env = match &real_pool_model_dir {
+        Some(model_dir) => Some(install_pool_test_env(model_dir).await),
+        None => None,
+    };
 
     let (release_tx, release_rx) = oneshot::channel();
     let release = Arc::new(Mutex::new(Some(release_rx)));
@@ -790,7 +791,7 @@ async fn phone_pool_multi_child_routing_isolation_and_resync() {
         eprintln!("PIR_PHONE_TEST_MODEL_DIR not set; skipping phone pool multi-child coverage");
         return;
     };
-    install_pool_test_env(&model_dir);
+    let _env = install_pool_test_env(&model_dir).await;
     let stack = start_live_stack("pool-full").await;
 
     let mut phone = connect_phone(stack.addr, &stack.user_token).await;
@@ -1180,7 +1181,7 @@ async fn phone_pool_child_correlated_response_is_emitted_once() {
         );
         return;
     };
-    install_pool_test_env(&model_dir);
+    let _env = install_pool_test_env(&model_dir).await;
     let stack = start_live_stack("pool-response-once").await;
 
     let mut phone = connect_phone(stack.addr, &stack.user_token).await;
@@ -1239,7 +1240,7 @@ async fn phone_pool_two_clients_same_child_command_get_own_response_only() {
         eprintln!("PIR_PHONE_TEST_MODEL_DIR not set; skipping two-client pool response coverage");
         return;
     };
-    install_pool_test_env(&model_dir);
+    let _env = install_pool_test_env(&model_dir).await;
     let stack = start_live_stack("pool-two-clients").await;
 
     let mut first = connect_phone(stack.addr, &stack.user_token).await;
@@ -1370,7 +1371,7 @@ async fn phone_pool_two_clients_prompt_same_child_stream_attribution() {
         eprintln!("PIR_PHONE_TEST_MODEL_DIR not set; skipping dual-prompt pool coverage");
         return;
     };
-    install_pool_test_env(&model_dir);
+    let _env = install_pool_test_env(&model_dir).await;
     let stack = start_live_stack("pool-dual-prompt").await;
 
     let mut first = connect_phone(stack.addr, &stack.user_token).await;
@@ -1730,7 +1731,7 @@ async fn start_slow_pool_with_two_clients(tag: &str) -> (LiveStack, RelayWs, Rel
 /// Shared pool-child + two-client setup against an arbitrary isolated agent
 /// dir (the spawn target and model provider come from that dir's models.json).
 async fn start_pool_with_two_clients(tag: &str, model_dir: &str) -> (LiveStack, RelayWs, RelayWs) {
-    install_pool_test_env(model_dir);
+    let _env = install_pool_test_env(model_dir).await;
     let stack = start_live_stack(tag).await;
 
     let mut first = connect_phone(stack.addr, &stack.user_token).await;
@@ -3232,7 +3233,7 @@ async fn phone_pool_extension_ui_dialog_round_trip_clears_pending_state() {
         eprintln!("PIR_PHONE_TEST_DIALOG not set; skipping pool dialog coverage");
         return;
     };
-    install_pool_test_env(&model_dir);
+    let _env = install_pool_test_env(&model_dir).await;
     let stack = start_live_stack("pool-dialog").await;
     let mut ws = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut ws).await;

@@ -1,11 +1,11 @@
-//! Unsafe block gate (U2): `#![deny(unsafe_code)]` in `src/lib.rs` stops new
-//! `unsafe` outside the reviewed platform/FFI modules, but a module- or
+//! Unsafe block gate (U2): `#![deny(unsafe_code)]` in each source crate stops
+//! new `unsafe` outside the reviewed platform/FFI modules, but a module- or
 //! function-level `#[allow(unsafe_code)]` (U1) also switches the lint off for
 //! everything inside the allowlisted region. This integration test closes that
-//! hole at block granularity: it scans every `src/**/*.rs`, counts the real
-//! `unsafe {`, `unsafe fn`, `unsafe impl` constructs (comments and string /
-//! char / raw literals are ignored), and compares the per-file counts with the
-//! checked-in ceiling in `tests/unsafe_gate_allowlist.txt`.
+//! hole at block granularity: it scans every workspace source root listed below,
+//! counts the real `unsafe {`, `unsafe fn`, `unsafe impl` constructs (comments
+//! and string / char / raw literals are ignored), and compares the per-file
+//! counts with the checked-in ceiling in `tests/unsafe_gate_allowlist.txt`.
 //!
 //! Rules:
 //! - a file containing unsafe with no allowlist entry fails (new file);
@@ -20,14 +20,14 @@
 //! with:
 //!
 //! ```text
-//! cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist
+//! cargo test --test zz_merged_2 unsafe_gate::print_current_unsafe_allowlist -- --ignored --nocapture
 //! ```
 //!
 //! then replace the data lines in `tests/unsafe_gate_allowlist.txt` and review
 //! the diff. Format (one line per file, `#` starts a comment):
 //!
 //! ```text
-//! <path relative to src/, forward slashes> <blocks> <unsafe fns> <unsafe impls/traits>
+//! <workspace-relative path, forward slashes> <blocks> <unsafe fns> <unsafe impls/traits>
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +42,102 @@ fn manifest_dir() -> PathBuf {
 
 fn src_dir() -> PathBuf {
     manifest_dir().join("src")
+}
+
+/// Every source root the gate walks, with the path prefix that keeps the
+/// historical allowlist spelling. The core and facade keep their old
+/// `src/...`-relative paths; the terminal UI crate is scanned as `tui/...`
+/// (its files used to live under `src/tui/`).
+fn source_roots() -> Vec<(PathBuf, &'static str)> {
+    vec![
+        (src_dir(), "src/"),
+        (
+            manifest_dir().join("crates/pir-core/src"),
+            "crates/pir-core/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-tui/src"),
+            "crates/pir-tui/src/",
+        ),
+        (
+            manifest_dir().join("crates/pi-phone-server/src"),
+            "crates/pi-phone-server/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-native-shell/src"),
+            "crates/pir-native-shell/src/",
+        ),
+        // The extracted plugin protocol and builtin implementation crates. They
+        // are published and deny `unsafe_code`, so the gate must see them: a
+        // module-level allow there would otherwise be invisible.
+        (
+            manifest_dir().join("crates/pir-plugin-api/src"),
+            "crates/pir-plugin-api/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtins/src"),
+            "crates/pir-builtins/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-subagent/src"),
+            "crates/pir-builtin-subagent/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-mode/src"),
+            "crates/pir-builtin-mode/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-mcp/src"),
+            "crates/pir-builtin-mcp/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-codemode/src"),
+            "crates/pir-builtin-codemode/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-context-mode/src"),
+            "crates/pir-builtin-context-mode/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-tool-search/src"),
+            "crates/pir-builtin-tool-search/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-tool-repair/src"),
+            "crates/pir-builtin-tool-repair/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-todo/src"),
+            "crates/pir-builtin-todo/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-memory/src"),
+            "crates/pir-builtin-memory/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-builtin-phone/src"),
+            "crates/pir-builtin-phone/src/",
+        ),
+        // The 2026-11-25 extraction: these crates are their own build units
+        // now, so the unsafe gate must walk them too (a crate only scanned
+        // when it is listed here — the gate does not enumerate members).
+        (
+            manifest_dir().join("crates/pir-telemetry/src"),
+            "crates/pir-telemetry/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-ai-types/src"),
+            "crates/pir-ai-types/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-durable/src"),
+            "crates/pir-durable/src/",
+        ),
+        (
+            manifest_dir().join("crates/pir-protocol/src"),
+            "crates/pir-protocol/src/",
+        ),
+    ]
 }
 
 fn allowlist_path() -> PathBuf {
@@ -432,7 +528,7 @@ fn parse_allowlist(text: &str, source_label: &str) -> BTreeMap<String, UnsafeCou
         if fields.next().is_some() {
             panic!(
                 "{source_label}:{line_number}: extra field(s) in `{line}` (expected \
-                 `<path relative to src/> <blocks> <unsafe fns> <unsafe impls>`)"
+                 `workspace-relative path <blocks> <unsafe fns> <unsafe impls>`)"
             );
         }
         let counts = UnsafeCounts { blocks, fns, impls };
@@ -453,7 +549,7 @@ fn parse_count(
     let Some(raw) = fields.next() else {
         panic!(
             "{source_label}:{line_number}: missing `{name}` count in `{line}` (expected \
-             `<path relative to src/> <blocks> <unsafe fns> <unsafe impls>`)"
+             `workspace-relative path <blocks> <unsafe fns> <unsafe impls>`)"
         );
     };
     raw.parse::<u32>().unwrap_or_else(|_| {
@@ -473,7 +569,7 @@ fn validate_allowlist_path(relative: &str, source_label: &str, line_number: usiz
     if invalid {
         panic!(
             "{source_label}:{line_number}: allowlist path `{relative}` must be a forward-slash \
-             path relative to src/ ending in `.rs` (for example `tui/terminal.rs`)"
+             `workspace-relative path` ending in `.rs` (for example `crates/pir-tui/src/terminal.rs`)"
         );
     }
 }
@@ -484,7 +580,7 @@ fn render_sites(relative: &str, sites: &[UnsafeSite]) -> String {
     let mut lines: Vec<String> = sites
         .iter()
         .take(MAX_SITES)
-        .map(|site| format!("    src/{relative}:{}: {}", site.line, site.kind.label()))
+        .map(|site| format!("    {relative}:{}: {}", site.line, site.kind.label()))
         .collect();
     if sites.len() > MAX_SITES {
         lines.push(format!(
@@ -506,7 +602,7 @@ fn evaluate_gate(
     for (relative, observation) in observed {
         if !allowlist.contains_key(relative) {
             outcome.failures.push(format!(
-                "NEW FILE WITH UNSAFE: src/{relative} has {} but is not in \
+                "NEW FILE WITH UNSAFE: {relative} has {} but is not in \
                  {ALLOWLIST_RELATIVE_PATH}\n{}",
                 observation.counts.describe(),
                 render_sites(relative, &observation.sites)
@@ -519,13 +615,13 @@ fn evaluate_gate(
         let Some(observation) = observed.get(relative) else {
             if all_source_files.contains(relative) {
                 outcome.tighten_hints.push(format!(
-                    "src/{relative}: allowlist records {} but the file has no unsafe code left — \
+                    "{relative}: allowlist records {} but the file has no unsafe code left — \
                      remove this entry (or set it to `0 0 0`)",
                     ceiling.describe()
                 ));
             } else {
                 outcome.tighten_hints.push(format!(
-                    "src/{relative}: allowlist entry no longer matches any file under src/ — \
+                    "{relative}: allowlist entry no longer matches any file under workspace source roots — \
                      remove the stale entry"
                 ));
             }
@@ -533,14 +629,14 @@ fn evaluate_gate(
         };
         if observation.counts.exceeds(*ceiling) {
             outcome.failures.push(format!(
-                "INCREASED UNSAFE: src/{relative} now has {} but the allowlist caps it at {}\n{}",
+                "INCREASED UNSAFE: {relative} now has {} but the allowlist caps it at {}\n{}",
                 observation.counts.describe(),
                 ceiling.describe(),
                 render_sites(relative, &observation.sites)
             ));
         } else if observation.counts != *ceiling {
             outcome.tighten_hints.push(format!(
-                "src/{relative}: allowlist records {} but the tree now has {} — tighten the \
+                "{relative}: allowlist records {} but the tree now has {} — tighten the \
                  allowlist",
                 ceiling.describe(),
                 observation.counts.describe()
@@ -587,35 +683,41 @@ fn read_source(path: &Path) -> String {
 }
 
 fn collect_observations() -> (BTreeSet<String>, BTreeMap<String, Observation>) {
-    let root = src_dir();
-    assert!(
-        root.is_dir(),
-        "missing src/ directory at {} — the gate walked the wrong root",
-        root.display()
-    );
-
-    let mut paths = Vec::new();
-    collect_rs_files(&root, &mut paths);
-    assert!(
-        !paths.is_empty(),
-        "no .rs files found under {} — the gate walked the wrong root",
-        root.display()
-    );
+    let roots = source_roots();
+    for (root, _) in &roots {
+        assert!(
+            root.is_dir(),
+            "missing source directory at {} — the gate walked the wrong root",
+            root.display()
+        );
+    }
 
     let mut all_files = BTreeSet::new();
     let mut observed = BTreeMap::new();
-    for path in paths {
-        let relative = relative_source_path(&root, &path);
-        let sites = scan_unsafe_sites(&read_source(&path));
-        all_files.insert(relative.clone());
-        if sites.is_empty() {
-            continue;
+    for (root, prefix) in &roots {
+        let mut paths = Vec::new();
+        collect_rs_files(root, &mut paths);
+        assert!(
+            !paths.is_empty(),
+            "no .rs files found under {} — the gate walked the wrong root",
+            root.display()
+        );
+        for path in paths {
+            let relative = format!("{prefix}{}", relative_source_path(root, &path));
+            assert!(
+                all_files.insert(relative.clone()),
+                "duplicate source key: {relative}"
+            );
+            let sites = scan_unsafe_sites(&read_source(&path));
+            if sites.is_empty() {
+                continue;
+            }
+            let mut counts = UnsafeCounts::default();
+            for site in &sites {
+                counts.add(site.kind);
+            }
+            observed.insert(relative, Observation { counts, sites });
         }
-        let mut counts = UnsafeCounts::default();
-        for site in &sites {
-            counts.add(site.kind);
-        }
-        observed.insert(relative, Observation { counts, sites });
     }
     (all_files, observed)
 }
@@ -631,8 +733,8 @@ fn no_new_unsafe_blocks_outside_the_reviewed_allowlist() {
         panic!(
             "unsafe gate: cannot read the checked-in allowlist {}: {error}\n\
              The gate needs a reviewed inventory of the unsafe constructs that are already in \
-             src/. Generate it with:\n  \
-             cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist",
+             workspace source roots. Generate it with:\n  \
+             cargo test --test zz_merged_2 unsafe_gate::print_current_unsafe_allowlist -- --ignored --nocapture",
             allowlist_file.display()
         )
     });
@@ -642,7 +744,7 @@ fn no_new_unsafe_blocks_outside_the_reviewed_allowlist() {
 
     if !outcome.failures.is_empty() {
         panic!(
-            "unsafe gate failed: src/ contains unsafe code that is not covered by the reviewed \
+            "unsafe gate failed: workspace source roots contain unsafe code that is not covered by the reviewed \
              allowlist ({ALLOWLIST_RELATIVE_PATH}).\n\
              \n{}\n\
              \nHow to fix:\n  \
@@ -654,7 +756,7 @@ fn no_new_unsafe_blocks_outside_the_reviewed_allowlist() {
              {ALLOWLIST_RELATIVE_PATH} (counts are per file: blocks, unsafe fns, unsafe \
              impls/traits).\n     \
              Print the inventory for the current tree with:\n       \
-             cargo test --test unsafe_gate -- --ignored --nocapture \
+             cargo test --test zz_merged_2 unsafe_gate::print_current_unsafe_allowlist -- --ignored --nocapture \
              print_current_unsafe_allowlist\n  \
              3. Do not widen a module/file `#[allow(unsafe_code)]` to cover new blocks: this gate \
              counts blocks, so an increase always fails regardless of the lint allow.",
@@ -665,7 +767,7 @@ fn no_new_unsafe_blocks_outside_the_reviewed_allowlist() {
     if !outcome.tighten_hints.is_empty() {
         let body = format!(
             "unsafe gate notice (not a failure): {} allowlist entr{} can be tightened because \
-             src/ currently has less unsafe code than recorded:\n{}\n\
+             workspace source roots currently have less unsafe code than recorded:\n{}\n\
              Update {ALLOWLIST_RELATIVE_PATH} to match the current tree.",
             outcome.tighten_hints.len(),
             if outcome.tighten_hints.len() == 1 {
@@ -702,7 +804,7 @@ fn print_current_unsafe_allowlist() {
          # fails `no_new_unsafe_blocks_outside_the_reviewed_allowlist`; removing one\n\
          # passes and asks for this file to be tightened.\n\
          #\n\
-         # Format: <path relative to src/> <blocks> <unsafe fns> <unsafe impls/traits>\n\
+         # Format: <workspace-relative path> <blocks> <unsafe fns> <unsafe impls/traits>\n\
          # Regenerate with:\n\
          #   cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist"
     );
@@ -819,8 +921,8 @@ fn simulated_gate_rejects_new_or_growing_unsafe() {
         impls: 0,
     };
     let mut allowlist = BTreeMap::new();
-    allowlist.insert("ffi/a.rs".to_string(), ceiling);
-    let all_files: BTreeSet<String> = ["ffi/a.rs", "core/b.rs"]
+    allowlist.insert("src/ffi/a.rs".to_string(), ceiling);
+    let all_files: BTreeSet<String> = ["src/ffi/a.rs", "src/core/b.rs"]
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -845,7 +947,7 @@ fn simulated_gate_rejects_new_or_growing_unsafe() {
 
     // At the ceiling: passes.
     let mut observed = BTreeMap::new();
-    observed.insert("ffi/a.rs".to_string(), observed_at_ceiling(ceiling));
+    observed.insert("src/ffi/a.rs".to_string(), observed_at_ceiling(ceiling));
     let outcome = evaluate_gate(&allowlist, &observed, &all_files);
     assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
     assert!(
@@ -857,7 +959,7 @@ fn simulated_gate_rejects_new_or_growing_unsafe() {
     // One extra block: fails and prints file/line.
     let mut observed = BTreeMap::new();
     observed.insert(
-        "ffi/a.rs".to_string(),
+        "src/ffi/a.rs".to_string(),
         observed_at_ceiling(UnsafeCounts {
             blocks: 3,
             fns: 1,
@@ -878,7 +980,7 @@ fn simulated_gate_rejects_new_or_growing_unsafe() {
     // A new file with unsafe: fails even when no entry exists.
     let mut observed = BTreeMap::new();
     observed.insert(
-        "core/b.rs".to_string(),
+        "src/core/b.rs".to_string(),
         observed_at_ceiling(UnsafeCounts {
             blocks: 1,
             fns: 0,
@@ -896,7 +998,7 @@ fn simulated_gate_rejects_new_or_growing_unsafe() {
     // One block removed: passes with a tightening notice.
     let mut observed = BTreeMap::new();
     observed.insert(
-        "ffi/a.rs".to_string(),
+        "src/ffi/a.rs".to_string(),
         observed_at_ceiling(UnsafeCounts {
             blocks: 1,
             fns: 1,
@@ -920,11 +1022,11 @@ fn allowlist_parser_reads_counts_and_rejects_malformed_lines() {
     assert!(parse_allowlist("", "test").is_empty());
     assert!(parse_allowlist("# comment only\n\n", "test").is_empty());
     let parsed = parse_allowlist(
-        "# header\nffi/a.rs 2 1 0\ncore/b.rs 0 0 0 # trailing comment is allowed\n",
+        "src/ffi/a.rs 2 1 0\ncrates/pir-core/src/core/b.rs 0 0 0 # trailing comment is allowed\n",
         "test",
     );
     assert_eq!(
-        parsed.get("ffi/a.rs"),
+        parsed.get("src/ffi/a.rs"),
         Some(&UnsafeCounts {
             blocks: 2,
             fns: 1,
@@ -933,14 +1035,17 @@ fn allowlist_parser_reads_counts_and_rejects_malformed_lines() {
     );
 
     for (text, needle) in [
-        ("ffi/a.rs 2 1\n", "missing `impls` count"),
-        ("ffi/a.rs 2 1 0 extra\n", "extra field"),
+        ("src/ffi/a.rs 2 1\n", "missing `impls` count"),
+        ("src/ffi/a.rs 2 1 0 extra\n", "extra field"),
         (
-            "ffi/a.rs 2 1 0\nffi/a.rs 0 0 0\n",
+            "src/ffi/a.rs 2 1 0\nsrc/ffi/a.rs 0 0 0\n",
             "duplicate allowlist entry",
         ),
-        ("/abs.rs 0 0 0\n", "must be a forward-slash path"),
-        ("core/b.rs 0 0 zero\n", "not a non-negative integer"),
+        (
+            "/abs.rs 0 0 0\n",
+            "must be a forward-slash `workspace-relative path`",
+        ),
+        ("src/core/b.rs 0 0 zero\n", "not a non-negative integer"),
     ] {
         let result = std::panic::catch_unwind(|| parse_allowlist(text, "test"));
         let error = result.expect_err(&format!("expected panic for {text:?}"));

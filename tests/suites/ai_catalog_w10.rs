@@ -49,7 +49,8 @@ const UPSTREAM_MODELS: &[(&str, &str)] = &[
     ("step-5-preview-free", "openai-completions"),
 ];
 
-const OPENCODE_GO_JSON: &str = include_str!("../../src/ai/providers/catalog/opencode-go.json");
+const OPENCODE_GO_JSON: &str =
+    include_str!("../../crates/pir-core/src/ai/providers/catalog/opencode-go.json");
 
 fn opencode_go() -> BuiltinProvider {
     load_provider("opencode-go")

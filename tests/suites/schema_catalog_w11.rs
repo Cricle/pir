@@ -399,7 +399,7 @@ const PIR_COMPAT_EXTRAS: &[&str] = &[
 ];
 
 fn openai_compat_keys() -> BTreeSet<String> {
-    let source = read_source("src/ai/types/model/compat.rs");
+    let source = read_source("crates/pir-ai-types/src/model/compat.rs");
     let mut keys = BTreeSet::new();
     for line in source.lines() {
         if let Some(start) = line.find("rename = \"") {
@@ -509,7 +509,7 @@ fn models_schema_compat_matches_openai_compat() {
 #[test]
 fn models_schema_model_items_match_pi_model_config() {
     let schema = read_schema("models");
-    let source = read_source("src/ai/providers/pi_config.rs");
+    let source = read_source("crates/pir-core/src/ai/providers/pi_config.rs");
     let rust: BTreeSet<String> = set_of(struct_fields(&source, "PiModelConfig"));
     let provider = &schema["properties"]["providers"]["patternProperties"]["^.*$"];
 
@@ -543,8 +543,8 @@ fn models_schema_model_items_match_pi_model_config() {
 #[test]
 fn models_schema_enums_match_rust_types() {
     let schema = read_schema("models");
-    let models_source = read_source("src/ai/types/model.rs");
-    let formats_source = read_source("src/ai/types/model/formats.rs");
+    let models_source = read_source("crates/pir-ai-types/src/model.rs");
+    let formats_source = read_source("crates/pir-ai-types/src/model/formats.rs");
     let compat = &schema["$defs"]["ProviderCompat"]["properties"];
 
     let thinking_levels = set_of(enum_variants(&models_source, "ThinkingLevel"));
@@ -619,9 +619,9 @@ fn keybindings_schema_enumerates_every_rust_action_id() {
     let schema = read_schema("keybindings");
     let mut rust_ids = BTreeSet::new();
     for source in [
-        "src/tui/keybindings.rs",
-        "src/config/keybindings.rs",
-        "src/tui/altscreen_search.rs",
+        "crates/pir-tui/src/keybindings.rs",
+        "crates/pir-core/src/config/keybindings.rs",
+        "crates/pir-tui/src/altscreen_search.rs",
     ] {
         let text = read_source(source);
         for quote in text.match_indices('"') {
@@ -698,7 +698,7 @@ const LEGACY_SETTINGS_KEYS: &[&str] = &["queueMode", "websockets"];
 #[test]
 fn settings_schema_properties_match_settings_struct() {
     let schema = read_schema("settings");
-    let source = read_source("src/config/settings.rs");
+    let source = read_source("crates/pir-core/src/config/settings.rs");
     let rust: BTreeSet<String> = set_of(struct_fields(&source, "Settings"));
     let mut documented = keys_of(&schema["properties"]);
     for legacy in LEGACY_SETTINGS_KEYS {
@@ -721,7 +721,7 @@ fn settings_schema_properties_match_settings_struct() {
 #[test]
 fn settings_schema_nested_objects_match_their_structs() {
     let schema = read_schema("settings");
-    let source = read_source("src/config/settings/schema.rs");
+    let source = read_source("crates/pir-core/src/config/settings/schema.rs");
     let properties = &schema["properties"];
 
     let cases: &[(&str, &str)] = &[
@@ -769,7 +769,7 @@ fn settings_schema_nested_objects_match_their_structs() {
 #[test]
 fn settings_schema_defaults_match_documented_constants() {
     let schema = read_schema("settings");
-    let defaults = read_source("src/config/defaults.rs");
+    let defaults = read_source("crates/pir-core/src/config/defaults.rs");
     let properties = &schema["properties"];
 
     let bool_cases: &[(&str, &str, bool)] = &[
@@ -784,7 +784,7 @@ fn settings_schema_defaults_match_documented_constants() {
         let needle = format!("const {constant}: bool = {expected}");
         assert!(
             defaults.contains(&needle),
-            "src/config/defaults.rs must declare `{needle}`"
+            "crates/pir-core/src/config/defaults.rs must declare `{needle}`"
         );
         assert_eq!(
             properties[*property]["default"],
@@ -814,10 +814,10 @@ fn settings_schema_defaults_match_documented_constants() {
 #[test]
 fn settings_schema_enums_match_rust_enums() {
     let schema = read_schema("settings");
-    let source = read_source("src/config/settings/schema.rs");
+    let source = read_source("crates/pir-core/src/config/settings/schema.rs");
     let properties = &schema["properties"];
     let thinking = set_of(enum_variants(
-        &read_source("src/ai/types/model.rs"),
+        &read_source("crates/pir-ai-types/src/model.rs"),
         "ThinkingLevel",
     ));
 
@@ -893,11 +893,11 @@ fn settings_schema_enums_match_rust_enums() {
 #[test]
 fn theme_schema_colors_match_the_color_table() {
     let schema = read_schema("theme");
-    let source = read_source("src/config/schema.rs");
+    let source = read_source("crates/pir-core/src/config/schema.rs");
     let header = "const THEME_COLORS: &[(&str, &str, bool)] = &[";
     let start = source
         .find(header)
-        .expect("src/config/schema.rs declares THEME_COLORS");
+        .expect("crates/pir-core/src/config/schema.rs declares THEME_COLORS");
     let table = &source[start + header.len()..];
     let table = &table[..table.find("];").expect("THEME_COLORS is closed")];
 
@@ -984,7 +984,7 @@ const THINKING_LEVEL_ORDER: &[&str] = &["off", "minimal", "low", "medium", "high
 const MODALITY_ORDER: &[&str] = &["text", "image", "audio", "video"];
 
 fn catalog_dir() -> PathBuf {
-    repo_root().join("src/ai/providers/catalog")
+    repo_root().join("crates/pir-core/src/ai/providers/catalog")
 }
 
 fn ordered_subset<'a>(keys: &[&'a str], allowed: &[&str]) -> Vec<&'a str> {

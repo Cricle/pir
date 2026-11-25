@@ -433,8 +433,6 @@ fn expected_builtin_events() -> Vec<(&'static str, EventInterest)> {
         ),
         #[cfg(feature = "extensions")]
         ("codemode", EventInterest::None),
-        #[cfg(feature = "python")]
-        ("python", EventInterest::None),
         #[cfg(feature = "tool-search")]
         ("tool-search", EventInterest::None),
         // `session_start` only: connect/discover (mcp) and replay re-arm (todo).
@@ -675,7 +673,7 @@ fn audited_plugins_with_undeclared_arms_stay_limited_to_todo() {
     // Everything else must declare a fence (or have no handlers at all), so a
     // new undeclared arm cannot slip in unnoticed.
     for (name, interest) in &declared {
-        if matches!(*name, "subagent" | "codemode" | "python" | "tool-search") {
+        if matches!(*name, "subagent" | "codemode" | "tool-search") {
             assert_eq!(
                 interest,
                 &EventInterest::None,

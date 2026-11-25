@@ -4,11 +4,13 @@ name: CI
 # - lint (Linux): fmt, clippy --all-targets --all-features, SDK no-default
 #   feature matrix, doctests, and the offline SDK examples. One runner, one
 #   target dir: the example builds reuse the lint compile artifacts.
-# - test (Windows): the full nextest suite, eight sequential groups. This is
-#   the primary platform and the only place the whole suite runs.
+# - test (Windows): the full nextest suite, eight sequential groups. This
+#   primary platform runs the complete suite after one bounded prebuild.
 # - test-linux-subset (Linux): lib + bins only (plus a type-check of all
 #   tests). Catches Linux-only runtime regressions without paying for the
 #   full integration suite twice.
+# - test-macos (macOS): all-target check plus selected merged TUI smoke tests;
+#   it is a platform smoke lane, not a second full-suite lane.
 # Benchmarks are MANUAL ONLY (`scripts/run_benchmarks.sh`, dev profile): CI
 # compiles them through clippy --all-targets but never runs them — criterion
 # wall-clock numbers are meaningless on a shared runner.
@@ -67,7 +69,7 @@ jobs:
           # off for the whole script — the diagnostic pipelines may exit
           # non-zero (grep with no match) and must not abort the annotations.
           set +e
-          cargo clippy --all-targets --all-features --locked -- -D warnings 2>&1 | tee /tmp/clippy.log
+          cargo clippy --workspace --exclude pir-native-shell --all-targets --all-features --locked -- -D warnings 2>&1 | tee /tmp/clippy.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             {
@@ -119,7 +121,7 @@ jobs:
             cargo check --lib --locked --no-default-features --features "$features"
           done
       - name: Doctests
-        run: cargo test --doc --locked
+        run: cargo test --workspace --exclude pir-native-shell --doc --locked
       - name: SDK examples (offline set; the script checks the example set first)
         run: bash scripts/run_examples.sh
 
@@ -143,6 +145,70 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install nextest
         uses: taiki-e/install-action@cargo-nextest
+      # The eight-group step below enumerates `pir-sdk`'s integration targets,
+      # so it never runs another workspace crate's own tests. The builtin
+      # implementation crates and the plugin protocol carry the pure-logic
+      # suites (tokenization/BM25, the repair pipeline, the todo domain, the
+      # bridge mapping), so they get their own run: without it those tests are
+      # compiled by `--all-targets` but never executed.
+      #
+      # `pir-phone-server` is here for the same reason and was the one member
+      # missing: it is `publish = false`, so it is excluded from the release
+      # publish order, but its six integration suites and the relay unit
+      # suites never ran in CI — only `scripts/phone_server_check.sh`, which no
+      # gate invokes. `pir-native-shell` stays excluded with the rest of this
+      # workflow (it needs the opt-in `desktop`/GPUI backend).
+      #
+      # nextest is also what makes two process-global test fixtures reliable,
+      # because it gives every test its own process:
+      #   * `bash_eviction_utf8::eviction_cut_lands_on_a_utf8_boundary`
+      #     re-points TMP/TEMP/TMPDIR at a regular file to force spill creation
+      #     to fail, which would break any concurrently running suite; it gates
+      #     itself on NEXTEST_RUN_ID and SKIPs under plain `cargo test --test`.
+      #   * `plugin_services_hardening::has_auth_serves_warm_cache...` and
+      #     `mcp_integration::reload_leaves_connections_lazy...` need the
+      #     process-global PIR_AGENT_DIR to stay put for their whole run.
+      # Keep the `--test zz_merged_*` groups on nextest for that reason; running
+      # them with plain `cargo test` reintroduces the shared-process races
+      # documented in TEST-2 (`.audit/review-2026-11-23/findings.jsonl`).
+      - name: Workspace crate tests (plugin api, builtins, engine, TUI, relay)
+        shell: bash
+        run: |
+          set +e
+          cargo nextest run --locked --profile ci \
+            -p pir-plugin-api \
+            -p pir-telemetry \
+            -p pir-ai-types \
+            -p pir-durable \
+            -p pir-protocol \
+            -p pir-builtins \
+            -p pir-builtin-subagent \
+            -p pir-builtin-mode \
+            -p pir-builtin-mcp \
+            -p pir-builtin-codemode \
+            -p pir-builtin-context-mode \
+            -p pir-builtin-tool-search \
+            -p pir-builtin-tool-repair \
+            -p pir-builtin-todo \
+            -p pir-builtin-memory \
+            -p pir-builtin-phone \
+            -p pir-tui \
+            -p pir-core \
+            -p pir-phone-server 2>&1 | tee /tmp/nextest-crates.log
+          status=${PIPESTATUS[0]}
+          echo "::notice title=Workspace crate tests::exit=${status}"
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '### Workspace crate tests failed'
+              echo '```'
+              tail -120 /tmp/nextest-crates.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            sed -r 's/\x1b\[[0-9;]*[mK]//g' /tmp/nextest-crates.log | grep -E -A6 '^\s*(FAIL|error(\[|:))' | head -80 | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=Workspace crate test::$line"
+            done
+          fi
+          exit "$status"
       - name: Tests (eight sequential groups; per-group binary cleanup)
         shell: bash
         run: |
@@ -164,16 +230,26 @@ jobs:
               | jq -r '.packages[] | select(.name == "pir-sdk") | .targets[] | select(.kind[] == "test") | .name' \
               | tr -d '\r')
           else
-            targets=()
-            for f in tests/zz_merged_*.rs; do
-              targets+=("$(basename "$f" .rs)")
-            done
+            targets=(
+              zz_merged_1 zz_merged_2 zz_merged_3 zz_merged_4
+              zz_merged_5 zz_merged_6 zz_merged_7 zz_merged_8
+              worker_threads_real g_durable_integration
+              print_native_session resume_on_error
+              feature_off_surface sdk_consumer_surface sdk_consumer_embed rpc_export_off
+            )
           fi
           if [ "${#targets[@]}" -eq 0 ]; then
             echo "no integration test targets found"
             exit 1
           fi
           echo "integration test targets: ${targets[*]}"
+          echo "prebuilding all test targets once for parallel linking"
+          CARGO_INCREMENTAL=0 cargo test --no-run --tests --locked
+          prebuild_status=$?
+          if [ "$prebuild_status" -ne 0 ]; then
+            echo "test target prebuild failed: $prebuild_status"
+            exit "$prebuild_status"
+          fi
           for shard in 1 2 3 4 5 6 7 8; do
             args=()
             if [ "$shard" -eq 1 ]; then args+=("--lib" "--bins"); fi
@@ -241,6 +317,34 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@cargo-nextest
       - name: Lib + bin unit tests
-        run: cargo nextest run --lib --bins --locked --profile ci
+        # `--workspace` is load-bearing: this is a non-virtual workspace whose
+        # default members are `pir-sdk` alone, so without it the support
+        # crates' lib tests never run on Linux.
+        run: cargo nextest run --workspace --exclude pir-native-shell --lib --bins --locked --profile ci
       - name: Type-check every integration test (Linux)
-        run: cargo check --tests --locked
+        run: cargo check --workspace --exclude pir-native-shell --tests --locked
+
+  test-macos:
+    name: macOS check + TUI smoke
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-check
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Cargo check all targets
+        run: cargo check --workspace --exclude pir-native-shell --all-targets --locked
+      - name: TUI and cross-platform smoke tests
+        shell: bash
+        # Each filter must name the harness that actually CONTAINS the module:
+        # libtest exits 0 on an empty filter match, so a wrong harness name is
+        # a silently green lane rather than a failure. Keep these in sync with
+        # `scripts/gen_merged_tests.ps1` when a module moves.
+        run: |
+          cargo test --locked --test zz_merged_2 tui_input_order
+          cargo test --locked --test zz_merged_1 tui_render_parity
+          cargo test --locked --test zz_merged_5 tui_dirty_refresh

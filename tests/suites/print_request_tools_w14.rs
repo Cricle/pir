@@ -33,7 +33,7 @@
 //! `_isActivatedOnRegistration` over that set, not a fixed core list
 //! (`src/coding_agent/tool_selection.rs:318-339`); print passes its MERGED
 //! registry, so the core tools AND the registration-active plugin tools
-//! (`ctx_*`, `python`, `todo`, ...) are declared, while `powershell`
+//! (`ctx_*`, `todo`, ...) are declared, while `powershell`
 //! (`defaultActive: false`) and the `codemode`/`tool_search` model-only tools
 //! are not. `tests/suites/print_callability_w13.rs` pins the same set against
 //! a real session. The bug-3 fix is about the REGISTRY, not the declaration:
@@ -610,8 +610,6 @@ fn assert_plugin_tools_declared(names: &[String]) {
     ] {
         assert_declares(names, tool);
     }
-    #[cfg(feature = "python")]
-    assert_declares(names, "python");
     #[cfg(feature = "todo")]
     assert_declares(names, "todo");
     #[cfg(feature = "subagent")]
@@ -639,11 +637,7 @@ fn default_print_declares_core_and_builtin_plugin_tools() {
         let mut count = 0;
         #[cfg(feature = "context-mode")]
         {
-            count += 9;
-        }
-        #[cfg(feature = "python")]
-        {
-            count += 1;
+            count += 11;
         }
         #[cfg(feature = "todo")]
         {
@@ -730,7 +724,7 @@ fn no_builtin_tools_keeps_plugin_tools_and_drops_core() {
 /// Declared set: the shared selection rule's exclude-only base is every tool
 /// that activates on registration in the host's available set, so `bash` is
 /// gone, the other registration-active core tools survive, and the
-/// registration-active plugin tools (`ctx_*`, `python`, `todo`, ...) are
+/// registration-active plugin tools (`ctx_*`, `todo`, ...) are
 /// declared too (`src/coding_agent/tool_selection.rs:318-339`) — the same set
 /// a session declares, pinned by `tests/suites/print_callability_w13.rs`.
 ///
@@ -819,7 +813,6 @@ fn no_extensions_declares_no_plugin_tools() {
         assert!(
             !name.starts_with("ctx_")
                 && !name.starts_with("mcp__")
-                && name != "python"
                 && name != "todo"
                 && name != "subagent"
                 && name != "tool_search"
@@ -856,33 +849,6 @@ fn disabled_builtin_extension_context_mode_declares_no_ctx_tools() {
     // The rest of the plan is untouched.
     #[cfg(feature = "todo")]
     assert_declares(&names, "todo");
-    #[cfg(feature = "python")]
-    assert_declares(&names, "python");
     #[cfg(feature = "subagent")]
     assert_declares(&names, "subagent");
-}
-
-// ---------------------------------------------------------------------------
-// 7. `settings.pythonTool: false`
-// ---------------------------------------------------------------------------
-
-/// `pythonTool: false` folds `python` into `SettingsManager::disabled_builtins`,
-/// so `builtin:python` is dropped from the plan before the host instantiates
-/// it. Print used to build its host directly and skip that gate.
-#[cfg(feature = "python")]
-#[test]
-fn python_tool_disabled_setting_declares_no_python_tool() {
-    let case = run_case("python-tool-off", 0, json!({ "pythonTool": false }), &[]);
-    assert_success(&case);
-    let names = declared_tools(&case);
-
-    assert!(
-        !names.iter().any(|name| name == "python"),
-        "`pythonTool: false` must remove the python tool: {names:?}"
-    );
-    // The other builtins stay on the plan.
-    #[cfg(feature = "context-mode")]
-    assert_declares(&names, "ctx_execute");
-    #[cfg(feature = "todo")]
-    assert_declares(&names, "todo");
 }

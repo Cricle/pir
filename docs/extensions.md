@@ -4,6 +4,25 @@ pir loads JS/TS extensions through the embedded QuickJS runtime (rquickjs + swc 
 runtime. Load with `-e <path>` (file or directory), or discover from `<agentDir>/extensions`,
 `<cwd>/.pi/extensions` (trust-gated), and installed packages ([packages.md](packages.md)).
 
+## Native value bridge (`__pir_native`)
+
+The hot boundary between a JS extension and the Rust host is JSON-**shaped** but no longer JSON-**encoded**:
+`globalThis.__pir_native` exposes functions that take and return live QuickJS values, converted to/from
+`serde_json::Value` trees in-process (`crates/pir-core/src/extensions/runtime/native_bridge.rs`). The context snapshot, event
+dispatch, tool execution, and the models/usage/tool/command snapshots cross as objects — no `JSON.stringify` /
+`JSON.parse` at the seam. The legacy `__pir_host` string functions remain as a fallback: every prelude call site
+guards with `typeof __pir_native?.x === "function"`, so a boot path without the native tier degrades to the
+string bridge unchanged. Extension source files are not modified by any of this.
+
+## Preferring native builtins over JS packages (`PIR_PREFER_NATIVE`)
+
+Two native-first rules are always on because two faces would double-apply: `builtin:tool-repair` suppresses the
+JS `pi-tool-repair` package, and `builtin:phone` suppresses `@malinamnam/pi-phone`. For builtins that are full
+native ports of JS packages (subagent, mcp, codemode, tool-search, todo, context-mode), set
+`PIR_PREFER_NATIVE=1` to drop the matching JS package entry from the load plan so the Rust implementation runs
+instead — again without changing plugin code. The default preserves upstream first-wins behavior (a JS file
+extension wins a name collision over a builtin). See `crates/pir-core/src/plugins/loader.rs`'s `NATIVE_PRECEDENCE`.
+
 ## Default-disabled packages
 
 `@malinamnam/pi-phone` stays installed and listed in `packages` but is **skipped by default**: it starts a local
@@ -43,7 +62,7 @@ pir --only-builtin --no-extensions # --no-extensions wins (no builtins, no JS)
 - **No JS runtime**: only `builtin:<name>` pseudo-paths, so a plan-only `ExtensionHandle` (`has_js_runtime() ==
   false`) — no QuickJS actor, prelude, SWC transpile, `node:*` shims or npm/config scan.
 - **Native surface intact**: every builtin's tools/commands/hooks register through the unified plugin host
-  (`subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool_search`, `tool-repair`, `todo`, `memory`, plus
+  (`subagent`, `mcp`, `codemode`, `context-mode`, `tool_search`, `tool-repair`, `todo`, `memory`, plus
   `phone` when named).
 - **Precedence and hosts**: `--no-extensions` wins (unchanged: only explicit `-e` paths, no builtins injected); the
   flag is global and resolved once for TUI, RPC, print and `--mode json`, while `server`/`client` load no extension
@@ -118,14 +137,28 @@ export default function (pi) {
 `registerVirtualModel` ([custom-provider.md](custom-provider.md)), `registerShortcut`, `registerFlag`,
 `registerMCPServer`, `events.on/emit`. Tool parameter schemas are validated at load; `pi.on(event, handler)` is
 fail-closed against the known-event registry (an unknown name is a load-time `TypeError`; accepted set:
-`src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
+`crates/pir-core/src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
 `pir --help-extensions` (the upstream `Extension CLI Flags:` help section); `--help` itself never executes
 extension code.
+
+`registerMarkdownTransformer(fn, { messageTypes })` follows upstream v1.5.2 (#11756): the transformer runs only
+on the surfaces it names (`user`, `assistant`, `assistant-thinking`, `custom`, `summary`, `changelog`), and the
+default is the transcript trio. An unregistered surface leaves the markdown untouched. The named form
+(`registerMarkdownTransformer(name, options)`) keeps pir's per-name registration and accepts the same
+`messageTypes`.
+
+`ctx.ui.custom(factory, { blocked: { kind, message } })` follows upstream v1.5.2 (#11471): a component that
+waits for the user reports pi as blocked through OSC 7501 (`kind` is `permission` / `question` / `auth`; an
+unknown kind degrades to `question`). Both forms participate — an inline component joins the dialog stack with
+the status, a floating overlay keeps its own status source — and the report lasts until the interaction ends,
+**also while `setHidden()` hides the component**. A typed dialog above it wins the report, since that is the
+prompt actually waiting. `ctx.sessionManager` exposes upstream `ReadonlySessionManager` in full, including
+`getSessionDir()`.
 
 `pi.events` is a **JS-runtime-only** bus: `emit` synchronously invokes the prelude's `busSubs` subscribers
 (`prelude.js.txt:3075`). The native `EventService` (`PluginContext::events()`) is a separate Rust bus with no
 cross-face bridge — JS emissions do not reach native subscribers and vice versa
-(`src/agent_session/plugin_services.rs:178-182`, `:4161-4219`; `src/plugins/services/mod.rs:2112-2126`).
+(`crates/pir-core/src/agent_session/plugin_services.rs:178-182`, `:4161-4219`; `crates/pir-core/src/plugins/services/mod.rs:2112-2126`).
 
 ## The `ctx` surface
 
@@ -201,7 +234,7 @@ Every host↔JS queue is bounded and the bound is visible. **If the source can p
 backpressure: the OS pipe/socket/transport stops being read); only where Node coalesces or truncates (watcher
 notifications, blocking `spawnSync`) does the queue drop, and every drop is counted through `ext_diag!` (`[ext]
 …` / `[env-daemon] …` / `[env-client] …` / `[session] …`, repeat-collapsed by the logging router). The
-provider event stream (`src/ai/event_stream.rs`, capacity 32 + producer backpressure) uses the same pattern.
+provider event stream (`crates/pir-core/src/ai/event_stream.rs`, capacity 32 + producer backpressure) uses the same pattern.
 
 | Queue (source) | Bound | When full | Observation |
 |---|---|---|---|

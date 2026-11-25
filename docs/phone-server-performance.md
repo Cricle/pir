@@ -73,11 +73,10 @@ Legacy scenario harness (`scripts/phone_server_bench.sh --iterations 5`):
   not write redb or fan out a catalog.
 - The unfiltered catalog walks the redb updated-at B-tree in reverse with a
   live-row offset, so soft-deleted rows cannot create page gaps.
-- `/api/health` uses redb table length and registry counters (`O(1)`); it does
-  not scan 1M sessions.
+- `/api/health` returns only constant-size liveness and PWA compatibility fields; detailed relay counters are authenticated.
 - Static assets use `Bytes::from_static`; gzip is enabled for HTTP responses.
 - `/api/metrics` exposes RSS/VmHWM, relay counters, cache bytes and registry
-  counts.
+  counts to authenticated users only.
 
 ## Interpretation
 

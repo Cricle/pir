@@ -47,6 +47,7 @@ fn handle_config(cwd: &std::path::Path, has_ui: bool) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -552,17 +553,18 @@ async fn session_manager_methods_backed_by_snapshot() {
         sessions: json!([]),
         session_id: Some("s-1".to_string()),
         session_path: Some("/tmp/session.jsonl".to_string()),
+        session_dir: Some("/tmp".to_string()),
         context_tokens: None,
         context_window: Some(4096),
         has_pending_messages: false,
         project_trusted: true,
         cwd: Some("/tmp".to_string()),
         header: json!({ "id": "s-1", "cwd": "/tmp" }),
-        branch_json: serde_json::to_string(&tree).expect("branch text"),
-        tree_json,
+        branch_json: serde_json::to_string(&tree).expect("branch text").into(),
+        tree_json: tree_json.into(),
         leaf_id: Some("entry-2".to_string()),
         labels: json!({ "entry-2": "pinned" }),
-        projection_json: serde_json::to_string(&json!({ "entries": [ { "entry": {}, "messages": [] }, { "entry": {}, "messages": [] } ], "messages": [] })).expect("projection text"),
+        projection_json: serde_json::to_string(&json!({ "entries": [ { "entry": {}, "messages": [] }, { "entry": {}, "messages": [] } ], "messages": [] })).expect("projection text").into(),
         // A file-backed snapshot (session_path is set above).
         session_persisted: Some(true),
     });

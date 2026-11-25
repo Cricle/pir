@@ -107,8 +107,8 @@ acknowledged and ignored by the compact web shell.
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/` `/assets/*` | none | PWA static files |
-| GET | `/api/health` | optional | version, uptime, counts, cache stats, RSS/VmHWM |
-| GET | `/api/metrics` | none | process memory, registry state and relay counters |
+| GET | `/api/health` | none | minimal version/protocol liveness and PWA compatibility fields; no relay counters |
+| GET | `/api/metrics` | `PIR_PHONE_SERVER_METRICS_TOKEN` | process memory, registry state and relay counters; disabled (404) unless a separate metrics token is configured |
 | GET | `/api/version` | none | protocol version |
 | GET | `/api/me` | user | current user |
 | GET | `/api/devices?cursor=&offset=&limit=` | user | user's devices; limit default 50 / max 200, `nextCursor`/`hasMore` |
@@ -222,6 +222,7 @@ fanned out to every subscriber of that session. Metadata changes are sent with
 | `--public-url` | none | canonical URL shown in the PWA/health |
 | `--allowed-origin` | same-origin | extra browser origins for CORS and WebSocket Origin checks (repeatable) |
 | `PIR_PHONE_SERVER_PEPPER` | `<data-dir>/secret` | token-hash pepper (rotate by reissuing tokens) |
+| `PIR_PHONE_SERVER_METRICS_TOKEN` | none | separate bearer token for the global `/api/metrics` endpoint; keep it out of ordinary user tokens |
 | `PIR_PHONE_SERVER_MAX_RESIDENT_SESSIONS` | `100000` | high-water resident session runtimes; `0` disables eviction. Only offline, unsubscribed sessions are evicted; online sessions stay resident and catalog pages hydrate from redb |
 | `PIR_PHONE_SERVER_URL` | none | plugin default server URL |
 | `PIR_PHONE_DEVICE_TOKEN` | none | plugin device token |
@@ -230,8 +231,7 @@ fanned out to every subscriber of that session. Metadata changes are sent with
 | `PI_PHONE_CUSTOM_EVENTS` | none | comma-separated opt-in `phone.custom.*` event names; max 64 KiB each |
 | `PI_PHONE_SESSION_POOL_EXECUTABLE` | current `pir` binary | override the child binary used by the phone session pool |
 
-Every session/device/agent route requires a user or device token (only the PWA shell and `/api/health`,
-`/api/metrics`, `/api/version` are anonymous). Use TLS for any public
+Every session/device/agent route requires a user or device token (the PWA shell and `/api/health`, `/api/version` are anonymous; `/api/metrics` is disabled unless a separate `PIR_PHONE_SERVER_METRICS_TOKEN` is configured). Use TLS for any public
 deployment; either put it behind Caddy/Nginx/Tailscale or terminate TLS in the
 process in a future revision.
 
@@ -298,38 +298,21 @@ log in, and send a prompt through the same PWA used in production.
 ### Repeatable benchmark
 
 ```bash
-bash scripts/phone_server_bench.sh --iterations 5
-```
-
-The harness uses fixed counts and deterministic IDs; it prints a Markdown
-table plus one `BENCH_JSON` line per scenario. Current release-profile
-reference results on the development machine:
-
-| scenario | p50 | p95 |
-|---|---:|---:|
-| 10k sessions, first 50-row catalog page | **0.04 ms** | **2.61 ms** |
-| 50 phones × 100 live events | **47.6 ms** | **48.0 ms** |
-| 400 KiB snapshot delivery | **1.52 ms** | **2.15 ms** |
-| client reconnect + agent resync | **3.45 ms** | **4.05 ms** |
-
-The dedicated load/resource harness adds 100-client fan-out, 10k catalog
-percentiles, RSS/VmHWM and CPU:
-
-```bash
+bash scripts/phone_server_bench.sh --iterations 5   # scenario harness
 bash scripts/phone_server_load.sh \
   --sessions 10000 --clients 100 --events 500 --iterations 20
 ```
 
-Latest reference: 10k catalog p50/p95/p99 **0.40/0.64/0.85 ms**,
-100×500 fan-out **50,000 msgs in 56.2 ms (~889k msgs/s)**, RSS
-**3.3 → 27.7 → 53.3 MiB** (start → seeded → after fan-out). A 1M-session
-metadata catalog runs at **617 MiB peak RSS**. See
-[`phone-server-performance.md`](phone-server-performance.md) for methodology
-and caveats.
+Both harnesses use fixed counts and deterministic IDs; they print a Markdown
+table plus one `BENCH_JSON` line per scenario. The reference numbers — 10k and
+1M-session catalog percentiles, 100-client fan-out throughput, RSS/CPU, and the
+legacy scenario table — live in
+[`phone-server-performance.md`](phone-server-performance.md) together with the
+methodology and caveats, and are not restated here. Use the release profile for
+numbers comparable across machines.
 
-Use the release profile for comparable numbers across machines. The stress
-scenarios live in `crates/pi-phone-server/tests/stress_scenarios.rs` and are
-run by `scripts/phone_server_check.sh`.
+The stress scenarios live in `crates/pi-phone-server/tests/stress_scenarios.rs`
+and run under `scripts/phone_server_check.sh`.
 
 The `mock_agent` example registers one session and answers prompts with a
 canned reply, which is useful for exercising the PWA without a real agent.

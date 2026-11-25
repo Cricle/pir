@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-const GOOGLE_JSON: &str = include_str!("../src/ai/providers/catalog/google.json");
-const GOOGLE_VERTEX_JSON: &str = include_str!("../src/ai/providers/catalog/google-vertex.json");
+const GOOGLE_JSON: &str = include_str!("../crates/pir-core/src/ai/providers/catalog/google.json");
+const GOOGLE_VERTEX_JSON: &str =
+    include_str!("../crates/pir-core/src/ai/providers/catalog/google-vertex.json");
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

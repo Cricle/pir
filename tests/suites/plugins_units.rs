@@ -87,8 +87,6 @@ fn unknown_builtins_are_absent() {
     assert!(instantiate_builtin("").is_none());
     assert!(instantiate_builtin("mcp").is_some());
     assert!(instantiate_builtin("codemode").is_some());
-    // pir-only builtin: the embedded RustPython `python` tool.
-    assert!(instantiate_builtin("python").is_some());
     // The ported npm `@juicesharp/rpiv-todo` package: `todo` + `/todos`.
     assert!(instantiate_builtin("todo").is_some());
     assert_eq!(
@@ -98,7 +96,6 @@ fn unknown_builtins_are_absent() {
             "mode",
             "mcp",
             "codemode",
-            "python",
             "context-mode",
             "tool-search",
             "tool-repair",
@@ -262,9 +259,10 @@ fn cli_paths_come_first_then_project_then_global() {
     // paths (upstream package-manager.ts:986-1001): `builtin:subagent` dedups
     // into its CLI position, the default paths follow, then the remaining
     // builtins in factory order; `phone` is compiled but default-disabled, so
-    // it is not inserted.
+    // it is not inserted. `python` is no longer a builtin (the embedded
+    // interpreter was removed), so the appended set is one shorter.
 
-    assert_eq!(ordered.len(), 13);
+    assert_eq!(ordered.len(), 12);
     assert_eq!(ordered[0], PathBuf::from("cli.ts"));
     assert_eq!(ordered[1], builtin("subagent"));
     assert_eq!(ordered[2], PathBuf::from("D:/proj/.pi/extensions"));
@@ -273,12 +271,11 @@ fn cli_paths_come_first_then_project_then_global() {
     assert_eq!(ordered[4], builtin("mode"));
     assert_eq!(ordered[5], builtin("mcp"));
     assert_eq!(ordered[6], builtin("codemode"));
-    assert_eq!(ordered[7], builtin("python"));
-    assert_eq!(ordered[8], builtin("context-mode"));
-    assert_eq!(ordered[9], builtin("tool-search"));
-    assert_eq!(ordered[10], builtin("tool-repair"));
-    assert_eq!(ordered[11], builtin("todo"));
-    assert_eq!(ordered[12], builtin("memory"));
+    assert_eq!(ordered[7], builtin("context-mode"));
+    assert_eq!(ordered[8], builtin("tool-search"));
+    assert_eq!(ordered[9], builtin("tool-repair"));
+    assert_eq!(ordered[10], builtin("todo"));
+    assert_eq!(ordered[11], builtin("memory"));
 
     let cli_only = order_extension_paths(&cli, &defaults, true);
     assert_eq!(cli_only, cli);
@@ -309,7 +306,6 @@ fn compiled_out_builtins_name_their_cargo_feature() {
         ("tool-repair", "tool-repair"),
         ("tool-search", "tool-search"),
         ("mcp", "mcp"),
-        ("python", "python"),
         ("codemode", "extensions"),
         ("todo", "todo"),
         ("memory", "memory"),
@@ -569,4 +565,38 @@ fn synthetic_sources() {
         Some("inline".to_owned())
     );
     assert_eq!(PluginInfo::synthetic_source("/tmp/x.ts"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Native-first precedence table (src/plugins/loader.rs)
+// ---------------------------------------------------------------------------
+
+use pir::plugins::loader::{is_js_package_path, native_precedence_applies, NATIVE_PRECEDENCE};
+
+#[test]
+fn always_on_single_face_rules_ignore_the_opt_in() {
+    assert!(native_precedence_applies(0, false)); // tool-repair
+    assert!(native_precedence_applies(1, false)); // phone
+}
+
+#[test]
+fn full_port_pairs_need_the_opt_in() {
+    // Without PIR_PREFER_NATIVE, upstream's first-wins behavior is kept.
+    assert!(!native_precedence_applies(2, false)); // subagent
+    assert!(!native_precedence_applies(
+        NATIVE_PRECEDENCE.len() - 1,
+        false
+    ));
+    // With the switch, every native port wins over its JS package.
+    for index in 0..NATIVE_PRECEDENCE.len() {
+        assert!(native_precedence_applies(index, true));
+    }
+}
+
+#[test]
+fn package_path_match_is_case_insensitive_and_component_exact() {
+    let path = std::path::Path::new("/x/node_modules/PI-SUBAGENTS/index.ts");
+    assert!(is_js_package_path(path, "pi-subagents"));
+    // A partial component must not match.
+    assert!(!is_js_package_path(path, "pi-subagent"));
 }

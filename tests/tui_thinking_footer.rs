@@ -21,11 +21,13 @@ use pir::tui::theme::set_theme;
 use pir::tui::Component;
 
 /// The palette is process-global; serialize this binary's tests.
+///
+/// This must be the SHARED lock, not a `static` declared here: `set_theme`
+/// bumps the global `Theme::generation()`, which invalidates every sibling
+/// suite's memoized rows. A per-file mutex does not exclude
+/// `tui_frame_reuse`'s whole-row memos in the same binary.
 fn lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::common::tui_frame_counter_lock()
 }
 
 fn footer_state() -> FooterState {

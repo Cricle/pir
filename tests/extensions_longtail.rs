@@ -45,6 +45,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a custom test prompt.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -54,6 +55,7 @@ fn test_config_default_prompt() -> ExtensionConfig {
     ExtensionConfig {
         system_prompt: String::new(),
         limits: Some(Default::default()),
+        allow_process_exit: false,
         ..test_config_at(&std::env::temp_dir())
     }
 }

@@ -5285,6 +5285,14 @@ async fn thousands_of_tool_updates_are_exactly_once_in_one_prompt_run() {
         .await
         .expect("build flood-probe agent");
 
+    // This test asserts EXACTLY-ONCE delivery of every update, so backpressure
+    // must not be in play: the default 1024-slot channel DROPS events when a
+    // run outpaces the consumer (documented behavior), and under a loaded
+    // merged harness the drain rate varies enough to lose a few hundred
+    // (observed `3949/4500`). Size the channel above the whole burst so the
+    // producer can never outrun it; the drop path itself is covered by the
+    // `set_event_channel_capacity(1)` tests in `sdk_agent_session_errors`.
+    agent.set_event_channel_capacity(TOTAL + 16);
     let started = std::time::Instant::now();
     let events: Vec<SdkEvent> = agent
         .prompt_stream("flood the update channel")
@@ -5376,9 +5384,10 @@ async fn long_running_real_bash_stream_memory_curve_stays_bounded() {
 
     let cwd = TempDir::new("sdk-memory-curve");
     let sessions = cwd.path().join("sessions");
-    let python = std::env::var("PIR_MEMORY_CURVE_PYTHON").unwrap_or_else(|_| "python".to_owned());
+    // Pure POSIX shell stream: no external interpreter dependency.
+    let line = "y".repeat(5000);
     let command = format!(
-        "'{python}' -c 'import sys,time\nline=\"y\"*5000\nend=time.time()+150\nwhile time.time()<end:\n    sys.stdout.write(line);sys.stdout.write(chr(10));sys.stdout.flush();time.sleep(0.02)'"
+        "end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do printf '%s\\n' '{line}'; sleep 0.02; done"
     );
     let registry = registry(Arc::new(move |index, _context| match index {
         0 => assistant(

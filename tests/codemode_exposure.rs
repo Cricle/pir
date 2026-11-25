@@ -9,7 +9,10 @@
 //! executes model calls against the declared set only).
 //!
 //! The settings tests count the caching-path loads through
-//! [`pir::plugins::codemode::settings_load_count`]: constructing the builtin
+//! [`pir::plugins::codemode::watch_settings_loads`] (the per-agent-dir
+//! counter — the process-wide [`pir::plugins::codemode::settings_load_count`]
+//! is moved by every session any sibling suite constructs, which made the
+//! assertion racy inside a merged harness): constructing the builtin
 //! plugin reads settings once, script executions read none, and `/reload`
 //! reads once more (also picking up a changed `codemode.mode`). The agent dir
 //! is a temp directory (`PIR_AGENT_DIR`), never `~/.pi`.
@@ -34,7 +37,7 @@ use pir::ai::types::{
 use pir::coding_agent::ToolSelection;
 use pir::config::settings::CodemodeMode;
 use pir::plugins::codemode::{
-    new_codemode_plugin, settings_load_count, CodemodeConfig, CodemodePlugin, CodemodeTool,
+    new_codemode_plugin, watch_settings_loads, CodemodeConfig, CodemodePlugin, CodemodeTool,
 };
 use pir::plugins::PluginHost;
 
@@ -504,6 +507,10 @@ async fn mode_only_hides_direct_declarations_for_an_active_codemode() {
 #[tokio::test(flavor = "current_thread")]
 async fn settings_load_once_per_construction_and_once_more_on_reload() {
     let _lock = TEST_LOCK.lock().await;
+    // The settings scope is the agent dir, and `PIR_AGENT_DIR` is
+    // process-global: hold the shared per-binary lock so no sibling suite can
+    // re-point it mid-test.
+    let _env_lock = crate::common::agent_dir_env_lock().lock().await;
     let agent_dir = TempDir::new("agent-dir");
     let temp = TempDir::new("cwd");
     let _env = AgentDirGuard::set(&agent_dir.0);
@@ -513,10 +520,16 @@ async fn settings_load_once_per_construction_and_once_more_on_reload() {
     )
     .expect("write initial settings");
 
-    let before = settings_load_count();
+    // The ATTRIBUTABLE per-agent-dir counter, not the process-wide one: every
+    // `AgentSession` in this binary registers the default codemode builtin, so
+    // a sibling suite's session construction bumps the global count between the
+    // reads (observed `left: 9, right: 6`). This counts only loads against the
+    // agent dir pinned above.
+    let loads = watch_settings_loads(&agent_dir.0);
+    let before = loads.count();
     let plugin = new_codemode_plugin();
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 1,
         "plugin construction resolves settings exactly once"
     );
@@ -557,7 +570,7 @@ async fn settings_load_once_per_construction_and_once_more_on_reload() {
     let first = run_prompt(&agent, "two scripts").await;
     assert!(tool_result_text(&first, "codemode").1.contains("one"));
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 1,
         "script executions must not read settings"
     );
@@ -577,14 +590,14 @@ async fn settings_load_once_per_construction_and_once_more_on_reload() {
         .await
         .expect("reload");
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 2,
         "`/reload` resolves settings exactly once more"
     );
 
     let second = run_prompt(&agent, "after reload").await;
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 2,
         "the post-reload script execution must not read settings"
     );

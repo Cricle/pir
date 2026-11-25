@@ -452,6 +452,7 @@ async fn print_js_extension_hooks_flow_through_the_shared_host() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("extension runtime");
     runtime
@@ -503,6 +504,7 @@ async fn print_applies_actionable_notifications() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("extension runtime");
     runtime

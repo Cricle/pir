@@ -4,19 +4,30 @@
 `~/.pi/agent/npm/node_modules/@juicesharp/rpiv-todo`). It ships the model-facing `todo` tool, the `/todos` slash
 command, and transcript-backed task-list persistence.
 
-- Implementation: `src/plugins/builtin/todo.rs` (feature `todo`); entry `src/plugins/builtin.rs` (`name: "todo"`,
-  `replaceable: true`).
-- Upstream contract truth: `docs/tool-schema.md`; this document records only pir's semantics and deviations. Tests:
-  module unit tests; `tests/suites/todo_builtin.rs` (registration, `/todos`, persistence, CPU invariants);
+- Pure domain: `crates/pir-builtin-todo/src/` (types, status machine, dependency graph, reducer,
+  envelope, replay, the LRU session store — published, engine-free). Runtime half:
+  `crates/pir-core/src/plugins/builtin/todo.rs` (the `todo` tool, `/todos`, the overlay, the
+  `ToolResult` adapter); feature `todo`; entry `crates/pir-core/src/plugins/builtin.rs`
+  (`name: "todo"`, `replaceable: true`).
+- Upstream contract truth: `docs/tool-schema.md`; this document records only pir's semantics and
+  deviations. Tests: `crates/pir-builtin-todo/tests/*.rs` (the pure domain);
+  `tests/suites/todo_builtin.rs` (registration, `/todos`, persistence, CPU invariants);
   `tests/suites/sdk.rs` (`.builtin("todo")`, session-file round trip).
 
 ## 1. Tool contract
 
-One tool, `todo`, with six actions — `create`, `update`, `list`, `get`, `delete`, `clear` — and the upstream
-parameter set (`subject`, `description`, `activeForm`, `status`, `blockedBy`, `addBlockedBy`, `removeBlockedBy`,
-`owner`, `metadata`, `id`, `includeDeleted`). `todo_parameters_schema()` generates the JSON Schema with the same
-properties, enums and descriptions as TypeBox (LLM-facing copy verbatim; only key order differs — `serde_json`
-sorts maps).
+One tool, `todo`, with seven actions — `create`, `update`, `batch`, `list`, `get`, `delete`, `clear` — and the
+upstream parameter set (`subject`, `description`, `activeForm`, `status`, `blockedBy`, `addBlockedBy`,
+`removeBlockedBy`, `owner`, `metadata`, `id`, `includeDeleted`) plus pir's `updates` array for `batch`.
+`todo_parameters_schema()` generates the JSON Schema: the upstream properties/enums/descriptions are unchanged,
+and `batch`/`updates` are additive.
+
+`create` accepts an optional `status` so a task can start directly in `in_progress` or `completed` (the default
+stays `pending`; `deleted` is rejected). `update` already moves directly between `pending`, `in_progress` and
+`completed`. `batch` applies a non-empty array of `create`/`update`/`delete`/`clear` operations in order and
+**commits atomically**: every item reduces against a scratch state and a failing item leaves the previous list
+untouched. `list`/`get` and nested `batch` items are rejected; the cap is 100 items per call. This lets a model
+complete one task and start the next in a single request instead of spending a turn per status change.
 
 Status machine (a same→same transition is an accepted no-op):
 
@@ -48,7 +59,10 @@ Rejections are **in-band**: content is `Error: <message>`, `details.error` is th
 Error strings are upstream-verbatim for every case in `docs/tool-schema.md` (`subject required for create`,
 `blockedBy: #N not found|is deleted`, `id required for <action>`, `#N not found`, the long `update requires at
 least one mutable field: …`, `illegal transition <from> → <to>`, `cannot block #N on itself`, `addBlockedBy:
-…`, `#N is already deleted`); the bounded-record guards add new ones (§5).
+…`, `#N is already deleted`); the bounded-record guards add new ones (§5). pir-specific additions are
+`cannot create a deleted task`, `batch requires a non-empty updates array`, `batch supports at most 100 updates
+(got N)`, `batch item N: unknown action`, `batch item N: nested batch is not allowed`, `batch item N: list|get
+is read-only; call it directly`, and the prefixed reducer error `batch item N (<action>): <message>`.
 
 ## 2. Persistence semantics
 
@@ -156,8 +170,9 @@ precedent), so the print-mode list rides that field with `ok = true`. Print mode
 | State per session | O(tasks); `TodoState { tasks, next_id }` and nothing derived |
 | Records | `MAX_TASKS_PER_SESSION` = 1000 tasks; `MAX_METADATA_BYTES` = 16 KiB per task; `MAX_SUBJECT_CHARS` = 1024; `MAX_DESCRIPTION_CHARS` = 8192; `MAX_ACTIVE_FORM_CHARS` = 256; `MAX_OWNER_CHARS` = 256 |
 | Sessions map | LRU, `MAX_SESSION_SLOTS` = 8; cleared on `on_shutdown` |
-| Replay | one cheap pass per push: O(entries) filtering + allocation-free structural hash of matching `details`, **zero** deserializations when the fingerprint is unchanged; when moved, exactly one O(tasks) deserialization (the last matching one). Pushes are ≤ 2 per run, never per delta |
+| Replay | one cheap pass per push: O(entries) filtering + a structural hash of only the **last** matching snapshot (plus entry/match counts), **zero** deserializations when the fingerprint is unchanged; when moved, exactly one O(tasks) deserialization. Pushes are ≤ 2 per run, never per delta |
 | Reducer | in place after validation; only the updated task is cloned for the no-op comparison; `detect_cycle` is an iterative O(V+E) DFS (no recursion, stack-safe at the task cap) |
+| Batch | at most `MAX_BATCH_ITEMS` = 100 operations; one snapshot clone plus one working `TodoState` clone per call (not per item), committed only when every item succeeds |
 | Sanitizer | single O(chars) pass, no regex |
 | Events | `events()` = `["session_start"]`: `message_update` and the per-batch `tool_result` fan-out never reach the plugin through gated loop paths (host `has_handlers`/`has_native_handlers` gate). A direct `PluginHost::emit("tool_result", …)` still reaches the defensive branch, where only a matching `todo` envelope replaces state |
 
@@ -182,7 +197,9 @@ Pinned by `tests/suites/todo_builtin.rs` and module unit tests.
 | 14 | `~/.config/rpiv-todo/config.json` (`maxWidgetLines`, `collapseKey`, `guidance`) | Not read | The native overlay uses fixed 12-row/width clipping and the registered `ctrl+shift+t`; the config file is not a settings surface yet |
 | 15 | Overlay widget, collapse state, "completed rows fade after the turn", per-row glyphs/colors, `selectOverlayLayout`; only the foreground session's overlay repaints | Native widget factory + collapse state ported; no per-row colors/fade or `selectOverlayLayout`. `ctrl+shift+t` reaches the native handler through `PluginHost::invoke_shortcut`, routed by the TUI key path through the worker | One overlay mechanism (`ctx.ui.setWidget`, `WidgetPlacement::Overlay`); Rust-backed and JS shortcuts share the TUI key path but dispatch on their own thread |
 | 16 | `/todos` through `ctx.ui.notify(..., "info")` | UI sessions open a focused `ctx.ui.custom` list (select/expand/advance/delete); print mode keeps the `CommandOutcome.error` text channel | The interactive list is the primary surface; print cannot take keyboard input |
+| 17 | Six actions; one mutation per call | Adds `batch` with an `updates` array; mutating items apply in order and commit atomically (max 100) | A model otherwise spends one full request per status change; batching removes the todo-only turn tax without changing the upstream actions |
+| 18 | `create` always starts `pending` | `create` accepts `status: pending\|in_progress\|completed`; `deleted` is rejected | A task can start in its real state; a batch can create and finish a small task without three round trips |
 
-Everything else — six actions, parameter names/semantics, status machine, tombstones, dependency validation and
+Everything else — the upstream six actions, parameter names/semantics, status machine, tombstones, dependency validation and
 `blocks` edges, metadata null-deletion, the envelope shape, all contract error strings, `list`/`get` content lines
 and the `/todos` layout — follows upstream.

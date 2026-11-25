@@ -331,7 +331,7 @@ async fn routing_blocks_large_simple_file_reads_only() {
         ("read", json!({ "path": "missing.log" })),
         (
             "ctx_execute",
-            json!({ "code": "import os\nprint(os.getcwd())" }),
+            json!({ "code": "console.log(process.cwd())" }),
         ),
         ("ctx_search", json!({ "queries": ["anything"] })),
     ] {
@@ -492,9 +492,11 @@ async fn large_tool_result_is_indexed_under_the_session_source() {
         .unwrap_or_else(|| panic!("search results: {value}"));
     assert!(!results.is_empty(), "the large result was indexed: {value}");
     assert_eq!(results[0]["source"], json!("session:sess-42"));
-    assert_eq!(
-        results[0]["title"],
-        json!("bash: npm"),
+    // The hit may be a `(part N)` chunk of the result (a large result is split
+    // by size even without blank lines), so compare the title prefix.
+    let title = results[0]["title"].as_str().unwrap_or_default();
+    assert!(
+        title.starts_with("bash: npm"),
         "the title is compact (tool + first command token): {value}"
     );
 
@@ -760,9 +762,9 @@ async fn doctor_reports_lazy_state_then_database_counts() {
     let lazy = harness.run(CTX_DOCTOR_TOOL_NAME, json!({})).await;
     assert!(!lazy.is_error, "{}", lazy.content);
     let value = parse_json(&lazy);
-    assert_eq!(value["python"]["status"], json!("not started"), "{value}");
-    assert_eq!(value["python"]["workerStarted"], json!(false), "{value}");
-    assert_eq!(value["python"]["spawnCount"], json!(0), "{value}");
+    assert_eq!(value["sandbox"]["status"], json!("not started"), "{value}");
+    assert_eq!(value["sandbox"]["workerStarted"], json!(false), "{value}");
+    assert_eq!(value["sandbox"]["spawnCount"], json!(0), "{value}");
     assert_eq!(value["database"]["exists"], json!(false), "{value}");
     assert_eq!(value["database"]["open"], json!(false), "{value}");
     assert_eq!(value["database"]["chunks"], json!(0), "{value}");
@@ -812,7 +814,7 @@ async fn doctor_reports_lazy_state_then_database_counts() {
     let value = parse_json(&report);
     assert_eq!(value["database"]["exists"], json!(true), "{value}");
     assert_eq!(value["database"]["open"], json!(true), "{value}");
-    assert_eq!(value["database"]["schemaVersion"], json!(1), "{value}");
+    assert_eq!(value["database"]["schemaVersion"], json!(2), "{value}");
     assert_eq!(value["database"]["fts5Available"], json!(true), "{value}");
     assert_eq!(value["database"]["chunks"], json!(1), "{value}");
     assert_eq!(value["database"]["sources"], json!(1), "{value}");
@@ -821,8 +823,8 @@ async fn doctor_reports_lazy_state_then_database_counts() {
         "{value}"
     );
     assert_eq!(
-        value["python"]["status"],
+        value["sandbox"]["status"],
         json!("not started"),
-        "doctor itself must not spawn the interpreter: {value}"
+        "doctor itself must not spawn the JS runtime: {value}"
     );
 }

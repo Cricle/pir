@@ -59,6 +59,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -706,6 +707,73 @@ fn default_extension_paths_respect_the_trust_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// (f) native value bridge: `__pir_native` JSON <-> live QuickJS conversion
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "extensions")]
+mod native_bridge_round_trip {
+    use pir::extensions::runtime::native_bridge::{js_to_json, json_to_js};
+    use rquickjs::{Context, Runtime};
+    use serde_json::{Number, Value as JsonValue};
+
+    /// Every JSON shape the host dispatches (context, tools, models) must
+    /// survive the JSON-free path unchanged: nothing is stringified at the
+    /// seam, and numbers keep their integer/float identity.
+    #[test]
+    fn json_js_round_trip() {
+        let input: JsonValue = serde_json::json!({
+            "null": null,
+            "bool": true,
+            "int": 42,
+            "negative": -7,
+            "float": 1.5,
+            "string": "中\n\"quoted\"",
+            "nested": {"a": [1, 2, {"b": false}]},
+            "array": [null, "x", 3.25],
+        });
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        ctx.with(|ctx| {
+            let js = json_to_js(&ctx, &input).expect("json_to_js");
+            let back = js_to_json(&js).expect("js_to_json");
+            assert_eq!(back, input);
+            assert_eq!(back["int"], JsonValue::Number(Number::from(42)));
+        });
+    }
+
+    /// `session_tree` is the motivating payload: the JSON->JS direction is
+    /// iterative because the tree can be deeper than the JS stack.
+    #[test]
+    fn json_js_deep_tree_does_not_overflow() {
+        let mut input = JsonValue::Number(Number::from(1));
+        for _ in 0..512 {
+            input = JsonValue::Array(vec![input]);
+        }
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        ctx.with(|ctx| {
+            let js = json_to_js(&ctx, &input).expect("json_to_js deep");
+            let back = js_to_json(&js).expect("js_to_json deep");
+            assert_eq!(back, input);
+        });
+    }
+
+    /// Non-finite JS numbers have no `serde_json::Number`; they degrade to
+    /// null exactly like `JSON.stringify` does.
+    #[test]
+    fn non_finite_js_numbers_become_null() {
+        let rt = Runtime::new().expect("runtime");
+        let ctx = Context::full(&rt).expect("context");
+        ctx.with(|ctx| {
+            let js: rquickjs::Value = ctx.eval("NaN").expect("eval NaN");
+            assert_eq!(js_to_json(&js).expect("NaN to json"), JsonValue::Null);
+            let js: rquickjs::Value = ctx.eval("Infinity").expect("eval Infinity");
+            assert_eq!(js_to_json(&js).expect("Infinity to json"), JsonValue::Null);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // C2 — deflated JS shim assets: byte identity + non-gate inflate measurement
 // ---------------------------------------------------------------------------
 
@@ -754,7 +822,7 @@ mod shim_deflate {
         ),
         (
             "child_process_shim.js.txt",
-            "936b44e90fdb74d543c18d3dbefa68619eba1389c3db3639ae09a63515c5baaa",
+            "cc5787b06621a712f389ccfff15d37663baf1f6b7a4dd3c14202045d23d29d75",
         ),
         (
             "cluster_shim.js.txt",
@@ -806,7 +874,7 @@ mod shim_deflate {
         ),
         (
             "fs_shim.js.txt",
-            "5ed9e10ee1aea9dcb7f5ab8702940cacafe4a4f7650d7f42d0557e574a2aec20",
+            "31e34ed99ab1c20b84418ab32ebc8fd3d2ae3fa11582c2ed2576828c73cd9fc7",
         ),
         (
             "http2_shim.js.txt",
@@ -966,7 +1034,13 @@ mod shim_deflate {
             // #11630: host-resolved `keyText`/`keyHint` are injected into
             // `ToolRenderContext`, `MessageRenderOptions`, and
             // `EntryRenderOptions`.
-            "45a68a8e771059aa331794fed6c539c088a1337b78ad1023dd0b95f36e8168a8",
+            // NATIVE-VALUE-BRIDGE: `__pir_native` tier — typed context and
+            // event/tool dispatch entries crossing the boundary as live
+            // QuickJS objects instead of JSON strings.
+            // v1.5.2: `ctx.sessionManager.getSessionDir()`, markdown-transformer
+            // `messageTypes` filtering (#11756) and `ctx.ui.custom({blocked})`
+            // program status (#11471, both forms and while hidden).
+            "a54dfe371409967b824fd939f44acdd3a0287b9ffb22dd9942f1e59a109d87ca",
         ),
         (
             "process_global_stub.js.txt",
@@ -1161,7 +1235,7 @@ mod shim_deflate {
                 "{name}: decompressed bytes drifted from the pre-deflate source"
             );
 
-            let disk = std::fs::read(format!("src/extensions/api/js/{name}"))
+            let disk = std::fs::read(format!("crates/pir-core/src/extensions/api/js/{name}"))
                 .unwrap_or_else(|error| panic!("{name}: cannot read source: {error}"));
             // The blobs are generated from canonical LF bytes (see
             // scripts/gen_shims_deflate.py); a Windows checkout with
@@ -1192,7 +1266,7 @@ mod shim_deflate {
     /// direction so a newly added `*.js.txt` cannot silently ship without a
     /// blob: every source is either embedded through one of the shim
     /// registries or is the one file `src/main_cli` embeds directly
-    /// (`script_boot.js.txt`, `include_str!`, no deflate), and `assets/shims`
+    /// (`script_boot.js.txt`, `include_str!`, no deflate), and `crates/pir-core/assets/shims`
     /// holds exactly one blob per embedded shim (no missing or orphan blobs).
     #[test]
     fn shim_sources_and_blobs_are_fully_covered() {
@@ -1207,7 +1281,9 @@ mod shim_deflate {
         assert_eq!(embedded.len(), 90, "embedded shim count");
 
         let mut sources: BTreeSet<String> = BTreeSet::new();
-        for entry in std::fs::read_dir("src/extensions/api/js").expect("read shim source dir") {
+        for entry in std::fs::read_dir("crates/pir-core/src/extensions/api/js")
+            .expect("read shim source dir")
+        {
             let path = entry.expect("shim source dir entry").path();
             let name = path
                 .file_name()
@@ -1243,7 +1319,8 @@ mod shim_deflate {
         }
 
         let mut blob_sources: BTreeSet<String> = BTreeSet::new();
-        for entry in std::fs::read_dir("assets/shims").expect("read shim blob dir") {
+        for entry in std::fs::read_dir("crates/pir-core/assets/shims").expect("read shim blob dir")
+        {
             let path = entry.expect("shim blob dir entry").path();
             let name = path
                 .file_name()
@@ -1262,7 +1339,7 @@ mod shim_deflate {
             embedded.iter().map(|name| (*name).to_owned()).collect();
         assert_eq!(
             blob_sources, embedded_names,
-            "assets/shims must hold exactly one blob per embedded shim (missing or orphan blob)"
+            "crates/pir-core/assets/shims must hold exactly one blob per embedded shim (missing or orphan blob)"
         );
     }
 
@@ -1311,8 +1388,16 @@ mod shim_deflate {
     /// that the blob inflates to the source bytes and that GOLDEN matches the
     /// source SHA-256, so any valid zlib stream is equivalent.
     ///
+    /// The source is CRLF-normalized before compressing, exactly like the
+    /// Python generator: without it a Windows checkout embeds CRLF blobs while
+    /// Linux CI embeds LF, and the byte-exact gate fails there.
+    ///
     /// Run with:
-    /// `cargo test --test g_extensions -- --ignored regenerate_shim_deflate`
+    /// `PIR_REGENERATE_SHIMS=fs_shim.js.txt \
+    ///  cargo test --test zz_merged_3 shim_deflate::regenerate_shim_deflate -- --ignored --nocapture`
+    ///
+    /// Then update that shim's SHA-256 in `GOLDEN` (it hashes the pre-deflate
+    /// source bytes, so it changes with the source, not with the blob).
     #[test]
     #[ignore = "one-shot generator: run after editing a *.js.txt shim source"]
     fn regenerate_shim_deflate() {
@@ -1322,9 +1407,13 @@ mod shim_deflate {
             .unwrap_or_else(|_| vec!["prelude.js.txt".to_owned()]);
         for name in &names {
             let name = name.as_str();
-            let source_path = format!("src/extensions/api/js/{name}");
+            let source_path = format!("crates/pir-core/src/extensions/api/js/{name}");
             let source = std::fs::read(&source_path)
                 .unwrap_or_else(|error| panic!("{source_path}: {error}"));
+            // Canonical LF, matching `scripts/gen_shims_deflate.py`.
+            let source: Vec<u8> = String::from_utf8_lossy(&source)
+                .replace("\r\n", "\n")
+                .into_bytes();
             let mut encoder =
                 flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
             encoder
@@ -1333,7 +1422,7 @@ mod shim_deflate {
             let blob = encoder
                 .finish()
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let out = format!("assets/shims/{name}.deflate");
+            let out = format!("crates/pir-core/assets/shims/{name}.deflate");
             std::fs::write(&out, &blob).unwrap_or_else(|error| panic!("{out}: {error}"));
             eprintln!("[regen] {out}: {} -> {} bytes", source.len(), blob.len());
         }

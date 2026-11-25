@@ -1,13 +1,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub data_dir: PathBuf,
     pub listen: SocketAddr,
     pub public_url: Option<String>,
     pub allowed_origins: Vec<String>,
     pub pepper: String,
+    pub metrics_token: Option<String>,
     pub max_connections: usize,
     pub max_devices_per_user: usize,
     pub max_sessions_per_user: usize,
@@ -21,6 +22,32 @@ pub struct Config {
     /// metadata remains in redb and catalog pages hydrate from the store.
     /// 0 disables the high-water eviction (historical behavior).
     pub max_resident_sessions: usize,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("data_dir", &self.data_dir)
+            .field("listen", &self.listen)
+            .field("public_url", &self.public_url)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("pepper", &"<redacted>")
+            .field(
+                "metrics_token",
+                &self.metrics_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("max_connections", &self.max_connections)
+            .field("max_devices_per_user", &self.max_devices_per_user)
+            .field("max_sessions_per_user", &self.max_sessions_per_user)
+            .field("max_clients_per_session", &self.max_clients_per_session)
+            .field("max_ws_message_bytes", &self.max_ws_message_bytes)
+            .field("max_client_queue", &self.max_client_queue)
+            .field("max_agent_queue", &self.max_agent_queue)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("max_resident_sessions", &self.max_resident_sessions)
+            .finish()
+    }
 }
 
 impl Config {
@@ -57,6 +84,10 @@ impl Config {
             public_url,
             allowed_origins,
             pepper,
+            metrics_token: std::env::var("PIR_PHONE_SERVER_METRICS_TOKEN")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
             max_connections: 20_000,
             max_devices_per_user: 10,
             max_sessions_per_user: 500,

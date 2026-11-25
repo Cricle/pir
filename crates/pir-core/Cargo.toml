@@ -1,0 +1,291 @@
+[package]
+name = "pir-core"
+# Library crate name; consumers import it as `pir_core`. External users should
+# depend on the `pir-sdk` facade instead (library name `pir`), which re-exports
+# this crate under the historical `pir::...` paths.
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "UI-agnostic engine for the pi coding agent (agent loop, providers, sessions, tools, runtime)"
+license = "MIT OR Apache-2.0"
+authors = ["Earendil Works <team@earendil.works>"]
+repository = "https://github.com/Cricle/pir"
+
+# Embedded JS shims / agent presets are compile-time `include_bytes!`/
+# `include_str!` inputs under `assets/`; the crate cannot build without them.
+include = ["/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/src/**", "/assets/**"]
+
+[lib]
+name = "pir_core"
+path = "src/lib.rs"
+
+# The core is deliberately free of terminal/front-end dependencies: no
+# crossterm, no clipboard, no renderer. UI crates (`pir-tui`, future web/gui
+# front ends) depend on this crate; the `pir-sdk` facade re-exports it.
+[dependencies]
+anyhow = "1"
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+# Provider-neutral AI value types, the AI error, the transport seam and the
+# event stream. Re-exported at the historical `crate::ai::{types,error,
+# transport,util,event_stream}` paths so no call site changes.
+pir-ai-types = { path = "../pir-ai-types", version = "0.3.2" }
+# Durable conversation/task/document runtime. Optional: re-exported at the
+# historical `crate::durable` path by the `durable` feature (default-on via
+# `full`), so a slim embed skips its 56k lines.
+pir-durable = { path = "../pir-durable", version = "0.3.2", optional = true }
+# Vendor-neutral span/metric/propagation/trace-store core. Pure std +
+# serde_json; no engine types. `pir-core` re-exports it at the historical
+# `crate::telemetry` path, so every internal `crate::telemetry::…` use keeps
+# resolving and the public `pir::telemetry` surface is unchanged.
+pir-telemetry = { path = "../pir-telemetry", version = "0.3.2" }
+# Provider-agnostic wire protocol (strict CBOR, framing, schema validation).
+# Pure serde/ciborium; no engine types. Re-exported at the historical
+# `crate::protocol` path so no call site changes.
+pir-protocol = { path = "../pir-protocol", version = "0.3.2" }
+# Builtin implementation crates. The pure logic lives there; `pir-core` keeps
+# the runtime halves (QuickJS, SQLite, rmcp transports, AgentSession) and the
+# host. Each edge is optional and bound to the feature with the same name, so
+# `--no-default-features` builds none of them.
+pir-builtin-subagent = { path = "../pir-builtin-subagent", version = "0.3.2", optional = true }
+pir-builtin-mode = { path = "../pir-builtin-mode", version = "0.3.2", optional = true }
+pir-builtin-mcp = { path = "../pir-builtin-mcp", version = "0.3.2", optional = true }
+pir-builtin-codemode = { path = "../pir-builtin-codemode", version = "0.3.2", optional = true }
+pir-builtin-context-mode = { path = "../pir-builtin-context-mode", version = "0.3.2", optional = true }
+pir-builtin-tool-search = { path = "../pir-builtin-tool-search", version = "0.3.2", optional = true }
+pir-builtin-tool-repair = { path = "../pir-builtin-tool-repair", version = "0.3.2", optional = true }
+pir-builtin-todo = { path = "../pir-builtin-todo", version = "0.3.2", optional = true }
+pir-builtin-memory = { path = "../pir-builtin-memory", version = "0.3.2", optional = true }
+pir-builtin-phone = { path = "../pir-builtin-phone", version = "0.3.2", optional = true }
+# The aggregate builtin catalog. `default-features = false` is load-bearing:
+# the catalog this crate installs must be exactly the set of builtins this
+# build compiled in, which is driven by the feature forwards below.
+pir-builtins = { path = "../pir-builtins", version = "0.3.2", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "fs", "process", "signal"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "native-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "native-tls"], optional = true }
+futures-util = "0.3"
+tracing = "0.1"
+regex = "1.13.1"
+memmap2 = { version = "0.9", optional = true }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.23"
+sha2 = "0.10"
+hmac = { version = "0.12", optional = true }
+md-5 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+getrandom = "0.3"
+pbkdf2 = { version = "0.12", optional = true }
+flate2 = { version = "1.1", optional = true }
+brotli = { version = "8", optional = true }
+zstd = { version = "0.13", optional = true }
+cm-memory = { version = "0.3.1", default-features = false, optional = true }
+rsa = { version = "0.9", features = ["sha2"], optional = true }
+unicode-segmentation = "1.13"
+# The edit-preview diff engine. Only `coding_agent/tools/edit.rs` uses it, and
+# that module is compiled for `tool-edit` / `ui-support` only, so the crate is
+# optional and those two features pull it in.
+similar = { version = "2", optional = true }
+memchr = "2"
+unicode-normalization = "0.1"
+rquickjs = { version = "0.14.0", features = ["futures", "loader"], optional = true }
+swc_ecma_parser = { version = "46.0.0", optional = true }
+swc_ecma_codegen = { version = "32.0.3", optional = true }
+swc_ecma_ast = { version = "29.0.2", optional = true }
+swc_ecma_transforms_base = { version = "50.0.0", optional = true }
+swc_ecma_transforms_typescript = { version = "56.0.0", optional = true }
+swc_common = { version = "26.0.0", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"], optional = true }
+grep-searcher = { version = "0.1", optional = true }
+grep-regex = { version = "0.1", optional = true }
+ignore = { version = "0.4", optional = true }
+encoding_rs = "0.8"
+notify = { version = "8.2", optional = true }
+tokio-util = "0.7"
+strum = { version = "0.27", features = ["derive"] }
+derive_more = { version = "2", features = ["display", "from"] }
+globset = "0.4"
+semver = "1"
+rmcp = { version = "3.5", default-features = false, optional = true, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest-native-tls",
+    "server",
+    "transport-io",
+] }
+aes = { version = "0.8", optional = true }
+scrypt = { version = "0.11", optional = true }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"], optional = true }
+brush-core = { version = "0.5.0", optional = true }
+brush-builtins = { version = "0.2.0", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Diagnostics",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[features]
+# `full` is the engine's own complete profile. The user-facing `pir` binary
+# gets the identical set through the `pir-sdk` facade (which adds `tui`).
+default = ["full"]
+full = [
+    "durable",
+    "extensions",
+    "context-mode",
+    "mcp",
+    "env",
+    "env-daemon",
+    "server",
+    "subagent",
+    "tool-repair",
+    "tool-search",
+    "todo",
+    "memory",
+    "phone",
+    "provider-openai",
+    "provider-anthropic",
+    "provider-google",
+    "provider-bedrock",
+    "provider-mistral",
+    "cli",
+    "tools",
+    "grep-find",
+    "image-tools",
+    "mcp-sd",
+    "brush",
+    "session",
+    "skills",
+    "sdk",
+    "client",
+    "minimal",
+]
+# The durable runtime, re-exported at `crate::durable`. Part of `full`, so the
+# shipped binary is unchanged; a slim embed leaves it off.
+durable = ["dep:pir-durable"]
+session = ["dep:memmap2"]
+skills = []
+sdk = []
+minimal = []
+provider-openai = ["dep:tokio-tungstenite"]
+provider-anthropic = []
+provider-google = ["dep:rsa"]
+provider-bedrock = ["dep:hmac"]
+provider-mistral = []
+image-resize = ["dep:image"]
+image-tools = ["image-resize"]
+cli = ["dep:clap", "print", "rpc", "export-html"]
+print = []
+rpc = []
+export-html = []
+tool-read = []
+tool-bash = []
+tool-powershell = []
+tool-edit = ["dep:similar"]
+tool-write = []
+tool-ls = []
+tool-background = []
+tools = [
+    "tool-read",
+    "tool-bash",
+    "tool-powershell",
+    "tool-edit",
+    "tool-write",
+    "tool-ls",
+    "tool-background",
+]
+grep-find = [
+    "dep:grep-searcher",
+    "dep:grep-regex",
+    "dep:ignore",
+    # The repair crate's `grep`/`find` field-alias rows are gated the same way:
+    # with the tools compiled out, a repair must not rewrite a call into a tool
+    # this build does not have. Weak dependency (`?`): this only forwards when
+    # `tool-repair` already pulled the crate in, so `grep-find` alone adds no
+    # dependency.
+    "pir-builtin-tool-repair?/grep-find",
+]
+extensions = [
+    "dep:rquickjs",
+    "dep:notify",
+    "dep:flate2",
+    "dep:brotli",
+    "dep:zstd",
+    "dep:aes",
+    "dep:scrypt",
+    "dep:md-5",
+    "dep:sha1",
+    "dep:pbkdf2",
+    "dep:rsa",
+    "dep:hmac",
+    "dep:rusqlite",
+    "dep:swc_ecma_parser",
+    "dep:swc_ecma_codegen",
+    "dep:swc_ecma_ast",
+    "dep:swc_ecma_transforms_base",
+    "dep:swc_ecma_transforms_typescript",
+    "dep:swc_common",
+    "dep:pir-builtin-codemode",
+    "pir-builtins/codemode",
+]
+brush = ["dep:brush-core", "dep:brush-builtins"]
+# UI support: the edit-preview engine (`compute_edits_diff`) + confinement
+# helpers a front end renders without registering the edit tool itself.
+ui-support = ["dep:similar"]
+context-mode = ["extensions", "dep:rusqlite", "dep:pir-builtin-context-mode", "pir-builtins/context-mode"]
+mcp = ["dep:rmcp", "extensions", "dep:pir-builtin-mcp", "pir-builtins/mcp"]
+mcp-sd = ["mcp", "dep:ignore"]
+env = ["dep:notify", "dep:ignore"]
+env-daemon = ["env"]
+# Server-side RPC surface. Forwards to `pir-protocol`'s matching feature so the
+# typed-encoder helpers (`ModelRef::from_value`) exist in exactly the builds
+# that compile the server.
+server = ["pir-protocol/server"]
+client = []
+subagent = ["dep:pir-builtin-subagent", "dep:pir-builtin-mode", "pir-builtins/subagent", "pir-builtins/mode"]
+# `mode` (the foreman/plan session modes) is only meaningful on top of the
+# `subagent` tool it delegates through, so enabling it implies `subagent`. The
+# alias exists so every builtin has a feature of its own name: a consumer can
+# ask for `mode` directly, and the `feature_matrix` / catalog mapping stays
+# one-to-one (`pir-builtins`'s `mode` row names `subagent` as its host feature).
+mode = ["subagent"]
+tool-repair = ["dep:pir-builtin-tool-repair", "pir-builtins/tool-repair"]
+tool-search = ["dep:pir-builtin-tool-search", "pir-builtins/tool-search"]
+todo = ["dep:pir-builtin-todo", "pir-builtins/todo"]
+memory = ["dep:cm-memory", "dep:pir-builtin-memory", "pir-builtins/memory"]
+phone = ["dep:tokio-tungstenite", "dep:pir-builtin-phone", "pir-builtins/phone"]
+# Test-only: pull in `pir-telemetry`'s in-memory recorder (`TestTelemetry`).
+# Not part of `full` — production never constructs it; the workspace test
+# suites enable this through `pir-sdk`.
+telemetry-testing = ["pir-telemetry/testing"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+disallowed_methods = "warn"
+disallowed_types = "warn"
+wildcard_dependencies = "warn"
+negative_feature_names = "warn"
+missing_const_for_thread_local = "allow"
+
+[package.metadata.cargo-machete]
+ignored = ["md-5", "openssl-sys"]

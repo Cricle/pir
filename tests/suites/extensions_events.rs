@@ -49,6 +49,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -1273,6 +1274,11 @@ async fn ctx_facade_reports_session_model_and_thinking() {
                     scopedModels: ctx.scopedModels.length,
                     sessionId: ctx.sessionManager.getSessionId(),
                     sessionPath: ctx.sessionManager.getSessionPath(),
+                    // Upstream `ReadonlySessionManager.getSessionDir()`: the
+                    // accessor exists on `ctx.sessionManager` (a read-only
+                    // session may have no directory).
+                    hasSessionDir: typeof ctx.sessionManager.getSessionDir === "function",
+                    sessionDir: ctx.sessionManager.getSessionDir(),
                     modelId: ctx.model ? ctx.model.id : null,
                     contextWindow: ctx.model ? ctx.model.contextWindow : null,
                     models: ctx.modelRegistry.listModels().length,
@@ -1339,6 +1345,12 @@ async fn ctx_facade_reports_session_model_and_thinking() {
     // accessor exists and returns a defined shape.
     assert!(ctx["sessionId"].is_null() || ctx["sessionId"].is_string());
     assert!(ctx["sessionPath"].is_null() || ctx["sessionPath"].is_string());
+    assert_eq!(
+        ctx["hasSessionDir"],
+        json!(true),
+        "upstream ReadonlySessionManager exposes getSessionDir()"
+    );
+    assert!(ctx["sessionDir"].is_null() || ctx["sessionDir"].is_string());
 }
 
 #[tokio::test(flavor = "current_thread")]

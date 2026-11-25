@@ -981,6 +981,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         session_id: Some("test-session".to_string()),
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
+        allow_process_exit: false,
         limits: Some(Default::default()),
     }
 }

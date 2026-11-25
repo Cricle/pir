@@ -9,7 +9,7 @@
 //! (its items are `pub(crate)`, unreachable through the public `pir` API;
 //! the module has no crate-internal imports, so it compiles standalone).
 
-#[path = "../src/coding_agent/tools/image.rs"]
+#[path = "../crates/pir-core/src/coding_agent/tools/image.rs"]
 // The module's callers live in the pir lib, which this test crate does not
 // include, so some of its items are dead here by construction.
 #[allow(dead_code)]

@@ -1,0 +1,21 @@
+[package]
+name = "pir-builtin-subagent"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Host-neutral pure core of the pir subagent builtin: agent discovery, frontmatter parsing, result aggregation"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+# Messages are handled as `serde_json::Value` rows and frontmatter is parsed
+# with `serde_yaml`; the crate itself defines no serde-derived type, so plain
+# `serde` is deliberately absent (a declared-but-unused dependency).
+serde_json = "1"
+serde_yaml = "0.9"

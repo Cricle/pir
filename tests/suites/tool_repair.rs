@@ -1887,6 +1887,7 @@ async fn session_js_message_end_and_native_hook_share_one_ordered_chain() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("runtime");
     let loaded = runtime

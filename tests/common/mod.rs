@@ -173,6 +173,36 @@ pub async fn codex_ws_pool_guard() -> tokio::sync::MutexGuard<'static, ()> {
     codex_ws_pool_lock().lock().await
 }
 
+/// The ONE process-wide lock every test that RESETS and then reads the TUI
+/// frame counters (`pir::tui::{RowsWork, ToolMemoWork}`) must take.
+///
+/// Those counters are single process-global atomics (`ROWS_WORK`,
+/// `TOOL_MEMO_WORK`), not thread-locals: `RowsWork::reset()` zeroes the same
+/// seven atomics every renderer thread increments, and a renderer only bumps
+/// them when its own thread is measuring. So a concurrent render — any other
+/// TUI test drawing *any* frame — adds its own `pool_growth`/`row_writes`
+/// between one test's `reset()` and `snapshot()`, and a steady-frame assertion
+/// reads a non-zero pool growth it never caused
+/// (`tui_frame_reuse::user_bash_block_serves_its_whole_row_set_from_the_memo`
+/// failed exactly this way under `cargo test --test zz_merged_2`).
+///
+/// As with [`agent_dir_env_lock`], a lock declared inside one suite module only
+/// serializes that module: `tui_frame_reuse` and `tui_windowed_transcript`
+/// each had their own `static TEST_LOCK`, so they did not exclude each other.
+/// Declaring it here (once per test binary) makes every frame-measuring suite in
+/// the binary share one lock. Separate binaries are separate processes, so the
+/// per-binary copy cannot race across harnesses.
+///
+/// This is a **std** mutex: every holder is a synchronous `#[test]` rendering
+/// frames (no `.await` inside the critical section), so an async lock would
+/// only add a runtime dependency.
+pub fn tui_frame_counter_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Wait until the producer side of the Codex WebSocket transport has returned
 /// the previous turn's socket to the process-global pool.
 ///

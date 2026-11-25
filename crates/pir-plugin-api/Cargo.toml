@@ -1,0 +1,17 @@
+[package]
+name = "pir-plugin-api"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Engine-free plugin protocol for the pir coding agent: builtin descriptors, plugin events, tool results"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

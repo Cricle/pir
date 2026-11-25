@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Regenerate the deterministic zlib blobs embedded for the extension JS shims.
 
-The raw `src/extensions/api/js/*.js.txt` files remain the checked-in source of
-truth (tests and the SDK-surface auditors read them). The Rust extension host
-embeds `assets/shims/<name>.js.txt.deflate` via `include_bytes!` and inflates
-each blob once per process on first use (`src/extensions/api/embedded.rs`).
+The raw `crates/pir-core/src/extensions/api/js/*.js.txt` files remain the
+checked-in source of truth (tests and the SDK-surface auditors read them). The
+Rust extension host embeds `crates/pir-core/assets/shims/<name>.js.txt.deflate`
+via `include_bytes!` and inflates each blob once per process on first use
+(`crates/pir-core/src/extensions/api/embedded.rs`).
 
 Why the blobs live outside `src/`: the source-hygiene gate
 (`tests/suites/source_hygiene.rs`) reads *every* file under `src/` as UTF-8
@@ -33,8 +34,8 @@ import sys
 import zlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_DIR = os.path.join(REPO, "src", "extensions", "api", "js")
-OUT_DIR = os.path.join(REPO, "assets", "shims")
+SRC_DIR = os.path.join(REPO, "crates", "pir-core", "src", "extensions", "api", "js")
+OUT_DIR = os.path.join(REPO, "crates", "pir-core", "assets", "shims")
 SKIP = {"script_boot.js.txt"}  # embedded from src/main_cli (not this tranche)
 
 LEVEL = 9

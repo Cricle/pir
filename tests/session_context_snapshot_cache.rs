@@ -22,7 +22,7 @@
 //!   registration or a changed plugin-provider definition invalidates it.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use pir::agent_session::{AgentSession, AgentSessionConfig};
 use pir::ai::auth::{
@@ -39,27 +39,30 @@ use pir::session_manager::{
     reset_session_list_file_reads, session_list_file_reads, SessionManager,
 };
 
-/// Serializes every test in this file: the credential-cache test pins the
-/// process-global `PIR_AGENT_DIR` while it runs, and the other tests' pushes
+/// Serializes every test that pins or reads the process-global `PIR_AGENT_DIR`:
+/// the credential-cache test pins it while it runs, and the other tests' pushes
 /// read the same environment for their auth fingerprint.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+///
+/// It must be the SHARED lock, not a `static` declared here: the environment is
+/// process-global, so a suite-local mutex only serializes this file's tests and
+/// leaves the catalog-push assertions racing every other suite in the binary
+/// that pins the agent dir (`model_catalog_push_retries_after_a_transient_credential_load_failure`
+/// and its siblings failed exactly that way under
+/// `cargo test --test zz_merged_1` while passing in isolation).
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    crate::common::agent_dir_env_lock()
 }
 
 /// Pins `PIR_AGENT_DIR` for one test and restores it (panic included) on
-/// drop, while holding [`ENV_LOCK`] for the test's whole lifetime.
+/// drop, while holding the shared agent-dir lock for the test's whole lifetime.
 struct AgentDirOverride {
     previous: Option<std::ffi::OsString>,
-    _lock: MutexGuard<'static, ()>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl AgentDirOverride {
-    fn new(agent_dir: &Path) -> Self {
-        let lock = env_lock();
+    async fn new(agent_dir: &Path) -> Self {
+        let lock = env_lock().lock().await;
         let previous = std::env::var_os("PIR_AGENT_DIR");
         std::env::set_var("PIR_AGENT_DIR", agent_dir);
         Self {
@@ -586,6 +589,7 @@ fn extension_config(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -668,7 +672,7 @@ async fn snapshot_catalog(handle: &ExtensionHandle) -> serde_json::Value {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn unchanged_push_reuses_the_previous_snapshot() {
-    let _serial = env_lock();
+    let _serial = env_lock().lock().await;
     let temp = TempDir::new("reuse");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
@@ -769,7 +773,7 @@ async fn unchanged_push_reuses_the_previous_snapshot() {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn context_tokens_reports_last_usage_not_the_lifetime_total() {
-    let _serial = env_lock();
+    let _serial = env_lock().lock().await;
     let temp = TempDir::new("last-usage");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
@@ -863,7 +867,7 @@ async fn context_tokens_reports_last_usage_not_the_lifetime_total() {
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn cache_hit_does_not_walk_context_usage() {
-    let _serial = env_lock();
+    let _serial = env_lock().lock().await;
     let temp = TempDir::new("usage-calls");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
@@ -933,7 +937,7 @@ async fn cache_hit_does_not_walk_context_usage() {
 async fn model_catalog_push_is_cached_until_the_auth_environment_changes() {
     let temp = TempDir::new("catalog-cache");
     let agent_dir = TempDir::new("catalog-cache-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
 
     let cwd = temp.path().to_string_lossy().into_owned();
@@ -1026,7 +1030,7 @@ async fn model_catalog_push_is_cached_until_the_auth_environment_changes() {
 async fn model_catalog_push_retries_after_a_transient_credential_load_failure() {
     let temp = TempDir::new("catalog-load-retry");
     let agent_dir = TempDir::new("catalog-load-retry-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     std::fs::write(agent_dir.path().join("models.json"), "{ not valid json\n")
         .expect("write invalid models.json");
 
@@ -1081,7 +1085,7 @@ async fn model_catalog_push_retries_after_a_transient_credential_load_failure() 
 async fn model_catalog_push_detects_same_size_same_mtime_rewrite() {
     let temp = TempDir::new("catalog-same-stamp");
     let agent_dir = TempDir::new("catalog-same-stamp-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
     let path = agent_dir.path().join("models.json");
     let before = std::fs::metadata(&path)
@@ -1161,7 +1165,7 @@ async fn model_catalog_push_detects_an_auth_env_value_change() {
     const KEY_VAR: &str = "PIR_SNAP2_TEST_API_KEY";
     let temp = TempDir::new("catalog-env-change");
     let agent_dir = TempDir::new("catalog-env-change-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let _key = EnvVarOverride::set(KEY_VAR, "key-one");
     write_models_json_template(agent_dir.path(), "alpha", "$PIR_SNAP2_TEST_API_KEY");
 
@@ -1210,7 +1214,7 @@ async fn model_catalog_push_detects_an_auth_env_value_change() {
 async fn model_catalog_push_rebuilds_after_a_registry_registration() {
     let temp = TempDir::new("catalog-registry");
     let agent_dir = TempDir::new("catalog-registry-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
 
     let cwd = temp.path().to_string_lossy().into_owned();
@@ -1286,7 +1290,7 @@ async fn model_catalog_push_rebuilds_after_a_registry_registration() {
 async fn model_catalog_push_is_cached_across_plugin_provider_resyncs() {
     let temp = TempDir::new("catalog-plugin-provider");
     let agent_dir = TempDir::new("catalog-plugin-provider-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
 
     let cwd = temp.path().to_string_lossy().into_owned();
@@ -1373,7 +1377,7 @@ async fn model_catalog_push_is_cached_across_plugin_provider_resyncs() {
 async fn child_session_sharing_registry_installs_its_own_extension_api_keys() {
     let temp = TempDir::new("catalog-child-provider");
     let agent_dir = TempDir::new("catalog-child-provider-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
 
@@ -1437,7 +1441,7 @@ async fn child_session_sharing_registry_installs_its_own_extension_api_keys() {
 async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
     let temp = TempDir::new("catalog-child-oauth");
     let agent_dir = TempDir::new("catalog-child-oauth-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1576,7 +1580,7 @@ async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
 async fn child_session_cleanup_restores_the_parent_shared_oauth_provider() {
     let temp = TempDir::new("catalog-child-cleanup");
     let agent_dir = TempDir::new("catalog-child-cleanup-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1685,7 +1689,7 @@ async fn child_session_cleanup_restores_the_parent_shared_oauth_provider() {
 async fn child_session_cleanup_removes_provider_without_previous_owner() {
     let temp = TempDir::new("catalog-child-cleanup-no-previous");
     let agent_dir = TempDir::new("catalog-child-cleanup-no-previous-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let child_runtime = start_oauth_runtime(&temp, "child").await;
@@ -1739,7 +1743,7 @@ async fn child_session_cleanup_removes_provider_without_previous_owner() {
 async fn child_session_cleanup_does_not_remove_parent_replacement() {
     let temp = TempDir::new("catalog-child-cleanup-overwrite");
     let agent_dir = TempDir::new("catalog-child-cleanup-overwrite-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1810,7 +1814,7 @@ async fn child_session_cleanup_does_not_remove_parent_replacement() {
 async fn sibling_cleanup_skips_finished_sibling_and_removes_without_parent() {
     let temp = TempDir::new("catalog-sibling-cleanup-no-parent");
     let agent_dir = TempDir::new("catalog-sibling-cleanup-no-parent-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let sibling_a_runtime = start_oauth_runtime(&temp, "sibling-a").await;
@@ -1871,7 +1875,7 @@ async fn sibling_cleanup_skips_finished_sibling_and_removes_without_parent() {
 async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
     let temp = TempDir::new("catalog-sibling-cleanup-parent");
     let agent_dir = TempDir::new("catalog-sibling-cleanup-parent-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1948,7 +1952,7 @@ async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
 async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
     let temp = TempDir::new("catalog-sibling-cleanup-lifo");
     let agent_dir = TempDir::new("catalog-sibling-cleanup-lifo-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -2028,7 +2032,7 @@ async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
 async fn child_session_cleanup_after_definition_removal_still_removes_owned_provider() {
     let temp = TempDir::new("catalog-child-cleanup-defs-removed");
     let agent_dir = TempDir::new("catalog-child-cleanup-defs-removed-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
 
@@ -2078,7 +2082,7 @@ async fn child_session_cleanup_after_definition_removal_still_removes_owned_prov
 async fn stream_simple_rollback_to_plain_reinstalls_the_plain_provider() {
     let temp = TempDir::new("catalog-stream-rollback");
     let agent_dir = TempDir::new("catalog-stream-rollback-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
     let handle = ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
@@ -2148,7 +2152,7 @@ async fn stream_simple_rollback_to_plain_reinstalls_the_plain_provider() {
 async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows() {
     let temp = TempDir::new("catalog-provider-overlay-oauth");
     let agent_dir = TempDir::new("catalog-provider-overlay-oauth-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let auth_path = temp.path().join("auth.json");
     let mut base =
         ProviderRegistry::default().with_auth_storage(Arc::new(FileAuthStorage::new(auth_path)));
@@ -2506,7 +2510,7 @@ async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows(
 async fn single_session_plain_provider_keeps_registry_visibility() {
     let temp = TempDir::new("catalog-provider-overlay-plain");
     let agent_dir = TempDir::new("catalog-provider-overlay-plain-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
+    let _env = AgentDirOverride::new(agent_dir.path()).await;
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
     let config = agent_config_with_registry(
@@ -2641,7 +2645,7 @@ mod fragment_cache_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn append_pushes_extend_the_cached_fragments_and_stay_byte_equal() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         reset_fragment_cache_stats_for_test();
         let temp = TempDir::new("frag-extend");
         let cwd = temp.path().to_string_lossy().into_owned();
@@ -2745,7 +2749,7 @@ mod fragment_cache_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn label_append_extends_fragments_and_publishes_the_label() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         reset_fragment_cache_stats_for_test();
         let temp = TempDir::new("frag-label");
         let cwd = temp.path().to_string_lossy().into_owned();
@@ -2825,7 +2829,7 @@ mod fragment_cache_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn branch_falls_back_to_a_full_fragment_build() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         reset_fragment_cache_stats_for_test();
         let temp = TempDir::new("frag-branch");
         let cwd = temp.path().to_string_lossy().into_owned();
@@ -2945,7 +2949,7 @@ mod branch_text_cache_tests {
             .last()
             .expect("a recorded snapshot")
             .branch_json
-            .clone()
+            .to_string()
     }
 
     /// One push that must rebuild, then: the recorded `branch_json` equals the
@@ -2982,7 +2986,7 @@ mod branch_text_cache_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn branch_text_extends_on_appends_and_falls_back_on_structure_changes() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         reset_branch_text_cache_stats_for_test();
         let temp = TempDir::new("branch-text");
         let cwd = temp.path().to_string_lossy().into_owned();
@@ -3172,7 +3176,7 @@ mod branch_text_cache_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn branch_text_same_path_reload_serves_stale_bytes() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         let temp = TempDir::new("branch-reload");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
@@ -3287,7 +3291,7 @@ mod branch_text_cache_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn zero_message_cached_projection_splice_emits_invalid_json() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         let temp = TempDir::new("empty-aggregate");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
@@ -3383,7 +3387,7 @@ mod native_snapshot_shape_tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn native_only_push_skips_the_js_only_views_but_keeps_entries() {
-        let _serial = env_lock();
+        let _serial = env_lock().lock().await;
         let temp = TempDir::new("native-js-gate");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");

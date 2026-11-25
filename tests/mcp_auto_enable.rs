@@ -795,6 +795,7 @@ mod direct_bridge {
             system_prompt: String::new(),
             is_idle: true,
             limits: Some(Default::default()),
+            allow_process_exit: false,
         })
         .expect("extension runtime")
     }

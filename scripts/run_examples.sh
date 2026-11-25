@@ -46,21 +46,20 @@ run streaming "sdk"
 run plugin "sdk"
 run control "sdk"
 
-# Durable core (no cargo feature): host timer + report + native fallback.
-run dev_durable_timers ""
+# Durable runtime (the default-on `durable` feature / `pir-durable` crate):
+# host timer + report + native fallback.
+run dev_durable_timers "durable"
 
-# Durable core: on_report vs timer report, set_timer phase lifecycle.
-run dev_durable_reports ""
+# Durable runtime: on_report vs timer report, set_timer phase lifecycle.
+run dev_durable_reports "durable"
 
 # The only example that persists/attaches transcript files.
 run sessions "sdk,session"
 
-# Real file edit + real Python test. Needs PIR_PYTHON pointing at a Python 3
-# binary. It does NOT skip when the variable is unset: the example falls back
-# to `python` on PATH, so on a host where `python` is the Windows Store
-# placeholder (or absent) this step fails with a nonzero exit instead of
-# silently passing. That is deliberate — a skipped repair step would make the
-# only end-to-end edit+test example vacuous.
+# Real file edit + real shell test suite. The example needs `bash` on PATH;
+# it does not skip when bash is absent, so a broken host fails this step
+# instead of silently passing. That is deliberate — a skipped repair step
+# would make the only end-to-end edit+test example vacuous.
 run mini_coding "sdk,tools"
 
 # Persistent-session extras: compaction evidence, and lifecycle subcommands

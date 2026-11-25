@@ -1,6 +1,25 @@
-# FEATURES.md — feature contract (2026-10-27)
+# FEATURES.md — feature contract
 
 Contract, not a measurement log. Current baselines: [`RESULTS.md`](../RESULTS.md).
+
+> **Crate ownership (2026-11-21):** the engine features in this document are
+> declared in `crates/pir-core/Cargo.toml`; `tui`/`image-protocol` are
+> front-end features owned by `crates/pir-tui` and `pir-sdk`. The facade
+> forwards every user-facing name unchanged (`session`, `extensions`, …), so
+> the matrix and all documented commands behave as described. See
+> [`architecture.md`](architecture.md).
+>
+> **Builtin features forward to a published crate (2026-11-25):** each builtin
+> feature (`subagent`, `mode`, `mcp`, `codemode` under `extensions`,
+> `context-mode`, `tool-search`, `tool-repair`, `todo`, `memory`, `phone`) also
+> enables the matching optional `pir-builtin-*` dependency, which carries that
+> builtin's pure logic. Turning a feature off drops BOTH the crate and the
+> in-engine runtime, so the "feature off" behavior below is unchanged.
+>
+> `mode` is an alias of `subagent`: the foreman/plan session modes are only
+> meaningful on top of the `subagent` tool they delegate through, so enabling
+> `mode` enables `subagent`. The alias exists so every builtin has a feature of
+> its own name instead of being reachable only as a side effect.
 
 ## 1. Contract
 
@@ -8,19 +27,24 @@ Contract, not a measurement log. Current baselines: [`RESULTS.md`](../RESULTS.md
    `--no-default-features` is runnable; every other surface is a cargo feature. `default = ["full"]`.
 2. A feature-off build must be usable: the command is absent or returns the exact documented off-error (``this
    build was built without the `X` feature`` for commands, ``this build was compiled without the `X` feature`` for
-   the `--tools` diagnostics). No panic, no silent no-op. The `pir grep|sed|python` native fallback is the one
+   the `--tools` diagnostics). No panic, no silent no-op. The `pir grep|sed` native fallback is the one
    deliberate silent swap (`--no-fallback`/`PIR_NATIVE_FALLBACK=0` disables it).
 3. A `#[cfg]` must never change the feature-ON path.
 4. `Cargo.toml` is single-writer: declare the feature/optional deps before gating code.
-5. `scripts/feature_matrix.sh` asserts **85 cargo invocations** (57 lib + 18 bin + 2 SDK consumer + 8 smoke). Every selectable
-   feature except `default`/`full` has its own `cargo check --lib --no-default-features --features <f>` row.
+5. `scripts/feature_matrix.sh` asserts **119 cargo invocations**: 87 root-package rows (59 lib + 18 bin + 2 SDK consumer + 8 smoke) plus 32 support-crate rows (16 extracted crates × no-default + all-features). Every selectable
+feature except `default`/`full` has its own `cargo check --lib --no-default-features --features <f>` row.
+
 
 ## 2. Feature graph
 
 **Core (always compiled):** `agent`, `agent_session`, `ai` (plain `/chat/completions` adapter;
 Responses/Codex/`pi-messages` are `provider-*`-gated), `minimal` (zero-feature profile), `config`, `compaction`,
-`durable`, `diagnostics`, `env_client`, `logging`, `plugins` framework, `protocol`, `session_manager`,
-`system_prompt`, `telemetry`, `text`, `coding_agent::json` and tool plumbing. Every core-tool leaf is off (the
+`diagnostics`, `env_client`, `logging`, `plugins` framework, `session_manager`,
+`system_prompt`, `coding_agent::json` and tool plumbing. `durable`, `telemetry`, `protocol`, the AI value types
+(`ai::types`/`ai::util`/`ai::event_stream`/`ai::error`/the transport seam), the terminal-text helpers (`text`) and
+the on-disk session record types (`session_manager::types`) are separate crates (`pir-durable`, `pir-telemetry`,
+`pir-protocol`, `pir-ai-types`) re-exported at their historical paths; `durable` is the one that is also a cargo
+feature. Every core-tool leaf is off (the
 seven `tool-*` leaves and `grep-find`), so `register_core_tools` is a no-op and `CORE_TOOL_NAMES` is empty.
 The core's HTTP stack (`reqwest` + native-tls behind `ai::transport`/`ai::auth::http`) is deliberately
 unconditional: the plain OpenAI-compatible adapter is core (the `minimal` profile needs one runnable wire
@@ -50,11 +74,13 @@ provider) and every OAuth flow drives the shared auth HTTP client, so every feat
 | `tools` | meta-feature over the seven `tool-*` leaves above |
 | `grep-find` | in-process ripgrep `grep`/`find`; an **independent leaf** — does NOT imply `tools` or any `tool-*`, so a search-only embed compiles grep/find without read/bash/edit/write/ls/background; `tool-grep`/`tool-find` deferred |
 | `image-tools` | inline images in `read` (the `image` crate; no separate `image` tool) |
+| `image-resize` | engine-side image codec/resize helpers without enabling the full `image-tools` tool surface |
 | `tui` | terminal UI: loop, editor, renderers, clipboard, themes, mermaid |
+| `pir-native-shell/desktop` | workspace-only experimental Native Shell/NSH + GPUI desktop front end; build with `cargo build -p pir-native-shell --features desktop`, not through `pir-sdk` |
+| `pir-native-shell/mobile` | workspace-only target-gated iOS UIKit / Android JNI adapter boundary; not a published `pir-sdk` facade feature |
 | `image-protocol` | half-block preview renderer in the TUI (`/image`); default-on in `full`, independently disableable; off: `terminal.showImages: true` renders the `[Image: …]` text fallback |
 | `extensions` | QuickJS, JS/TS + SWC, `node:*`, `codemode`, hooks/widgets |
-| `python` | embedded RustPython `python` |
-| `context-mode` | `ctx_*` + FTS5/BM25 (implies `python`) |
+| `context-mode` | `ctx_*` Code Mode (JavaScript/TypeScript on the embedded QuickJS suite) + FTS5/BM25 (implies `extensions`) |
 | `mcp` / `mcp-sd` | MCP client + builtin (implies `extensions`) / `pir mcp-sd` stdio server (implies `mcp`) |
 | `env` / `env-daemon` | env-daemon watch/list backend (`notify` + `ignore`; dependency-only alone, implied by `env-daemon`) / built-in pi-env protocol-v1 daemon (`pir env-daemon`; implies `env`, `frame`/`decode` stay core) |
 | `server` | in-tree `pir server` |
@@ -77,16 +103,18 @@ feature compiles only the remote agent client (`/phone-start wss://...`); the
 legacy embedded HTTP server is gone. See
 [`docs/phone-server.md`](phone-server.md).
 
-**Not features:** `compaction`/`telemetry` are core (public types span 21 files; no-op stubs rejected); `durable`
-is core; `bug_report` is gated by `tui`; `print`/`rpc`/`export-html` and the `env-daemon` split are features.
+**Not features:** `compaction` is core (public types span 21 files; no-op stubs rejected); `durable` is the
+default-on `durable` feature that pulls the separate `pir-durable` crate (re-exported at `crate::durable`; a slim
+embed drops it with `--no-default-features`); `telemetry` is likewise the separate `pir-telemetry` crate re-exported
+unconditionally (`Telemetry::noop()` is the off path, not a feature); `bug_report` is gated by `tui`; `print`/`rpc`/`export-html` and the `env-daemon` split are features.
 Remaining deferred split: `tool-grep`/`tool-find` (both stay under `grep-find`); `grep-find` owns only
 `grep-searcher`/`grep-regex`/`ignore` and implies no `tools`/`tool-*`. No `sqlite` feature:
-`node:sqlite`/better-sqlite3 ride `extensions`; `context-mode` pulls bundled SQLite via `rusqlite`; `python` pulls
-bundled `libsqlite3-sys`, so SQLite cannot be removed while Python is kept. SDK scope: [`docs/sdk.md`](sdk.md).
+`node:sqlite`/better-sqlite3 ride `extensions`; `context-mode` pulls bundled SQLite via `rusqlite` through its
+`extensions` dependency. SDK scope: [`docs/sdk.md`](sdk.md).
 
 ## 3. Default-on policy
 
-Default-on: `subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool-search`, `tool-repair`, `todo`,
+Default-on: `subagent`, `mcp`, `codemode`, `context-mode`, `tool-search`, `tool-repair`, `todo`,
 `memory` (mcp drags extensions; codemode needs extensions; context-mode lazy; memory's store lives next to the
 session transcript). `phone` is **off** even in `full` — it opens an outbound
 connection to the central relay and needs a server URL/device token. `--only-builtin` loads exactly the Rust builtins (no settings/package scan, QuickJS, SWC or `node:*`);
@@ -96,15 +124,16 @@ connection to the central relay and needs a server URL/device token. `--only-bui
 
 **`balanced` (the default) declares a deliberate SUPERSET of upstream pi's
 `DEFAULT_TOOL_NAMES`.** With no `--tools` / `settings.defaultTools`, a full
-build declares **22 tools**: the registration-active core nine plus the 13
+build declares **24 tools**: the registration-active core nine plus the 15
 default-active builtin-extension tools.
 
 Core nine: `background_abort`, `background_status`, `bash`, `edit`, `find`,
 `grep`, `ls`, `read`, `write` (`powershell` stays registered-but-inactive,
-exactly like upstream). Builtin thirteen: `ctx_batch_execute`, `ctx_doctor`,
-`ctx_execute`, `ctx_execute_file`, `ctx_fetch_and_index`, `ctx_index`,
-`ctx_purge`, `ctx_search`, `ctx_stats`, `python`, `todo`, `memory`,
-`subagent` — all default-active under the builtin-extension policy (§3).
+exactly like upstream). Builtin fifteen: `ctx_batch`, `ctx_batch_execute`,
+`ctx_doctor`, `ctx_execute`, `ctx_execute_file`, `ctx_execute_tool`,
+`ctx_fetch_and_index`, `ctx_index`, `ctx_purge`, `ctx_resume`, `ctx_search`,
+`ctx_stats`, `todo`, `memory`, `subagent` — all default-active under the
+builtin-extension policy (§3).
 `--no-extensions` leaves the core nine; `codemode`, `tool_search`, `powershell`
 and MCP bridges stay registered-but-not-declared unless selected. Upstream pi
 declares four (`read`, `bash`, `edit`, `write`).
@@ -112,14 +141,14 @@ declares four (`read`, `bash`, `edit`, `write`).
 This is a product decision, not drift: the extra core five are pir's own
 capabilities — the in-process ripgrep `grep`/`find` pair, `ls`, and the
 scheduler-owned `background_status`/`background_abort` controls (see
-`docs/tui.md` and `MAPPING.md` for the background/detach surface) — and the 13
+`docs/tui.md` and `MAPPING.md` for the background/detach surface) — and the 15
 builtins are the default-on extension layer. The measured cost of the full
-declaration is ~+30.7 KB of `tools[]` JSON on the first request (~+7.7k tokens
-at 4 chars/token; ~26 KB of it the builtins), against pi's 4-tool 2,969 B (see
-the round-1 A/B report at
-`.play/evidence/ab-round1/lane-ab-prompt/REPORT.md` § 7 and the 2026-11-14
-decision brief `.play/live-assist/x10-tool-loadout.md`, which records this as
-the decided deliberate deviation).
+24-tool declaration is **~+33 KB of `tools[]` JSON on the first request
+(~+8.3k tokens at 4 chars/token), ~28 KB of it the builtins**, against pi's
+4-tool 2,969 B. (An earlier `~+30.7 KB / ~+7.7k tokens` figure is the 22-tool
+measurement taken before `ctx_batch`/`ctx_resume`/`ctx_execute_tool` were added;
+the builtin layer accounts for the difference.) This is the decided deliberate
+deviation, recorded 2026-11-14.
 
 Two ways to shrink it, both first-class:
 
@@ -144,7 +173,7 @@ the tree).
 |---|---|
 | `full` | `default = ["full"]` |
 | `minimal` | `--no-default-features` (the `minimal` marker adds nothing). Builds `pir-minimal`, not the full `pir` CLI: one OpenAI-compatible provider, one `read_file` tool, in-memory session |
-| `no-js` | `cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,memory,python,context-mode,phone,provider-*,tools,grep-find,image-tools,session,skills` |
+| `no-js` | `cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,memory,context-mode,phone,provider-*,tools,grep-find,image-tools,session,skills` |
 | `tui-slim` | `cli,tui,tools,provider-openai,provider-anthropic,session,skills` (no `env-daemon`) |
 | `sdk-headless` | bare + needed `provider-*`/`sdk` |
 
@@ -170,14 +199,14 @@ GNU, fat tables pinned per combo.
 | `memory` | +4.57 MiB | cm-memory (+12) | R28 100 prompts: 16.35 / 30.0 MiB (+10.10 live over baseline; store resident) |
 | `extensions` | +21.32 MiB | rquickjs/swc/crypto/rusqlite (+333) | — |
 | `mcp` | +39.85 MiB | rmcp + extensions tree (+426) | R29 100 engine drives: 5.54 / 25.0 MiB (+3.36 live / +9.49 WS) |
-| `python` | +33.09 MiB | RustPython (+391) | R29 100 engine drives: 9.82 / 46.2 MiB (+7.64 live / +30.7 WS) |
-| `context-mode` | +34.92 MiB | python + rusqlite (+399) | R29 100 engine drives: 11.77 / 32.4 MiB (+9.60 live / +16.9 WS) |
+| `context-mode` | +0.0 MiB over `extensions` | rusqlite (already linked by `extensions`) | reuses the QuickJS suite; no separate interpreter |
 | `image-tools` | +0.00 MiB | image (+31, already linked) | — |
 | `session+tools` | +2.32 MiB | memmap2 | R28 100 prompts: 11.08 / 26.4 MiB (+4.82 live over baseline) |
 
 MiB = 1024² bytes (the R28/R29 REPORT tables quote the same samples in
-decimal MB, ~5% larger: memory +10.59 MB, mcp +3.52 MB, python +8.01 MB,
-context-mode +10.06 MB live deltas).
+decimal MB, ~5% larger: memory +10.59 MB, mcp +3.52 MB, context-mode
++10.06 MB live deltas). `context-mode` now runs JavaScript on the same
+`extensions` QuickJS suite and links no separate interpreter.
 
 Zero tui/ratatui/crossterm/phone packages in every combo (the optionality
 leak check; `rquickjs` appears only under the documented
@@ -196,7 +225,6 @@ import. Idle WS 6,208–8,356 KiB (6.1–8.2 MiB), warm start 30–43 ms across 
 |---|---|
 | `tui` | `` `interactive mode` is unavailable: this build was built without the `tui` feature ``; `--mode rpc` works; `--list-models` substring filter |
 | `extensions` | `pir js`/`__codemode-worker` missing-feature; on-disk `-e` dropped with a `pir:` diagnostic; `builtin:codemode` not compiled; handles report no JS runtime |
-| `python` | `builtin:python` not compiled; `pir python` falls back to system python unless `--no-fallback` |
 | `context-mode` | `builtin:context-mode` not compiled; no `ctx_*` |
 | `mcp` / `mcp-sd` | `mcp check/list/login/logout`, `mcp-sd` missing-feature; `builtin:mcp` not compiled; `mcp add/remove` still write config / `pir mcp-sd` reports missing `mcp-sd` (the `cli,mcp` build compiles; tested) |
 | `env` / `env-daemon` | dependency-only backend (no daemon): `pir env-daemon` needs `env-daemon` / `` `pir env-daemon` is unavailable: this build was built without the `env-daemon` feature `` (exit 1); `frame`/`decode` and the remote-env client still compile |
@@ -240,7 +268,7 @@ a user must never lose visible information silently (PROTOCOL v8 §5).
 ## 6. Verification
 
 ```bash
-bash scripts/feature_matrix.sh            # 85 cargo invocations (57 lib + 18 bin + 2 consumer + 8 smoke)
+bash scripts/feature_matrix.sh            # 119 invocations (87 root + 32 support-crate)
 cargo check --lib --no-default-features --features tool-read   # each feature alone
 cargo check --lib --no-default-features --features grep-find   # independent search leaf
 cargo check --bin pir-minimal --no-default-features            # zero-feature agent
@@ -259,5 +287,5 @@ every other leaf reports its own missing-feature diagnostic.
 
 ## 7. Boundaries
 
-- `mcp→extensions`, `mcp-sd→mcp`, `context-mode→python`, `image-protocol→tui` are deliberate. The seven
+- `mcp→extensions`, `mcp-sd→mcp`, `context-mode→extensions`, `image-protocol→tui` are deliberate. The seven
   `tool-*` leaves are dependency-free; `tools` is exactly their union.

@@ -65,8 +65,12 @@ struct FakeUi {
     notices: Mutex<Vec<String>>,
     /// Prefix of the option value to select (e.g. "approve" or "deny").
     select_prefix: Mutex<Option<String>>,
+    /// Per-call overrides consumed before `select_prefix` (review → approve).
+    select_script: Mutex<Vec<String>>,
     select_values: Mutex<Vec<String>>,
     last_select_title: Mutex<Option<String>>,
+    /// `(title, prefill)` of every editor dialog opened.
+    editor_requests: Mutex<Vec<(String, String)>>,
 }
 
 impl Default for FakeUi {
@@ -74,8 +78,10 @@ impl Default for FakeUi {
         Self {
             notices: Mutex::new(Vec::new()),
             select_prefix: Mutex::new(None),
+            select_script: Mutex::new(Vec::new()),
             select_values: Mutex::new(Vec::new()),
             last_select_title: Mutex::new(None),
+            editor_requests: Mutex::new(Vec::new()),
         }
     }
 }
@@ -92,6 +98,13 @@ impl FakeUi {
     fn selecting(prefix: &str) -> Arc<Self> {
         let ui = Arc::new(Self::default());
         *ui.select_prefix.lock().unwrap() = Some(prefix.to_owned());
+        ui
+    }
+
+    /// Queue one prefix per dialog call, e.g. ["review", "approve"].
+    fn selecting_script(prefixes: &[&str]) -> Arc<Self> {
+        let ui = Arc::new(Self::default());
+        *ui.select_script.lock().unwrap() = prefixes.iter().map(|p| (*p).to_owned()).collect();
         ui
     }
 }
@@ -112,7 +125,15 @@ impl UiService for FakeUi {
     ) -> ServiceFuture<'static, ServiceResult<Option<String>>> {
         *self.last_select_title.lock().unwrap() = Some(title.to_owned());
         *self.select_values.lock().unwrap() = options.iter().map(|o| o.value.clone()).collect();
-        let prefix = self.select_prefix.lock().unwrap().clone();
+        let scripted = {
+            let mut script = self.select_script.lock().unwrap();
+            if script.is_empty() {
+                None
+            } else {
+                Some(script.remove(0))
+            }
+        };
+        let prefix = scripted.or_else(|| self.select_prefix.lock().unwrap().clone());
         let choice = prefix.and_then(|prefix| {
             options
                 .iter()
@@ -120,6 +141,20 @@ impl UiService for FakeUi {
                 .map(|o| o.value.clone())
         });
         Box::pin(async move { Ok(choice) })
+    }
+
+    fn editor(
+        &self,
+        title: &str,
+        prefill: Option<&str>,
+        _dialog: DialogOptions,
+    ) -> ServiceFuture<'static, ServiceResult<Option<String>>> {
+        self.editor_requests
+            .lock()
+            .unwrap()
+            .push((title.to_owned(), prefill.unwrap_or_default().to_owned()));
+        // A dismissed read-only review (Esc).
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -190,7 +225,6 @@ const ALL_TOOLS: &[&str] = &[
     "bash",
     "edit",
     "write",
-    "python",
     "codemode",
     "memory",
 ];
@@ -316,6 +350,24 @@ async fn emit_prompt(host: &PluginHost, with_options: bool) -> Value {
         .expect("emit before_agent_start");
     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
     payload
+}
+
+/// The handler result, where `before_agent_start` injections land (they are
+/// merged into the outcome, not the mutable event payload).
+async fn emit_prompt_result(host: &PluginHost) -> Value {
+    let mut payload = json!({
+        "type": "before_agent_start",
+        "messageType": "user",
+        "prompt": "do the task",
+        "systemPrompt": "base prompt",
+        "systemPromptOptions": { "sections": {} }
+    });
+    let outcome = host
+        .emit("before_agent_start", &mut payload)
+        .await
+        .expect("emit before_agent_start");
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    outcome.result
 }
 
 async fn emit_tool(host: &PluginHost, tool: &str) -> Value {
@@ -503,7 +555,7 @@ async fn foreman_hides_non_allowlisted_tool_declarations() {
         sorted,
         "the host aggregate must expose the plugin's filter"
     );
-    for tool in ["bash", "edit", "write", "python", "codemode", "memory"] {
+    for tool in ["bash", "edit", "write", "codemode", "memory"] {
         assert!(
             hidden.iter().any(|name| name == tool),
             "foreman must hide `{tool}` from the model: {hidden:?}"
@@ -651,6 +703,43 @@ async fn plan_mode_hides_mutations_and_blocks_execution_subagents() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn foreman_reviewer_only_call_loses_write_capable_tools() {
+    let session = FakeSession::new(true, &["subagent", "read"]);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("enable foreman");
+
+    // Reviewer-only calls are exempt from manual approval, so the plugin must
+    // strip write-capable tools even when the caller asks for them.
+    let mut payload = json!({
+        "type": "tool_call",
+        "toolCallId": "call-reviewer-tools",
+        "toolName": "subagent",
+        "input": {
+            "agent": "reviewer",
+            "task": "verify the delivered file",
+            "tools": ["read", "write", "edit", "bash"],
+        },
+    });
+    let outcome = host
+        .emit("tool_call", &mut payload)
+        .await
+        .expect("emit reviewer call");
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    let tools: Vec<&str> = payload["input"]["tools"]
+        .as_array()
+        .expect("tools overridden")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(tools, vec!["read", "grep", "find", "ls", "bash"]);
+    assert!(!tools.contains(&"write"), "{tools:?}");
+    assert!(!tools.contains(&"edit"), "{tools:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reviewer_structured_verdicts_win_over_text() {
     assert!(
         !gate_after_reviewer_text(r#"{"verdict":"PASS","evidence":"all checks pass"}"#).await,
@@ -693,6 +782,62 @@ async fn reviewer_structured_verdicts_win_over_text() {
         gate_after_reviewer_text("PASS verdict FAIL after recheck").await,
         "a PASS followed by an explicit FAIL verdict must not be read as success"
     );
+    // `visual` reports the evidence available to the reviewer; it must never
+    // override the verdict itself.
+    assert!(
+        !gate_after_reviewer_text(
+            r#"{"verdict":"PASS","visual":"not_checked","evidence":"no UI artifact"}"#
+        )
+        .await,
+        "visual=not_checked must not downgrade a structured PASS"
+    );
+    assert!(
+        gate_after_reviewer_text(
+            r#"{"verdict":"FAIL","visual":"verified","evidence":"screenshot shows overlap"}"#
+        )
+        .await,
+        "visual=verified must not upgrade a structured FAIL"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreman_gate_rejects_truncated_workers_and_reviewers() {
+    let session = FakeSession::new(true, &["subagent", "read"]);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("enable foreman");
+
+    // A worker that hit the model's output limit produced a truncated file;
+    // the reviewer gate must not treat that generation as verifiable.
+    emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
+    let mut worker = reviewer_tool_result("call-worker", "partial output");
+    worker["details"]["results"][0]["agent"] = json!("worker");
+    worker["details"]["results"][0]["stopReason"] = json!("length");
+    let result = emit_settle(&host, completed_turn(vec![worker])).await;
+    assert_eq!(result["continue"], true, "{result}");
+    assert!(
+        result["entries"][0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("failed"),
+        "a truncated worker must be reported as failed work: {result}"
+    );
+
+    // A reviewer that itself hit the output limit cannot return a trustworthy
+    // verdict, even when its visible text starts with a JSON PASS.
+    emit_tool_input(&host, "subagent", "call-review", reviewer_input()).await;
+    let mut review = reviewer_tool_result(
+        "call-review",
+        r#"{"verdict":"PASS","visual":"not_checked","evidence":"looks fine"}"#,
+    );
+    review["details"]["results"][0]["stopReason"] = json!("length");
+    let result = emit_settle(&host, completed_turn(vec![review])).await;
+    assert_eq!(
+        result["continue"], true,
+        "a truncated reviewer must not satisfy the gate: {result}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -723,6 +868,9 @@ async fn foreman_switches_prompt_and_status_and_normal_restores_them() {
     assert!(section.contains("`subagent`"), "{section}");
     assert!(section.contains("reviewer"), "{section}");
     assert!(section.contains("restricted"), "{section}");
+    assert!(section.contains("an authorized smoke command"), "{section}");
+    assert!(section.contains("first execution cycle"), "{section}");
+    assert!(section.contains("independent execution"), "{section}");
     let rendered = pir::extensions::system_prompt_options::SystemPromptOptions::from_json(
         &payload["systemPromptOptions"],
     )
@@ -762,6 +910,14 @@ async fn foreman_switches_prompt_and_status_and_normal_restores_them() {
         .as_str()
         .unwrap_or_default();
     assert!(plan_section.contains("<plan_mode>"), "{plan_section}");
+    let plan_flat = plan_section
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        plan_flat.contains("startup and first execution cycle"),
+        "plan verification must require executing runnable deliverables: {plan_section}"
+    );
     assert!(
         plan_payload["systemPromptOptions"]["sections"]
             .get("foreman_mode")
@@ -772,6 +928,34 @@ async fn foreman_switches_prompt_and_status_and_normal_restores_them() {
         .await
         .expect("leave plan mode");
     assert_eq!(status.text("mode"), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mode_switch_injects_a_one_shot_transition_message() {
+    let session = FakeSession::new(true, &["subagent", "read"]);
+    let status = Arc::new(FakeStatus::default());
+    let (host, _plugin) = host_with(session, status);
+
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("enable foreman");
+
+    let first = emit_prompt_result(&host).await;
+    let text = first["messages"]
+        .as_array()
+        .and_then(|messages| messages.first())
+        .and_then(|message| message.pointer("/content/0/text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(text.contains("MODE CHANGED to foreman"), "{first}");
+    assert!(text.contains("supersedes"), "{first}");
+
+    // The note belongs to the transition, not to every later turn.
+    let second = emit_prompt_result(&host).await;
+    assert!(
+        second.get("messages").is_none(),
+        "the transition note must be one-shot: {second}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -850,6 +1034,69 @@ async fn foreman_approval_queue_journals_and_resumes_the_next_worker() {
     let outcome = host.emit("tool_call", &mut retry).await.expect("retry");
     assert_ne!(outcome.result["block"], true, "{:?}", outcome.result);
     assert_eq!(retry["input"]["executor"], "process");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_approval_id_covers_the_request_authority() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-approval-id-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let (host, _plugin) = host_with(session, Arc::new(FakeStatus::default()));
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("enable foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual approvals");
+
+    // Same task text, different authority: a read-only approval must not
+    // unlock a request that also carries `write`.
+    for (call, tools) in [
+        ("call-narrow", json!(["read"])),
+        ("call-wide", json!(["read", "write"])),
+    ] {
+        let mut payload = json!({
+            "type": "tool_call",
+            "toolCallId": call,
+            "toolName": "subagent",
+            "input": { "agent": "worker", "task": "do the thing", "tools": tools },
+        });
+        let outcome = host
+            .emit("tool_call", &mut payload)
+            .await
+            .expect("tool_call");
+        assert_eq!(outcome.result["block"], true, "{:?}", outcome.result);
+    }
+
+    let mut journal_path = path.as_os_str().to_owned();
+    journal_path.push(".foreman.jsonl");
+    let journal =
+        std::fs::read_to_string(std::path::PathBuf::from(journal_path)).expect("foreman journal");
+    let ids: Vec<String> = journal
+        .lines()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            (value.get("t") == Some(&Value::String("approval".to_owned()))
+                && value.get("state") == Some(&Value::String("requested".to_owned())))
+            .then(|| value.get("id")?.as_str().map(str::to_owned))
+            .flatten()
+        })
+        .collect();
+    assert_eq!(
+        ids.len(),
+        2,
+        "two distinct requests need two approvals: {ids:?}"
+    );
+    assert_ne!(ids[0], ids[1], "the tool list must affect the id: {ids:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1106,6 +1353,75 @@ async fn approving_worker_a_does_not_admit_worker_b() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_consumed_worker_approval_stays_consumed_after_resume() {
+    let dir = std::env::temp_dir().join(format!(
+        "pir-mode-consume-resume-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let (host, _plugin) = host_with(session, Arc::new(FakeStatus::default()));
+    host.dispatch_command("mode", "foreman")
+        .await
+        .expect("foreman");
+    host.dispatch_command("foreman", "approvals manual")
+        .await
+        .expect("manual");
+
+    let input = worker_input();
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a", input.clone()).await["block"],
+        true
+    );
+    let journal_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".foreman.jsonl");
+        std::path::PathBuf::from(p)
+    };
+    let journal = std::fs::read_to_string(&journal_path).expect("journal");
+    let id = journal
+        .lines()
+        .find_map(|line| {
+            let v: Value = serde_json::from_str(line).ok()?;
+            (v.get("t") == Some(&Value::String("approval".to_owned()))
+                && v.get("state") == Some(&Value::String("requested".to_owned())))
+            .then(|| v.get("id")?.as_str().map(str::to_owned))
+            .flatten()
+        })
+        .expect("approval id");
+    pir::foreman::decide_approval(&path, Some(&id), true).expect("approve");
+    let mut start = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut start)
+        .await
+        .expect("restore");
+
+    // The one-shot approval admits the matching delegation once.
+    assert_ne!(
+        emit_tool_input(&host, "subagent", "call-a2", input.clone()).await["block"],
+        true,
+        "the approved delegation must run"
+    );
+
+    // A restart replays the journal: the persisted consumption must win over
+    // the old Approved snapshot, so the same delegation is gated again.
+    let mut restart = json!({"type": "session_start", "reason": "resume"});
+    host.emit("session_start", &mut restart)
+        .await
+        .expect("restore after consumption");
+    assert_eq!(
+        emit_tool_input(&host, "subagent", "call-a3", input).await["block"],
+        true,
+        "a consumed approval must not be re-armed by a replay"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// approve-all (a single CLI decision over all pending) must grant EVERY
 /// pending worker, not just the last one. Previously `allow_next_worker_id`
 /// was a single slot, so the second approval overwrote the first and the
@@ -1184,7 +1500,6 @@ async fn foreman_blocks_direct_mutation_and_allows_read_only_and_subagent() {
         "powershell",
         "edit",
         "write",
-        "python",
         "codemode",
         "ctx_execute",
         "ctx_execute_file",
@@ -1393,6 +1708,9 @@ async fn foreman_gate_requires_a_reviewer_after_a_worker() {
             .contains("reviewer"),
         "{result}"
     );
+    let nudge = entry["content"].as_str().unwrap_or_default();
+    assert!(nudge.contains("an authorized smoke command"), "{result}");
+    assert!(nudge.contains("first execution cycle"), "{result}");
     assert_eq!(
         ui.notices()
             .iter()
@@ -1446,7 +1764,7 @@ async fn reviewer_pass_after_a_worker_allows_settle() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn reviewer_pass_in_a_chain_satisfies_the_gate() {
+async fn reviewer_pass_in_a_mixed_chain_cannot_verify_the_worker() {
     let session = FakeSession::new(true, &["subagent", "read"]);
     let status = Arc::new(FakeStatus::default());
     let (host, _plugin) = host_with(session, status);
@@ -1472,7 +1790,14 @@ async fn reviewer_pass_in_a_chain_satisfies_the_gate() {
         completed_turn(vec![reviewer_tool_result("call-chain", "PASS")]),
     )
     .await;
-    assert_ne!(result["continue"], true, "{result}");
+    // Both agents share one call id, so the PASS could cover work that ran
+    // concurrently (parallel) or afterwards (a reviewer-first chain). The
+    // foreman contract requires a separate reviewer call; a mixed call must
+    // not settle as verified.
+    assert_eq!(
+        result["continue"], true,
+        "a mixed worker+reviewer call must stay gated: {result}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1499,6 +1824,17 @@ async fn reviewer_fail_error_and_stderr_keep_the_gate() {
         let result = emit_settle(&host, completed_turn(vec![reviewer_result])).await;
         assert_eq!(result["continue"], true, "{label}: {result}");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reviewer_first_frame_failure_keeps_the_gate() {
+    assert!(
+        gate_after_reviewer_text(
+            r#"{"verdict":"FAIL","visual":"not_checked","evidence":"node first_frame.cjs first-frame broken.html exited 1: the first menu frame read particles.length before initialization; syntax checks passed."}"#,
+        )
+        .await,
+        "a failed runtime check must not settle even when syntax passes"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1804,7 +2140,7 @@ fn submit_plan_input(plan: &str) -> Value {
 }
 
 fn submit_plan_input_with_verification(plan: &str, verification: &str) -> Value {
-    json!({ "plan": plan, "verification": verification })
+    json!({ "plan": plan, "verification": [verification] })
 }
 
 /// A successful shell command: assistant toolCall paired with a zero-exit
@@ -2091,6 +2427,9 @@ async fn approve_plan_with_verification_value(
 ) -> (PluginHost, Arc<FakeStatus>) {
     let path = dir.join("session.jsonl");
     let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
+    // Approval can enumerate an (empty) transcript, so the baseline is a
+    // complete empty set rather than "unknown" (which fail-closes the gate).
+    session.set_entries(json!([]));
     let status = Arc::new(FakeStatus::default());
     let ui = FakeUi::selecting("approve");
     let messages = Arc::new(FakeMessages::default());
@@ -2115,12 +2454,63 @@ async fn approve_plan_with_verification_value(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn approvals_offer_a_read_only_plan_review() {
+    let dir = plan_dir("review");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
+    session.set_entries(json!([]));
+    let status = Arc::new(FakeStatus::default());
+    // First menu call opens the review, the second approves the plan.
+    let ui = FakeUi::selecting_script(&["review", "approve"]);
+    let messages = Arc::new(FakeMessages::default());
+    let (host, _plugin) = host_with_plan(session, Arc::clone(&status), ui.clone(), messages);
+    host.dispatch_command("mode", "plan")
+        .await
+        .expect("enter plan mode");
+    let outcome = emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification("1. build the thing\n2. verify it", "cargo test"),
+    )
+    .await;
+    assert_eq!(outcome["block"], true, "{outcome}");
+
+    let result = host
+        .dispatch_command("approvals", "")
+        .await
+        .expect("approvals command");
+    assert!(result.ok, "{result:?}");
+    let text = result.error.unwrap_or_default();
+    assert!(text.contains("Approved plan"), "{text}");
+
+    let requests = ui
+        .editor_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].0.contains("Plan "), "{}", requests[0].0);
+    assert!(
+        requests[0].1.contains("build the thing"),
+        "{}",
+        requests[0].1
+    );
+    assert!(
+        requests[0].1.contains("Verification commands:"),
+        "{}",
+        requests[0].1
+    );
+    assert!(requests[0].1.contains("cargo test"), "{}", requests[0].1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn approving_a_plan_keeps_a_contract_and_injects_it_into_normal_prompts() {
     let dir = plan_dir("contract-prompt");
     let (host, status) = approve_plan_with_contract(
         &dir,
         "1. build the thing\n2. verify it",
-        "run the unit tests successfully",
+        "python -m unittest",
     )
     .await;
     assert_eq!(status.text("mode"), None, "normal mode restored");
@@ -2129,10 +2519,7 @@ async fn approving_a_plan_keeps_a_contract_and_injects_it_into_normal_prompts() 
     let sections = &payload["systemPromptOptions"]["sections"];
     let contract = sections["execution_contract"].as_str().unwrap_or_default();
     assert!(contract.contains("build the thing"), "{contract}");
-    assert!(
-        contract.contains("run the unit tests successfully"),
-        "{contract}"
-    );
+    assert!(contract.contains("python -m unittest"), "{contract}");
     assert!(
         contract.contains("real tool result"),
         "evidence requirement is explicit: {contract}"
@@ -2142,9 +2529,92 @@ async fn approving_a_plan_keeps_a_contract_and_injects_it_into_normal_prompts() 
     os.push(".foreman.jsonl");
     let journal = std::fs::read_to_string(PathBuf::from(os)).expect("journal");
     assert!(journal.contains("active_contract"), "{journal}");
+    assert!(journal.contains("python -m unittest"), "{journal}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_verified_contract_stops_being_injected_as_active_work() {
+    let dir = plan_dir("contract-complete-prompt");
+    let (host, _status) = approve_plan_with_contract(
+        &dir,
+        "1. build the thing\n2. verify it",
+        "python -m unittest",
+    )
+    .await;
+
+    // Before evidence, the contract is active and the prompt says so.
+    let pending = emit_prompt(&host, true).await;
     assert!(
-        journal.contains("run the unit tests successfully"),
-        "{journal}"
+        pending["systemPromptOptions"]["sections"]["execution_contract"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("build the thing")
+    );
+
+    let passed = emit_settle(&host, successful_verification_turn("call-verify")).await;
+    assert_ne!(passed["continue"], true, "verification passes: {passed}");
+
+    // After the gate accepts evidence, the prompt must stop demanding it:
+    // prompt and gate always describe the same contract state.
+    let done = emit_prompt(&host, true).await;
+    assert!(
+        done["systemPromptOptions"]["sections"]
+            .get("execution_contract")
+            .is_none(),
+        "a verified contract is no longer active work: {}",
+        done["systemPromptOptions"]["sections"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn preapproved_shell_calls_cannot_satisfy_the_contract_without_the_marker() {
+    let dir = plan_dir("contract-baseline");
+    let path = dir.join("session.jsonl");
+    let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
+    // The command was already in the transcript when the plan was approved;
+    // its call id must be part of the persisted baseline.
+    session.set_entries(json!([{
+        "messages": [{
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call-before",
+                "name": "bash",
+                "arguments": { "command": "python -m unittest" }
+            }]
+        }]
+    }]));
+    let status = Arc::new(FakeStatus::default());
+    let ui = FakeUi::selecting("approve");
+    let messages = Arc::new(FakeMessages::default());
+    let (host, _plugin) = host_with_plan(session, Arc::clone(&status), ui, messages);
+
+    host.dispatch_command("mode", "plan").await.ok();
+    emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification("1. build", "python -m unittest"),
+    )
+    .await;
+    host.dispatch_command("approvals", "").await.ok();
+
+    // No PLAN APPROVED marker in the settle payload (as after compaction):
+    // only the call-id baseline can tell that this result predates approval.
+    let stale = successful_verification_turn_with_command("call-before", "python -m unittest");
+    let gated = emit_settle(&host, stale).await;
+    assert_eq!(
+        gated["continue"], true,
+        "a pre-approval call must not satisfy the contract: {gated}"
+    );
+
+    let fresh = successful_verification_turn_with_command("call-after", "python -m unittest");
+    let passed = emit_settle(&host, fresh).await;
+    assert_ne!(
+        passed["continue"], true,
+        "a call created after approval passes: {passed}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2164,12 +2634,8 @@ async fn a_plain_normal_run_without_a_contract_is_not_gated() {
 #[tokio::test(flavor = "current_thread")]
 async fn contract_gate_nudges_until_a_successful_verification_tool_result() {
     let dir = plan_dir("contract-gate");
-    let (host, _status) = approve_plan_with_contract(
-        &dir,
-        "1. build the thing",
-        "run the unit tests successfully",
-    )
-    .await;
+    let (host, _status) =
+        approve_plan_with_contract(&dir, "1. build the thing", "python -m unittest").await;
 
     // No verification tool result yet: the gate asks for one (custom message).
     let gated = emit_settle(&host, completed_turn(vec![])).await;
@@ -2190,12 +2656,8 @@ async fn contract_gate_nudges_until_a_successful_verification_tool_result() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_shell_command_does_not_satisfy_the_contract_gate() {
     let dir = plan_dir("contract-fail");
-    let (host, _status) = approve_plan_with_contract(
-        &dir,
-        "1. build the thing",
-        "run the unit tests successfully",
-    )
-    .await;
+    let (host, _status) =
+        approve_plan_with_contract(&dir, "1. build the thing", "python -m unittest").await;
 
     let failed_turn = vec![
         json!({
@@ -2233,12 +2695,8 @@ async fn a_failed_shell_command_does_not_satisfy_the_contract_gate() {
 #[tokio::test(flavor = "current_thread")]
 async fn contract_gate_stops_after_three_nudges_and_marks_unverified() {
     let dir = plan_dir("contract-cap");
-    let (host, status) = approve_plan_with_contract(
-        &dir,
-        "1. build the thing",
-        "run the unit tests successfully",
-    )
-    .await;
+    let (host, status) =
+        approve_plan_with_contract(&dir, "1. build the thing", "python -m unittest").await;
 
     for _ in 0..3 {
         let gated = emit_settle(&host, completed_turn(vec![])).await;
@@ -2259,60 +2717,11 @@ async fn contract_gate_stops_after_three_nudges_and_marks_unverified() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn verification_from_before_approval_does_not_satisfy_the_contract() {
-    let dir = plan_dir("contract-preapproval");
-    let (host, _status) = approve_plan_with_contract(
-        &dir,
-        "1. build the thing",
-        "run the unit tests successfully",
-    )
-    .await;
-
-    // A successful command that appears BEFORE the current PLAN APPROVED user
-    // turn is stale evidence and must not clear the gate.
-    let stale = vec![
-        json!({
-            "role": "assistant",
-            "content": [{
-                "type": "toolCall",
-                "id": "call-before",
-                "name": "bash",
-                "arguments": { "command": "python -m unittest" }
-            }],
-            "stopReason": "toolUse"
-        }),
-        json!({
-            "role": "toolResult",
-            "toolCallId": "call-before",
-            "toolName": "bash",
-            "isError": false,
-            "content": [{ "type": "text", "text": "Ran 3 tests OK
-        Command exited with code 0" }],
-            "details": { "exitCode": 0 }
-        }),
-        json!({
-            "role": "user",
-            "content": [{ "type": "text", "text": "PLAN APPROVED: current approval" }]
-        }),
-        json!({
-            "role": "assistant",
-            "content": [{ "type": "text", "text": "done" }],
-            "stopReason": "stop"
-        }),
-    ];
-    let gated = emit_settle(&host, stale).await;
-    assert_eq!(
-        gated["continue"], true,
-        "pre-approval command is stale: {gated}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn a_new_worker_after_verification_invalidates_the_contract_evidence() {
-    let dir = plan_dir("contract-worker-invalidates");
+async fn a_completed_contract_is_not_reopened_by_a_later_worker() {
+    let dir = plan_dir("contract-worker-after-complete");
     let path = dir.join("session.jsonl");
     let session = FakeSession::with_path(true, &["subagent", "bash", "read"], path);
+    session.set_entries(json!([]));
     let status = Arc::new(FakeStatus::default());
     let ui = FakeUi::selecting("approve");
     let messages = Arc::new(FakeMessages::default());
@@ -2323,25 +2732,32 @@ async fn a_new_worker_after_verification_invalidates_the_contract_evidence() {
         &host,
         "submit_plan",
         "call-plan",
-        submit_plan_input_with_verification("1. build", "run tests"),
+        submit_plan_input_with_verification("1. build", "python -m unittest"),
     )
     .await;
     assert_eq!(outcome["block"], true, "{outcome}");
     host.dispatch_command("approvals", "").await.ok();
 
-    // Verification passes first.
     let passed = emit_settle(&host, successful_verification_turn("call-verify")).await;
     assert_ne!(
         passed["continue"], true,
         "first verification passes: {passed}"
     );
 
-    // A new worker can change the artifact: old evidence must be invalidated.
+    // The contract is one-shot: later work (even a worker) is ordinary Normal
+    // work, not a re-opened plan.
     emit_tool_input(&host, "subagent", "call-worker", worker_input()).await;
-    let gated = emit_settle(&host, completed_turn(vec![])).await;
-    assert_eq!(
-        gated["continue"], true,
-        "new worker invalidates evidence: {gated}"
+    let settled = emit_settle(&host, completed_turn(vec![])).await;
+    assert_ne!(
+        settled["continue"], true,
+        "a completed contract stays retired: {settled}"
+    );
+    let prompt = emit_prompt(&host, true).await;
+    assert!(
+        prompt["systemPromptOptions"]["sections"]
+            .get("execution_contract")
+            .is_none(),
+        "a retired contract is not injected: {prompt}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2359,6 +2775,75 @@ async fn strict_verification_commands_require_the_exact_command_to_run() {
     // The exact declared command succeeds -> gate passes.
     let passed = emit_settle(&host, successful_verification_turn("call-strict")).await;
     assert_ne!(passed["continue"], true, "exact command passes: {passed}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn write_call_after(text: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "toolCall",
+                "id": "call-write",
+                "name": "write",
+                "arguments": { "path": "late.txt", "content": text }
+            }],
+            "stopReason": "toolUse"
+        }),
+        json!({
+            "role": "toolResult",
+            "toolCallId": "call-write",
+            "toolName": "write",
+            "isError": false,
+            "content": [{ "type": "text", "text": "Successfully wrote to late.txt" }]
+        }),
+    ]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn verification_followed_by_a_mutation_does_not_retire_the_contract() {
+    let dir = plan_dir("verify-then-mutate");
+    let (host, _status) = approve_plan_with_verification_value(
+        &dir,
+        "1. build the thing",
+        json!(["python -m unittest"]),
+    )
+    .await;
+
+    let mut turn = successful_verification_turn("call-verify");
+    // Drop the closing text turn and mutate after the verification command.
+    turn.pop();
+    turn.extend(write_call_after("late change"));
+    turn.push(json!({
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "done" }],
+        "stopReason": "stop"
+    }));
+    let gated = emit_settle(&host, turn).await;
+    assert_eq!(
+        gated["continue"], true,
+        "evidence before a later write must not retire the contract: {gated}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_mutation_before_verification_still_retires_the_contract() {
+    let dir = plan_dir("mutate-then-verify");
+    let (host, _status) = approve_plan_with_verification_value(
+        &dir,
+        "1. build the thing",
+        json!(["python -m unittest"]),
+    )
+    .await;
+
+    let mut turn = write_call_after("initial change");
+    turn.extend(successful_verification_turn("call-verify"));
+    let passed = emit_settle(&host, turn).await;
+    assert_ne!(
+        passed["continue"], true,
+        "the declared command after the mutation must pass: {passed}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2393,23 +2878,55 @@ async fn a_different_successful_command_does_not_satisfy_strict_verification() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn legacy_text_verification_still_accepts_any_successful_command() {
-    let dir = plan_dir("legacy-verify");
-    let (host, _status) = approve_plan_with_contract(
-        &dir,
-        "1. build the thing",
-        "run the unit tests successfully",
+async fn a_completed_contract_is_retired_after_resume() {
+    let dir = plan_dir("completed-contract-resume");
+    let path = dir.join("session.jsonl");
+
+    let session = FakeSession::with_path(true, &["subagent", "read", "bash"], path.clone());
+    session.set_entries(json!([]));
+    let status = Arc::new(FakeStatus::default());
+    let ui = FakeUi::selecting("approve");
+    let messages = Arc::new(FakeMessages::default());
+    let (host, _plugin) = host_with_plan(session, status, ui, messages);
+    host.dispatch_command("mode", "plan").await.ok();
+    emit_tool_input(
+        &host,
+        "submit_plan",
+        "call-plan",
+        submit_plan_input_with_verification("1. build", "python -m unittest"),
     )
     .await;
+    host.dispatch_command("approvals", "").await.ok();
 
     let passed = emit_settle(
         &host,
-        successful_verification_turn_with_command("call-any", "echo legacy-ok"),
+        successful_verification_turn_with_command("call-verify", "python -m unittest"),
     )
     .await;
+    assert_ne!(passed["continue"], true, "verified: {passed}");
+    drop(host);
+
+    // A completed one-shot contract is not restored as active work.
+    let session2 = FakeSession::with_path(true, &["subagent", "read", "bash"], path);
+    let status2 = Arc::new(FakeStatus::default());
+    let (host2, _plugin2) = host_with(session2, status2);
+    let mut start = json!({ "type": "session_start", "reason": "resume" });
+    host2
+        .emit("session_start", &mut start)
+        .await
+        .expect("emit session_start");
+
+    let prompt = emit_prompt(&host2, true).await;
+    assert!(
+        prompt["systemPromptOptions"]["sections"]
+            .get("execution_contract")
+            .is_none(),
+        "retired contract has no prompt: {prompt}"
+    );
+    let settled = emit_settle(&host2, completed_turn(vec![])).await;
     assert_ne!(
-        passed["continue"], true,
-        "legacy text path accepts any successful command: {passed}"
+        settled["continue"], true,
+        "retired contract does not gate after resume: {settled}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2491,6 +3008,59 @@ async fn an_aborted_worker_blocks_reviewer_pass() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn a_resumed_failed_worker_still_blocks_a_later_reviewer_pass() {
+    let dir = plan_dir("worker-fail-resume");
+    let path = dir.join("session.jsonl");
+
+    // First run journals the worker delegation but exits before the gate can
+    // snapshot anything. On resume the worker call id must be reconstructed
+    // from the Delegation event, not lost.
+    let session1 = FakeSession::with_path(true, &["subagent", "read"], path.clone());
+    let status1 = Arc::new(FakeStatus::default());
+    let (host1, _plugin1) = host_with(session1, status1);
+    host1.dispatch_command("mode", "foreman").await.ok();
+    emit_tool_input(&host1, "subagent", "call-worker", worker_input()).await;
+    drop(host1);
+
+    let session2 = FakeSession::with_path(true, &["subagent", "read"], path);
+    session2.set_entries(json!([{
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": "call-worker",
+                    "name": "subagent",
+                    "arguments": { "agent": "worker", "task": "write the file" }
+                }]
+            },
+            worker_failure_result("call-worker", "error")
+        ]
+    }]));
+    let status2 = Arc::new(FakeStatus::default());
+    let (host2, _plugin2) = host_with(session2, status2);
+
+    // A second reviewer delegation supersedes the old reviewer state but must
+    // never hide the failed worker.
+    emit_tool_input(&host2, "subagent", "call-review-2", reviewer_input()).await;
+    let result = emit_settle(
+        &host2,
+        vec![
+            json!({"role":"user","content":[{"type":"text","text":"do the task"}]}),
+            worker_failure_result("call-worker", "error"),
+            reviewer_tool_result("call-review-2", "PASS"),
+            json!({"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}),
+        ],
+    )
+    .await;
+    assert_eq!(
+        result["continue"], true,
+        "resumed worker failure must survive the journal replay: {result}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn submit_plan_requires_a_non_empty_verification_field() {
     let dir = plan_dir("require-verify");
     let path = dir.join("session.jsonl");
@@ -2512,19 +3082,24 @@ async fn submit_plan_requires_a_non_empty_verification_field() {
         missing["reason"]
     );
 
-    // Empty verification string and empty array are rejected too.
-    let empty_text = emit_tool_input(
+    // Free-form prose is rejected even when non-empty: only executable
+    // commands can be verified.
+    let prose = emit_tool_input(
         &host,
         "submit_plan",
         "call-2",
-        json!({"plan": "1. do x", "verification": "   "}),
+        json!({"plan": "1. do x", "verification": "run the unit tests"}),
     )
     .await;
-    assert_eq!(empty_text["block"], true, "{empty_text}");
-    assert!(empty_text["reason"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("verification"));
+    assert_eq!(prose["block"], true, "{prose}");
+    assert!(
+        prose["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verification"),
+        "{}",
+        prose["reason"]
+    );
 
     let empty_array = emit_tool_input(
         &host,
@@ -2544,7 +3119,7 @@ async fn submit_plan_requires_a_non_empty_verification_field() {
         &host,
         "submit_plan",
         "call-4",
-        submit_plan_input_with_verification("1. do x", "run tests"),
+        submit_plan_input_with_verification("1. do x", "python -m unittest"),
     )
     .await;
     let reason = ok["reason"].as_str().unwrap_or_default();

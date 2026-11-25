@@ -11,10 +11,12 @@
 //!   within a test window — the first revalidation is one full interval out,
 //!   mirroring upstream's `stored.checkedAt < interval -> skip`).
 //!
-//! Standalone binary: tests/ and tests/suites/ are another agent's conflict
-//! zone, so nothing is registered into any `g_*.rs` suite. One `#[test]` fn
-//! keeps the process-global env-var mutations (`PI_OFFLINE`,
-//! `PI_CATALOG_BASE_URL`, `PIR_AGENT_DIR`) race-free.
+//! Merged into `zz_merged_1` (see `tests/zz_merged_1.rs`), so this file is no
+//! longer a private process: one `#[test]` fn still keeps its own env-var
+//! mutations (`PI_OFFLINE`, `PI_CATALOG_BASE_URL`, `PIR_AGENT_DIR`) from
+//! interleaving *within* the file, and the process-global
+//! `crate::common::agent_dir_env_lock()` — which every suite pinning
+//! `PIR_AGENT_DIR` in that binary shares — excludes the rest of the harness.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -198,6 +200,13 @@ impl Drop for EnvGuard {
 
 #[test]
 fn catalog_overlay_install_end_to_end() {
+    // Taken BEFORE the file-local `EnvGuard` so the two are never released out
+    // of order (the shared lock restores nothing; it only excludes). This test
+    // is synchronous and runs on the libtest thread with no tokio context, so
+    // `blocking_lock` is the only way to take the async shared lock here — and
+    // it is legal because nothing on this thread is driving a runtime yet
+    // (the runtime below is created after the guard is in hand).
+    let _env_lock = crate::common::agent_dir_env_lock().blocking_lock();
     let env = EnvGuard::take(&["PI_OFFLINE", "PI_CATALOG_BASE_URL", "PIR_AGENT_DIR"]);
     let agent_dir = temp_agent_dir("e2e");
     std::env::set_var("PIR_AGENT_DIR", &agent_dir);

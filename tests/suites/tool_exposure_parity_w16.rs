@@ -201,7 +201,7 @@ fn fake_model() -> Model {
 }
 
 /// The registry an audited host runs with: the core tools plus the merged
-/// plugin tools, one per exposure class — `ctx_*`/`python`/`todo`/`subagent`
+/// plugin tools, one per exposure class — `ctx_*`/`todo`/`subagent`
 /// are `direct` and default-active, `tool_search` is `model-only` with
 /// `defaultActive: false` (`plugins/builtin/tool_search.rs`), the
 /// `codemode`-exposure entry is callable-but-undeclared until explicitly
@@ -210,7 +210,13 @@ fn fake_model() -> Model {
 fn run_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     register_core_tools(&mut registry);
-    for name in ["ctx_execute", "ctx_search", "python", "todo", "subagent"] {
+    for name in [
+        "ctx_execute",
+        "ctx_search",
+        "ctx_execute_file",
+        "todo",
+        "subagent",
+    ] {
         registry.register(direct(name));
     }
     registry.register(inactive("tool_search", ToolExposure::ModelOnly));
@@ -966,6 +972,7 @@ fn extension_runtime(cwd: &std::path::Path) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
     .expect("extension runtime")
 }

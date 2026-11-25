@@ -317,6 +317,7 @@ fn env_with_updates(
     on_update: Option<pir::agent::tool_execution::ToolUpdateFn>,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -504,6 +505,17 @@ async fn previous_substitutes_empty_when_the_prior_step_has_no_final_text() {
     assert_eq!(details["results"][1]["task"], "step two: <>");
 }
 
+/// Strip Windows' `\\?\` verbatim prefix so a `std::fs::canonicalize` result
+/// (what the subagent uses to resolve a child cwd) compares equal to the
+/// plain path the fixture built. No-op on non-Windows.
+fn strip_verbatim(path: &std::path::Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
+
 #[tokio::test]
 async fn chain_and_single_cwd_reach_the_child_process() {
     // Upstream spawns each child with `cwd: step.cwd ?? defaultCwd`; pir
@@ -539,7 +551,11 @@ async fn chain_and_single_cwd_reach_the_child_process() {
     .await;
     assert!(!result.is_error, "content: {}", result.content);
     let chain_cwds = observed.lock().unwrap().clone();
-    assert_eq!(chain_cwds.last(), Some(&subdir), "chain step cwd");
+    assert_eq!(
+        chain_cwds.last().map(|p| strip_verbatim(p)),
+        Some(strip_verbatim(&subdir)),
+        "chain step cwd"
+    );
 
     // Single-mode cwd.
     observed.lock().unwrap().clear();
@@ -551,7 +567,11 @@ async fn chain_and_single_cwd_reach_the_child_process() {
     .await;
     assert!(!result.is_error, "content: {}", result.content);
     let single_cwds = observed.lock().unwrap().clone();
-    assert_eq!(single_cwds.last(), Some(&subdir), "single mode cwd");
+    assert_eq!(
+        single_cwds.last().map(|p| strip_verbatim(p)),
+        Some(strip_verbatim(&subdir)),
+        "single mode cwd"
+    );
 }
 
 // ---------------------------------------------------------------------------

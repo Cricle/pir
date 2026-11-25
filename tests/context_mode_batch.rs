@@ -1,9 +1,9 @@
-//! Tests for `ctx_batch_execute`: multiple Python scripts in one call, each
-//! auto-indexed under its own source label, with optional inline queries.
+//! Tests for `ctx_batch_execute`: multiple JavaScript scripts in one call,
+//! each auto-indexed under its own source label, with optional inline queries.
 //!
 //! Hermetic: the knowledge base lives in a per-test temp directory
 //! (`ContextModePlugin::with_db_path`) and the scripts run on the embedded
-//! RustPython interpreter (no system Python, no network).
+//! QuickJS runtime (no network).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,15 +25,6 @@ use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext
 // ---------------------------------------------------------------------------
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-/// The embedded RustPython VM serializes user code behind a process-wide
-/// execution lock (`src/plugins/builtin/python_vm.rs`), and cargo runs this
-/// binary's tests concurrently. Without this gate a script can spend its whole
-/// per-script deadline queued behind another test's script (the batch then
-/// reports "timed out while queued" instead of the behavior under test). Hold
-/// it for one whole tool call so every call's budget starts only once the
-/// shared interpreter is free.
-static PYTHON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Self-cleaning temp directory.
 struct TestDir(PathBuf);
@@ -103,9 +94,6 @@ impl Harness {
     }
 
     async fn run(&self, name: &str, args: Value) -> ToolResult {
-        // Every tool call may reach the shared interpreter; holding the gate
-        // across the call keeps the per-script deadlines honest.
-        let _serial = PYTHON_TEST_LOCK.lock().await;
         self.tool(name)
             .run(&args, &ToolContext::new(self.cwd.clone()))
             .await
@@ -143,8 +131,8 @@ async fn batch_indexes_each_script_and_returns_sections_from_the_right_label() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "label": "alpha", "code": "print('alpha_marker apples')" },
-                { "label": "beta", "code": "print('beta_marker bananas')" }
+                { "label": "alpha", "code": "console.log('alpha_marker apples')" },
+                { "label": "beta", "code": "console.log('beta_marker bananas')" }
             ],
             "queries": ["beta_marker"],
             "source": "demo"
@@ -182,8 +170,8 @@ async fn batch_indexes_each_script_and_returns_sections_from_the_right_label() {
         assert!(hit.get("content").is_none(), "{value}");
     }
 
-    // Every script runs in a fresh namespace on the same lazy interpreter.
-    assert_eq!(harness.plugin.python_spawn_count(), 1);
+    // Every script runs in a fresh module scope on the same lazy runtime.
+    assert_eq!(harness.plugin.js_spawn_count(), 1);
 }
 
 #[tokio::test]
@@ -192,8 +180,8 @@ async fn batch_sources_are_label_scoped_for_exact_source_filtering() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "label": "alpha", "code": "print('alpha_filter_marker')" },
-                { "label": "beta", "code": "print('beta_filter_marker')" }
+                { "label": "alpha", "code": "console.log('alpha_filter_marker')" },
+                { "label": "beta", "code": "console.log('beta_filter_marker')" }
             ],
             "source": "filterbase"
         }))
@@ -245,7 +233,7 @@ async fn batch_sources_are_label_scoped_for_exact_source_filtering() {
     // A single-script batch indexes under the bare base source.
     let single = harness
         .batch(json!({
-            "scripts": [{ "code": "print('solo_filter_marker')" }],
+            "scripts": [{ "code": "console.log('solo_filter_marker')" }],
             "source": "solo"
         }))
         .await;
@@ -267,7 +255,7 @@ async fn batch_sources_are_label_scoped_for_exact_source_filtering() {
 async fn default_source_is_stable_batch_hash() {
     let harness = Harness::new("default-source");
     let args = json!({
-        "scripts": [{ "code": "print('default_source_marker')" }]
+        "scripts": [{ "code": "console.log('default_source_marker')" }]
     });
     let first = harness.batch(args.clone()).await;
     assert!(!first.is_error, "{}", first.content);
@@ -309,9 +297,9 @@ async fn failing_script_does_not_prevent_the_next_and_is_summarized() {
             "scripts": [
                 {
                     "label": "boom",
-                    "code": "print('partial_marker')\n1 / 0"
+                    "code": "console.log('partial_marker')\nthrow new Error('boom')"
                 },
-                { "label": "after", "code": "print('after_marker')" }
+                { "label": "after", "code": "console.log('after_marker')" }
             ],
             "queries": ["after_marker"],
             "source": "failbatch"
@@ -330,14 +318,12 @@ async fn failing_script_does_not_prevent_the_next_and_is_summarized() {
         .as_str()
         .unwrap_or_else(|| panic!("failing script gets a preview: {value}"));
     assert!(
-        preview.contains("ZeroDivisionError"),
+        preview.contains("boom"),
         "the preview names the failure: {preview}"
     );
     assert!(
-        !value
-            .to_string()
-            .contains("Traceback (most recent call last)"),
-        "the traceback is summarized, not pasted: {value}"
+        !value.to_string().contains("context-exec-"),
+        "the stack is summarized, not pasted: {value}"
     );
     assert!(
         !result.content.contains("partial_marker"),
@@ -359,13 +345,13 @@ async fn failing_script_does_not_prevent_the_next_and_is_summarized() {
 }
 
 #[tokio::test]
-async fn each_script_gets_a_fresh_namespace() {
+async fn each_script_gets_a_fresh_module_scope() {
     let harness = Harness::new("fresh-namespace");
     let result = harness
         .batch(json!({
             "scripts": [
-                { "code": "leaked = 41" },
-                { "code": "print(leaked)" }
+                { "code": "let leaked = 41" },
+                { "code": "console.log(leaked)" }
             ],
             "source": "fresh"
         }))
@@ -383,13 +369,13 @@ async fn each_script_gets_a_fresh_namespace() {
         summaries[1]["errorPreview"]
             .as_str()
             .unwrap_or_default()
-            .contains("NameError"),
-        "the second script starts from a fresh namespace: {value}"
+            .contains("not defined"),
+        "the second script starts from a fresh module scope: {value}"
     );
     assert_eq!(
-        harness.plugin.python_spawn_count(),
+        harness.plugin.js_spawn_count(),
         1,
-        "all scripts share the one lazy interpreter"
+        "all scripts share the one lazy runtime"
     );
 }
 
@@ -410,7 +396,7 @@ async fn script_and_query_bounds_are_enforced_before_execution() {
     );
 
     let too_many: Vec<Value> = (0..17)
-        .map(|index| json!({ "code": format!("print({index})") }))
+        .map(|index| json!({ "code": format!("console.log({index})") }))
         .collect();
     let rejected = harness.batch(json!({ "scripts": too_many })).await;
     assert!(rejected.is_error);
@@ -433,7 +419,7 @@ async fn script_and_query_bounds_are_enforced_before_execution() {
     let too_many_queries: Vec<String> = (0..33).map(|index| format!("query{index}")).collect();
     let rejected = harness
         .batch(json!({
-            "scripts": [{ "code": "print('bounds')" }],
+            "scripts": [{ "code": "console.log('bounds')" }],
             "queries": too_many_queries
         }))
         .await;
@@ -447,7 +433,7 @@ async fn script_and_query_bounds_are_enforced_before_execution() {
     let oversized = "a".repeat(513);
     let rejected = harness
         .batch(json!({
-            "scripts": [{ "code": "print('bounds')" }],
+            "scripts": [{ "code": "console.log('bounds')" }],
             "queries": [oversized]
         }))
         .await;
@@ -459,8 +445,8 @@ async fn script_and_query_bounds_are_enforced_before_execution() {
     );
 
     assert!(
-        !harness.plugin.has_python_worker(),
-        "rejected arguments never start the interpreter"
+        !harness.plugin.has_js_worker(),
+        "rejected arguments never start the JS runtime"
     );
 }
 
@@ -471,8 +457,8 @@ async fn timeout_applies_per_script_and_the_batch_continues() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "label": "runaway", "code": "while True:\n    pass" },
-                { "label": "next", "code": "print('survived_marker')" }
+                { "label": "runaway", "code": "while (true) {}" },
+                { "label": "next", "code": "console.log('survived_marker')" }
             ],
             "queries": ["survived_marker"],
             "timeout": 2,
@@ -518,7 +504,7 @@ async fn per_script_output_cap_is_respected_and_bodies_stay_out_of_context() {
     let harness = Harness::new("cap");
     let result = harness
         .batch(json!({
-            "scripts": [{ "label": "big", "code": "print('x' * 1_100_000)" }]
+            "scripts": [{ "label": "big", "code": "console.log('x'.repeat(1_100_000))" }]
         }))
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -556,7 +542,7 @@ async fn query_sections_are_snippets_not_full_chunks() {
     let result = harness
         .batch(json!({
             "scripts": [
-                { "code": "print('needle_body ' + 'Z' * 6000)" }
+                { "code": "console.log('needle_body ' + 'Z'.repeat(6000))" }
             ],
             "queries": ["needle_body"],
             "source": "bodybatch"

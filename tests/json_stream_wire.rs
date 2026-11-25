@@ -543,13 +543,13 @@ fn agent_event_corpus() -> Vec<AgentEvent> {
         },
         AgentEvent::TurnEnd {
             turn: 1,
-            message: assistant.clone(),
-            tool_results: vec![result_message.clone()],
+            message: Arc::new(assistant.clone()),
+            tool_results: Arc::from(vec![result_message.clone()]),
         },
         AgentEvent::TurnEnd {
             turn: 2,
-            message: assistant.clone(),
-            tool_results: Vec::new(),
+            message: Arc::new(assistant.clone()),
+            tool_results: Arc::from([]),
         },
         AgentEvent::MessageStart {
             turn: 0,
@@ -1565,10 +1565,12 @@ fn random_agent_event(
         },
         3 => AgentEvent::TurnEnd {
             turn,
-            message: random_assistant_message(rng, pieces, long),
-            tool_results: (0..rng.below(3))
-                .map(|_| random_tool_result(rng, pieces, long))
-                .collect(),
+            message: Arc::new(random_assistant_message(rng, pieces, long)),
+            tool_results: Arc::from(
+                (0..rng.below(3))
+                    .map(|_| random_tool_result(rng, pieces, long))
+                    .collect::<Vec<_>>(),
+            ),
         },
         4 => AgentEvent::MessageStart {
             turn,
@@ -2159,8 +2161,8 @@ mod wire_size_tests {
             },
             AgentEvent::TurnEnd {
                 turn: 1,
-                message: assistant.clone(),
-                tool_results: vec![tool_result.clone()],
+                message: Arc::new(assistant.clone()),
+                tool_results: Arc::from(vec![tool_result.clone()]),
             },
             AgentEvent::StreamStart {
                 turn: 1,

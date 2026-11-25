@@ -36,8 +36,9 @@
 | `PIR_CODEMODE_TIMEOUT_MS` / `PIR_CODEMODE_MAX_OUTPUT_CHARS` / `PIR_CODEMODE_MAX_OUTPUT_ITEMS` | Codemode sandbox limits |
 | `PIR_CODEMODE_MEMORY_MB` | Codemode sandbox heap cap override (`0` = no cap; default 128) |
 | `PIR_TOOL_MAX_SOURCE_BYTES` | Whole-file source ceiling for `edit`, image decode and grep context reads (default 67108864 = 64 MiB; `read` streams and is not capped). A positive byte count overrides; `0`/malformed falls back rather than disabling the guard |
-| `PIR_READ_BEFORE_EDIT` | Gate for `edit`/`write` on an existing file: `off` (no check), `warn` (proceed with a warning), `edit-warn` (edit may proceed with a warning for partial/stale reads; write stays strict), or `enforce` (refuse, default). Case-insensitive; `0`/`false`/`disabled` = `off`, `warning` = `warn`; unset/unrecognized = `enforce` in balanced, `edit-warn` in efficient. Requires a full read that is unchanged (mtime/size); new-file writes bypass the check; successful writes/edits refresh the ledger; resolved once at session build |
-| `PIR_NATIVE_FALLBACK=0` | Disable the `pir grep\|sed\|python` fallback to the system tool (`0`/`false`; unset or any other value keeps it enabled) |
+| `PIR_READ_BEFORE_EDIT` | Gate for `edit`/`write` on an existing file: `off` (no check), `warn` (proceed with a warning), `edit-warn` (edit may proceed with a warning for partial/stale reads; write stays strict), `edit-partial` (edit may proceed with a warning after a partial read; stale/never-read targets and `write` stay strict; default), or `enforce` (refuse any incomplete read). Case-insensitive; `0`/`false`/`disabled` = `off`, `warning` = `warn`; unset/unrecognized = `edit-partial` in both balanced and efficient. A partial read must still be unchanged (mtime/size); new-file writes bypass the check; successful writes/edits refresh the ledger; resolved once at session build |
+| `PIR_TOOL_OUTPUT_MAX_LINES` / `PIR_TOOL_OUTPUT_MAX_BYTES` | `read`/`bash` output truncation caps. Positive integers override; otherwise `PIR_PERF_PROFILE=efficient` uses 1,000 lines / 24 KiB, and every other profile uses the historical 2,000 lines / 50 KiB. The `read` continuation footer and the `bash` tail footer report the effective limit |
+| `PIR_NATIVE_FALLBACK=0` | Disable the `pir grep\|sed` fallback to the system tool (`0`/`false`; unset or any other value keeps it enabled) |
 | `PIR_CONTEXT_MODE_ROUTING` / `PIR_CONTEXT_MODE_INDEX_RESULTS` | `context-mode` `tool_call` routing / `tool_result` auto-indexing. Both default on; disabled by `0`, `false`, `off` or `no` (unset or any other value keeps it on) |
 | `PI_EXT_MEMORY_MB` / `PI_EXT_STACK_MB` / `PI_EXT_GC_THRESHOLD_MB` / `PI_EXT_CALL_TIMEOUT_MS` / `PI_EXT_HOOK_TIMEOUT_MS` / `PI_EXT_BEFORE_AGENT_START_TIMEOUT_MS` | Extension runtime QuickJS limits and lifecycle budgets (override `extensionLimits`; see [extensions.md](extensions.md)) |
 | `PIR_JS_MEMORY_MB` | Heap cap of a `pir js` run in MiB. `0`/unset = no cap. A malformed value (including negative) is reported on stderr and ignored. `pir js` reads neither `PI_EXT_MEMORY_MB` nor `extensionLimits` |
@@ -46,8 +47,9 @@
 
 | Variable | Meaning |
 |---|---|
-| `PIR_SUBAGENT_MAX_TURNS` | Per-child turn cap (one turn = one model request; default 1000). A positive integer overrides; `0` removes the cap; malformed/negative values keep the default. Resolved once when the subagent tool is built and applied to every single/chain/parallel child |
-| `PIR_SUBAGENT_WALL_CLOCK_MS` | Per-child wall-clock budget in milliseconds (default 1800000 = 30 minutes). A positive integer overrides; `0` disables the budget; malformed/negative values keep the default. Resolved once when the subagent tool is built and applied to every single/chain/parallel child |
+| `PIR_SUBAGENT_MAX_TURNS` | Per-child turn cap (one turn = one model request; default from `performance.subagentMaxTurns`: 1000 balanced, 100 efficient). A positive integer overrides the settings value; `0` removes the cap; malformed/negative values keep the resolved setting. Resolved at each `subagent` call and applied to every single/chain/parallel child |
+| `PIR_SUBAGENT_MAX_TOTAL_TOKENS` | Per-child cumulative token budget (`input + output + cache_read + cache_write`). Default from `performance.subagentMaxTotalTokens`: unlimited on balanced, 100,000 on efficient. A positive integer overrides; `0` disables the budget; malformed/negative values keep the resolved setting |
+| `PIR_SUBAGENT_WALL_CLOCK_MS` | Per-child wall-clock budget in milliseconds (default 1800000 = 30 minutes). A positive integer overrides; `0` disables the budget; malformed/negative values keep the default. Resolved at each `subagent` call and applied to every single/chain/parallel child |
 
 ## Server / remote
 
@@ -92,4 +94,37 @@ and never logged.
 | `VISUAL`, `EDITOR` | External editor (Ctrl+G) when the `externalEditor` setting is empty: `VISUAL` first, then `EDITOR`; blank values are skipped; default `notepad` on Windows / `nano` elsewhere |
 | `PI_SHARE_VIEWER_URL` / `PI_RADIUS_GATEWAY` | `/share` gist viewer URL prefix (default `https://pi.dev/session/`) / Radius gateway override (default `https://radius.pi.dev`) |
 
-`RADIUS_API_KEY` and other provider keys are listed in `pir auth`.
+`RADIUS_API_KEY` and other provider keys are listed in `pir auth` and
+[`providers.md`](providers.md).
+
+## Loading & selection
+
+| Variable | Meaning |
+|---|---|
+| `PIR_PREFER_NATIVE=1` | Drop the JS package from the load plan when a full native port exists (`subagent`, `mcp`, `codemode`, `tool-search`, `todo`, `context-mode`). Off by default, keeping upstream first-wins (an installed/selected JS package still wins). The `tool-repair` and `phone` single-face rules always apply |
+| `PIR_SYSTEM_PROMPT_FILE` | Read the system prompt from this file instead of the discovered `SYSTEM.md`. A failed read aborts a print run (see [`system-prompt-audit.md`](system-prompt-audit.md) B17) |
+| `PIR_TOOL_MAX_SOURCE_BYTES` | Ceiling for a tool read that must materialize a whole file (`edit`, image decode, grep context); default 64 MiB. Malformed or `0` falls back to the default instead of disabling the guard |
+
+## Builtins
+
+| Variable | Meaning |
+|---|---|
+| `PIR_CONTEXT_MODE_MEMORY_MB` | `context-mode` QuickJS heap cap in MiB (default and maximum 512; `0` = uncapped) |
+| `PIR_FOREMAN_PIR` | Override the `pir` binary a process-router subagent and a detached foreman run spawn (unset = the current executable) |
+| `PIR_FOREMAN_STRICT_EXIT` | Detached-job form of "an unverified run is not success": a run that never wrote a journal or did not reach `VERIFIED` exits non-zero (see [`foreman.md`](foreman.md)) |
+
+## Diagnostics (internal)
+
+Developer-only switches: they change logging or test seams, never behavior a
+user should depend on.
+
+| Variable | Meaning |
+|---|---|
+| `PIR_MCP_DEBUG` | Print dispatch-deadline diagnostics for a blocked MCP dispatch |
+| `PIR_PERF_TRACE` | Perf tracing around session build |
+| `PIR_DEBUG_RPC` | `[rpc-debug]` stderr lines on run-claim |
+| `PIR_PAGED_DEBUG` | `DBG paged threshold` lines for compaction window math |
+| `PIR_ALLOC_TRACE` | TUI allocator tracing (heap-profile tests) |
+| `PIR_EXT_SKIP_PRELUDE` / `PIR_EXT_SKIP_NODE_BUILTINS` | Skip the JS host prelude / node builtin bootstrap at extension boot (test seam; breaks extensions that need them) |
+| `PIR_RESUME_ON_ERROR=1` | On resume, inject a synthetic continuation prompt when the leaf is a failed request (off by default) |
+| `PIR_FAIL_FAST` | Fail fast on the first error in a test/batch context |

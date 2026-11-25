@@ -81,6 +81,7 @@ fn print_config_at(cwd: &Path, mode: &str) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 

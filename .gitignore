@@ -1,6 +1,6 @@
 # Rust
 /target/
-/target-lane-*/
+/target-*/
 **/*.rs.bk
 Cargo.lock.bak
 
@@ -52,6 +52,8 @@ pnpm-lock.yaml
 *.js
 # Standalone pi-phone PWA client source (served/embedded by the central server).
 !clients/pi-phone-pwa/**
+# Native-shell embedded runtime asset is Rust source input, not a Node artifact.
+!crates/pir-native-shell/assets/app.js
 
 # OS
 .DS_Store

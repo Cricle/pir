@@ -1,0 +1,18 @@
+[package]
+name = "pir-builtin-mode"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Host-neutral foreman/plan/normal mode domain for the pir coding agent: phases, approvals, journal replay, delegation routing"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

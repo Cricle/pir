@@ -49,7 +49,6 @@ fn every_builtin_loads_explicitly_and_exposes_its_surface() {
         ("subagent", &["subagent"], &[]),
         ("mcp", &["list_mcp_resources"], &["mcp"]),
         ("codemode", &["codemode"], &[]),
-        ("python", &["python"], &[]),
         ("context-mode", &["ctx_execute", "ctx_search"], &[]),
         ("tool-search", &["tool_search"], &[]),
         ("tool-repair", &[], &[]),
@@ -101,7 +100,6 @@ fn default_plan_is_all_default_enabled_builtins_but_phone() {
             "builtin:mode",
             "builtin:mcp",
             "builtin:codemode",
-            "builtin:python",
             "builtin:context-mode",
             "builtin:tool-search",
             "builtin:tool-repair",
@@ -112,7 +110,7 @@ fn default_plan_is_all_default_enabled_builtins_but_phone() {
         .map(String::from)
         .collect::<Vec<_>>()
     );
-    for tool in ["subagent", "python", "ctx_execute", "todo"] {
+    for tool in ["subagent", "ctx_execute", "todo"] {
         assert!(tools.iter().any(|t| t == tool), "missing {tool}: {tools:?}");
     }
     assert!(!plugins.iter().any(|p| p == "builtin:phone"));
@@ -136,10 +134,10 @@ fn disabled_builtins_and_only_builtin_and_unknown_diagnostic() {
         );
     }
 
-    let only = pir::plugins::order_extension_paths(&[PathBuf::from("builtin:python")], &[], true);
-    assert_eq!(only, vec![PathBuf::from("builtin:python")]);
+    let only = pir::plugins::order_extension_paths(&[PathBuf::from("builtin:todo")], &[], true);
+    assert_eq!(only, vec![PathBuf::from("builtin:todo")]);
     let (plugins, _, _) = names(&host_for(&only));
-    assert_eq!(plugins, vec!["builtin:python".to_owned()]);
+    assert_eq!(plugins, vec!["builtin:todo".to_owned()]);
 
     let host = host_for(&[PathBuf::from("builtin:nope")]);
     let registry = host.registry();
@@ -273,7 +271,7 @@ fn print_default_and_selected_wire_surface() {
     let _ = std::fs::remove_dir_all(&dir);
     write_agent(&dir, port, "{}");
     let tools = wire_tools(&dir, &bodies, &[]);
-    for expected in ["subagent", "python", "ctx_execute", "ctx_search", "todo"] {
+    for expected in ["subagent", "ctx_execute", "ctx_search", "todo"] {
         assert!(
             tools.iter().any(|t| t == expected),
             "missing {expected}: {tools:?}"
@@ -309,10 +307,10 @@ fn print_settings_disable_and_no_mcp_and_unknown_builtin() {
     write_agent(
         &dir,
         port,
-        r#"{"disabledBuiltinExtensions":["python","context-mode","todo","subagent"]}"#,
+        r#"{"disabledBuiltinExtensions":["context-mode","todo","subagent"]}"#,
     );
     let tools = wire_tools(&dir, &bodies, &["--no-mcp"]);
-    for gone in ["python", "ctx_execute", "ctx_search", "todo", "subagent"] {
+    for gone in ["ctx_execute", "ctx_search", "todo", "subagent"] {
         assert!(
             !tools.iter().any(|t| t == gone),
             "{gone} survived: {tools:?}"

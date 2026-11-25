@@ -223,8 +223,8 @@ fn resolve_extension_paths_in(
     // `disabledBuiltinExtensions` (the `--no-mcp` → ["mcp"] pattern): the
     // settings key (UNIONED across the global and trusted-project scopes, so
     // a project can add names but never re-enable a globally disabled
-    // builtin) composed with the flag names, plus `pythonTool: false` folded
-    // in as `python`. Settings and flags only ever ADD names here. The filter
+    // builtin) composed with the flag names. Settings and flags only ever ADD
+    // names here. The filter
     // runs after both plan branches, so an explicit `-e builtin:<name>` or
     // `--only-builtin` cannot resurrect a disabled builtin (upstream
     // `disabledBuiltinExtensions` semantics).

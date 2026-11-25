@@ -239,6 +239,20 @@ fn update_plan(argv: &[&str]) -> pir::coding_agent::cli::UpdatePlan {
 }
 
 #[test]
+fn models_flag_is_accepted_after_the_print_subcommand() {
+    // Upstream parses `--models` position-independently; the value form is
+    // hoisted to the root flag, while `update --models` keeps its bool meaning.
+    let cli = parse_preprocessed(&["print", "--models", "a,b", "hi"]);
+    assert_eq!(cli.models.as_deref(), Some("a,b"));
+    let cli = parse_preprocessed(&["print", "hi", "--models=a,b"]);
+    assert_eq!(cli.models.as_deref(), Some("a,b"));
+    assert_eq!(
+        update_request(&["update", "--models"]),
+        UpdateRequest::Models
+    );
+}
+
+#[test]
 fn update_flags_resolve_to_upstream_targets() {
     assert_eq!(update_request(&["update"]), UpdateRequest::SelfUpdate);
     assert_eq!(

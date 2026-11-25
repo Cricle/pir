@@ -1,11 +1,13 @@
-# Upstream drift status — pi `38ff99177` (v1.4.0+62)
+# Upstream drift status — audited through pi v1.5.2
 
-Static code audit of the port against the upstream clone at `c:/wp/empty/pi`
+Static code audit of the port against an upstream clone at `c:/wp/empty/pi`.
+Two baselines: the per-commit classification below covers
 `HEAD = 38ff99177` ("fix(durable): continue runs after tool handoffs",
-2026-10-24, tag `v1.4.0` + 62 commits). Read-only: every row is **code
-evidence read from this tree**, not a test run. Nothing here replaces
-`cargo check`, the test suites, ConPTY or release gates; current gate evidence
-is [`../RESULTS.md`](../RESULTS.md) and the port map is
+2026-10-24, tag `v1.4.0` + 62 commits), and a later section carries the
+2026-11-15 sync audit against `v1.5.2` (`b4afdddf44e`, 2026-11-10, 641 commits).
+Read-only: every row is **code evidence read from this tree**, not a test run.
+Nothing here replaces `cargo check`, the test suites, ConPTY or release gates;
+current gate evidence is [`../RESULTS.md`](../RESULTS.md) and the port map is
 [`../MAPPING.md`](../MAPPING.md).
 
 ## Counts
@@ -142,8 +144,8 @@ Checked (the 16 previously unchecked commits):
 | `16f5f0af4` | IndexedDbStorage | N/A | Browser-only storage backend; pir is a native Rust binary with no IndexedDB surface. |
 | `4759f09fb` / `89e309581` / `4c25119f5` / `cae9fd28a` | SQLite WAL replication + revert | N/A | Upstream added and then reverted the replication stack; HEAD carries no replication. |
 | `48c8f3228` | Replicated SQLite connection wrapper | N/A | Chord's replication surface is not ported; pir's SQLite storage is local-only by design. |
-| `d9025a5f5` | Shared TelemetryStore + trace renderer + SQLite store | Partial | `src/telemetry/store.rs` and `src/telemetry/render.rs` provide `TelemetryStore`/`MemoryTelemetryStore`/`render_trace`; the chord-specific SQLite telemetry adapter is N/A (no chord sqlite). |
-| `e5fe9777b` | Drop models retired upstream | Landed (default) | `ai/providers/resolution.rs` default for `github-copilot` is now `gpt-6.1-sol` (was `gpt-5.4`); the frozen 42-provider catalog remains a pinned snapshot, not a live models.dev mirror. |
+| `d9025a5f5` | Shared TelemetryStore + trace renderer + SQLite store | Partial | `crates/pir-core/src/telemetry/store.rs` and `crates/pir-core/src/telemetry/render.rs` provide `TelemetryStore`/`MemoryTelemetryStore`/`render_trace`; the chord-specific SQLite telemetry adapter is N/A (no chord sqlite). |
+| `e5fe9777b` | Drop models retired upstream | Landed (default) | `ai/providers/resolution.rs` default for `github-copilot` is now `gpt-6.1-sol` (was `gpt-5.4`); the frozen 43-provider catalog remains a pinned snapshot, not a live models.dev mirror. |
 | `fdce48eb4` | Drop Codex models rejected for ChatGPT accounts | N/A | Catalog/model data snapshot decision; no Codex account-gated lifecycle in the port. |
 | `530015d93` | Only announced removals list as unavailable | N/A (covered by adapter) | pir's `resolve_transcript` has only the mid-convo-system-messages switch; the Responses adapter tracks `unavailable_tools` in `openai_responses/shared.rs` when it renders removal notices. |
 | `caa6967b6` | Keep prompt cache across tool changes on Responses | Landed-equivalent | `ResponsesToolSupport::Additions` + `append_system_tool_additions` reuse a deterministic `pi_tool_load_*` call instead of re-declaring tools. |
@@ -223,9 +225,12 @@ diff plus the current tree.
 | Unverified | 2 |
 | **Total** | **130** |
 
-Full per-commit tables with `file:line` evidence:
-`.play/evidence/upstream-v152/audit-half1.md` and `audit-half2.md` (local
-working evidence; the counts above are their exact totals).
+Full per-commit tables with `file:line` evidence were written to
+`.play/evidence/upstream-v152/audit-half1.md` and `audit-half2.md` — local
+working evidence that is **not tracked in the repository** (`.play/` is
+gitignored), so the counts in the table above are the durable record. The
+12/22/2 landed-or-partial items are summarized in the "Landed since the audit"
+paragraphs below.
 
 **Landed since the audit (2026-11-16)**, each with a regression test:
 LiteLLM `context window exceeded` overflow, Zhipu 1308 non-retryable and
@@ -267,19 +272,42 @@ and PageUp/PageDown in autocomplete and `/settings` (#7629); and host-resolved
 `keyText`/`keyHint` hints injected into extension tool/message/entry render
 contexts (#11630).
 
-**Open items worth a follow-up lane** (all small, upstream citations in the
-audit tables): the fork choice for a missing session cwd (4ea88379); MCP
-refresh redirect/cancel guards; `pi auth login/logout` flags; and the
-remaining queue/window/DX items (package-update summary).
-The prioritized Wave A/B/C breakdown with `file:line` evidence is
-[`upstream-next-plan.md`](upstream-next-plan.md).
+**Remaining work.** After the 2026-11-16 batches and the 2026-11-17 TUI work,
+three buckets remain (per-item landing record in `CHANGELOG.md`; A/B numbers and
+raw-data paths in [`../RESULTS.md`](../RESULTS.md)).
 
-**Deferred / large (not a parity bug)**: Anthropic message threads,
-Bedrock strict-tool fallback, the pi-schema coercion superset, extension
-changelogs UI, MCP client-ID metadata `auto`, package-update version
-summary, Markdown-transformer surfaces, temporary npm/git source scopes,
-and the views/settings/Chord feature families. These need their own design
-pass; they are recorded here so a future sync can scope from evidence.
+*Wave B — medium, each needs a small design pass* (upstream citations in the
+audit tables):
+
+1. Fork option for a missing session cwd (#11060, `4ea88379`): extend the
+   TUI/startup prompt to Continue/Fork/Cancel, write the fork with the current
+   cwd and parent session id, and fix `/import` copying before the cwd check.
+2. Prompt/tree navigation overlap (#9154): reserve a prompt-preflight count
+   across input hooks/auth checks so `navigate_tree` refuses while a prompt sits
+   between submit and `_startRun`.
+3. `pi auth login/logout` flags (#11823): `--no-browser`, `--api-key`, and the
+   Radius MCP credential hook.
+4. Package update version summary (#53/#54): record per-source before/after
+   versions and claim "up to date" only after an actual check.
+5. Queued steer/follow-up image normalization (#11862): resize at delivery
+   time, not only on the idle prompt path.
+6. Strict-tool rejection memory (#11860): remember per-session strict-mode
+   rejections instead of retrying blindly.
+7. Bash timeout after shell exit (#11613): report the shell exit code in the
+   timeout message when pipes stay open; Windows needs a design decision because
+   the reader-grace loop already returns before the deadline.
+
+*Wave C — deferred feature families* (not parity bugs; they need their own
+design and data refresh): Anthropic message threads, Bedrock strict-tool
+fallback, the pi-schema coercion/validation superset, extension-package
+changelog UI, MCP client-ID metadata `auto`, temporary npm/git source scopes,
+the edit-splice engine, and the views/settings/Chord families.
+
+
+**Closed on 2026-11-23**: Markdown-transformer message surfaces (#11756,
+`registerMarkdownTransformer(fn, { messageTypes })`) and `ctx.ui.custom()`
+blocked program status (#11851/#11471, both component forms, retained while
+hidden). The same pass added `ctx.sessionManager.getSessionDir()`.
 
 Two rows are **Unverified** (`b2cb6292` credential-write settle on exit,
 `80d4d3c8` overlay reset on reload): their surfaces do not exist in the Rust

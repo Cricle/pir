@@ -178,6 +178,7 @@ fn dialog_handle(cwd: &Path, has_ui: bool) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     })
 }
 

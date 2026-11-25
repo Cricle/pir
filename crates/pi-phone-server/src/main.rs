@@ -208,9 +208,7 @@ async fn serve(
         "pir-phone-server listening on http://{}",
         listener.local_addr()?
     );
-    axum::serve(listener, http::router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    http::serve_with_shutdown(listener, state, shutdown_signal()).await?;
     Ok(())
 }
 

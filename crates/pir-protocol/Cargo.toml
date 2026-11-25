@@ -1,0 +1,30 @@
+[package]
+name = "pir-protocol"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Provider-agnostic wire protocol for pir: strict CBOR subset, length-prefixed framing and schema validation"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+# The strict CBOR subset decoder/encoder. `protocol` is its only user in the
+# workspace, so the dependency moved here with the module.
+ciborium = "0.2.2"
+serde = { version = "1", features = ["derive", "rc"] }
+# `preserve_order` is load-bearing: the protocol round-trips arbitrary JSON
+# values (tool args/results) and reorders would change wire bytes.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+
+[features]
+default = []
+# The server-side typed-encoder helpers (`ModelRef::from_value` and friends),
+# carried over from the `pir-core` module split. `pir-core` forwards its own
+# `server` feature here so the surface stays identical.
+server = []

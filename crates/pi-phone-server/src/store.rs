@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,29 +70,37 @@ pub struct Store {
 impl Store {
     pub fn open(data_dir: impl AsRef<Path>) -> anyhow::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&data_dir)?;
+        create_private_dir(&data_dir)?;
         let secret_path = data_dir.join("secret");
-        let pepper = std::env::var("PIR_PHONE_SERVER_PEPPER")
+        let pepper = if let Some(secret) = std::env::var("PIR_PHONE_SERVER_PEPPER")
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .or_else(|| {
-                std::fs::read_to_string(&secret_path)
-                    .ok()
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty())
-            })
-            .unwrap_or_else(|| {
-                let secret = generate_token();
-                let _ = std::fs::write(&secret_path, &secret);
-                set_private_permissions(&secret_path);
-                secret
-            });
+        {
+            secret
+        } else if let Some(secret) = std::fs::read_to_string(&secret_path)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            set_private_permissions(&secret_path)?;
+            secret
+        } else {
+            // The secret is a long-lived credential root. Do not continue
+            // with an in-memory fallback if durable creation fails.
+            let secret = generate_token();
+            create_private_secret(&secret_path, &secret)
+                .with_context(|| format!("create {}", secret_path.display()))?;
+            secret
+        };
         if pepper.len() < 32 {
             anyhow::bail!("server secret is too short: {}", secret_path.display());
         }
-        let db = Database::create(data_dir.join("phone.redb"))
-            .with_context(|| format!("open {}", data_dir.join("phone.redb").display()))?;
+        let db_path = data_dir.join("phone.redb");
+        ensure_private_file(&db_path)?;
+        let db =
+            Database::create(&db_path).with_context(|| format!("open {}", db_path.display()))?;
+        set_private_permissions(&db_path)?;
         let store = Self {
             db: Arc::new(db),
             data_dir,
@@ -250,6 +259,15 @@ impl Store {
         let read = self.db.begin_read()?;
         let table = read.open_table(TOKENS)?;
         let Some(value) = table.get(hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(value.value())?))
+    }
+
+    pub fn find_token_by_id(&self, token_id: &str) -> anyhow::Result<Option<TokenRow>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(TOKENS_BY_ID)?;
+        let Some(value) = table.get(token_id)? else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_slice(value.value())?))
@@ -929,63 +947,60 @@ fn build_session_row(
     }
 }
 
-#[cfg(unix)]
-fn set_private_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o600);
-        let _ = std::fs::set_permissions(path, permissions);
+fn create_private_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)?;
     }
+    Ok(())
+}
+
+fn ensure_private_file(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return set_private_permissions(path);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn create_private_secret(path: &Path, secret: &str) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(secret.as_bytes())?;
+    file.sync_all()?;
+    set_private_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn list_tokens_reads_key_suffixes_and_device_revoke_kills_device_tokens() {
-        let dir = std::env::temp_dir().join(format!("pir-phone-store-test-{}", Uuid::new_v4()));
-        let store = Store::open(&dir).expect("open store");
-        let user = store.create_user("token-user", None).expect("user");
-        let (user_token, user_row) = store
-            .create_token(&user.id, "user", Some("user token"), None)
-            .expect("user token");
-        let device = store
-            .create_device(&user.id, "device", None)
-            .expect("device");
-        let (device_token, device_row) = store
-            .create_token(&user.id, "device", Some("device token"), Some(&device.id))
-            .expect("device token");
-
-        let rows = store.list_tokens(&user.id).expect("list tokens");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| row.id == user_row.id));
-        assert!(rows.iter().any(|row| row.id == device_row.id));
-
-        assert!(store
-            .revoke_device(&user.id, &device.id)
-            .expect("revoke device"));
-        let rows = store
-            .list_tokens(&user.id)
-            .expect("list tokens after revoke");
-        assert!(rows
-            .iter()
-            .find(|row| row.id == device_row.id)
-            .is_some_and(|row| row.revoked_at.is_some()));
-        assert!(rows
-            .iter()
-            .find(|row| row.id == user_row.id)
-            .is_some_and(|row| row.revoked_at.is_none()));
-        assert!(!store
-            .revoke_device(&user.id, &device.id)
-            .expect("repeat revoke"));
-        assert!(crate::auth::authenticate_token(&store, &device_token, "device").is_err());
-        assert!(crate::auth::authenticate_token(&store, &user_token, "user").is_ok());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+fn set_private_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }

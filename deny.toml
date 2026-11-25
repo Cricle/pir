@@ -47,17 +47,9 @@ allow = [
     # is not effective, i.e. strictly more permissive than the MIT/Apache
     # entries above (no copyleft, no attribution requirement).
     "CC0-1.0",
-    # rustpython-doc 0.3.0 / rustpython-pylib 0.4.0 carry no SPDX expression in
-    # Cargo.toml; cargo-deny reads their LICENSE / Lib/PSF-LICENSE files as
-    # Python-2.0.1. The PSF license is permissive, OSI-approved and
-    # GPL-compatible; both crates ship only embedded Python docs/stdlib.
-    "Python-2.0.1",
     # terminfo 0.9.0 (via brush-core 0.5's embedded-shell feature) is WTFPL, a
     # permissive public-domain-equivalent license.
     "WTFPL",
-    # rustpython-vm 0.4 bigint backend (malachite) — the embedded python tool
-    # is an explicit pir feature; LGPL terms apply to the library itself only
-    "LGPL-3.0-only",
     # rpds 1.2 (persistent data structures) — a brush-core 0.5 dependency of
     # the optional `brush` feature (the embedded shell). MPL-2.0 is file-level
     # copyleft: it imposes nothing on pir's own sources, only on modified

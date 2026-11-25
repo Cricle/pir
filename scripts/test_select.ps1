@@ -188,7 +188,7 @@ $Rules = @(
        Broad   = @('subagent_builtin', 'subagent_runtime_isolation', 'tool_registration_fix', 'shell_totals_fix', 'codemode_whitelist', 'agent_mutation_serialization_fix', 'g_tools', 'g_extensions', 'p2_fixes') },
     @{ Re = '^src/coding_agent/'
        Targets = @('g_tools', 'g_cli_server')
-       Broad   = @('shell_pool', 'truncate_tail_edge', 'tool_registration_fix', 'session_context_cli', 'cli_parity_fixes', 'codemode_whitelist', 'security_fixes', 'subagent_builtin', 'g_protocol', 'python_plugin') },
+       Broad   = @('shell_pool', 'truncate_tail_edge', 'tool_registration_fix', 'session_context_cli', 'cli_parity_fixes', 'codemode_whitelist', 'security_fixes', 'subagent_builtin', 'g_protocol') },
     @{ Re = '^src/compaction/'
        Targets = @('g_agent', 'dry_convergence')
        Broad   = @('p2_inbox_toctou', 'core_round2_fixes', 'g_tools', 'session_manager_ext') },
@@ -201,7 +201,7 @@ $Rules = @(
        Targets = @('mcp_units', 'mcp_strict', 'mcp_integration')
        Broad   = @('g_ai', 'g_extensions', 'g_cli_server') },
     @{ Re = '^src/plugins/'
-       Targets = @('g_extensions', 'python_plugin', 'sdk_extensibility', 'npm_modules')
+       Targets = @('g_extensions', 'sdk_extensibility', 'npm_modules')
        Broad   = @('codemode_whitelist', 'codemode_worker_cancel', 'subagent_builtin', 'g_tools', 'mcp_integration', 'extensions_runtime') },
     @{ Re = '^src/session_manager/'
        Targets = @('g_agent', 'g_protocol', 'session_manager_ext')
@@ -254,7 +254,7 @@ function Get-ChangedFiles {
     }
     $cut = (Get-Date).AddMinutes(-$Since)
     $out = @()
-    foreach ($d in @("src", "tests", "benches", "schemas", ".github")) {
+    foreach ($d in @("src", "crates", "tests", "benches", "schemas", ".github")) {
         $p = Join-Path $root $d
         if (Test-Path $p) {
             $out += Get-ChildItem -Path $p -Recurse -File |
@@ -314,7 +314,7 @@ if ($full) {
     if ($List) { exit 0 }
     # -ExecutionPolicy Bypass: this host's LocalMachine policy is Restricted,
     # and a child powershell.exe does not inherit the parent's -File bypass.
-    $fullArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "test_fast.ps1"))
+    $fullArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "test_fast.ps1"), "-UseNextest")
     if ($NoBuild) { $fullArgs += "-NoBuild" }
     if ($NoRun) { Write-Host "[test_select] -NoRun: not running"; exit 0 }
     if ($Concurrency -gt 0) { $fullArgs += @("-Concurrency", $Concurrency) }
@@ -325,13 +325,37 @@ if ($full) {
 
 if (-not $NoSmoke) { foreach ($t in $SmokeTargets) { [void]$targets.Add($t) } }
 
-# Validate every planned name against the real target list, so a typo in the
-# table above degrades into "target dropped + warning" instead of a cargo
-# error that aborts the whole subset build.
-$knownTargets = @(Get-ChildItem -Path (Join-Path $root "tests\*.rs") | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) }) + @("pir")
-$bad = @($targets | Where-Object { $knownTargets -notcontains $_ })
-foreach ($b in $bad) { [void]$targets.Remove($b) }
-if ($bad.Count -gt 0) { Write-Warning ("[test_select] dropped unknown target name(s): " + ($bad -join ", ")) }
+# Validate and resolve planned names against the generated harness map. The mapping
+# table predates merged targets and may name a root test file/module; resolve that
+# name to the harness that actually includes it instead of silently dropping it.
+$knownTargets = @(
+    "zz_merged_1", "zz_merged_2", "zz_merged_3", "zz_merged_4",
+    "zz_merged_5", "zz_merged_6", "zz_merged_7", "zz_merged_8"
+) + @("worker_threads_real", "durable_memcopy_bench", "g_durable", "print_native_session", "resume_on_error", "feature_off_surface", "sdk_consumer_surface", "sdk_consumer_embed", "rpc_export_off", "pir")
+
+function Resolve-MergedTarget([string]$name) {
+    if ($knownTargets -contains $name) { return $name }
+    $module = "$name.rs"
+    foreach ($index in 1..8) {
+        $harness = Join-Path $root "tests/zz_merged_$index.rs"
+        if ((Test-Path $harness) -and (Select-String -LiteralPath $harness -SimpleMatch -Pattern "path = `"$module`"" -Quiet)) {
+            return "zz_merged_$index"
+        }
+    }
+    return $null
+}
+
+$resolvedTargets = [System.Collections.Generic.HashSet[string]]::new()
+$bad = @()
+foreach ($target in @($targets)) {
+    $resolved = Resolve-MergedTarget $target
+    if ($null -eq $resolved) { $bad += $target } else { [void]$resolvedTargets.Add($resolved) }
+}
+$targets = $resolvedTargets
+foreach ($b in $bad) { Write-Warning ("[test_select] dropped unknown target name(s): " + $b) }
+if ($bad.Count -gt 0 -and $AllowUnmapped) {
+    $notes += "unresolved test target(s): " + ($bad -join ", ")
+}
 
 Write-Host ("[test_select] changed {0} file(s) (window: {1})" -f $changed.Count, $(if ($Since -le 0) { "git dirty tree" } else { "last $Since min" }))
 foreach ($c in $changed) { Write-Host ("  changed: " + $c) }
@@ -350,7 +374,7 @@ if ($NoRun) { Write-Host "[test_select] -NoRun: not running"; exit 0 }
 
 Write-Host ""
 $t0 = Get-Date
-$sel = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "test_fast.ps1"), "-Tests", ($plan -join ","))
+$sel = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "test_fast.ps1"), "-UseNextest", "-Tests", ($plan -join ","))
 if ($NoBuild) { $sel += "-NoBuild" }
 if ($Concurrency -gt 0) { $sel += @("-Concurrency", $Concurrency) }
 if ($Threads -gt 0) { $sel += @("-Threads", $Threads) }

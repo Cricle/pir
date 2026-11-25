@@ -1,9 +1,8 @@
 # Unsafe-code inventory for tests/unsafe_gate.rs (U2 gate).
 #
-# Each line caps one file under src/ at the reviewed number of unsafe
-# constructs. The gate counts real `unsafe {`, `unsafe fn` and
-# `unsafe impl`/`unsafe trait` tokens only (comments and string/char/raw
-# literals are ignored), and compares component-wise:
+# Each line caps one file under the workspace source roots. The gate counts real
+# `unsafe {`, `unsafe fn` and `unsafe impl`/`unsafe trait` tokens only (comments
+# and string/char/raw literals are ignored), and compares component-wise:
 #
 #   - a file with unsafe but no entry here fails (new unsafe surface);
 #   - a count above the ceiling fails and prints `src/<file>:<line>` for every
@@ -19,36 +18,37 @@
 # `#[allow(unsafe_code)]` to cover a new block: this gate counts blocks.
 #
 # Regenerate the data lines with:
-#   cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist
+#   cargo test --test zz_merged_2 unsafe_gate::print_current_unsafe_allowlist -- --ignored --nocapture
 # The helper prints bare counts; re-add each per-entry boundary comment during
 # review (they are part of the reviewed inventory, not decoration).
-coding_agent/tools/bash.rs 5 0 0  # Win32 Job Object FFI; Win32 GetFileAttributesW shell-path check; Unix killpg on the shell's process group
-coding_agent/tools/confine.rs 27 0 0  # Unix openat/mkdirat/fstatat/renameat/unlinkat; Win32 reparse-point-aware open
-coding_agent/tools/shell_pool.rs 28 1 0  # Win32 Job Object/console FFI, Unix geteuid; one unsafe fn (ACL check)
-coding_agent/tools/spill.rs 16 0 0  # Win32 security-descriptor/ACL + CreateFileW FFI
-coding_agent/tools/util.rs 1 0 0  # Win32 FormatMessageW for locale-independent OS error text (PIR-BIN-077); caller-owned fixed buffer
-env_daemon/pty.rs 9 0 0  # ConPTY and Unix pty/termios FFI
-env_daemon/sys/unix.rs 5 0 0  # libc process/session/filesystem FFI
-env_daemon/sys/windows.rs 10 0 0  # Win32 process/console/filesystem FFI
-env_daemon/watch.rs 2 0 0  # libc statfs/name-to-handle watcher FFI
-extensions/runtime/exec.rs 1 0 0  # libc::kill on a child this process spawned
-extensions/runtime/host_functions/buffer_ops.rs 3 0 0  # QuickJS raw typed-array accessors
+crates/pir-core/src/coding_agent/tools/bash.rs 5 0 0  # Win32 Job Object FFI; Win32 GetFileAttributesW shell-path check; Unix killpg on the shell's process group
+crates/pir-core/src/coding_agent/tools/confine.rs 27 0 0  # Unix openat/mkdirat/fstatat/renameat/unlinkat; Win32 reparse-point-aware open
+crates/pir-core/src/coding_agent/tools/shell_pool.rs 28 1 0  # Win32 Job Object/console FFI, Unix geteuid; one unsafe fn (ACL check)
+crates/pir-core/src/coding_agent/tools/spill.rs 16 0 0  # Win32 security-descriptor/ACL + CreateFileW FFI
+crates/pir-core/src/coding_agent/tools/util.rs 1 0 0  # Win32 FormatMessageW for locale-independent OS error text (PIR-BIN-077); caller-owned fixed buffer
+crates/pir-core/src/env_daemon/pty.rs 9 0 0  # ConPTY and Unix pty/termios FFI
+crates/pir-core/src/env_daemon/sys/unix.rs 5 0 0  # libc process/session/filesystem FFI
+crates/pir-core/src/env_daemon/sys/windows.rs 10 0 0  # Win32 process/console/filesystem FFI
+crates/pir-core/src/env_daemon/watch.rs 2 0 0  # libc statfs/name-to-handle watcher FFI
+crates/pir-core/src/extensions/runtime/exec.rs 1 0 0  # libc::kill on a child this process spawned
+crates/pir-core/src/extensions/runtime/host_functions/buffer_ops.rs 3 0 0  # QuickJS raw typed-array accessors
+crates/pir-core/src/extensions/runtime/host_functions.rs 0 0 1  # rquickjs JsLifetime for static Rust-only userdata (SAFETY comment at the site)
 # child_fns: one reviewed Unix block (`libc::kill`). The Windows
 # `WaitForSingleObject` block was removed in favour of safe `Child::try_wait`
 # polling; keep this ceiling at 1, do not raise it for that block again.
-extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child this process spawned
-extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
-jobs.rs 14 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes (all with SAFETY notes)
-mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
-plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
-plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
-session_manager/mod.rs 4 0 0  # Win32 GetFileInformationByHandle identity probe (BY_HANDLE_FILE_INFORMATION) + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle)
-session_manager/retention.rs 7 0 0  # Win32 OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes
-session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
-tui/alloc_trace.rs 11 4 1  # process-global GlobalAlloc delegation (R62 counters moved from lib to bin; PIR-BIN-022 zero-size fallback stays inside the impl)
-tui/spill_preview.rs 1 0 0  # memmap2 read-only map of a spill file (Arc<Mmap> preview, see PIR-TUI-023/R61 spill decision)
-tui/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
-tui/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
-tui/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
+crates/pir-core/src/extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child this process spawned
+crates/pir-core/src/extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
+crates/pir-core/src/jobs.rs 16 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes + macOS proc_pidinfo(PROC_PIDTBSDINFO) start token (all with SAFETY notes)
+crates/pir-core/src/mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
+crates/pir-core/src/plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
+crates/pir-core/src/plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
+crates/pir-core/src/file_identity.rs 4 0 0  # Win32 FILE_ID_INFO identity probe via GetFileInformationByHandleEx + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle); moved out of session_manager/mod.rs so the spill exception shares the same implementation
+crates/pir-core/src/session_manager/retention.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes (the start-token probe is now delegated to jobs.rs instead of duplicated)
+crates/pir-core/src/session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
+crates/pir-tui/src/alloc_trace.rs 0 4 1  # process-global GlobalAlloc delegation (R62 counters moved from lib to bin; PIR-BIN-022 zero-size fallback stays inside the impl)
+crates/pir-tui/src/spill_preview.rs 1 0 0  # memmap2 read-only map of a spill file (Arc<Mmap> preview, see PIR-TUI-023/R61 spill decision)
+crates/pir-tui/src/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
+crates/pir-tui/src/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
+crates/pir-tui/src/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
 
-# total: 24 file(s), 158 unsafe block(s), 5 unsafe fn, 1 unsafe impl/trait
+# total: 26 file(s), 150 unsafe block(s), 5 unsafe fn, 2 unsafe impl/trait

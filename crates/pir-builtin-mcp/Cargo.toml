@@ -1,0 +1,16 @@
+[package]
+name = "pir-builtin-mcp"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Host-neutral pure core of the pir MCP builtin: tool namespacing and exposure resolution rules"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }

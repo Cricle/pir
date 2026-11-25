@@ -12,8 +12,8 @@ const STREAM_FOLLOW_INTERVAL_MS = 320;
 const STREAM_FOLLOW_MIN_HEIGHT_DELTA = 16;
 const PROGRAMMATIC_SCROLL_GUARD_MS = 700;
 
-export function storeToken(token) {
-  storeStoredToken(token);
+export function storeToken(token, base = state.serverBase) {
+  storeStoredToken(token, base);
 }
 
 export function resetToken({ clearInput = false } = {}) {

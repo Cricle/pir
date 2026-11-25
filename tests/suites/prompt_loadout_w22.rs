@@ -235,12 +235,12 @@ fn modifier_and_exclude_selections_keep_the_active_set_order() {
 
 /// The exact pir-only bullets, verbatim. These encode enforcement upstream does
 /// not have (`docs/system-prompt-audit.md` §4, B19):
-/// - the read-before-edit gate (`PIR_READ_BEFORE_EDIT`, default `enforce`),
+/// - the read-before-edit gate (`PIR_READ_BEFORE_EDIT`, default `edit-partial`),
 /// - the literal-path check (`coding_agent/tools/util.rs`),
 /// - the broad-search guard (`tools.broadSearchGuard`, default true),
 /// - the finish/verification check.
 const PIR_ONLY_RULES: [&str; 4] = [
-    "Read an existing file completely (no offset/limit) before writing or editing it; after your own successful write/edit you do not need to re-read it unless the tool reports an external change",
+    "Read an existing file before editing it, and read it completely (no offset/limit) before overwriting it with write; after your own successful write/edit you do not need to re-read it unless the tool reports an external change",
     "Pass literal filesystem paths to read/edit/write; never use shell substitutions such as $(pwd) or backticks in path arguments",
     "Run shell commands from the current working directory; never scan /, /tmp, the home directory, or an entire drive to find project files, and do not run recursive searches outside the project",
     "Before finishing, re-read the task specification and verify the edge cases it names (empty input, trailing newlines, ranges, and error exits); run the relevant tests, not only the visible ones",

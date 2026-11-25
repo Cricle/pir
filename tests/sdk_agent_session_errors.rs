@@ -103,6 +103,7 @@ fn script_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
     }
 }
 
@@ -283,6 +284,11 @@ globalThis.__sdkErrorsResult = out;
 
 #[tokio::test(flavor = "current_thread")]
 async fn agent_session_prompt_rejects_on_failed_and_aborted_turns() {
+    // This test mutates `PIR_AGENT_DIR`/`PIR_EXECUTABLE`/the provider key for
+    // the WHOLE process: take the shared per-binary lock so a sibling suite in
+    // the same merged harness cannot observe (or overwrite) the redirected
+    // environment mid-test.
+    let _env_lock = crate::common::agent_dir_env_lock().lock().await;
     let dir = TempDir::new("cas-errors");
     let agent_dir = TempDir::new("cas-errors-agent");
     let session_dir = dir.path().join("sessions");

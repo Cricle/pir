@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 description = "Central information proxy for pi-phone sessions"
 publish = false
 
+[lints.rust]
+unsafe_code = "deny"
+
 [lib]
 name = "pir_phone_server"
 path = "src/lib.rs"

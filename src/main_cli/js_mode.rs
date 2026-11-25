@@ -56,7 +56,14 @@ const NODE_COMPAT_VERSION: &str = "v24.19.0";
 
 /// Script-mode boot overlay (see `extensions/api/js/script_boot.js.txt`):
 /// argv/execPath placeholders are replaced with JSON literals before eval.
-const SCRIPT_BOOT: &str = include_str!("../extensions/api/js/script_boot.js.txt");
+///
+/// Read through the engine's accessor rather than `include_str!`: the asset
+/// moved into `crates/pir-core` with the engine split, so a relative
+/// `include_str!` from this crate no longer resolves, and a `const` cannot call
+/// a function — hence a function-local read at the one use site.
+fn script_boot() -> &'static str {
+    pir::extensions::api::script_boot_source()
+}
 
 /// Stack for the script thread: the entry module transpile (swc) and the
 /// QuickJS runtime both recurse on deep module graphs; match the generous
@@ -320,6 +327,7 @@ async fn run_script(script_path: PathBuf, argv: Vec<String>, exec_path: String) 
         // Explicit injection: the standalone script runner must not inherit
         // the extension host's heap policy (see [`script_limits`]).
         limits: Some(script_limits()),
+        allow_process_exit: true,
         ..Default::default()
     };
     let runtime = match ExtensionRuntime::new(config).await {
@@ -347,7 +355,7 @@ async fn run_script(script_path: PathBuf, argv: Vec<String>, exec_path: String) 
     runtime.allow_root(pir::coding_agent::context::agent_dir().join("npm"));
 
     // Script-mode overlay: argv/execPath + real-stdio console + process.exit.
-    let boot = SCRIPT_BOOT
+    let boot = script_boot()
         .replace(
             "__PIR_SCRIPT_ARGV__",
             &serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_string()),
@@ -409,6 +417,7 @@ async fn run_eval(code: String, argv: Vec<String>, exec_path: String) -> i32 {
         // Explicit injection: the standalone script runner must not inherit
         // the extension host's heap policy (see [`script_limits`]).
         limits: Some(script_limits()),
+        allow_process_exit: true,
         ..Default::default()
     };
     let runtime = match ExtensionRuntime::new(config).await {
@@ -426,7 +435,7 @@ async fn run_eval(code: String, argv: Vec<String>, exec_path: String) -> i32 {
 
     // Script-mode overlay: argv/execPath + real-stdio console + process.exit
     // (the overlay's `__pirScriptRun` module runner stays unused here).
-    let boot = SCRIPT_BOOT
+    let boot = script_boot()
         .replace(
             "__PIR_SCRIPT_ARGV__",
             &serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_string()),

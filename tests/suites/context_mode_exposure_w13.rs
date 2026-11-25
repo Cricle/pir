@@ -12,12 +12,12 @@
 //!
 //! Nine tools: exactly `register_core_tools`'s set minus `powershell`
 //! (registered, but `default_active: false`). Every `ctx_*` tool was absent —
-//! and so was every other plugin tool (`todo`, `python`, `tool_search`,
-//! `subagent`) — even though `builtin:context-mode` is `default_enabled` and
+//! and so was every other plugin tool (`todo`, `tool_search`, `subagent`) —
+//! even though `builtin:context-mode` is `default_enabled` and
 //! the build carries the `context-mode` feature.
 //!
 //! The break was never registration: `ContextModePlugin::register` registers
-//! all nine tools, and `PluginHost::build` runs it. The break was the MERGE.
+//! all twelve tools, and `PluginHost::build` runs it. The break was the MERGE.
 //! Print mode builds the unified plugin host (for the MCP reach wait hook and
 //! the builtin lifecycle) but its own tool registry only ever received
 //! `register_core_tools` + `merge_extension_tools` (the JS face). The Rust
@@ -30,10 +30,10 @@
 //!
 //! - the plugin-host seam: a DEFAULT plan (the real `order_extension_paths`
 //!   builtin insertion, not a hand-written path list) yields a host whose
-//!   registry resolves all nine `ctx_*` tools as `Direct` + `default_active`,
+//!   registry resolves all twelve `ctx_*` tools as `Direct` + `default_active`,
 //!   i.e. ACTIVE — not merely registered;
 //! - the merge seam: `merge_plugin_tools` (the function the print host now
-//!   calls) makes those nine tools active in the run registry, so
+//!   calls) makes those twelve tools active in the run registry, so
 //!   `declared_tool_definitions` — literally the request's `tools` list —
 //!   carries them;
 //! - the droppability contract is unchanged: `disabledBuiltinExtensions:
@@ -54,20 +54,24 @@ use pir::agent::tool_execution::{
 };
 use pir::extensions::{ExtensionConfig, SessionContextSnapshot};
 use pir::plugins::builtin::{
-    ContextModePlugin, CTX_BATCH_EXECUTE_TOOL_NAME, CTX_DOCTOR_TOOL_NAME,
-    CTX_EXECUTE_FILE_TOOL_NAME, CTX_EXECUTE_TOOL_NAME, CTX_FETCH_AND_INDEX_TOOL_NAME,
-    CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
+    ContextModePlugin, CTX_BATCH_EXECUTE_TOOL_NAME, CTX_BATCH_TOOL_NAME, CTX_DOCTOR_TOOL_NAME,
+    CTX_EXECUTE_FILE_TOOL_NAME, CTX_EXECUTE_TOOL_NAME, CTX_EXECUTE_TOOL_PROXY_NAME,
+    CTX_FETCH_AND_INDEX_TOOL_NAME, CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_RESUME_TOOL_NAME,
+    CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
 };
 use pir::plugins::{AgentPlugin, PluginHost};
 
-/// The nine tool names `ContextModePlugin::register` installs, in the order
+/// The twelve tool names `ContextModePlugin::register` installs, in the order
 /// the plugin registers them.
-const CTX_TOOL_NAMES: [&str; 9] = [
+const CTX_TOOL_NAMES: [&str; 12] = [
+    CTX_EXECUTE_TOOL_PROXY_NAME,
     CTX_EXECUTE_TOOL_NAME,
     CTX_EXECUTE_FILE_TOOL_NAME,
     CTX_BATCH_EXECUTE_TOOL_NAME,
+    CTX_BATCH_TOOL_NAME,
     CTX_INDEX_TOOL_NAME,
     CTX_SEARCH_TOOL_NAME,
+    CTX_RESUME_TOOL_NAME,
     CTX_STATS_TOOL_NAME,
     CTX_PURGE_TOOL_NAME,
     CTX_DOCTOR_TOOL_NAME,
@@ -163,7 +167,7 @@ fn resolved_tool_names(host: &PluginHost) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_plan_constructs_the_context_mode_builtin_and_registers_nine_tools() {
+fn default_plan_constructs_the_context_mode_builtin_and_registers_twelve_tools() {
     let fixture = default_host();
     let host = &fixture.host;
     let plugin_paths: Vec<String> = host
@@ -231,13 +235,13 @@ fn every_context_mode_tool_is_active_on_registration() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. The merge seam: the nine tools reach the run registry and the request's
+// 3. The merge seam: the twelve tools reach the run registry and the request's
 //    declaration list. This is the fix — before it, a print-mode run's
 //    registry held only core tools.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merged_run_registry_declares_all_nine_context_mode_tools() {
+fn merged_run_registry_declares_all_twelve_context_mode_tools() {
     let fixture = default_host();
     let registry = merged_registry(&fixture.host);
 
@@ -278,7 +282,7 @@ fn merged_run_registry_declares_all_nine_context_mode_tools() {
             "the merge must not drop core tool `{core}`: {declared_names:?}"
         );
     }
-    // The pre-fix shape the probe captured: nine tools. The merge must have
+    // The pre-fix shape the probe captured: twelve tools. The merge must have
     // moved past it.
     assert!(
         definitions.len() > 9,
@@ -402,11 +406,11 @@ fn default_plan_registration_stays_lazy() {
     assert_eq!(
         registrations.tools.len(),
         CTX_TOOL_NAMES.len(),
-        "the plugin must register exactly its nine tools"
+        "the plugin must register exactly its twelve tools"
     );
     assert!(
-        !plugin.has_python_worker(),
-        "registering must not start the Python worker"
+        !plugin.has_js_worker(),
+        "registering must not start the JS worker"
     );
     assert!(
         !plugin.index_is_open(),
