@@ -1987,10 +1987,13 @@ fn subagent_runs_through_the_agent_loop_with_session_env() {
 
                 let mut tools = ToolRegistry::new();
                 tools.register(Arc::new(SubagentTool::default()));
-                // The loop-built session env resolves the user-agent directory from the
-                // process agent dir; point it at the fixture for this test. (The other
-                // tests in this binary inject the directory through the env struct and
-                // never read the process env, so this is race-free here.)
+                // The loop-built session env resolves the user-agent directory
+                // from the process agent dir; point it at the fixture for this
+                // test. The SHARED per-binary lock keeps a sibling suite in the
+                // same merged harness from pinning `PIR_AGENT_DIR` at the same
+                // time (both would otherwise see the other's fixture, and a
+                // spawned child would then fail to resolve its catalog model).
+                let _agent_dir_guard = crate::common::agent_dir_env_lock().blocking_lock();
                 let previous_agent_dir = std::env::var("PIR_AGENT_DIR").ok();
                 std::env::set_var("PIR_AGENT_DIR", &temp.0);
                 let agent = Arc::new(AgentSession::new(AgentSessionConfig {

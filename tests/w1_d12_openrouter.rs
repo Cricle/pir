@@ -60,12 +60,14 @@ fn chat_model(id: &str) -> Model {
 
 /// Serializes the tests that mutate process-global env (`PIR_AGENT_DIR`,
 /// `PI_CATALOG_BASE_URL`, provider keys).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+///
+/// The SHARED per-binary lock, not a `static` declared here: a file-local
+/// mutex only serializes this suite and leaves it racing every other suite in
+/// the same merged harness that pins `PIR_AGENT_DIR` — which is how a child
+/// spawned mid-test resolved the other suite's agent dir and reported
+/// "Model not found".
+fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    crate::common::agent_dir_env_lock().blocking_lock()
 }
 
 fn unique_dir(tag: &str) -> PathBuf {

@@ -1604,8 +1604,11 @@ async fn reqwest_transport_does_not_follow_cross_host_redirects() {
 
 #[tokio::test]
 async fn oauth_client_does_not_follow_cross_host_redirects() {
-    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _guard = ENV_LOCK.lock().await;
+    // The SHARED per-binary agent-dir lock: this test pins `PIR_AGENT_DIR` for
+    // the whole body, and a sibling suite in the same merged harness resolves
+    // provider models through the process environment too (a file-local mutex
+    // would leave both pinned at once and hand a child the wrong agent dir).
+    let _guard = crate::common::agent_dir_env_lock().lock().await;
     let mut saved = clear_proxy_env();
     // Pin the global settings scope to an empty directory so a user-level
     // `httpProxy` setting cannot reroute the loopback request.
