@@ -28,9 +28,27 @@ use pir::ai::types::{Model, ModelCost, ModelCostRates};
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// The SHARED per-binary agent-dir lock (`crate::common::agent_dir_env_lock`).
+///
+/// These tests mutate `PIR_AGENT_DIR`, which
+/// `ai::providers::settings::agent_dir()` reads on every call — including from
+/// tests in OTHER modules of the same merged harness (`ai_proxy` pins its own
+/// temp agent dir). A file-private mutex cannot exclude those, so a sibling's
+/// mutation would look like a config-stamp change here and turn a cache HIT
+/// into a re-execution (`command_values_are_cached_per_command`).
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    crate::common::agent_dir_env_lock()
+}
+
+/// Take [`env_lock`] from a synchronous `#[test]`.
+///
+/// The shared lock is a `tokio::sync::Mutex`; `blocking_lock` is the sync
+/// entry point (no runtime is required and none of these tests holds a
+/// reactor). The returned guard is free-standing, so callers keep it in a
+/// `let _guard = …` binding — dropping it releases the guard, the ownership of
+/// which is what the scope needs.
+fn lock_agent_dir() -> tokio::sync::MutexGuard<'static, ()> {
+    env_lock().blocking_lock()
 }
 
 fn set_env(key: &str, value: Option<&str>) {
@@ -58,7 +76,7 @@ const AGENT_DIR_VARS: [&str; 3] = [
 /// exports `PIR_AGENT_DIR` can no longer redirect the load, and a sibling
 /// suite can no longer leave a pin behind for this test to observe.
 struct AgentDirEnv {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
@@ -69,9 +87,7 @@ impl AgentDirEnv {
 
     /// Clear every agent-dir override, then apply `pins` (name/value pairs).
     fn scoped(pins: &[(&'static str, &str)]) -> Self {
-        let lock = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = lock_agent_dir();
         let saved = AGENT_DIR_VARS
             .iter()
             .map(|key| (*key, std::env::var_os(key)))
@@ -372,7 +388,7 @@ fn padded_models_json(total_bytes: usize) -> String {
 
 #[test]
 fn models_json_over_limit_is_treated_as_absent() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     let previous = std::env::var("PIR_AGENT_DIR").ok();
     let dir = temp_dir("models-json-over-limit");
     let contents = padded_models_json(9 * 1024 * 1024);
@@ -401,7 +417,7 @@ fn models_json_over_limit_is_treated_as_absent() {
 
 #[test]
 fn models_json_under_limit_still_parses() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     let previous = std::env::var("PIR_AGENT_DIR").ok();
     let dir = temp_dir("models-json-small");
     let contents = padded_models_json(1024);
@@ -460,7 +476,7 @@ fn wrong_typed_models_json_fields_report_pi_schema_errors() {
     // Through the real loader the same file degrades to the empty layer plus
     // the recorded pi-text warning (PIR-BIN-098): no invented model id, no
     // error return.
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     let previous = std::env::var("PIR_AGENT_DIR").ok();
     let dir = temp_dir("models-json-schema");
     std::fs::write(
@@ -499,7 +515,7 @@ fn wrong_typed_models_json_fields_report_pi_schema_errors() {
 
 #[test]
 fn chatgpt_redirect_uri_follows_callback_host_env() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     set_env("PI_OAUTH_CALLBACK_HOST", None);
     assert_eq!(redirect_uri(), "http://127.0.0.1:1455/auth/callback");
     set_env("PI_OAUTH_CALLBACK_HOST", Some("localhost"));
@@ -769,7 +785,7 @@ fn models_json_resolves_under_pir_coding_agent_dir() {
 
 #[test]
 fn agent_dir_honors_every_override_variable() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     let dir = temp_dir("agent-dir-vars");
     let dir_str = dir.to_str().unwrap();
 
@@ -806,7 +822,7 @@ fn agent_dir_honors_every_override_variable() {
 /// keybindings settings).
 #[test]
 fn session_and_theme_dirs_honor_pir_agent_dir_only() {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     let dir = temp_dir("agent-dir-alias");
     let dir_str = dir.to_str().unwrap();
 
@@ -966,7 +982,7 @@ fn command_values_are_cached_per_command() {
     // that dir's config stamps, so a concurrent `PIR_AGENT_DIR` mutation from a
     // sibling test would show up as a MISS and re-run this command. Hold the
     // same lock the env-mutating tests use.
-    let _guard = env_lock().lock().unwrap();
+    let _guard = lock_agent_dir();
     clear_config_value_cache();
     let path = temp_dir("command-cache").join("hits.txt");
     // The command appends a marker to a file (each execution is observable)

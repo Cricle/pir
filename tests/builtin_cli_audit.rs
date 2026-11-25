@@ -100,6 +100,7 @@ fn default_plan_is_all_default_enabled_builtins_but_phone() {
             "builtin:mode",
             "builtin:mcp",
             "builtin:codemode",
+            "builtin:python",
             "builtin:context-mode",
             "builtin:tool-search",
             "builtin:tool-repair",

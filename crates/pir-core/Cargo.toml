@@ -80,8 +80,17 @@ md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
 getrandom = "0.3"
 pbkdf2 = { version = "0.12", optional = true }
-flate2 = { version = "1.1", optional = true }
-brotli = { version = "8", optional = true }
+# node:zlib host ops (deflate/gzip/brotli/zstd) and the shim-deflate inflation in
+# `extensions::api::embedded`. The `zlib-rs` backend is pure Rust like
+# miniz_oxide but roughly 2x faster (a port of zlib's C, including the
+# longest-match deflate path); it also provides the `any_zlib` API surface
+# (`new_with_window_bits`, `set_dictionary`) the node:zlib stream implementation
+# needs, which the default miniz_oxide backend does not expose.
+flate2 = { version = "1.1", default-features = false, features = [
+    "zlib-rs",
+    "runtime_detection",
+], optional = true }
+brotli = { version = "9", optional = true }
 zstd = { version = "0.13", optional = true }
 cm-memory = { version = "0.3.1", default-features = false, optional = true }
 rsa = { version = "0.9", features = ["sha2"], optional = true }
@@ -92,7 +101,18 @@ unicode-segmentation = "1.13"
 similar = { version = "2", optional = true }
 memchr = "2"
 unicode-normalization = "0.1"
-rquickjs = { version = "0.14.0", features = ["futures", "loader"], optional = true }
+# Embedded QuickJS. `parallel` swaps rquickjs's `Lrc` for `Arc`, which is what
+# makes a `Runtime`/`Context` (and the session that owns them) `Send`: the
+# `python`/`context-mode` tools hold a session across an await inside the
+# agent's boxed `Send` future. `disable-assertions` drops the engine's
+# per-access debug assertions, which cost more than they catch in a host that
+# already owns every call site.
+rquickjs = { version = "0.14.0", features = [
+    "futures",
+    "loader",
+    "parallel",
+    "disable-assertions",
+], optional = true }
 swc_ecma_parser = { version = "46.0.0", optional = true }
 swc_ecma_codegen = { version = "32.0.3", optional = true }
 swc_ecma_ast = { version = "29.0.2", optional = true }
@@ -120,6 +140,10 @@ rmcp = { version = "3.5", default-features = false, optional = true, features = 
 ] }
 aes = { version = "0.8", optional = true }
 scrypt = { version = "0.11", optional = true }
+# SHA-3 (Keccak) behind node:crypto's `sha3-*` digests.
+sha3 = { version = "0.10", optional = true }
+# WHATWG URL parsing behind the `url` virtual module and `fs`'s `URL` paths.
+url = { version = "2.5", optional = true }
 rusqlite = { version = "0.31", features = ["bundled", "hooks"], optional = true }
 brush-core = { version = "0.5.0", optional = true }
 brush-builtins = { version = "0.2.0", optional = true }
@@ -150,6 +174,7 @@ full = [
     "durable",
     "extensions",
     "context-mode",
+    "python",
     "mcp",
     "env",
     "env-daemon",
@@ -230,6 +255,8 @@ extensions = [
     "dep:zstd",
     "dep:aes",
     "dep:scrypt",
+    "dep:sha3",
+    "dep:url",
     "dep:md-5",
     "dep:sha1",
     "dep:pbkdf2",
@@ -250,6 +277,11 @@ brush = ["dep:brush-core", "dep:brush-builtins"]
 # helpers a front end renders without registering the edit tool itself.
 ui-support = ["dep:similar"]
 context-mode = ["extensions", "dep:rusqlite", "dep:pir-builtin-context-mode", "pir-builtins/context-mode"]
+# The `python` builtin tool. The name is kept for Settings/tool-selection
+# compatibility; the tool now runs JavaScript on the embedded QuickJS runtime
+# (`plugins/builtin/js_vm.rs`), so this pulls the same engine as context-mode
+# without the Python interpreter that used to back it.
+python = ["extensions"]
 mcp = ["dep:rmcp", "extensions", "dep:pir-builtin-mcp", "pir-builtins/mcp"]
 mcp-sd = ["mcp", "dep:ignore"]
 env = ["dep:notify", "dep:ignore"]

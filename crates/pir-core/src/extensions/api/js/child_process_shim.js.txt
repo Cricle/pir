@@ -1,9 +1,221 @@
 
 import EventEmitter from "@node/events";
 import { Readable } from "@node/stream";
+import { constants as osConstants } from "@node/os";
 
 const Buffer = globalThis.Buffer;
 const call = globalThis.__pirNodeCall;
+
+// ---------------------------------------------------------------------------
+// Node-shaped argument validation (internal/errors shapes)
+// ---------------------------------------------------------------------------
+
+function childCodedError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  Object.defineProperty(error, "toString", {
+    value: function () { return this.name + " [" + String(this.code) + "]: " + this.message; },
+    writable: true, enumerable: false, configurable: true,
+  });
+  return error;
+}
+
+/// `util.inspect`-lite for the primitives the messages carry.
+function childPrimitiveText(value) {
+  if (typeof value === "string") {
+    return "'" + value.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  }
+  if (typeof value === "bigint") return String(value) + "n";
+  if (typeof value === "function") return "[Function: " + (value.name || "anonymous") + "]";
+  if (typeof value === "object" && value !== null) {
+    if (Array.isArray(value)) return value.length === 0 ? "[]" : "[ " + value.map(childPrimitiveText).join(", ") + " ]";
+    const keys = Object.keys(value);
+    if (keys.length === 0) return "{}";
+    return "{ " + keys.map((key) => key + ": " + childPrimitiveText(value[key])).join(", ") + " }";
+  }
+  return String(value);
+}
+
+function childReceivedText(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "function") return "function " + (value.name || "");
+  if (type === "object") {
+    const ctor = value.constructor;
+    if (ctor && typeof ctor.name === "string" && ctor.name !== "") {
+      return "an instance of " + ctor.name;
+    }
+    return String(value);
+  }
+  let inspected = childPrimitiveText(value);
+  if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
+  return "type " + type + " (" + inspected + ")";
+}
+
+function childInvalidArgType(name, expected, value, property) {
+  return childCodedError(TypeError, "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" ' + (property ? "property" : "argument") +
+    " must be " + expected + ". Received " + childReceivedText(value));
+}
+
+function childInvalidArgValue(name, value) {
+  return childCodedError(TypeError, "ERR_INVALID_ARG_VALUE",
+    "The argument '" + name + "' is invalid. Received " + childPrimitiveText(value));
+}
+
+function pirChildIsArrayBufferView(value) {
+  return value !== null && typeof value === "object" &&
+    typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView(value);
+}
+
+function childOutOfRange(name, range, value) {
+  return childCodedError(RangeError, "ERR_OUT_OF_RANGE",
+    'The value of "' + name + '" is out of range. It must be ' + range + ". Received " + childPrimitiveText(value));
+}
+
+/// `validateFunction` for callbacks (Node names them `callback` here).
+function childCheckCallback(callback) {
+  if (typeof callback !== "function") {
+    throw childInvalidArgType("callback", "of type function", callback);
+  }
+  return callback;
+}
+
+/// `validateBoolean` on an options field (property wording, null allowed).
+function childBooleanOption(options, name) {
+  const value = options[name];
+  if (value === undefined || value === null) return;
+  if (typeof value !== "boolean") {
+    throw childInvalidArgType("options." + name, "of type boolean", value, true);
+  }
+}
+
+/// `validateString` on an options field (property wording, null allowed).
+function childStringOption(options, name) {
+  const value = options[name];
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string") {
+    throw childInvalidArgType("options." + name, "of type string", value, true);
+  }
+}
+
+/// `validateInt32` on an options field (uid/gid).
+function childInt32Option(options, name) {
+  const value = options[name];
+  if (value === undefined || value === null) return;
+  if (typeof value !== "number") {
+    throw childInvalidArgType("options." + name, "int32", value, true);
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 4294967295) {
+    throw childInvalidArgType("options." + name, "int32", value, true);
+  }
+}
+
+/// Node's `validateTimeout`: an unsigned integer (undefined/null mean none).
+function childValidateTimeout(timeout) {
+  if (timeout === undefined || timeout === null) return undefined;
+  if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 0) {
+    throw childOutOfRange("timeout", "an unsigned integer", timeout);
+  }
+  return timeout;
+}
+
+/// Node's `validateMaxBuffer`: a positive number, Infinity and fractions are
+/// accepted here (libuv floors the buffer size later).
+function childValidateMaxBuffer(maxBuffer) {
+  if (maxBuffer === undefined || maxBuffer === null) return undefined;
+  if (typeof maxBuffer !== "number" || Number.isNaN(maxBuffer) || maxBuffer < 0) {
+    throw childOutOfRange("options.maxBuffer", "a positive number", maxBuffer);
+  }
+  return maxBuffer;
+}
+
+/// `validateSignal`: a known signal name (case-insensitive) or number.
+function childValidateKillSignal(signal) {
+  if (signal === undefined || signal === null) return undefined;
+  const signals = (osConstants && osConstants.signals) || {};
+  let known = false;
+  let name;
+  if (typeof signal === "number") {
+    if (Number.isInteger(signal)) {
+      for (const key of Object.keys(signals)) {
+        if (signals[key] === signal) { known = true; name = key; break; }
+      }
+    }
+    if (!known) throw childCodedError(TypeError, "ERR_UNKNOWN_SIGNAL", "Unknown signal: " + String(signal));
+  } else if (typeof signal === "string") {
+    const upper = signal.toUpperCase();
+    if (Object.prototype.hasOwnProperty.call(signals, upper)) { known = true; name = upper; }
+    if (!known) throw childCodedError(TypeError, "ERR_UNKNOWN_SIGNAL", "Unknown signal: " + signal);
+  } else {
+    throw childInvalidArgType("options.killSignal", "of type string or number", signal, true);
+  }
+  return name;
+}
+
+/// Node's `validateAbortSignal`: an AbortSignal-shaped object (or null).
+function childValidateSignalOption(signal) {
+  if (signal === undefined || signal === null) return undefined;
+  // Accept both a real AbortSignal (addEventListener) and the minimal
+  // `{ aborted: true }` shape used by the test harness / lightweight callers
+  // that only need the "already aborted" fast path. Requiring addEventListener
+  // unconditionally rejects those, so fall back to the `aborted` field.
+  if (typeof signal !== "object" ||
+      (typeof signal.addEventListener !== "function" &&
+       typeof signal.aborted !== "boolean")) {
+    throw childInvalidArgType("options.signal", "an instance of AbortSignal", signal, true);
+  }
+  return signal;
+}
+
+/// Signals this runtime delivers. The host's `spawnKill` calls `Child::kill`
+/// (SIGKILL on Unix, TerminateProcess on Windows) and carries no signal
+/// argument, so every accepted name means "terminate the child".
+///
+/// On win32 that is what Node itself does: libuv's `uv_kill` calls
+/// TerminateProcess for any signal, so accepting the names plugins actually
+/// use (SIGTERM/SIGKILL and the Ctrl-C/HUP family) is parity rather than
+/// pretending. Unknown names stay `ERR_UNKNOWN_SIGNAL`, and signals whose
+/// graceful meaning would matter on POSIX (SIGUSR1, SIGWINCH, …) are not
+/// invented here.
+const CHILD_FORCE_SIGNALS = {
+  SIGTERM: true,
+  SIGKILL: true,
+  SIGINT: true,
+  SIGHUP: true,
+  SIGQUIT: true,
+};
+
+function childSignalSupported(name) {
+  return name === undefined || CHILD_FORCE_SIGNALS[name] === true;
+}
+
+function childUnsupportedSignal(name) {
+  return childCodedError(Error, "ERR_NOT_SUPPORTED",
+    "child_process cannot deliver " + name + " in the pir extension runtime: " +
+    "the host only force-terminates a child (SIGTERM/SIGKILL)");
+}
+
+/// Node's `getValidatedPath` subset accepted by `cwd`.
+function childValidateCwd(cwd) {
+  if (cwd === undefined || cwd === null) return undefined;
+  if (typeof cwd === "string") return cwd;
+  if (cwd instanceof Uint8Array) return Buffer.from(cwd).toString();
+  if (typeof cwd === "object" && typeof cwd.href === "string") return cwd;
+  throw childInvalidArgType("options.cwd",
+    "of type string or an instance of Buffer or URL", cwd, true);
+}
+
+/// Node's `validateArguments`: the second argument is either an array of
+/// arguments or the options object itself.
+function childSplitArgs(commandName, args, options) {
+  if (args === null || args === undefined) return { args: [], options: options };
+  if (Array.isArray(args)) return { args: args, options: options };
+  if (typeof args === "object") return { args: [], options: args };
+  throw childInvalidArgType("args", "of type object", args);
+}
+
 
 // Pump cadence: each tick hands the host a bounded wait (it never blocks the
 // runtime for longer) and delivers whatever the readers buffered since.
@@ -40,20 +252,20 @@ function decodeOutput(buffer, encoding) {
 // Node semantics: a provided `env` REPLACES the child's environment wholesale
 // (values are stringified; null/undefined entries are dropped).
 function encodeEnv(env) {
-  if (env === undefined || env === null) {
-    try {
-      return globalThis.process && globalThis.process.env
-        ? Object.fromEntries(Object.entries(globalThis.process.env))
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
+  if (env === undefined || env === null) return undefined;
   const out = {};
   for (const key of Object.keys(env)) {
     const value = env[key];
     if (value === undefined || value === null) continue;
-    out[key] = String(value);
+    // An own `__proto__` key is a legal environment variable name: plain
+    // assignment would hit Object.prototype's setter and silently drop it.
+    if (key === "__proto__") {
+      Object.defineProperty(out, key, {
+        value: String(value), enumerable: true, writable: true, configurable: true,
+      });
+    } else {
+      out[key] = String(value);
+    }
   }
   return out;
 }
@@ -86,11 +298,16 @@ function normalizeStdioSlot(value, index) {
   // pipes are synchronous, so the slot resolves to an ordinary pipe.
   if (value === "overlapped") return "pipe";
   if (typeof value === "number") {
+    // Node validates the fd as a non-negative integer (validateInteger):
+    // negatives and fractions raise ERR_OUT_OF_RANGE.
     if (!Number.isInteger(value) || value < 0) {
-      const error = new TypeError("Invalid fd in the stdio option: " + String(value));
+      const error = new TypeError(
+        "The value of \"stdio\" is out of range. It must be a non-negative integer. Received " + value
+      );
       error.code = "ERR_OUT_OF_RANGE";
       throw error;
     }
+    if (value <= 2) return "inherit";
     return value;
   }
   if (typeof value === "object") {
@@ -98,36 +315,107 @@ function normalizeStdioSlot(value, index) {
     if (typeof value.fd === "number" && Number.isInteger(value.fd) && value.fd >= 0) {
       return value.fd;
     }
-    const error = new TypeError(
-      "In the \"stdio\" option, only \"pipe\", \"ignore\", \"inherit\", a file descriptor number, or an fd-backed stream is supported at index " + index,
-    );
-    error.code = "ERR_INVALID_ARG_VALUE";
-    throw error;
   }
-  const error = new TypeError("Invalid stdio option value at index " + index + ": " + String(value));
-  error.code = "ERR_INVALID_ARG_VALUE";
-  throw error;
+  throw childInvalidArgValue("stdio", value);
 }
 
 function normalizeStdio(stdio) {
   if (stdio === undefined || stdio === null) return undefined; // host default: three pipes
   if (typeof stdio === "string") {
     if (stdio === "overlapped") return ["pipe", "pipe", "pipe"];
-    if (stdio !== "pipe" && stdio !== "ignore" && stdio !== "inherit") {
-      const error = new TypeError("Invalid stdio option value: " + String(stdio));
-      error.code = "ERR_INVALID_ARG_VALUE";
-      throw error;
+    if (stdio === "pipe" || stdio === "ignore" || stdio === "inherit") {
+      return [stdio, stdio, stdio];
     }
-    return [stdio, stdio, stdio];
+    throw childInvalidArgValue("stdio", stdio);
   }
   if (!Array.isArray(stdio)) {
-    const error = new TypeError("The \"stdio\" option must be a string or an array");
-    error.code = "ERR_INVALID_ARG_TYPE";
-    throw error;
+    throw childInvalidArgType("stdio", "an array", stdio);
   }
   const out = [];
   for (let index = 0; index < 3; index++) out.push(normalizeStdioSlot(stdio[index], index));
   return out;
+}
+
+/// Node's spawn/spawnSync options validation. Returns the options object with
+/// the normalized values the host payload needs.
+function childValidateSpawnOptions(options) {
+  if (options === undefined || options === null) return {};
+  if (typeof options !== "object") {
+    throw childInvalidArgType("options", "of type object", options);
+  }
+  childValidateCwd(options.cwd);
+  childBooleanOption(options, "detached");
+  childBooleanOption(options, "windowsHide");
+  childBooleanOption(options, "windowsVerbatimArguments");
+  childStringOption(options, "argv0");
+  childInt32Option(options, "uid");
+  childInt32Option(options, "gid");
+  const shell = options.shell;
+  if (shell !== undefined && shell !== null && typeof shell !== "boolean" && typeof shell !== "string") {
+    throw childInvalidArgType("options.shell",
+      "one of type boolean or string", shell, true);
+  }
+  childValidateTimeout(options.timeout);
+  childValidateMaxBuffer(options.maxBuffer);
+  childValidateSignalOption(options.signal);
+  // Validate only: the caller's options object is never mutated. A frozen or
+  // sealed options object would make the old `_pirKillSignalName` assignment
+  // throw in strict mode (Node adds no fields either); `spawnSync` re-reads
+  // the kill signal when it needs the name for its in-band error.
+  childValidateKillSignal(options.killSignal);
+  return options;
+}
+
+/// Node's `fileURLToPath` subset for the `cwd` option: percent-escapes are
+/// decoded (`file:///C:/Program%20Files/a` -> `C:/Program Files/a`), the
+/// Windows drive path loses its file-URL leading slash, and a `file://host/`
+/// authority becomes a UNC path. A malformed escape is left as written (the
+/// host then reports ENOENT, like Node's path lookup would).
+function childPercentDecode(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch (error) {
+    return text;
+  }
+}
+
+function childFileUrlToPath(href) {
+  const match = /^file:\/\/([^/]*)(\/.*)?$/i.exec(String(href));
+  if (match === null) return String(href).replace(/^file:/i, "");
+  const authority = match[1];
+  // A query/fragment cannot belong to a filesystem path.
+  let path = (match[2] || "/").split(/[?#]/)[0];
+  path = childPercentDecode(path);
+  if (authority !== "" && authority.toLowerCase() !== "localhost") {
+    return "\\\\" + authority + path.replace(/\//g, "\\");
+  }
+  // `/C:/dir` is the file-URL spelling of the win32 path `C:/dir`.
+  if (/^\/[A-Za-z]:/.test(path)) path = path.slice(1);
+  return path;
+}
+
+/// The host payload's `cwd` text (Node accepts string/Buffer/URL).
+function childCwdText(cwd) {
+  if (cwd === undefined || cwd === null) return undefined;
+  if (typeof cwd === "string") return cwd;
+  if (cwd instanceof Uint8Array) return Buffer.from(cwd).toString();
+  if (typeof cwd.href === "string") return childFileUrlToPath(cwd.href);
+  return String(cwd);
+}
+
+function childValidateCommand(value, name) {
+  if (typeof value !== "string") {
+    throw childInvalidArgType(name, "of type string", value);
+  }
+  return value;
+}
+
+/// Node's `validateArgumentNullCheck` for the command's NUL bytes.
+function childNulCheck(value, name) {
+  if (value.indexOf("\u0000") !== -1) {
+    throw childInvalidArgValue(name, value);
+  }
+  return value;
 }
 
 // The child's capture streams are real Readables from the stream pad: npm code
@@ -167,10 +455,20 @@ class ChildProcess extends EventEmitter {
     this._timer = undefined;
     this._polling = false;
     this._pollErrors = 0;
+    // `options.timeout` kill timer and `options.signal` detach hook.
+    this._timeoutTimer = undefined;
+    this._abortDetach = null;
+    // Set when `options.signal` aborted: exec/execFile report AbortError.
+    this._pirAborted = false;
   }
 
   kill(signal) {
+    const name = childValidateKillSignal(signal === undefined ? "SIGTERM" : signal);
+    // Node returns false once the child has exited (and for a process object
+    // whose spawn never started).
+    if (this.exitCode !== null || this.signalCode !== null) return false;
     if (this._id === undefined) return false;
+    if (!childSignalSupported(name)) throw childUnsupportedSignal(name);
     try {
       call("child", "spawnKill", { id: this._id });
     } catch (error) {
@@ -178,6 +476,21 @@ class ChildProcess extends EventEmitter {
     }
     this.killed = true;
     return true;
+  }
+
+  // Drop the timeout timer / abort listener once the child is gone (or the
+  // host entry disappeared): either one would otherwise keep the process
+  // object alive for a signal that can no longer do anything.
+  _clearDeadline() {
+    if (this._timeoutTimer !== undefined) {
+      globalThis.clearTimeout(this._timeoutTimer);
+      this._timeoutTimer = undefined;
+    }
+    if (this._abortDetach !== null) {
+      const detach = this._abortDetach;
+      this._abortDetach = null;
+      try { detach(); } catch (error) {}
+    }
   }
 
   // Both streams are always flowing pipes here, so ref/unref have nothing to
@@ -206,7 +519,10 @@ function pumpChild(child) {
     child._polling = false;
     child._pollErrors += 1;
     const code = error && (error.code || error.name);
-    if (code === "ESRCH" || child._pollErrors > 100) child._stopPolling();
+    if (code === "ESRCH" || child._pollErrors > 100) {
+      child._stopPolling();
+      child._clearDeadline();
+    }
     return;
   }
   child._polling = false;
@@ -220,6 +536,7 @@ function pumpChild(child) {
   // `done` marks the host's final sample: every byte the pipe readers
   // captured was delivered above, so exit/close trail the data events.
   child._stopPolling();
+  child._clearDeadline();
   if (typeof sample.exitCode === "number") child.exitCode = sample.exitCode;
   if (sample.signal) child.signalCode = sample.signal;
   child.emit("exit", child.exitCode, child.signalCode);
@@ -283,15 +600,25 @@ function childStdin(id) {
 }
 
 function spawn(command, args, options) {
-  if (args !== undefined && !Array.isArray(args)) {
-    options = args;
-    args = undefined;
-  }
-  const opts = options === undefined || options === null ? {} : options;
+  // Node validates the command (named "file"), then splits args/options.
+  command = childNulCheck(childValidateCommand(command, "file"), "file");
+  const split = childSplitArgs("file", args, options);
+  args = split.args;
+  const opts = childValidateSpawnOptions(split.options);
   const argv = (args || []).map((value) => String(value));
   // Argument validation is synchronous (Node throws here too); a *spawn*
   // failure stays asynchronous below.
   const stdio = normalizeStdio(opts.stdio);
+  // The kill signal only matters when the shim has to deliver it (timeout or
+  // abort); fail synchronously when the host cannot.
+  const killSignalName = childValidateKillSignal(opts.killSignal);
+  const usesKillSignal =
+    (typeof opts.timeout === "number" && opts.timeout > 0) ||
+    (opts.signal !== undefined && opts.signal !== null);
+  if (usesKillSignal && !childSignalSupported(killSignalName)) {
+    throw childUnsupportedSignal(killSignalName);
+  }
+  const killSignal = killSignalName === undefined ? "SIGTERM" : killSignalName;
   const child = new ChildProcess();
   child.spawnfile = String(command);
   child.spawnargs = [String(command)].concat(argv);
@@ -300,7 +627,7 @@ function spawn(command, args, options) {
     started = call("child", "spawnStart", {
       cmd: String(command),
       args: argv,
-      cwd: typeof opts.cwd === "string" ? opts.cwd : undefined,
+      cwd: childCwdText(opts.cwd),
       env: encodeEnv(opts.env),
       shell: shellOption(opts.shell),
       windowsHide: opts.windowsHide === true,
@@ -319,6 +646,33 @@ function spawn(command, args, options) {
   child.stdin = slots[0] === "pipe" ? childStdin(started.id) : null;
   if (slots[1] !== "pipe") child.stdout = null;
   if (slots[2] !== "pipe") child.stderr = null;
+  // The host op has no deadline of its own: a `timeout` is a shim timer that
+  // force-terminates the child through spawnKill, which is the cancel the
+  // caller asked for. It is cleared as soon as the final sample arrives.
+  if (typeof opts.timeout === "number" && opts.timeout > 0) {
+    child._timeoutTimer = globalThis.setTimeout(function () {
+      child._timeoutTimer = undefined;
+      child.kill(killSignal);
+    }, opts.timeout);
+  }
+  // `options.signal`: Node kills the child when the signal aborts (an already
+  // aborted signal kills on the next tick). The listener is detached at exit.
+  const signal = opts.signal;
+  if (signal !== undefined && signal !== null) {
+    const markAborted = function () {
+      child._pirAborted = true;
+      child.kill(killSignal);
+    };
+    if (signal.aborted) {
+      globalThis.__pirMicrotask(markAborted);
+    } else {
+      const onAbort = markAborted;
+      signal.addEventListener("abort", onAbort, { once: true });
+      child._abortDetach = function () {
+        try { signal.removeEventListener("abort", onAbort); } catch (error) {}
+      };
+    }
+  }
   child._timer = globalThis.setInterval(() => pumpChild(child), POLL_INTERVAL_MS);
   return child;
 }
@@ -351,6 +705,16 @@ function execWithCallback(command, args, opts, callback) {
   if (child.stdout) child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
   if (child.stderr) child.stderr.on("data", (chunk) => stderrChunks.push(chunk));  child.on("error", (error) => settle(error));
   child.on("close", (code, signal) => {
+    // Node's exec/execFile callback gets an AbortError (not a generic
+    // "Command failed") when options.signal aborted the child.
+    if (child._pirAborted) {
+      const error = new Error("The operation was aborted");
+      error.name = "AbortError";
+      error.code = "ABORT_ERR";
+      if (opts.signal && opts.signal.reason !== undefined) error.cause = opts.signal.reason;
+      settle(error);
+      return;
+    }
     if (code !== 0 || signal) {
       const error = new Error("Command failed: " + child.spawnargs.join(" "));
       error.code = code;
@@ -368,7 +732,9 @@ function exec(command, options, callback) {
     callback = options;
     options = undefined;
   }
-  const opts = options === undefined || options === null ? {} : options;
+  command = childNulCheck(childValidateCommand(command, "command"), "command");
+  if (callback !== undefined) childCheckCallback(callback);
+  const opts = childValidateSpawnOptions(options);
   const merged = Object.assign({}, opts);
   merged.shell = opts.shell === undefined ? true : opts.shell;
   return execWithCallback(String(command), [], merged, callback);
@@ -383,43 +749,117 @@ function execFile(file, args, options, callback) {
     callback = options;
     options = undefined;
   }
-  const opts = options === undefined || options === null ? {} : options;
+  file = childNulCheck(childValidateCommand(file, "file"), "file");
+  const split = childSplitArgs("file", args, options);
+  args = split.args;
+  const opts = childValidateSpawnOptions(split.options);
+  if (callback !== undefined) childCheckCallback(callback);
   return execWithCallback(String(file), args || [], opts, callback);
 }
 
-function spawnSync(command, args, options) {
-  if (args !== undefined && !Array.isArray(args)) {
-    options = args;
-    args = undefined;
-  }
-  const opts = options === undefined || options === null ? {} : options;
+function execSync(command, options) {
+  command = childNulCheck(childValidateCommand(command, "command"), "command");
+  const opts = childValidateSpawnOptions(options);
+  const merged = Object.assign({}, opts);
+  merged.shell = opts.shell === undefined ? true : opts.shell;
+  // Node's *Sync convenience methods default to utf8 strings (not Buffers).
+  if (merged.encoding === undefined) merged.encoding = "utf8";
+  const result = spawnSync(String(command), [], merged);
+  const error = syncFailure(result, String(command), []);
+  if (error) throw error;
+  return result.stdout;
+}
+
+function execFileSync(file, args, options) {
+  file = childNulCheck(childValidateCommand(file, "file"), "file");
+  const split = childSplitArgs("file", args, options);
+  args = split.args;
+  const opts = childValidateSpawnOptions(split.options);
+  const merged = Object.assign({}, opts);
+  if (merged.encoding === undefined) merged.encoding = "utf8";
   const argv = (args || []).map((value) => String(value));
-  // spawnSync defaults to Buffer output; its exec*Sync wrappers default to
-  // utf8 (handled there).
+  const result = spawnSync(String(file), argv, merged);
+  const error = syncFailure(result, String(file), argv);
+  if (error) throw error;
+  return result.stdout;
+}
+
+/// Node's libuv errno for a spawn error code on win32.
+function childErrno(code) {
+  switch (code) {
+    case "ENOENT": return -4058;
+    case "EACCES": return -4092;
+    case "EBADF": return -4083;
+    case "ENOBUFS": return -4060;
+    case "ETIMEDOUT": return -4039;
+    case "ABORT_ERR": return -4038;
+    case "EINVAL": return -4071;
+    case "ENOMEM": return -4057;
+    default: return undefined;
+  }
+}
+
+/// The in-band spawnSync failure object: Node exposes exactly
+/// `{ errno, code, syscall, path, spawnargs }` plus the Error message.
+function childSpawnSyncError(code, cmd, argv) {
+  const syscall = "spawnSync " + cmd;
+  const error = childCodedError(Error, code, syscall + " " + code);
+  error.errno = childErrno(code);
+  error.syscall = syscall;
+  error.path = cmd;
+  // Node's `spawnargs` on the error excludes the command itself.
+  error.spawnargs = argv.slice();
+  return error;
+}
+
+function spawnSync(command, args, options) {
+  command = childNulCheck(childValidateCommand(command, "file"), "file");
+  const split = childSplitArgs("file", args, options);
+  args = split.args;
+  const opts = childValidateSpawnOptions(split.options);
+  const argv = (args || []).map((value) => String(value));
+  // spawnSync defaults to Buffer output; its exec*Sync wrappers inherit that.
   const encoding = opts.encoding === undefined ? "buffer" : opts.encoding;
+  // The kill signal name the result reports when the host had to terminate a
+  // timed-out/aborted child (validated, not stored on the caller's object).
+  const killSignalName = childValidateKillSignal(opts.killSignal);
+  // Same honesty rule as spawn: the host force-terminates, so a timeout/abort
+  // that must deliver another signal fails instead of pretending it did.
+  if (((typeof opts.timeout === "number" && opts.timeout > 0) ||
+       (opts.signal !== undefined && opts.signal !== null)) &&
+      !childSignalSupported(killSignalName)) {
+    throw childUnsupportedSignal(killSignalName);
+  }
   // Argument validation is synchronous (Node throws here too, before the
   // child is spawned). The host resolves the same stdio table `spawn` uses.
   const stdio = normalizeStdio(opts.stdio);
   let input;
-  if (opts.input !== undefined && opts.input !== null && opts.input !== "") {
-    input = toChunkBuffer(opts.input, opts.inputEncoding).toString("base64");
+  if (opts.input !== undefined && opts.input !== null) {
+    if (typeof opts.input !== "string" && !pirChildIsArrayBufferView(opts.input)) {
+      throw childInvalidArgType("options.stdio[0]",
+        "of type string or an instance of Buffer, TypedArray, or DataView",
+        opts.input, true);
+    }
+    if (opts.input !== "") {
+      input = toChunkBuffer(opts.input, opts.inputEncoding).toString("base64");
+    }
   }
   let result;
   try {
     result = call("child", "spawnSync", {
       cmd: String(command),
       args: argv,
-      cwd: typeof opts.cwd === "string" ? opts.cwd : undefined,
+      cwd: childCwdText(opts.cwd),
       env: encodeEnv(opts.env),
       shell: shellOption(opts.shell),
       windowsHide: opts.windowsHide === true,
       stdio: stdio,
       input: input,
-      timeout: typeof opts.timeout === "number" && opts.timeout > 0
-        ? Math.floor(opts.timeout)
-        : undefined,
-      maxBuffer: typeof opts.maxBuffer === "number" && opts.maxBuffer > 0
-        ? Math.floor(opts.maxBuffer)
+      timeout: opts.timeout > 0 ? Math.floor(opts.timeout) : undefined,
+      maxBuffer: typeof opts.maxBuffer === "number" && !Number.isNaN(opts.maxBuffer) && opts.maxBuffer >= 0
+        ? (opts.maxBuffer === 0 || opts.maxBuffer === Infinity
+          ? Number.MAX_SAFE_INTEGER
+          : Math.floor(opts.maxBuffer))
         : undefined,
       // Node's AbortSignal option. The runtime exposes one shared abort flag
       // (the one `ctx.signal` reads), so the host polls it while it waits; an
@@ -429,7 +869,17 @@ function spawnSync(command, args, options) {
     });
   } catch (error) {
     // Node reports a spawn failure in-band (`error` field), not as a throw.
-    return { pid: 0, output: [null, null, null], stdout: null, stderr: null, status: null, signal: null, error: error };
+    // The result shape differs from a timeout: output/stdout/stderr are null
+    // or undefined and no status/signal is reported.
+    return {
+      pid: 0,
+      output: null,
+      stdout: undefined,
+      stderr: undefined,
+      status: null,
+      signal: null,
+      error: childSpawnSyncError(error && error.code ? error.code : "ENOENT", String(command), argv),
+    };
   }
   // A slot the call did not pipe (`ignore`/`inherit`/parent fd) reports null,
   // exactly like Node; only a piped slot carries captured bytes.
@@ -442,17 +892,15 @@ function spawnSync(command, args, options) {
   // Node reports timeout / abort / maxBuffer exhaustion as the result's
   // `error` field (spawnSync does not throw); execSync rethrows it.
   let error;
+  let signal = result.signal === undefined ? null : result.signal;
   if (result.error && typeof result.error === "object") {
-    error = new Error(result.error.message || "Command failed");
-    error.code = result.error.code;
-    error.errno = result.error.code;
-    error.syscall = "spawnSync " + String(command);
-    error.status = result.status === undefined ? null : result.status;
-    error.signal = result.signal === undefined ? null : result.signal;
-    error.stdout = stdout;
-    error.stderr = stderr;
-    error.pid = result.pid;
-    error.cmd = [String(command)].concat(argv).join(" ");
+    const code = result.error.code || "EIO";
+    error = childSpawnSyncError(code, String(command), argv);
+    // A killed blocking child reports the signal that stopped it. The host
+    // always terminates with SIGTERM semantics; a caller-supplied killSignal
+    // is what Node reports in that field. Node's error object carries no
+    // `signal` property (only the outer result does).
+    signal = signal || killSignalName || "SIGTERM";
   }
   return {
     pid: result.pid,
@@ -460,7 +908,7 @@ function spawnSync(command, args, options) {
     stdout: stdout,
     stderr: stderr,
     status: result.status === undefined ? null : result.status,
-    signal: result.signal === undefined ? null : result.signal,
+    signal: signal,
     error: error,
   };
 }
@@ -479,32 +927,6 @@ function syncFailure(result, command, args) {
     return error;
   }
   return null;
-}
-
-function execSync(command, options) {
-  const opts = options === undefined || options === null ? {} : options;
-  const merged = Object.assign({}, opts);
-  merged.shell = opts.shell === undefined ? true : opts.shell;
-  if (merged.encoding === undefined) merged.encoding = "utf8";
-  const result = spawnSync(String(command), [], merged);
-  const error = syncFailure(result, String(command), []);
-  if (error) throw error;
-  return result.stdout;
-}
-
-function execFileSync(file, args, options) {
-  if (args !== undefined && !Array.isArray(args)) {
-    options = args;
-    args = undefined;
-  }
-  const opts = options === undefined || options === null ? {} : options;
-  const merged = Object.assign({}, opts);
-  if (merged.encoding === undefined) merged.encoding = "utf8";
-  const argv = (args || []).map((value) => String(value));
-  const result = spawnSync(String(file), argv, merged);
-  const error = syncFailure(result, String(file), argv);
-  if (error) throw error;
-  return result.stdout;
 }
 
 // Internal fork plumbing for the IPC channel; the runtime hosts no IPC pipe,

@@ -167,6 +167,12 @@ pub mod file_identity;
 // Persistent cross-process background jobs (P0-2): a detached supervisor
 // records command/status/pid/exit-code under `<agent-dir>/jobs/<job-id>/`.
 pub mod jobs;
+// The structured Node/npm runtime surface (C-ABI bridge host ops). It used to
+// be a separate `pir-node` workspace crate, but an unpublished path dependency
+// blocks `cargo package`; the source now lives here as a private-in-package
+// module and is enabled with the JS engine under `extensions`.
+#[cfg(feature = "extensions")]
+pub mod pir_node;
 // Extension *data* types ([`extensions::types`]) are always compiled; the JS
 // engine inside is behind the `extensions` feature.
 pub mod extensions;

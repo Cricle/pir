@@ -1,196 +1,11 @@
 use super::*;
 
-/// Open file-descriptor registry for the fs v2 surface (`openSync` family).
-/// Lives in [`RuntimeState`]; the state itself survives `/reload`, so entries
-/// carry the runtime generation that opened them. Each runtime releases only
-/// its own generation's entries at teardown (`ExtensionRuntime::drop`); an
-/// old runtime whose `Drop` is deferred by in-flight work can therefore
-/// never close a descriptor opened by its successor.
-///
-/// GENERATION IS PER DESCRIPTOR, never table-global: `/reload` builds the
-/// successor runtime BEFORE the predecessor is torn down, and the predecessor's
-/// still-running JS may keep calling `fs.openSync` during that window. A
-/// mutable "current generation" on the table would then stamp the OLD
-/// runtime's later descriptors with the NEW generation — its own `Drop` would
-/// leave them open forever, and the successor's teardown would close
-/// descriptors it never opened out from under the still-live predecessor. So
-/// every insert carries the CALLER's generation explicitly.
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-pub struct FdTable {
-    next_fd: i32,
-    entries: HashMap<i32, FdEntry>,
-}
-
-/// Hard cap on simultaneously open `fs.open` descriptors per runtime.
-///
-/// The JS side can open descriptors in a loop and never close them; without a
-/// cap that exhausts the host process's OS descriptor budget (and every later
-/// host operation with `EMFILE`). 256 is Node's common soft-limit scale while
-/// staying far below a constrained device's process-wide descriptor budget;
-/// the table is shared by every extension of one runtime, so the cap is the
-/// runtime's total, not one extension's.
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-pub const MAX_OPEN_FDS: usize = 256;
-
-/// One open descriptor: the OS handle plus the host-tracked sequential
-/// offset (`fs.readSync(fd, buf, ..., null)` reads from here).
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-pub struct FdEntry {
-    pub file: std::fs::File,
-    /// Path text for Node-shaped error messages.
-    pub path: PathBuf,
-    /// Node `a`/`a+` semantics: writes append regardless of the offset.
-    append: bool,
-    /// Sequential offset; explicit positions never move it (Node/pread
-    /// behavior), absent positions read/write from here and advance it.
-    position: u64,
-    /// Generation of the runtime that opened this descriptor (see
-    /// [`FdTable`]).
-    generation: u64,
-}
-
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-impl FdTable {
-    pub fn new() -> Self {
-        Self {
-            // 0/1/2 are the stdio descriptors in Node; the first host fd is 3.
-            next_fd: 3,
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Register `file` and return its descriptor. Numbers are monotonic
-    /// (never reused), so a stale descriptor can only fail with EBADF.
-    ///
-    /// `generation` is the OPENING runtime's own key (see the type docs): the
-    /// descriptor is released by that runtime's teardown and by nothing else.
-    ///
-    /// `Err(())` when [`MAX_OPEN_FDS`] descriptors are already open; the
-    /// caller maps that to Node's `EMFILE` before the file handle is stored
-    /// (the unregistered `file` drops with the caller's error path).
-    pub fn insert(
-        &mut self,
-        file: std::fs::File,
-        path: PathBuf,
-        append: bool,
-        generation: u64,
-    ) -> Result<i32, ()> {
-        if self.entries.len() >= MAX_OPEN_FDS {
-            return Err(());
-        }
-        let fd = self.next_fd;
-        self.next_fd += 1;
-        self.entries.insert(
-            fd,
-            FdEntry {
-                file,
-                path,
-                append,
-                position: 0,
-                generation,
-            },
-        );
-        Ok(fd)
-    }
-
-    pub fn get_mut(&mut self, fd: i32) -> Option<&mut FdEntry> {
-        self.entries.get_mut(&fd)
-    }
-
-    /// Close: the returned entry drops (and releases the handle) with the
-    /// caller's binding.
-    pub fn remove(&mut self, fd: i32) -> Option<FdEntry> {
-        self.entries.remove(&fd)
-    }
-
-    /// Close every descriptor owned by `generation` (runtime teardown /
-    /// `/reload`). Scoped by generation: a reload's old generation and its
-    /// successor share this table, and the old `Drop` may run after the
-    /// successor has already opened descriptors of its own.
-    pub fn clear_generation(&mut self, generation: u64) {
-        self.entries
-            .retain(|_, entry| entry.generation != generation);
-    }
-}
-
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-impl FdEntry {
-    /// Read up to `length` bytes; `position` absent = sequential (advances
-    /// the tracked offset), explicit = a positioned read (offset untouched).
-    pub fn read(&mut self, length: usize, position: Option<u64>) -> std::io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; length];
-        let at = position.unwrap_or(self.position);
-        let read = positioned_read(&self.file, &mut buffer, at)?;
-        buffer.truncate(read);
-        if position.is_none() {
-            self.position = at + read as u64;
-        }
-        Ok(buffer)
-    }
-
-    /// Write `data`; `position` absent = sequential. Append-mode descriptors
-    /// write at EOF regardless (Node's documented `a` flag behavior).
-    pub fn write(&mut self, data: &[u8], position: Option<u64>) -> std::io::Result<usize> {
-        let at = if self.append {
-            self.file.metadata()?.len()
-        } else {
-            position.unwrap_or(self.position)
-        };
-        positioned_write(&self.file, data, at)?;
-        if self.append || position.is_none() {
-            self.position = at + data.len() as u64;
-        }
-        Ok(data.len())
-    }
-}
-
-/// Positioned read that does not move the OS file pointer (`pread` /
-/// `seek_read`); the tracked offset is the only sequential cursor.
-#[cfg(windows)]
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-fn positioned_read(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
-}
-
-#[cfg(unix)]
-fn positioned_read(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
-}
-
-/// Positioned write-all (`pwrite` / a `seek_write` loop — the Windows trait
-/// has no `write_all_at`).
-#[cfg(windows)]
-#[cfg_attr(not(feature = "extensions"), allow(dead_code))]
-fn positioned_write(file: &std::fs::File, data: &[u8], offset: u64) -> std::io::Result<()> {
-    let mut written = 0;
-    while written < data.len() {
-        let n = std::os::windows::fs::FileExt::seek_write(
-            file,
-            &data[written..],
-            offset + written as u64,
-        )?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "failed to write the whole buffer",
-            ));
-        }
-        written += n;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn positioned_write(file: &std::fs::File, data: &[u8], offset: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::write_all_at(file, data, offset)
-}
-
 /// Lock a shared-state mutex, recovering from poisoning instead of panicking.
 ///
 /// The extension-runtime state only holds plain data guarded by short critical
 /// sections, so a poisoned lock is safe to continue from: take the guard out
 /// of the `PoisonError` and carry on.
-pub fn lock_state<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_state<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -204,7 +19,7 @@ pub fn lock_state<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// discarded. Shared by [`ExtensionRuntime::recover_after_interrupt`] and the
 /// `codemode` sandbox (which runs its own minimal QuickJS runtime).
 #[cfg(feature = "extensions")]
-pub async fn recover_interrupted(
+pub(crate) async fn recover_interrupted(
     ctx: &rquickjs::AsyncContext,
     js_runtime: &rquickjs::AsyncRuntime,
 ) {
@@ -233,9 +48,12 @@ pub async fn recover_interrupted(
 
 #[cfg_attr(not(feature = "extensions"), allow(dead_code))]
 impl RuntimeState {
-    pub fn new(config: ExtensionConfig) -> Self {
+    pub(crate) fn new(config: ExtensionConfig) -> Self {
         Self {
             session_name: config.session_id.clone(),
+            // Replaced by `ExtensionRuntime::new_with_state` with the runtime's
+            // real key; 0 keeps the data-only (no engine) state well-formed.
+            generation: 0,
             call_timeout: DEFAULT_CALL_TIMEOUT,
             hook_timeout: HOOK_CALL_TIMEOUT,
             // Replaced by `ExtensionRuntime::new_with_state` with the
@@ -245,10 +63,6 @@ impl RuntimeState {
             memory_pressure_warned: false,
             memory_pressure_last_sample: None,
             thinking_level: "off".to_string(),
-            // Replaced by `ExtensionRuntime::new_with_state` with the real
-            // generation; `0` matches no table entry (a plan-only handle never
-            // registers host resources).
-            generation: 0,
             session: Arc::new(SessionContextSnapshot {
                 project_trusted: true,
                 ..SessionContextSnapshot::default()
@@ -306,7 +120,6 @@ impl RuntimeState {
             keybinding_hints: JsonValue::Null,
             has_autocomplete_suggesters: false,
             stream_hook_bridges: HashMap::new(),
-            fd_table: FdTable::new(),
             before_agent_start_timeout:
                 crate::extensions::limits::DEFAULT_BEFORE_AGENT_START_TIMEOUT,
             pending_commands: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -335,7 +148,7 @@ impl RuntimeState {
     /// `pi` objects. `/reload` additionally refuses to run while another
     /// command is executing (see `perform_reload`), and generation-scoped fd
     /// ownership covers the background-continuation window.
-    pub fn clear_extension_registries(&mut self) {
+    pub(crate) fn clear_extension_registries(&mut self) {
         self.invalidated = false;
         self.flags.clear();
         self.flag_values.clear();
@@ -380,7 +193,7 @@ impl RuntimeState {
     /// latest-wins state slots (`ToolUpdate` per tool call, `Status` per key,
     /// `Widget` per id, singleton UI slots) and drops the oldest
     /// fire-and-forget toasts before falling back to the oldest entries.
-    pub const NOTIFICATION_QUEUE_CAP: usize = 1024;
+    pub(crate) const NOTIFICATION_QUEUE_CAP: usize = 1024;
 
     /// Slots freed by one [`Self::enforce_notification_cap`] pass. The pass
     /// costs O(cap), so leaving a quarter of the queue free ties its frequency
@@ -389,7 +202,7 @@ impl RuntimeState {
     /// delta.
     const NOTIFICATION_QUEUE_TRIM: usize = Self::NOTIFICATION_QUEUE_CAP / 4;
 
-    pub fn push(&mut self, notification: Notification) {
+    pub(crate) fn push(&mut self, notification: Notification) {
         // Tag the side effect with the dispatch that produced it.
         //
         // Preferred source: the Rust-side epoch of the dispatch future that is
@@ -424,7 +237,7 @@ impl RuntimeState {
     /// to be executing on the actor concurrently (a host-originated
     /// `ctx.ui.notify` must not be mistaken for that dispatch's work and
     /// dropped on its timeout).
-    pub fn push_host(&mut self, notification: Notification) {
+    pub(crate) fn push_host(&mut self, notification: Notification) {
         self.push_tagged(0, notification);
     }
 
@@ -547,7 +360,7 @@ impl RuntimeState {
     /// the marker are removed by the handler's own `exitDispatch` (its JS
     /// `finally`); both collections are bounded, so a continuation that never
     /// resumes cannot grow them.
-    pub fn purge_abandoned_dispatch(&mut self, epoch: u64) {
+    pub(crate) fn purge_abandoned_dispatch(&mut self, epoch: u64) {
         if epoch == 0 {
             return;
         }
@@ -564,7 +377,7 @@ impl RuntimeState {
 
     /// The JS handler for `epoch` settled (`exitDispatch`): drop its JS epoch
     /// entry and its abandoned marker (when the caller had given up on it).
-    pub fn exit_js_dispatch(&mut self, epoch: u64) {
+    pub(crate) fn exit_js_dispatch(&mut self, epoch: u64) {
         if epoch == 0 {
             return;
         }
@@ -579,7 +392,7 @@ impl RuntimeState {
     /// Called by the drain paths (the producer normally drops them in
     /// [`Self::push`]; an entry queued between the timeout and the abandon
     /// marker is caught here).
-    pub fn filter_abandoned_notifications(&mut self) {
+    pub(crate) fn filter_abandoned_notifications(&mut self) {
         let abandoned = self
             .abandoned_dispatch_epochs
             .lock()
@@ -599,7 +412,7 @@ impl RuntimeState {
     /// short global TTL never evicts a waiter that is still inside its own
     /// longer request timeout. Called when a reply arrives and when a waiter
     /// registers.
-    pub fn sweep_expired_dialog_state(&mut self) {
+    pub(crate) fn sweep_expired_dialog_state(&mut self) {
         self.dialog_responses
             .retain(|_, (_, inserted_at, ttl)| inserted_at.elapsed() < *ttl);
         self.dialog_notifies
@@ -608,7 +421,7 @@ impl RuntimeState {
 
     /// Current value of a registered flag (CLI value > default); `None` when
     /// the flag was never registered by any extension.
-    pub fn flag_value(&self, name: &str) -> Option<FlagValue> {
+    pub(crate) fn flag_value(&self, name: &str) -> Option<FlagValue> {
         if !self.flags.iter().any(|f| f.name == name) {
             return None;
         }
@@ -619,7 +432,7 @@ impl RuntimeState {
     }
 
     /// Apply a CLI-provided value to a registered flag.
-    pub fn set_flag_value(&mut self, name: &str, value: FlagValue) -> Result<(), String> {
+    pub(crate) fn set_flag_value(&mut self, name: &str, value: FlagValue) -> Result<(), String> {
         let flag_type = self
             .flags
             .iter()
@@ -645,7 +458,7 @@ impl RuntimeState {
     /// host fn and the `ExtensionHandle::remove_virtual_model` accessor — go
     /// through this helper, so a definition write can never bypass the host
     /// gate's generation.
-    pub fn remove_virtual_model(&mut self, provider: &str, id: &str) -> bool {
+    pub(crate) fn remove_virtual_model(&mut self, provider: &str, id: &str) -> bool {
         let provider_of = |def: &JsonValue| -> String {
             def.get("provider")
                 .and_then(JsonValue::as_str)
@@ -671,7 +484,7 @@ impl RuntimeState {
     /// The physical catalog model for `provider`/`id` (upstream
     /// `getPhysicalModel`): the host-pushed registry snapshot filtered to
     /// non-virtual entries. `None` when unknown or virtual.
-    pub fn get_physical_model(&self, provider: &str, id: &str) -> Option<JsonValue> {
+    pub(crate) fn get_physical_model(&self, provider: &str, id: &str) -> Option<JsonValue> {
         self.model_registry
             .get("models")
             .and_then(JsonValue::as_array)

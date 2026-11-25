@@ -809,7 +809,7 @@ fn do_swap<'js>(ctx: &Ctx<'js>, this: &Object<'js>, size: usize) -> Result<Value
 /// its 16-bit alignment for `indexOfBytes`.
 fn buffer_codec_entry<'js>(
     ctx: Ctx<'js>,
-    op: String,
+    op: rquickjs::String<'js>,
     arg: Opt<Value<'js>>,
     flag_a: Opt<bool>,
     flag_b: Opt<bool>,
@@ -818,6 +818,10 @@ fn buffer_codec_entry<'js>(
 ) -> Result<Value<'js>> {
     let undefined = |ctx: &Ctx<'js>| Ok(Value::new_undefined(ctx.clone()));
     let arg = arg.0.as_ref();
+    // `to_cstring` borrows QuickJS's UTF-8 image of the op name; matching on
+    // the slice avoids the extra Rust `String` allocation a `String` parameter
+    // would do on every call. (Op names are 3..24 ASCII bytes.)
+    let op = op.to_cstring()?;
     match op.as_str() {
         // -- string → bytes (undefined ⇒ JS fallback) ------------------------
         "utf8Bytes" => {
@@ -830,28 +834,13 @@ fn buffer_codec_entry<'js>(
             let Some(text) = marshal_string(arg) else {
                 return undefined(&ctx);
             };
-            // One byte per UTF-16 unit, and a unit never outgrows the UTF-8
-            // bytes of its char: `len()` bounds the output exactly, so the
-            // `collect`'s `size_hint`-derived growth is replaced by one
-            // allocation.
-            let mut bytes = Vec::with_capacity(text.len());
-            bytes.extend(text.encode_utf16().map(|unit| (unit & 0xff) as u8));
-            typed_array_value(ctx, bytes)
+            typed_array_value(ctx, crate::pir_node::modules::buffer::latin1_encode(&text))
         }
         "utf16leBytes" => {
             let Some(text) = marshal_string(arg) else {
                 return undefined(&ctx);
             };
-            // Two bytes per unit under the same bound, hence `len() * 2` — an
-            // exact bound the flattening iterator cannot report: its hint
-            // assumes 3-byte sequences, so it proves only two thirds of the
-            // input (a third of this output).
-            let mut bytes = Vec::with_capacity(text.len() * 2);
-            bytes.extend(
-                text.encode_utf16()
-                    .flat_map(|unit| [unit as u8, (unit >> 8) as u8]),
-            );
-            typed_array_value(ctx, bytes)
+            typed_array_value(ctx, crate::pir_node::modules::buffer::utf16le_encode(&text))
         }
         "hexBytes" => {
             let Some(text) = marshal_string(arg) else {
@@ -867,35 +856,63 @@ fn buffer_codec_entry<'js>(
         }
 
         // -- bytes → string ---------------------------------------------------
+        //
+        // The optional `arg2`/`start` pair carries an explicit `[start, end)`
+        // byte range (`Buffer#toString` passes the receiver once instead of
+        // materializing a `subarray` view). Existing callers leave both empty.
         "utf8Decode" => {
             let bytes = codec_bytes(arg, &ctx)?;
             // SAFETY: no JS runs while the slice is held (see `buffer_bytes`).
-            let text = typed_read(bytes).map(utf8_decode).unwrap_or_default();
-            text.into_js(&ctx)
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            utf8_decode_value(&ctx, raw)
+        }
+        // Strict variant for shims that only need "valid UTF-8 or not": a
+        // replacement-decoding pass is wasted on input they will reject, and
+        // `undefined` lets them keep their own fallback/guard scan.
+        "utf8DecodeStrict" => {
+            let bytes = codec_bytes(arg, &ctx)?;
+            // SAFETY: as above.
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            match crate::pir_node::modules::buffer::utf8_decode_strict(raw) {
+                Some(text) => text.into_js(&ctx),
+                None => undefined(&ctx),
+            }
         }
         "latin1Decode" => {
             let bytes = codec_bytes(arg, &ctx)?;
             // SAFETY: as above.
-            let raw = typed_read(bytes).unwrap_or(&[]);
-            // One allocation sized for the input: a `char`-wise `collect` has
-            // no byte-length hint and would grow the string by repeated
-            // reallocation (a latin1 byte can be a 2-byte char, so this is a
-            // lower bound — the common ASCII input fits exactly).
-            let mut text = String::with_capacity(raw.len());
-            text.extend(raw.iter().map(|&b| b as char));
-            text.into_js(&ctx)
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            // ASCII stays in QuickJS's narrow (8-bit) string form with a
+            // straight copy. High bytes as UTF-8 force the engine to scan and
+            // decode the 2-byte image, so hand it UTF-16 units instead (the
+            // codec is exact: one code point per byte).
+            if raw.is_ascii() {
+                latin1_decode(raw).into_js(&ctx)
+            } else {
+                let units = crate::pir_node::modules::buffer::latin1_units(raw);
+                match js_string_from_utf16(&ctx, &units) {
+                    Some(text) => Ok(text),
+                    None => latin1_decode(raw).into_js(&ctx),
+                }
+            }
         }
         "hexEncode" => {
             let bytes = codec_bytes(arg, &ctx)?;
             // SAFETY: as above.
-            let text = typed_read(bytes).map(hex_encode).unwrap_or_default();
-            text.into_js(&ctx)
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            hex_encode(raw).into_js(&ctx)
         }
         "base64Encode" => {
             let bytes = codec_bytes(arg, &ctx)?;
             // SAFETY: as above.
-            let text = typed_read(bytes).map(base64_encode).unwrap_or_default();
-            text.into_js(&ctx)
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            base64_encode(raw).into_js(&ctx)
+        }
+        "base64urlEncode" => {
+            let bytes = codec_bytes(arg, &ctx)?;
+            // SAFETY: as above.
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            crate::pir_node::modules::buffer::base64url_encode(raw).into_js(&ctx)
         }
 
         // -- streaming chunk decodes (return {text, consumed}) ----------------
@@ -911,12 +928,15 @@ fn buffer_codec_entry<'js>(
         "utf16leDecodeChunk" => {
             let bytes = codec_bytes(arg, &ctx)?;
             // SAFETY: as above.
-            let raw = typed_read(bytes).unwrap_or(&[]);
-            // Unpaired surrogates cannot cross the host bridge → JS fallback.
-            let Some((text, consumed)) = utf16le_decode_chunk(raw) else {
+            let raw = codec_range(typed_read(bytes), arg2.0.as_ref(), start.0);
+            let (units, consumed) = crate::pir_node::modules::buffer::utf16le_decode_units(raw);
+            // Unpaired surrogates are legal JS string content, so this no
+            // longer answers `undefined` for them (the JS tier used to take
+            // those chunks byte by byte).
+            let Some(text) = js_string_from_utf16(&ctx, &units) else {
                 return undefined(&ctx);
             };
-            chunk_result(&ctx, &text, consumed)
+            chunk_result_value(&ctx, text, consumed)
         }
         // -- node:string_decoder streaming chunk (state carried in/out) --------
         "stringDecodeChunk" => {
@@ -1020,6 +1040,72 @@ fn buffer_codec_entry<'js>(
             Ok(Value::new_float(ctx, value))
         }
 
+        // -- byte-range compare / endian swap (O(n) kernels) -------------------
+        "compareBytes" => {
+            let Some(source_view) = codec_view(arg) else {
+                return undefined(&ctx);
+            };
+            let Some(args) = arg2.0.as_ref().and_then(Value::as_object) else {
+                return undefined(&ctx);
+            };
+            let Ok(target) = args.get::<_, Object<'js>>("target") else {
+                return undefined(&ctx);
+            };
+            let Some(target_view) = target.as_typed_array::<u8>() else {
+                return undefined(&ctx);
+            };
+            let offset = |key: &str| -> Option<usize> {
+                args.get::<_, f64>(key)
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(|value| value as usize)
+            };
+            let (Some(source_start), Some(source_end), Some(target_start), Some(target_end)) =
+                (offset("s"), offset("se"), offset("ts"), offset("te"))
+            else {
+                return undefined(&ctx);
+            };
+            // SAFETY: no JS runs while the slices are held (see `buffer_bytes`).
+            let (Some(source), Some(target_bytes)) =
+                (typed_read(source_view), typed_read(target_view))
+            else {
+                return undefined(&ctx);
+            };
+            if source_start > source_end
+                || source_end > source.len()
+                || target_start > target_end
+                || target_end > target_bytes.len()
+            {
+                return undefined(&ctx);
+            }
+            let verdict = crate::pir_node::modules::buffer::compare_ranges(
+                &source[source_start..source_end],
+                &target_bytes[target_start..target_end],
+            );
+            Ok(Value::new_float(ctx, verdict as f64))
+        }
+        "swapBytes" => {
+            let Some(view) = codec_view(arg) else {
+                return undefined(&ctx);
+            };
+            let Some(size) = start.0 else {
+                return undefined(&ctx);
+            };
+            if !size.is_finite() || size.fract() != 0.0 || !matches!(size as u32, 2 | 4 | 8) {
+                return undefined(&ctx);
+            }
+            let size = size as usize;
+            // SAFETY: no JS runs while the slice is held (see `buffer_bytes`).
+            let Some(buffer) = typed_bytes(view) else {
+                return undefined(&ctx);
+            };
+            if buffer.len() % size != 0 {
+                return undefined(&ctx);
+            }
+            crate::pir_node::modules::buffer::swap_in_place(buffer, size);
+            Ok(Value::new_float(ctx, 0.0))
+        }
+
         // -- util.inspect string escaper (lone surrogates stay in JS) ----------
         "strEscape" => {
             let Some(text) = marshal_string(arg) else {
@@ -1060,11 +1146,99 @@ fn codec_view<'a, 'js>(arg: Option<&'a Value<'js>>) -> Option<&'a TypedArray<'js
     arg?.as_object()?.as_typed_array::<u8>()
 }
 
+/// Optional `[begin, end)` byte range carried by the decode/enhance ops as
+/// `(arg2, start)`. Both must be finite numbers; anything else keeps the whole
+/// slice (the historical call shape). Bounds are clamped, so a caller bug can
+/// never panic inside the native arm.
+fn codec_range<'a>(
+    raw: Option<&'a [u8]>,
+    arg2: Option<&Value<'_>>,
+    start: Option<f64>,
+) -> &'a [u8] {
+    let raw = raw.unwrap_or(&[]);
+    let (Some(end), Some(begin)) = (arg2.and_then(Value::as_number), start) else {
+        return raw;
+    };
+    if !begin.is_finite() || !end.is_finite() {
+        return raw;
+    }
+    let len = raw.len() as f64;
+    let begin = begin.max(0.0).min(len) as usize;
+    let end = end.max(0.0).min(len) as usize;
+    if begin <= end {
+        &raw[begin..end]
+    } else {
+        &raw[end..end]
+    }
+}
+
 fn chunk_result<'js>(ctx: &Ctx<'js>, text: &str, consumed: usize) -> Result<Value<'js>> {
     let result = Object::new(ctx.clone())?;
     result.set("text", text)?;
     result.set("consumed", consumed as i32)?;
     Ok(result.into_value())
+}
+
+/// [`chunk_result`] with an already-built string value (UTF-16 construction
+/// cannot go through the `&str` `IntoJs` impl).
+fn chunk_result_value<'js>(
+    ctx: &Ctx<'js>,
+    text: Value<'js>,
+    consumed: usize,
+) -> Result<Value<'js>> {
+    let result = Object::new(ctx.clone())?;
+    result.set("text", text)?;
+    result.set("consumed", consumed as i32)?;
+    Ok(result.into_value())
+}
+
+/// Build a JS string from UTF-16 code units (lone surrogates included, which is
+/// what makes this the right constructor for `utf16le`). Returns `None` only if
+/// the engine rejects the allocation (OOM / over-long string), letting the
+/// caller keep its JS fallback.
+#[allow(unsafe_code)]
+fn js_string_from_utf16<'js>(ctx: &Ctx<'js>, units: &[u16]) -> Option<Value<'js>> {
+    use rquickjs::qjs;
+    // SAFETY: `units` is a live slice for the duration of the call and the
+    // returned value is owned (refcount 1), exactly the contract `from_raw`
+    // expects. No JS runs between the constructor call and the wrap.
+    unsafe {
+        let raw = qjs::JS_NewStringUTF16(ctx.as_raw().as_ptr(), units.as_ptr(), units.len() as _);
+        if raw.tag == qjs::JS_TAG_EXCEPTION as i64 {
+            let error = qjs::JS_GetException(ctx.as_raw().as_ptr());
+            qjs::JS_FreeValue(ctx.as_raw().as_ptr(), error);
+            return None;
+        }
+        Some(Value::from_raw(ctx.clone(), raw))
+    }
+}
+
+/// `utf8Decode` result as a JS value. Strings that contain a code point above
+/// U+00FF cannot use QuickJS's narrow (8-bit) representation, so the engine's
+/// UTF-8 constructor would run a full `utf8_scan` + decode pass; handing it
+/// UTF-16 units is a scan-free `memcpy` instead. Narrow-capable text keeps the
+/// UTF-8 fast path (ASCII is a straight copy).
+fn utf8_decode_value<'js>(ctx: &Ctx<'js>, bytes: &[u8]) -> Result<Value<'js>> {
+    // Valid UTF-8 (the hot path) is borrowed straight from the buffer: no
+    // intermediate Rust `String` allocation. Only the replacement fallback
+    // needs an owned result.
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        // The wide/narrow decision is an O(3) kernel (`pir-node`): doing that
+        // scan here, in the O0 host crate, cost ~10µs per 1.2KB string.
+        if let Some(units) = crate::pir_node::modules::buffer::utf8_units_if_wide(text) {
+            if let Some(value) = js_string_from_utf16(ctx, &units) {
+                return Ok(value);
+            }
+        }
+        return text.into_js(ctx);
+    }
+    let text = utf8_decode(bytes);
+    if let Some(units) = crate::pir_node::modules::buffer::utf8_units_if_wide(&text) {
+        if let Some(value) = js_string_from_utf16(ctx, &units) {
+            return Ok(value);
+        }
+    }
+    text.into_js(ctx)
 }
 
 /// JS string → Rust string; `None` when the value is not a string or cannot
@@ -1086,65 +1260,8 @@ fn marshal_string(arg: Option<&Value<'_>>) -> Option<String> {
 /// `utf8Decode`: invalid sequences become U+FFFD and a truncated trailing
 /// sequence is replaced once for its maximal subpart.
 fn utf8_decode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b0 = bytes[i];
-        if b0 < 0x80 {
-            out.push(b0 as char);
-            i += 1;
-            continue;
-        }
-        let need = if (0xc2..=0xdf).contains(&b0) {
-            1
-        } else if (0xe0..=0xef).contains(&b0) {
-            2
-        } else if (0xf0..=0xf4).contains(&b0) {
-            3
-        } else {
-            out.push('\u{FFFD}');
-            i += 1;
-            continue;
-        };
-        if i + need >= bytes.len() {
-            // Truncated trailing sequence: one replacement for the maximal subpart.
-            out.push('\u{FFFD}');
-            i += 1;
-            while i < bytes.len() && (0x80..=0xbf).contains(&bytes[i]) {
-                i += 1;
-            }
-            continue;
-        }
-        let mut valid = true;
-        for continuation in &bytes[i + 1..=i + need] {
-            if !(0x80..=0xbf).contains(continuation) {
-                valid = false;
-                break;
-            }
-        }
-        if !valid {
-            out.push('\u{FFFD}');
-            i += 1;
-            continue;
-        }
-        let cp: u32 = match need {
-            1 => (u32::from(b0 & 0x1f) << 6) | u32::from(bytes[i + 1] & 0x3f),
-            2 => {
-                (u32::from(b0 & 0x0f) << 12)
-                    | (u32::from(bytes[i + 1] & 0x3f) << 6)
-                    | u32::from(bytes[i + 2] & 0x3f)
-            }
-            _ => {
-                (u32::from(b0 & 0x07) << 18)
-                    | (u32::from(bytes[i + 1] & 0x3f) << 12)
-                    | (u32::from(bytes[i + 2] & 0x3f) << 6)
-                    | u32::from(bytes[i + 3] & 0x3f)
-            }
-        };
-        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-        i += need + 1;
-    }
-    out
+    // O(3) kernel in `pir-node` (the host crate itself is O0 in dev).
+    crate::pir_node::modules::buffer::utf8_decode(bytes)
 }
 
 /// Streaming variant for TextDecoder: returns `(text, consumed)`. An
@@ -1157,208 +1274,45 @@ fn utf8_decode_chunk(
     is_final: bool,
     fatal: bool,
 ) -> Result<(String, usize)> {
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b0 = bytes[i];
-        if b0 < 0x80 {
-            out.push(b0 as char);
-            i += 1;
-            continue;
-        }
-        let need = if (0xc2..=0xdf).contains(&b0) {
-            1
-        } else if (0xe0..=0xef).contains(&b0) {
-            2
-        } else if (0xf0..=0xf4).contains(&b0) {
-            3
-        } else {
-            if fatal {
-                return Err(Exception::throw_type(ctx, FATAL_DECODE_MESSAGE));
-            }
-            out.push('\u{FFFD}');
-            i += 1;
-            continue;
-        };
-        if bytes.len() - i - 1 < need {
-            if is_final {
-                if fatal {
-                    return Err(Exception::throw_type(ctx, FATAL_DECODE_MESSAGE));
-                }
-                out.push('\u{FFFD}');
-                return Ok((out, bytes.len()));
-            }
-            // Incomplete trailing sequence: leave it for the next chunk.
-            return Ok((out, i));
-        }
-        let mut valid = true;
-        for continuation in &bytes[i + 1..=i + need] {
-            if !(0x80..=0xbf).contains(continuation) {
-                valid = false;
-                break;
-            }
-        }
-        if !valid {
-            if fatal {
-                return Err(Exception::throw_type(ctx, FATAL_DECODE_MESSAGE));
-            }
-            out.push('\u{FFFD}');
-            i += 1;
-            continue;
-        }
-        let cp: u32 = match need {
-            1 => (u32::from(b0 & 0x1f) << 6) | u32::from(bytes[i + 1] & 0x3f),
-            2 => {
-                (u32::from(b0 & 0x0f) << 12)
-                    | (u32::from(bytes[i + 1] & 0x3f) << 6)
-                    | u32::from(bytes[i + 2] & 0x3f)
-            }
-            _ => {
-                (u32::from(b0 & 0x07) << 18)
-                    | (u32::from(bytes[i + 1] & 0x3f) << 12)
-                    | (u32::from(bytes[i + 2] & 0x3f) << 6)
-                    | u32::from(bytes[i + 3] & 0x3f)
-            }
-        };
-        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-        i += need + 1;
+    // O(3) WHATWG kernel: maximal-subpart replacement, incomplete tails held
+    // for the next chunk unless `is_final`. `invalid` reports any replacement
+    // so fatal mode can throw (the JS shim maps the TypeError to Node's
+    // ERR_ENCODING_INVALID_ENCODED_DATA shape).
+    let (text, consumed, invalid) =
+        crate::pir_node::modules::buffer::utf8_decode_whatwg(bytes, is_final);
+    if fatal && invalid {
+        return Err(Exception::throw_type(ctx, FATAL_DECODE_MESSAGE));
     }
-    Ok((out, bytes.len()))
-}
-
-/// UTF-16LE decode over whole bytes; the odd trailing byte is not consumed
-/// (streaming carries it, the final flush drops it — JS parity). Returns
-/// `None` when the data contains unpaired surrogates (cannot cross the host
-/// bridge → JS fallback).
-fn utf16le_decode_chunk(bytes: &[u8]) -> Option<(String, usize)> {
-    let paired_len = bytes.len() - (bytes.len() % 2);
-    // Decoded straight off the input pairs: materializing the code units in a
-    // `Vec<u16>` first would add a second buffer the length of the chunk (plus
-    // a write and a read pass over it) for nothing.
-    let unit_at = |at: usize| u16::from(bytes[at]) | (u16::from(bytes[at + 1]) << 8);
-    let mut out = String::with_capacity(paired_len / 2);
-    let mut at = 0;
-    while at < paired_len {
-        let unit = unit_at(at);
-        if (0xd800..0xdc00).contains(&unit) {
-            // A high surrogate needs its low partner: without one the string
-            // cannot cross the host bridge and the JS tier takes the chunk.
-            if at + 4 > paired_len {
-                return None;
-            }
-            let low = unit_at(at + 2);
-            if !(0xdc00..0xe000).contains(&low) {
-                return None;
-            }
-            let cp = 0x1_0000 + ((u32::from(unit - 0xd800) << 10) | u32::from(low - 0xdc00));
-            out.push(char::from_u32(cp)?);
-            at += 4;
-        } else if (0xdc00..0xe000).contains(&unit) {
-            return None; // lone low surrogate
-        } else {
-            out.push(char::from_u32(u32::from(unit))?);
-            at += 2;
-        }
-    }
-    Some((out, paired_len))
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    Ok((text, consumed))
 }
 
 /// Hex decode mirroring the JS `hexBytes`: stops at the first invalid pair
-/// and ignores a trailing single character.
+/// and ignores a trailing single character. O(3) kernel in `pir-node`.
 fn hex_decode(text: &str) -> Vec<u8> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let (Some(hi), Some(lo)) = (hex_nibble(bytes[i]), hex_nibble(bytes[i + 1])) else {
-            break;
-        };
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    out
+    crate::pir_node::modules::buffer::hex_decode(text)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 15) as usize] as char);
-    }
-    out
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        // Node's decoder table accepts the URL-safe alphabet in both modes
-        // (`Buffer.from('__--_--_--__', 'base64')` decodes like base64url).
-        b'+' | b'-' => Some(62),
-        b'/' | b'_' => Some(63),
-        _ => None,
-    }
+    crate::pir_node::modules::buffer::hex_encode(bytes)
 }
 
 /// Base64 decode mirroring the JS `base64Bytes`: `=` ends the payload,
-/// non-alphabet characters are skipped, bits flush on byte boundaries.
+/// non-alphabet characters are skipped, bits flush on byte boundaries. O(3)
+/// kernel in `pir-node`.
 fn base64_decode(text: &str) -> Vec<u8> {
-    // Every four input characters carry at most three output bytes (skipped
-    // characters and `=` only lower that), so this is a hard upper bound and
-    // the buffer never has to grow — same sizing idiom as `base64_encode`.
-    let mut out = Vec::with_capacity(text.len().div_ceil(4) * 3);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for &byte in text.as_bytes() {
-        if byte == b'=' {
-            break;
-        }
-        let Some(value) = base64_value(byte) else {
-            continue;
-        };
-        acc = (acc << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((acc >> bits) & 0xff) as u8);
-        }
-    }
-    out
+    crate::pir_node::modules::buffer::base64_decode(text)
 }
 
-/// Base64 encode with standard `=` padding (JS `base64Encode` parity).
+/// Base64 encode with standard `=` padding (JS `base64Encode` parity). O(3)
+/// kernel in `pir-node`.
 fn base64_encode(bytes: &[u8]) -> String {
-    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i < bytes.len() {
-        let b0 = bytes[i];
-        let b1 = bytes.get(i + 1).copied();
-        let b2 = bytes.get(i + 2).copied();
-        out.push(CHARS[(b0 >> 2) as usize] as char);
-        out.push(CHARS[(((b0 & 3) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
-        out.push(match b1 {
-            Some(b1) => CHARS[(((b1 & 15) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char,
-            None => '=',
-        });
-        out.push(match b2 {
-            Some(b2) => CHARS[(b2 & 63) as usize] as char,
-            None => '=',
-        });
-        i += 3;
-    }
-    out
+    crate::pir_node::modules::buffer::base64_encode(bytes)
+}
+
+/// latin1 → string: one byte is one code point (U+0000..=U+00FF). O(3) kernel
+/// in `pir-node`.
+fn latin1_decode(bytes: &[u8]) -> String {
+    crate::pir_node::modules::buffer::latin1_decode(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,9 +1671,8 @@ fn sd_decode_held(encoding: SdEncoding, bytes: &[u8]) -> Option<String> {
 }
 
 /// V8's `StringBytes::Encode` maximal-subpart UTF-8 decode, i.e. the shim's
-/// `pirUtf8Decode` — deliberately *not* [`utf8_decode`] above: the two differ
-/// on a sequence broken by a non-continuation byte (`E2 82 41` is one U+FFFD
-/// plus "A" here, two U+FFFD there).
+/// `pirUtf8Decode`. It now matches [`utf8_decode`] (both were fixed to the
+/// WHATWG maximal-subpart rule: `E2 82 41` is one U+FFFD plus "A").
 fn sd_utf8_decode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     let mut i = 0;

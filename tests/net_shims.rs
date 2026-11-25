@@ -134,8 +134,8 @@ export default (pi: any) => {
       "write('broken','buffer') typecheck (official test-stream-base-typechecking)",
       typeError !== null &&
         typeError.name === "TypeError" &&
-        typeError.code === "ERR_INVALID_ARG_TYPE" &&
-        typeError.message === "Second argument must be a buffer",
+        typeError.code === "ERR_UNKNOWN_ENCODING" &&
+        typeError.message === "Unknown encoding: buffer",
       JSON.stringify(typeError && [typeError.name, typeError.code, typeError.message]),
     );
 

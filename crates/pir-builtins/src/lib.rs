@@ -46,7 +46,7 @@ pub struct KnownBuiltin {
 
 /// Every builtin this workspace knows about, in registration order, regardless
 /// of which features are enabled.
-pub const KNOWN_BUILTINS: [KnownBuiltin; 10] = [
+pub const KNOWN_BUILTINS: [KnownBuiltin; 11] = [
     KnownBuiltin {
         name: "subagent",
         host_feature: "subagent",
@@ -70,6 +70,15 @@ pub const KNOWN_BUILTINS: [KnownBuiltin; 10] = [
         host_feature: "extensions",
         default_enabled: true,
         feature: "codemode",
+    },
+    // The `python` builtin keeps its Settings/tool-selection name, but the
+    // interpreter behind it is the embedded QuickJS runtime (the RustPython
+    // surface was removed), so it rides the engine's `python` feature.
+    KnownBuiltin {
+        name: "python",
+        host_feature: "python",
+        default_enabled: true,
+        feature: "python",
     },
     KnownBuiltin {
         name: "context-mode",
@@ -117,6 +126,13 @@ pub fn known(name: &str) -> Option<KnownBuiltin> {
 /// The factory for one builtin, or `None` when this build disabled its
 /// feature. The match is exhaustive on purpose: a row added to
 /// [`KNOWN_BUILTINS`] without a factory (or vice versa) fails to compile.
+///
+/// `python` is the one row with no factory here: its implementation
+/// (`pir-core`'s `plugins::builtin::python`) depends on the engine's agent and
+/// plugin traits, which this crate cannot reach. `pir-core` owns that factory
+/// and its `BUILTIN_EXTENSION_FACTORIES` table; this catalog keeps the row so
+/// `known()` can still explain a build that left the feature off, and
+/// `descriptors()` simply omits it (it has no factory to project).
 fn factory_for(name: &str) -> Option<pir_plugin_api::BuiltinPluginFactory> {
     match name {
         #[cfg(feature = "subagent")]
@@ -143,11 +159,13 @@ fn factory_for(name: &str) -> Option<pir_plugin_api::BuiltinPluginFactory> {
     }
 }
 
-/// Every builtin enabled in this build, in registration order.
+/// Every builtin this crate can instantiate, in registration order.
 ///
 /// The descriptor's order, `replaceable` flag, default-enable flag and host
 /// feature all come from [`KNOWN_BUILTINS`]; only the factory is decided by the
-/// feature gates.
+/// feature gates. A row this crate owns no factory for (`python`, see
+/// [`factory_for`]) is skipped: its factory lives in `pir-core`, which keeps
+/// the authoritative table for the engine's own builtins.
 pub fn descriptors() -> Vec<BuiltinDescriptor> {
     KNOWN_BUILTINS
         .iter()

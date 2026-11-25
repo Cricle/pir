@@ -104,6 +104,14 @@ name = "pir-minimal"
 path = "src/bin/pir-minimal.rs"
 required-features = []
 
+# The AOT bytecode generator: compiles every embedded JS shim to QuickJS
+# bytecode (`scripts/gen_shims_bytecode.*` drives it). Not shipped — it exists
+# so the checked-in `assets/bytecode` blobs can be regenerated and verified.
+[[bin]]
+name = "pir-gen-bytecode"
+path = "src/bin/pir_gen_bytecode.rs"
+required-features = ["extensions"]
+
 [lib]
 name = "pir"
 path = "src/lib.rs"
@@ -257,6 +265,20 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The AOT bytecode generator (`pir-gen-bytecode`) compiles the embedded shims
+# with rquickjs directly; nothing else in this facade crate touches the engine.
+# The feature set matches `pir-core`'s edge so Cargo resolves one shape.
+rquickjs = { version = "0.14.0", features = [
+    "futures",
+    "loader",
+    "parallel",
+    "disable-assertions",
+], optional = true }
+# Optional process-wide allocator for allocator A/B runs (feature
+# `mimalloc-alloc`, OFF by default). `default-features = false` selects plain
+# mimalloc; the `pir` bin registers `mimalloc::MiMalloc` as its
+# `#[global_allocator]`. A build without the feature keeps the previous setup.
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [features]
 # Today's behavior = `full` (every feature). The bin requires only `cli`
@@ -272,6 +294,7 @@ full = [
     "extensions",
     "context-mode",
     "mcp",
+    "python",
     "env",
     "env-daemon",
     "server",
@@ -346,9 +369,16 @@ tools = [
     "tool-background",
 ]
 grep-find = ["pir-core/grep-find"]
-extensions = ["pir-core/extensions", "pir-tui?/extensions"]
+extensions = ["pir-core/extensions", "pir-tui?/extensions", "dep:rquickjs"]
 brush = ["pir-core/brush"]
 context-mode = ["pir-core/context-mode"]
+# The `python` tool name is kept for Settings/tool-selection compatibility; the
+# tool now runs JavaScript on the embedded QuickJS runtime.
+python = ["pir-core/python"]
+# Allocator A/B switch for the `pir` binary only (`src/main.rs`). OFF by
+# default: enabling it swaps the process-wide allocator, which is what the
+# perf harness compares against the default.
+mimalloc-alloc = ["dep:mimalloc"]
 mcp = ["pir-core/mcp"]
 mcp-sd = ["pir-core/mcp-sd"]
 env = ["pir-core/env"]
@@ -436,7 +466,6 @@ unicode-segmentation = "1.13"
 similar = "2"
 memchr = "2"
 unicode-normalization = "0.1"
-rquickjs = { version = "0.14.0", features = ["futures", "loader"] }
 swc_ecma_parser = "46.0.0"
 swc_ecma_codegen = "32.0.3"
 swc_ecma_ast = "29.0.2"
@@ -770,3 +799,11 @@ required-features = ["sdk"]
 name = "rpc_export_off"
 path = "tests/rpc_export_off.rs"
 required-features = ["rpc"]
+
+
+# Test builds disable debug assertions: the integration harnesses assert their
+# own invariants, and the overflow checks in every (large) test binary were a
+# measurable part of the gate's runtime. Kept from the node-AOT branch so both
+# trees agree on the test profile.
+[profile.test]
+debug-assertions = false

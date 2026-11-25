@@ -186,10 +186,7 @@ V8 级 API / 多 context 暴露）。已评估过的 shim 替代（包全局 `Ui
   自相矛盾，比同 realm 更差 → 不做。
 - `test-util-inspect.js` 的 harness 预期失败口径本轮用控制组复验：
   `runner.mjs --node --only test-util-inspect.js` 仍 fail（node v24.19.0 同样过不了
-  JSStream stub），见 `REPORT.partial.md`。（注：pir 在该文件里更早失败于
-  `util.inspect` 的 async generator 函数 tag 文案 `[Function: abc] AsyncGeneratorFunction`
-  ≠ node 的 `[AsyncGeneratorFunction: abc]`——这是被 harness 口径遮住的一条真实 shim
-  差异，不影响计分，本轮不动。）
+  JSStream stub）；详见 `REPORT.md`。
 
 ## 历史结论（2026-10-13，第二波扩量：88 → 128 文件）
 

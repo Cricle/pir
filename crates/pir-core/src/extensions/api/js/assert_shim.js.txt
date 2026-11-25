@@ -968,6 +968,47 @@ function pirEntryScriptFile() {
 // The caller's frame, with this module's own frames and native bridge frames
 // skipped (frame *names* are matched, so an engine whose captureStackTrace
 // ignores its constructorOpt argument is handled the same way).
+// QuickJS has no V8 CallSite / prepareStackTrace: fall back to parsing the
+// plain error.stack text, whose frames look like
+//     at NAME (pir-ext:FILE:LINE:COL)
+// Skip this module's own (@node/assert) and native frames; the first frame on
+// a real module is the assertion's caller.
+function pirStackStringFrame() {
+  let stack;
+  try { stack = new Error().stack; } catch { return undefined; }
+  if (typeof stack !== "string") return undefined;
+  const lines = stack.split(String.fromCharCode(10));
+  for (const raw of lines) {
+    const open = raw.indexOf("(");
+    const close = raw.lastIndexOf(")");
+    if (open < 0 || close <= open) continue;
+    const inner = raw.slice(open + 1, close);
+    const c2 = inner.lastIndexOf(":");
+    const c1 = inner.lastIndexOf(":", c2 - 1);
+    if (c1 < 0 || c2 < 0) continue;
+    const file = inner.slice(0, c1);
+    const line = Number(inner.slice(c1 + 1, c2));
+    const col = Number(inner.slice(c2 + 1));
+    if (!file || !Number.isFinite(line) || line < 1) continue;
+    if (file.indexOf("@node/") === 0 || file.indexOf(".js.txt") !== -1) continue;
+    let f = file;
+    let fromEntry = false;
+    if (file === "eval_script" || file === "<input>") {
+      // Script-mode entries (pir js of a .js file) report the synthetic
+      // eval_script name; the real source is the entry file, and line/col
+      // index its text.
+      const entry = pirEntryScriptFile();
+      if (entry === undefined) continue;
+      f = entry;
+      fromEntry = true;
+    } else if (file.indexOf("pir-ext:") === 0) {
+      f = file.slice(8);
+    }
+    return { file: f, line: line, column: Number.isFinite(col) ? col : 0, fromEntry: fromEntry, evalSource: undefined };
+  }
+  return undefined;
+}
+
 function pirCallerSourceFrame() {
   const savedPrepare = Error.prepareStackTrace;
   const savedLimit = Error.stackTraceLimit;
@@ -992,7 +1033,7 @@ function pirCallerSourceFrame() {
   } catch {
     // Same as above: restoring is best-effort.
   }
-  if (!Array.isArray(sites)) return undefined;
+  if (!Array.isArray(sites)) return pirStackStringFrame();
   for (let i = 0; i < sites.length; i += 1) {
     const site = sites[i];
     if (site === null || site === undefined) continue;
@@ -1053,7 +1094,7 @@ function pirCallerSourceFrame() {
       evalSource,
     };
   }
-  return undefined;
+  return pirStackStringFrame();
 }
 
 function pirErrMessage(calleeNames) {
@@ -1062,28 +1103,43 @@ function pirErrMessage(calleeNames) {
   try {
     const frame = pirCallerSourceFrame();
     if (frame === undefined) return undefined;
-    const entry = typeof frame.evalSource === "string"
+    let entry = typeof frame.evalSource === "string"
       ? pirEvalSourceEntry(frame.evalSource)
       : pirReadSourceFile(frame.file);
+    if (entry === null) {
+      // The frame may resolve to a shim file (e.g. node_globals.js.txt) whose
+      // text is not on disk; the entry script (argv[1]) is the source whose
+      // line numbers the <input> frame already indexes.
+      const ef = pirEntryScriptFile();
+      entry = ef === undefined ? null : pirReadSourceFile(ef);
+    }
     if (entry === null) return undefined;
     let line = frame.line;
+    if (line < 1 || line > entry.lines.length) return undefined;
+    // QuickJS script-mode frames report the column at the END of the call
+    // (e.g. the closing brace), so a slice from there is empty. Try the frame
+    // column first, then the start of the frame line, keeping whichever finds
+    // the assertion's call span.
     let col0 = frame.column > 0 ? frame.column - 1 : 0;
-    const offset = pirOffsetOf(entry, line, col0);
     let callStart = -1;
-    if (offset >= 0 && calleeNames !== undefined) {
-      callStart = pirFindCallStart(entry, offset, calleeNames);
-      if (callStart >= 0) {
-        const pos = pirLineColOf(entry, callStart);
-        line = pos.line;
-        col0 = pos.col;
+    if (calleeNames !== undefined) {
+      for (const startCol of [col0, 0]) {
+        const off = pirOffsetOf(entry, line, startCol);
+        if (off < 0) continue;
+        const cs = pirFindCallStart(entry, off, calleeNames);
+        if (cs >= 0) {
+          const pos = pirLineColOf(entry, cs);
+          line = pos.line;
+          col0 = pos.col;
+          callStart = cs;
+          break;
+        }
       }
     }
-    if (line < 1 || line > entry.lines.length) return undefined;
     // A frame attributed to the entry script without a named ancestor may
     // belong to another module's eval script: only trust it when the callee
     // match confirms a call of this assert function sits at that position.
     const source = pirFirstExpression(entry.lines[line - 1], col0);
-    if (frame.fromEntry === true && callStart < 0) return undefined;
     if (source === undefined || source === "") return undefined;
     return "The expression evaluated to a falsy value:\n\n  " +
       source.replace(pirEscapeSequencesRegExp, pirEscapeFn) + "\n";
@@ -2326,6 +2382,26 @@ function pirFail(receiver, actual, expected, message, operator, stackStartFn, ar
 
 class AssertImpl {
   constructor(options) {
+    // Node's Assert constructor: validateObject(options) + validateBoolean on
+    // strict/skipPrototype + validateOneOf on diff. The codes and messages are
+    // observable (test-assert-class.js).
+    if (options === undefined) {
+      options = {};
+    } else if (options === null || Array.isArray(options) || typeof options !== "object") {
+      throw pirInvalidArgType("options", "Object", options);
+    }
+    if ("strict" in options && typeof options.strict !== "boolean") {
+      throw pirInvalidArgType("options.strict", "boolean", options.strict);
+    }
+    if ("skipPrototype" in options && typeof options.skipPrototype !== "boolean") {
+      throw pirInvalidArgType("options.skipPrototype", "boolean", options.skipPrototype);
+    }
+    if (options.diff !== undefined && options.diff !== "simple" && options.diff !== "full") {
+      const error = new TypeError("The property 'options.diff' must be one of: 'simple', 'full'. Received " +
+        pirInspectDefault(options.diff));
+      error.code = "ERR_INVALID_ARG_VALUE";
+      throw error;
+    }
     const opts = Object.assign({ strict: true, skipPrototype: false }, options);
     this.AssertionError = AssertionError;
     Object.defineProperty(this, kOptions, {
@@ -2862,54 +2938,159 @@ function pirInternalMatch(receiver, string, regexp, message, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// CallTracker (deprecated in Node; kept as a working tracker)
+// CallTracker (deprecated in Node; a full port of
+// internal/assert/calltracker.js — Node v24 behaviour and message shapes)
 // ---------------------------------------------------------------------------
 
-class CallTracker {
-  constructor() {
+// `validateUint32(value, 'expected', true)` reproduces the two errors Node's
+// validator raises (type first, then integer/range), including its message
+// templates and codes.
+function pirValidatePositiveUint32(value, name) {
+  if (typeof value !== "number") {
+    throw pirInvalidArgType(name, ["number"], value);
+  }
+  if (!Number.isInteger(value)) {
+    const error = new RangeError("The value of \"" + name +
+      "\" is out of range. It must be an integer. Received " + String(value));
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+  if (value < 1 || value > 4294967295) {
+    const error = new RangeError("The value of \"" + name +
+      "\" is out of range. It must be >= 1 && <= 4294967295. Received " + String(value));
+    error.code = "ERR_OUT_OF_RANGE";
+    throw error;
+  }
+}
+
+// Node's noop is primordials' FunctionPrototype (a bare callable with an empty
+// name, so reports use the "calls" fallback name).
+const pirCallTrackerNoop = Function.prototype;
+
+class CallTrackerContext {
+  constructor(options) {
+    this._expected = options.expected;
+    this._calls = [];
+    this._stackTrace = options.stackTrace;
+    this._name = options.name;
+  }
+
+  track(thisArg, args) {
+    // Node freezes the recorded arguments and the record itself.
+    const argsClone = Object.freeze(Array.prototype.slice.call(args));
+    this._calls.push(Object.freeze({ thisArg: thisArg, arguments: argsClone }));
+  }
+
+  get delta() {
+    return this._calls.length - this._expected;
+  }
+
+  reset() {
     this._calls = [];
   }
 
-  track(fn, expected) {
-    const self = this;
-    const tracker = function tracked(...args) {
-      tracker.actual += 1;
-      return fn.apply(this, args);
-    };
-    tracker.expected = expected === undefined ? 1 : expected;
-    tracker.actual = 0;
-    self._calls.push(tracker);
-    return tracker;
-  }
-
-  verify() {
-    for (const tracker of this._calls) {
-      if (tracker.actual !== tracker.expected) {
-        throw new AssertionError({
-          message: "Expected the function to be called " + tracker.expected +
-            " time(s), got " + tracker.actual,
-          actual: tracker.actual,
-          expected: tracker.expected,
-          operator: "strictEqual",
-        });
-      }
-    }
-    return undefined;
+  getCalls() {
+    return Object.freeze(Array.prototype.slice.call(this._calls));
   }
 
   report() {
-    return this._calls.map((tracker) => ({
-      message: tracker.toString(),
-      actual: tracker.actual,
-      expected: tracker.expected,
-      operator: "strictEval",
-      stack: [],
-    }));
+    if (this.delta !== 0) {
+      const message = "Expected the " + this._name + " function to be " +
+        "executed " + this._expected + " time(s) but was " +
+        "executed " + this._calls.length + " time(s).";
+      return {
+        message: message,
+        actual: this._calls.length,
+        expected: this._expected,
+        operator: this._name,
+        stack: this._stackTrace,
+      };
+    }
+    return undefined;
+  }
+}
+
+// Method order mirrors Node's class body (reset, getCalls, calls, report,
+// verify), which is observable through the prototype's key order.
+class CallTracker {
+  constructor() {
+    this._callChecks = new Set();
+    this._trackedFunctions = new WeakMap();
   }
 
-  reset(fn) {
-    if (fn === undefined) this._calls = [];
-    else this._calls = this._calls.filter((tracker) => tracker !== fn);
+  _getTrackedFunction(tracked) {
+    if (!this._trackedFunctions.has(tracked)) {
+      throw pirInvalidArgValue("tracked", tracked, "is not a tracked function");
+    }
+    return this._trackedFunctions.get(tracked);
+  }
+
+  reset(tracked) {
+    if (tracked === undefined) {
+      for (const check of this._callChecks) check.reset();
+      return;
+    }
+    this._getTrackedFunction(tracked).reset();
+  }
+
+  getCalls(tracked) {
+    return this._getTrackedFunction(tracked).getCalls();
+  }
+
+  calls(fn, expected = 1) {
+    if (process._exiting) {
+      const error = new Error("Cannot call function in process exit handler");
+      error.code = "ERR_UNAVAILABLE_DURING_EXIT";
+      throw error;
+    }
+    // Node's overloads: calls(1) => expected=1; calls()/calls(undefined) use
+    // the noop. Non-function objects are accepted and fail naturally at the
+    // Proxy boundary, exactly like Node.
+    if (typeof fn === "number") {
+      expected = fn;
+      fn = pirCallTrackerNoop;
+    } else if (fn === undefined) {
+      fn = pirCallTrackerNoop;
+    }
+
+    pirValidatePositiveUint32(expected, "expected");
+
+    const context = new CallTrackerContext({
+      expected: expected,
+      stackTrace: new Error(),
+      name: fn.name || "calls",
+    });
+    // `__proto__: null` is load-bearing (Node's handler sets it): tests patch
+    // Object.prototype.get, which would otherwise become the proxy's `get`
+    // trap and throw on every property read.
+    const tracked = new Proxy(fn, {
+      __proto__: null,
+      apply(target, thisArg, argList) {
+        context.track(thisArg, argList);
+        return Reflect.apply(target, thisArg, argList);
+      },
+    });
+    this._callChecks.add(context);
+    this._trackedFunctions.set(tracked, context);
+    return tracked;
+  }
+
+  report() {
+    const errors = [];
+    for (const context of this._callChecks) {
+      const message = context.report();
+      if (message !== undefined) errors.push(message);
+    }
+    return errors;
+  }
+
+  verify() {
+    const errors = this.report();
+    if (errors.length === 0) return;
+    const message = errors.length === 1 ?
+      errors[0].message :
+      "Functions were not called the expected number of times";
+    throw new AssertionError({ message: message, details: errors });
   }
 }
 
@@ -2950,6 +3131,12 @@ assert.strict = Object.assign(strict, assert, {
 assert.strict.Assert = Assert;
 assert.strict.strict = assert.strict;
 assert.Assert = Assert;
+
+// `CallTracker.calls()` rejects while Node dispatches `exit`, guarded by
+// `process._exiting`. The runtime sets `_exiting = true` in script_boot /
+// worker_boot immediately before emitting `exit`, so no user-visible exit
+// listener is needed here (a prepended listener would show up in
+// `process.listenerCount("exit")` and break Node's listener accounting).
 
 // The CJS require bridge hands out a plain copy of a builtin's ESM namespace
 // (see `__pirRequireFrom`); for assert that would flatten the callable module

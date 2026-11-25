@@ -186,7 +186,11 @@ import path from "node:path";
     const out = {};
     for (const key of Object.keys(row)) {
       const value = row[key];
-      out[key] = value instanceof Uint8Array ? Buffer.from(value) : value;
+      out[key] = Buffer.isBuffer(value)
+        ? value
+        : value instanceof Uint8Array
+          ? Buffer.from(value)
+          : value;
     }
     return out;
   }
@@ -207,7 +211,9 @@ import path from "node:path";
   class Statement extends EventEmitter {
     // `runResult` mints the lightweight object the addon passes as `this` to
     // a Database#run callback (a Statement carrying lastID/changes).
-    constructor(db, sql, runResult) {
+    // `compiled` is the Database's cached DatabaseSync statement for this SQL
+    // (the addon also keeps a prepared-statement cache per Database).
+    constructor(db, sql, runResult, compiled) {
       super();
       this._pirDb = db;
       this._pirSql = sql;
@@ -220,7 +226,7 @@ import path from "node:path";
         this.changes = runResult.changes;
         return;
       }
-      this._pirSync = db._pirSync.prepare(sql);
+      this._pirSync = compiled !== undefined ? compiled : db._pirSync.prepare(sql);
     }
 
     _pirEnsureLive() {
@@ -358,6 +364,7 @@ import path from "node:path";
       this.filename = filename;
       this._pirClosed = false;
       this._pirOpenError = null;
+      this._pirCompiled = new Map();
       const options = {};
       if (typeof flags === "number") {
         // OPEN_READONLY without OPEN_READWRITE/OPEN_CREATE is the read-only
@@ -422,7 +429,18 @@ import path from "node:path";
     _pirStatement(sql) {
       if (this._pirClosed) throw errInvalidState("The database connection is not open");
       if (this._pirSync === null) throw this._pirOpenError;
-      return new Statement(this, sql);
+      // The native addon caches prepared statements per Database; reuse the
+      // compile across `.run/.get/.all/.each/.map` calls with the same SQL.
+      // Each call still gets a fresh Statement wrapper (its bound state and
+      // the callback `this` are per-call).
+      const cache = this._pirCompiled;
+      let compiled = cache.get(sql);
+      if (compiled === undefined) {
+        compiled = this._pirSync.prepare(sql);
+        if (cache.size >= 256) cache.clear();
+        cache.set(sql, compiled);
+      }
+      return new Statement(this, sql, undefined, compiled);
     }
 
     _pirExec(sql) {
@@ -619,6 +637,7 @@ import path from "node:path";
     close(callback) {
       if (!this._pirClosed) {
         this._pirClosed = true;
+        this._pirCompiled.clear();
         if (this._pirSync !== null) this._pirSync.close();
       }
       if (typeof callback === "function") globalThis.__pirMicrotask(() => callback.call(this, null));

@@ -27,6 +27,24 @@ let threadId = 0;
 // Wire state for THIS runtime; mutated only by the worker boot overlay.
 const workerRuntime = { workerId: 0, applied: false };
 
+// Typed C-ABI message tier (`runtime/host_functions/worker_fns.rs`): values
+// cross the seam once, as live QuickJS values, instead of the legacy
+// `{id, data: JSON.stringify(...)}` envelope. Detected at module load (the
+// host functions are installed before the shim sweep); a host without the
+// typed globals keeps the legacy string wire below as the fallback.
+const typedSendRecord = typeof globalThis.__pirWorkerSend === "function"
+  ? globalThis.__pirWorkerSend
+  : null;
+const typedSendValue = typeof globalThis.__pirWorkerSendValue === "function"
+  ? globalThis.__pirWorkerSendValue
+  : null;
+const typedTryRecv = typeof globalThis.__pirWorkerTryRecv === "function"
+  ? globalThis.__pirWorkerTryRecv
+  : null;
+const typedRecvPoll = typeof globalThis.__pirWorkerRecvPoll === "function"
+  ? globalThis.__pirWorkerRecvPoll
+  : null;
+
 globalThis.__pirWorkerThreadsApply ?? (globalThis.__pirWorkerThreadsApply = (state) => {
   isMainThread = false;
   threadId = state.threadId;
@@ -35,6 +53,16 @@ globalThis.__pirWorkerThreadsApply ?? (globalThis.__pirWorkerThreadsApply = (sta
   workerRuntime.applied = true;
   const port = new EventEmitter();
   port.postMessage = (value) => {
+    // `undefined` is a valid top-level message (Node clones it as undefined);
+    // the recursive check would reject it inside an object, exactly like
+    // `toWireJson`'s JSON.stringify subset.
+    if (typedSendRecord !== null) {
+      if (value !== undefined) assertClonable(value);
+      // The native bridge answers `false` only when it cannot represent the
+      // value; the shim's existing error text is the contract.
+      if (typedSendRecord(state.workerId, value) === false) throw cloneUnsupported(value);
+      return;
+    }
     // Wrap in the control-record envelope the parent pump dispatches on
     // (`kind: "msg"`), keeping the clone validation of the inner value.
     const wire = toWireJson(value);
@@ -71,25 +99,47 @@ const cloneUnsupported = (value) => {
 };
 
 const assertClonable = (value, seen) => {
-  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return;
-  if (typeof value !== "object" && typeof value !== "function") throw cloneUnsupported(value);
-  if (typeof value === "function" || typeof value === "symbol") throw cloneUnsupported(value);
-  if (seen.has(value)) throw cloneUnsupported(value); // cycles
-  seen.add(value);
+  const type = typeof value;
+  if (value === null || type === "boolean" || type === "number" || type === "string") return;
+  if (type !== "object" && type !== "function") throw cloneUnsupported(value);
+  if (type === "function" || type === "symbol") throw cloneUnsupported(value);
+  // Identity list, not a Set: message trees are tiny, and the linear scan
+  // beats allocating a hash set on every send (the list is allocated lazily,
+  // so a primitive message never touches it).
+  if (seen === undefined) seen = [];
+  for (let i = 0; i < seen.length; i++) if (seen[i] === value) throw cloneUnsupported(value);
+  seen.push(value);
   if (Array.isArray(value)) {
-    for (const item of value) assertClonable(item, seen);
+    for (let i = 0; i < value.length; i++) {
+      const item = value[i];
+      const itemType = typeof item;
+      // Inline the primitive fast path: the recursive call for a scalar is
+      // pure interpreter overhead, and message payloads are mostly scalars.
+      if (item === null || itemType === "boolean" || itemType === "number" || itemType === "string") continue;
+      assertClonable(item, seen);
+    }
   } else {
     // Class instances (non-plain prototypes) would silently lose their
     // prototype through the JSON bridge — refuse them instead.
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw cloneUnsupported(value);
-    for (const key of Object.keys(value)) assertClonable(value[key], seen);
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) {
+      const item = value[keys[i]];
+      const itemType = typeof item;
+      if (item === null || itemType === "boolean" || itemType === "number" || itemType === "string") continue;
+      assertClonable(item, seen);
+    }
   }
+  // `seen` is the current traversal PATH, not every object ever visited: the
+  // same sub-object referenced twice is a legal message (Node's structured
+  // clone keeps/repeats it), while only an ancestor repeat is a cycle.
+  seen.pop();
 };
 
 const toWireJson = (value) => {
   if (value === undefined) return "null";
-  assertClonable(value, new Set());
+  assertClonable(value);
   let json;
   try { json = JSON.stringify(value); } catch { throw cloneUnsupported(value); }
   return json === undefined ? "null" : json;
@@ -143,10 +193,19 @@ class Worker extends EventEmitter {
   _settleExit(code) {
     if (this._exited) return;
     this._exited = true;
-    this._exitCode = code;
-    this.emit("exit", code);
-    if (this._id !== null) {
-      try { hostWorker("release", { id: this._id }); } catch { /* registry entry may already be gone */ }
+    // Node always reports a numeric exit code (a forced stop is 1); never let
+    // an `undefined` record leak into the event or terminate()'s resolution.
+    this._exitCode = typeof code === "number" && !Number.isNaN(code) ? code : 1;
+    // Release the host registry entry even when an `exit` listener throws:
+    // otherwise a throwing listener leaks the entry for the rest of the
+    // runtime's generation (and leaked entries count against the host's
+    // live-worker cap, eventually refusing every new Worker).
+    try {
+      this.emit("exit", this._exitCode);
+    } finally {
+      if (this._id !== null) {
+        try { hostWorker("release", { id: this._id }); } catch { /* registry entry may already be gone */ }
+      }
     }
   }
 
@@ -154,22 +213,53 @@ class Worker extends EventEmitter {
   // until the worker is done, terminated, or self-exited. The poll is an
   // awaited host future (notify + timer fallback), so timers, in-flight
   // fetches and other JS keep running between polls.
+  //
+  // With the typed tier the envelope and its records are live values: no
+  // JSON text is produced or parsed on this path. The legacy fallback parses
+  // the envelope and then each raw record once (same semantics, one round
+  // trip more).
   async _pump() {
     for (;;) {
       let res;
-      try {
-        res = JSON.parse(await __pir_host.workerRecvPoll(this._id, 250, "parent"));
-      } catch { break; }
-      if (res.messages && res.messages.length > 0) {
-        for (const raw of res.messages) {
-          let record;
-          try { record = JSON.parse(raw); } catch { continue; }
+      if (typedRecvPoll !== null) {
+        res = typedTryRecv(this._id, false);
+        if (res === undefined) {
+          try { res = await typedRecvPoll(this._id, 250, false); } catch { break; }
+          if (res === undefined) continue;
+        }
+      } else {
+        try {
+          res = JSON.parse(await __pir_host.workerRecvPoll(this._id, 250, "parent"));
+        } catch { break; }
+        const raws = res.messages;
+        if (raws && raws.length > 0) {
+          const records = new Array(raws.length);
+          for (let i = 0; i < raws.length; i++) {
+            try { records[i] = JSON.parse(raws[i]); } catch { records[i] = undefined; }
+          }
+          res.messages = records;
+        }
+      }
+      const records = res.messages;
+      if (records && records.length > 0) {
+        for (let i = 0; i < records.length; i++) {
+          const record = records[i];
+          if (record === undefined || record === null) continue;
           if (record.kind === "msg") {
             this.emit("message", record.data);
           } else if (record.kind === "error") {
             const error = new Error(record.message || "Worker failed");
             if (record.stack) error.stack = record.stack;
-            this.emit("error", error);
+            try {
+              this.emit("error", error);
+            } catch (listenerError) {
+              // No `error` listener (the shim's EventEmitter throws like
+              // Node). The worker failed, so settle it before rethrowing:
+              // otherwise the pump promise dies without releasing the host
+              // registry entry.
+              this._settleExit(1);
+              throw listenerError;
+            }
           } else if (record.kind === "exit") {
             this._settleExit(record.code);
           }
@@ -189,9 +279,15 @@ class Worker extends EventEmitter {
   }
 
   postMessage(value) {
-    if (this._exited || this._id === null) return;
+    const id = this._id;
+    if (id === null || this._exited) return;
+    if (typedSendValue !== null) {
+      if (value !== undefined) assertClonable(value);
+      if (typedSendValue(id, value) === false) throw cloneUnsupported(value);
+      return;
+    }
     const dataJson = toWireJson(value);
-    try { hostWorker("parentSend", { id: this._id, data: dataJson }); } catch { /* worker gone: drop */ }
+    try { hostWorker("parentSend", { id, data: dataJson }); } catch { /* worker gone: drop */ }
   }
 
   async terminate() {
@@ -251,35 +347,162 @@ function isMarkedAsUntransferable(_object) {
   return false;
 }
 
-// Inert message-port pad: ports exist, move no data (single-thread runtime),
-// and close asynchronously like a drained port.
-class MessagePort {
+// Same-realm MessagePort pair. Node's MessagePort is an EventTarget with
+// EventEmitter aliases; messages are delivered asynchronously and only after
+// the port was started (setting `onmessage` or attaching a 'message' listener
+// starts it). No structured clone is performed (the two ends share a realm, so
+// values pass through as on the global MessageChannel), and closing either end
+// closes the channel (`port.close()` is not a no-op like the old inert pad:
+// messages posted afterwards are dropped instead of silently vanishing into a
+// dead queue).
+class MessagePort extends EventEmitter {
   constructor() {
+    super();
     this.onmessage = null;
     this.onmessageerror = null;
-    this._started = false;
+    this._pirPeer = null;
+    this._pirClosed = false;
+    this._pirStarted = false;
+    this._pirQueue = [];
+    this._pirScheduled = false;
+    // The in-realm channel holds no host handle, so it never keeps the event
+    // loop alive: `hasRef()` is honest (`false`) and ref()/unref() only record
+    // the request. Node code that calls them unconditionally keeps working.
+    this._pirRef = false;
   }
-  postMessage(_value, _transferList) {}
+  _pirPost(value) {
+    if (this._pirClosed) return;
+    const peer = this._pirPeer;
+    if (peer === null || peer._pirClosed) return;
+    peer._pirQueue.push(value);
+    peer._pirSchedule();
+  }
+  _pirSchedule() {
+    if (this._pirScheduled || this._pirClosed) return;
+    this._pirScheduled = true;
+    const self = this;
+    const deliver = function () {
+      self._pirScheduled = false;
+      self._pirDeliver();
+    };
+    if (typeof globalThis.__pirMicrotask === "function") globalThis.__pirMicrotask(deliver);
+    else Promise.resolve().then(deliver);
+  }
+  _pirDeliver() {
+    if (this._pirClosed) {
+      this._pirQueue.length = 0;
+      return;
+    }
+    // A message nobody listens for yet waits in the queue (Node's port must
+    // be started; a listener added later pumps it via start()).
+    if (!this._pirStarted && typeof this.onmessage !== "function") return;
+    while (!this._pirClosed && this._pirQueue.length > 0) {
+      const data = this._pirQueue.shift();
+      if (typeof this.onmessage === "function") this.onmessage({ type: "message", data: data });
+      this.emit("message", data);
+    }
+  }
+  postMessage(value, _transferList) {
+    this._pirPost(value);
+  }
   start() {
-    this._started = true;
+    if (this._pirClosed) return;
+    this._pirStarted = true;
+    this._pirSchedule();
   }
-  close() {}
-  ref() {}
-  unref() {}
+  close() {
+    if (this._pirClosed) return;
+    this._pirClosed = true;
+    this._pirQueue.length = 0;
+    const peer = this._pirPeer;
+    if (peer !== null) {
+      peer._pirClosed = true;
+      peer._pirQueue.length = 0;
+      this._pirPeer = null;
+      peer._pirPeer = null;
+    }
+  }
+  ref() {
+    this._pirRef = true;
+    return this;
+  }
+  unref() {
+    this._pirRef = false;
+    return this;
+  }
   hasRef() {
-    return false;
+    return this._pirRef && !this._pirClosed;
   }
-  addEventListener() {}
-  removeEventListener() {}
+  // Node's MessagePort aliases `on`/`once` onto EventEmitter and starts on a
+  // 'message' subscription.
+  on(type, listener) {
+    if (type === "message") this.start();
+    return super.on(type, listener);
+  }
+  once(type, listener) {
+    if (type === "message") this.start();
+    return super.once(type, listener);
+  }
+  addEventListener(type, listener, options) {
+    if (type !== "message" && type !== "messageerror") return;
+    if (typeof listener === "function") {
+      if (options !== null && typeof options === "object" && options.once === true) {
+        this.once(type, listener);
+      } else {
+        this.on(type, listener);
+      }
+    } else if (listener !== null && typeof listener === "object" &&
+               typeof listener.handleEvent === "function") {
+      const original = listener;
+      const handler = function (event) { original.handleEvent(event); };
+      handler.__pirOriginal = original;
+      this.on(type, handler);
+    }
+    if (type === "message") this.start();
+  }
+  removeEventListener(type, listener) {
+    if (typeof listener === "function") {
+      this.off(type, listener);
+      return;
+    }
+    if (listener === null || typeof listener !== "object" ||
+        typeof listener.handleEvent !== "function") {
+      return;
+    }
+    const registered = this.listeners(type);
+    for (let i = 0; i < registered.length; i++) {
+      if (registered[i].__pirOriginal === listener) {
+        this.off(type, registered[i]);
+        break;
+      }
+    }
+  }
   getEventListener() {
-    return [];
+    return this.listeners("message");
   }
 }
+
+// Setting `onmessage` starts the port (Node's setter does the same): a message
+// queued before the handler was assigned is pumped then instead of waiting
+// forever for a start() the caller never planned to call.
+Object.defineProperty(MessagePort.prototype, "onmessage", {
+  get: function () {
+    return this._pirOnMessage === undefined ? null : this._pirOnMessage;
+  },
+  set: function (value) {
+    this._pirOnMessage = value;
+    if (typeof value === "function") this.start();
+  },
+  enumerable: false,
+  configurable: true,
+});
 
 class MessageChannel {
   constructor() {
     this.port1 = new MessagePort();
     this.port2 = new MessagePort();
+    this.port1._pirPeer = this.port2;
+    this.port2._pirPeer = this.port1;
   }
 }
 
@@ -294,8 +517,11 @@ class BroadcastChannel {
   unref() {}
 }
 
-function receiveMessageOnPort(_port) {
-  return undefined;
+function receiveMessageOnPort(port) {
+  if (port === null || typeof port !== "object" || port._pirClosed) return undefined;
+  const queue = port._pirQueue;
+  if (!Array.isArray(queue) || queue.length === 0) return undefined;
+  return { message: queue.shift() };
 }
 
 function moveMessagePortToContext(_port, _context) {

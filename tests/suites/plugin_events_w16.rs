@@ -435,6 +435,11 @@ fn expected_builtin_events() -> Vec<(&'static str, EventInterest)> {
         ("codemode", EventInterest::None),
         #[cfg(feature = "tool-search")]
         ("tool-search", EventInterest::None),
+        // Handler-free: the `python` builtin registers its tool/command only
+        // (no `on_event` override in `plugins::builtin::python`), so it keeps
+        // the default `EventInterest::None`.
+        #[cfg(feature = "python")]
+        ("python", EventInterest::None),
         // `session_start` only: connect/discover (mcp) and replay re-arm (todo).
         #[cfg(feature = "mcp")]
         ("mcp", EventInterest::List(vec!["session_start".to_owned()])),

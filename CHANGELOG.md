@@ -6,6 +6,52 @@ Post-0.3.2 backlog closure: every verified `reproduced` item in the local issue
 board was fixed against upstream pi, the upstream tree was audited through
 v1.5.2, and the generated test harnesses were rebuilt.
 
+### QuickJS AOT host (merged from `master`)
+
+- The embedded JS engine now boots from ahead-of-time QuickJS bytecode instead
+  of parsing the shims per runtime: `pir-gen-bytecode` compiles the prelude,
+  the assembled Node-compat globals bundle, the builtin-import bootstrap and
+  every virtual module (`@node/*`, `@juiceshark/*`, `typebox`, …) into guarded
+  `.qc` blobs under `crates/pir-core/assets/bytecode/`, and
+  `extensions::api::bytecode` embeds them. The inflated-source path remains as
+  the `PIR_EXT_BYTECODE=0` fallback.
+- `pir-node` (the structured Node/npm runtime surface behind the C-ABI bridge)
+  moved into `pir-core` as `pir_node`: an unpublished `pir-node` path
+  dependency blocks `cargo package`, so the source now lives in the package as
+  a private module behind `extensions`. Its 20 modules, the `fs`/`http`/child
+  process/worker host ops and the allocator moved with it.
+- RustPython is gone for good: `context-mode` and the `python` builtin both run
+  on the shared embedded QuickJS runtime (`plugins/builtin/js_vm.rs`), so the
+  sandbox, the extension host and `pir js` share one engine, one module loader
+  and one Node compatibility suite. The `python` tool name is kept for
+  Settings/tool-selection compatibility; only the interpreter changed.
+- Corrections made while landing the merge:
+  - `__pir_host.exitProcess` is registered only when
+    `ExtensionConfig::allow_process_exit` is set. It used to be unconditional,
+    which let any extension, context-mode script or worker tear down the host
+    agent through `process.exit(0)`; only the standalone `pir js` runner opts
+    in.
+  - `fs.truncateSync`/`ftruncateSync`/`truncate`/`ftruncate` reject a negative
+    length with `ERR_OUT_OF_RANGE` instead of clamping it to `0`, which silently
+    emptied the file.
+  - The prelude keeps `ctx.sessionManager.getSessionDir()` (upstream
+    `ReadonlySessionManager`); the merge had dropped it while the host accessor
+    `getSessionDirJson` was still wired.
+  - `pir-gen-bytecode` writes to `crates/pir-core/assets/bytecode` — the
+    directory `include_bytes!` actually reads — instead of the repository root,
+    and the ignored `regenerate_shim_deflate` test normalizes CRLF to LF like
+    `scripts/gen_shims_deflate.py`, so a Windows-checkout regeneration still
+    matches Linux CI.
+  - The shim-deflate gate paths follow the crate layout
+    (`crates/pir-core/src/extensions/api/js`, `crates/pir-core/assets/shims`).
+  - `pir-builtins::KNOWN_BUILTINS` gained the `python` row (and the engine
+    factory table is pinned against it); `pir-builtins` projects every row it
+    owns a factory for and documents that `python`'s factory stays in
+    `pir-core`, which is the only crate that can see the agent traits.
+  - Native-first plugin precedence is the default (opt out with
+    `PIR_PREFER_NATIVE=0`); the `tool-repair` and `phone` single-face rules
+    apply regardless.
+
 ### builtin extraction (pure logic in publishable crates)
 
 - The pure half of every builtin now lives in an engine-free, published crate:

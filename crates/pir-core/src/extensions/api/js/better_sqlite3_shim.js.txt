@@ -35,6 +35,62 @@ import { DatabaseSync } from "node:sqlite";
   const BIG = "$pirBig";
   const BLOB = "$pirBlob";
 
+  function isValueBuffer(value) {
+    return typeof Buffer !== "undefined" && Buffer.isBuffer(value);
+  }
+
+  // node:sqlite hands BLOBs back as plain Uint8Array; better-sqlite3 hands
+  // back Buffer. A `Buffer.from(arrayBuffer, offset, length)` is a view over
+  // the same bytes (no copy).
+  function toBufferValue(value) {
+    if (value instanceof Uint8Array && !isValueBuffer(value)) {
+      return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    return value;
+  }
+
+  function isPlainBindingObject(value) {
+    return value !== null && typeof value === "object" &&
+      !Array.isArray(value) && !ArrayBuffer.isView(value) &&
+      !(typeof ArrayBuffer !== "undefined" && value instanceof ArrayBuffer);
+  }
+
+  const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
+  // Own-property write for a name taken from the result set. A plain `out[key]
+  // = value` for `key === "__proto__"` goes through Object.prototype's
+  // `__proto__` setter instead of creating a property: a column alias like
+  // `SELECT 1 AS "__proto__.x"` (expand mode) would then mutate
+  // Object.prototype globally, and a plain `__proto__` column would vanish.
+  function defineRowKey(object, key, value) {
+    if (key === "__proto__") {
+      Object.defineProperty(object, key, {
+        value: value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    } else {
+      object[key] = value;
+    }
+  }
+
+  // better-sqlite3's binding contract: null/number/string/bigint/Buffer are
+  // accepted; booleans and undefined are rejected (unlike node:sqlite).
+  function validateBindingValue(value) {
+    if (value === null) return;
+    const type = typeof value;
+    if (type === "number" || type === "string" || type === "bigint") return;
+    if (type === "boolean") {
+      throw new TypeError("Cannot bind a boolean to a SQLite parameter");
+    }
+    if (type === "undefined") {
+      throw new TypeError("undefined is not a valid binding");
+    }
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+    throw new TypeError("Cannot bind a " + type + " to a SQLite parameter");
+  }
+
   // Decode one tagged cell the way better-sqlite3 would hand it back
   // (numbers unless safe-integers mode; blobs as Uint8Array/Buffer).
   function decodeCell(value, readBigInts) {
@@ -86,59 +142,112 @@ import { DatabaseSync } from "node:sqlite";
       this._pirRaw = false;
       this._pirExpand = false;
       this._pirReadBigInts = db._pirSafeIntegers === true;
-      sync.setReadBigInts(this._pirReadBigInts);
+      this._pirSyncModes();
+    }
+
+    _pirSyncModes() {
+      this._pirSync.setReadBigInts(this._pirReadBigInts);
+      // Arrays are the native shape for `.raw()` and the cheapest way to pluck
+      // a column (no object allocation, duplicate column names preserved).
+      this._pirSync.setReturnArrays(this._pirRaw || this._pirPluck);
+    }
+
+    // better-sqlite3 binding validation, before the node:sqlite layer binds
+    // missing names as NULL (which is not better-sqlite3 behaviour).
+    _pirValidateBind(args) {
+      if (this._pirDb._pirClosed) {
+        throw errInvalidState("The database connection is not open");
+      }
+      const sync = this._pirSync;
+      if (sync._pirHasNamed) {
+        if (!isPlainBindingObject(args[0])) {
+          throw new TypeError("Cannot use anonymous parameters with named parameters");
+        }
+        const object = args[0];
+        for (const param of sync._pirUnique) {
+          if (param.name === null) continue;
+          if (!hasOwn(object, param.bare) && !hasOwn(object, param.name)) {
+            throw new TypeError('Missing named parameter "' + param.bare + '"');
+          }
+        }
+        for (const key of Object.keys(object)) {
+          let known = sync._pirByName.has(key);
+          if (!known && sync._pirAllowBare) known = sync._pirByBare.has(key);
+          if (!known) throw new TypeError('Unknown named parameter "' + key + '"');
+          validateBindingValue(object[key]);
+        }
+        return;
+      }
+      const values = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
+      const expected = sync._pirUnique.length;
+      if (values.length > expected) {
+        throw new RangeError("Too many parameter values were provided");
+      }
+      if (values.length < expected) {
+        throw new TypeError("Too few parameter values were provided");
+      }
+      for (const value of values) validateBindingValue(value);
     }
 
     // Row post-processing, better-sqlite3 modes.
     _pirShapeRow(row) {
-      if (this._pirExpand && row !== undefined && row !== null) {
-        const out = Object.create(null);
+      if (row === undefined || row === null) return row;
+      const isArray = Array.isArray(row);
+      if (this._pirPluck) {
+        if (isArray) return row.length > 0 ? toBufferValue(row[0]) : undefined;
+        const values = Object.values(row);
+        return values.length > 0 ? toBufferValue(values[0]) : undefined;
+      }
+      if (this._pirRaw) {
+        if (isArray) return row.map(toBufferValue);
+        return Object.values(row).map(toBufferValue);
+      }
+      if (this._pirExpand) {
+        const out = {};
         for (const key of Object.keys(row)) {
+          const value = toBufferValue(row[key]);
           const dot = key.indexOf(".");
           if (dot === -1) {
-            out[key] = row[key];
+            defineRowKey(out, key, value);
           } else {
             const table = key.slice(0, dot);
             const column = key.slice(dot + 1);
-            if (!out[table] || typeof out[table] !== "object") {
-              out[table] = Object.create(null);
+            // Only an own group key counts: `out["__proto__"]` is
+            // Object.prototype, not a group this row built.
+            let group = hasOwn(out, table) ? out[table] : undefined;
+            if (!group || typeof group !== "object") {
+              group = {};
+              defineRowKey(out, table, group);
             }
-            out[table][column] = row[key];
+            defineRowKey(group, column, value);
           }
         }
         return out;
       }
-      if (this._pirRaw && Array.isArray(row) === false && row !== undefined && row !== null) {
-        return Object.values(row);
-      }
-      return row;
+      if (isArray) return row.map(toBufferValue);
+      // better-sqlite3 rows are plain objects (node:sqlite uses a null
+      // prototype).
+      const out = {};
+      for (const key of Object.keys(row)) defineRowKey(out, key, toBufferValue(row[key]));
+      return out;
     }
 
     _pirPostprocess(value) {
       if (value === undefined || value === null) return value;
-      if (Array.isArray(value)) {
-        return value.map((item) => this._pirShapeRow(item));
-      }
+      if (Array.isArray(value)) return value.map((item) => this._pirShapeRow(item));
       return this._pirShapeRow(value);
     }
 
-    _pirApplyModes(row) {
-      const shaped = this._pirPostprocess(row);
-      if (this._pirPluck && shaped !== undefined && shaped !== null) {
-        if (Array.isArray(shaped)) {
-          return shaped.map((item) => {
-            const keys = Object.keys(item);
-            return keys.length > 0 ? item[keys[0]] : undefined;
-          });
-        }
-        const keys = Object.keys(shaped);
-        return keys.length > 0 ? shaped[keys[0]] : undefined;
-      }
-      return shaped;
+    _pirApplyModes(value, isList) {
+      if (value === undefined || value === null) return value;
+      if (isList) return value.map((row) => this._pirShapeRow(row));
+      return this._pirShapeRow(value);
     }
 
     run(...args) {
-      const info = this._pirSync.run(...spreadArgs(args));
+      const spread = spreadArgs(args);
+      this._pirValidateBind(spread);
+      const info = this._pirSync.run(...spread);
       return {
         changes: this._pirReadBigInts ? info.changes : Number(info.changes),
         lastInsertRowid: this._pirReadBigInts
@@ -148,47 +257,73 @@ import { DatabaseSync } from "node:sqlite";
     }
 
     get(...args) {
-      const row = this._pirSync.get(...spreadArgs(args));
+      const spread = spreadArgs(args);
+      this._pirValidateBind(spread);
+      const row = this._pirSync.get(...spread);
       if (row === undefined) return undefined;
-      return this._pirApplyModes(row);
+      return this._pirApplyModes(row, false);
     }
 
     all(...args) {
-      const rows = this._pirSync.all(...spreadArgs(args));
-      return this._pirApplyModes(rows);
+      const spread = spreadArgs(args);
+      this._pirValidateBind(spread);
+      const rows = this._pirSync.all(...spread);
+      return this._pirApplyModes(rows, true);
     }
 
     iterate(...args) {
       const rows = this.all(...args);
       let index = 0;
+      const step = (value) => {
+        const result = Object.create(null);
+        result.done = value === undefined;
+        result.value = value === undefined ? null : value;
+        return result;
+      };
       const iterator = {
-        [Symbol.iterator]() { return iterator; },
         next() {
-          if (index < rows.length) {
-            return { value: rows[index++], done: false };
+          if (index < rows.length) return step(rows[index++]);
+          return step(undefined);
+        },
+        return() {
+          index = rows.length;
+          return step(undefined);
+        },
+        toArray() {
+          const out = [];
+          for (;;) {
+            const next = iterator.next();
+            if (next.done) return out;
+            out.push(next.value);
           }
-          return { value: undefined, done: true };
         },
-        return(value) {
-          return { value: value, done: true };
-        },
+        [Symbol.iterator]() { return iterator; },
       };
       return iterator;
     }
 
     columns() {
-      return this._pirSync.columns();
+      const columns = this._pirSync.columns();
+      return columns.map((column) => ({
+        name: column.name,
+        column: column.column,
+        table: column.table,
+        database: column.database,
+        type: column.type,
+      }));
     }
 
     pluck(state) {
       this._pirPluck = state === undefined ? true : state === true;
       if (this._pirPluck) this._pirRaw = false;
+      this._pirSyncModes();
       return this;
     }
 
     raw(state) {
       this._pirRaw = state === undefined ? true : state === true;
       if (this._pirRaw) this._pirPluck = false;
+      this._pirSyncModes();
       return this;
     }
 
@@ -197,10 +332,14 @@ import { DatabaseSync } from "node:sqlite";
       return this;
     }
 
-    setReadBigInts(enabled) {
-      this._pirReadBigInts = enabled === true;
-      this._pirSync.setReadBigInts(enabled);
+    safeIntegers(enabled) {
+      this._pirReadBigInts = enabled === undefined ? true : enabled === true;
+      this._pirSyncModes();
       return this;
+    }
+
+    setReadBigInts(enabled) {
+      return this.safeIntegers(enabled);
     }
 
     get sourceSQL() {
@@ -212,7 +351,7 @@ import { DatabaseSync } from "node:sqlite";
     }
 
     get reader() {
-      return true;
+      return this._pirSync.reader;
     }
   }
 

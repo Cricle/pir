@@ -716,10 +716,10 @@ pub fn truncate_to_width(text: &str, max_width: usize, ellipsis: &str) -> String
     // written after this string, stays part of the link and is clickable.
     if let Some(close) = active_osc8_close(&clipped) {
         clipped.push_str(&close);
-        clipped.push_str("\x1b[0m");
+        clipped.push_str(RESET);
         if !ellipsis.is_empty() {
             clipped.push_str(ellipsis);
-            clipped.push_str("\x1b[0m");
+            clipped.push_str(RESET);
         }
     } else {
         clipped.push_str(ellipsis);
@@ -1530,9 +1530,9 @@ pub fn replace_columns(line: &str, start: usize, width: usize, replacement: &str
                 for _ in 0..pad {
                     out.push(' ');
                 }
-                out.push_str("\x1b[0m");
+                out.push_str(RESET);
                 out.push_str(replacement);
-                out.push_str("\x1b[0m");
+                out.push_str(RESET);
                 for code in &active_codes {
                     out.push_str(code);
                 }
@@ -1540,7 +1540,7 @@ pub fn replace_columns(line: &str, start: usize, width: usize, replacement: &str
             }
             if col >= end {
                 if inserted && !resumed {
-                    out.push_str("\x1b[0m");
+                    out.push_str(RESET);
                     for code in &active_codes {
                         out.push_str(code);
                     }
@@ -1561,7 +1561,7 @@ pub fn replace_columns(line: &str, start: usize, width: usize, replacement: &str
         for _ in 0..pad {
             out.push(' ');
         }
-        out.push_str("\x1b[0m");
+        out.push_str(RESET);
         out.push_str(replacement);
     }
     out

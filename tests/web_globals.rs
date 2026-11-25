@@ -454,6 +454,12 @@ const RESPONSE_TS: &str = r#"
 export default (pi: any) => {
   pi.on("session_start", async () => {
     const out: any = {};
+    const statusDescriptor = Object.getOwnPropertyDescriptor(Response.prototype, "status");
+    out.prototypeAccessors =
+      "status" in Response.prototype &&
+      typeof statusDescriptor?.get === "function" &&
+      typeof statusDescriptor?.set === "function" &&
+      "bodyUsed" in Response.prototype;
 
     const response = new Response('{"a":1,"b":"two"}', {
       status: 201,
@@ -523,6 +529,10 @@ async fn response_aggregation_and_body_stream() {
     rt.allow_root(dir);
     let v = run_fixture(&rt, "response", RESPONSE_TS, "__responseOut").await;
 
+    assert_eq!(
+        v["prototypeAccessors"], true,
+        "Response state accessors exist on the prototype: {v}"
+    );
     assert_eq!(v["status"], 201, "custom status: {v}");
     assert_eq!(v["statusText"], "Created", "statusText table: {v}");
     assert_eq!(v["ok"], true, "ok flag: {v}");

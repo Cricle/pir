@@ -1232,6 +1232,18 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
+    /// Native `python` (the embedded QuickJS runtime; the name is kept for
+    /// Settings/tool-selection compatibility); unsupported flags exec the
+    /// system `python3` with the original argv
+    Python {
+        /// Arguments forwarded verbatim
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
     /// Show version information
     Version,
 }

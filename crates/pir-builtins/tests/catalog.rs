@@ -3,11 +3,12 @@
 
 use pir_builtins::*;
 
-const EXPECTED_ORDER: [&str; 10] = [
+const EXPECTED_ORDER: [&str; 11] = [
     "subagent",
     "mode",
     "mcp",
     "codemode",
+    "python",
     "context-mode",
     "tool-search",
     "tool-repair",
@@ -24,7 +25,15 @@ fn known_table_is_the_historical_order() {
 
 #[test]
 fn catalog_order_is_stable() {
-    assert_eq!(names(), EXPECTED_ORDER.to_vec());
+    // `python` is a known row without a factory here (its implementation needs
+    // the engine's agent traits and lives in `pir-core`), so the enabled
+    // catalog is the table minus that one row, in the same order.
+    let expected: Vec<&str> = EXPECTED_ORDER
+        .iter()
+        .copied()
+        .filter(|name| *name != "python")
+        .collect();
+    assert_eq!(names(), expected);
 }
 
 #[test]
@@ -36,14 +45,22 @@ fn descriptors_are_a_projection_of_the_known_table() {
         assert!(entry.replaceable, "{} must stay replaceable", entry.name);
     }
     // ... and nothing in the table is silently missing from a full build.
-    assert_eq!(descriptors().len(), KNOWN_BUILTINS.len());
+    // `python` is the documented exception: `pir-core` owns its factory.
+    let missing: Vec<&str> = KNOWN_BUILTINS
+        .iter()
+        .map(|row| row.name)
+        .filter(|name| !names().contains(name))
+        .collect();
+    assert_eq!(missing, vec!["python"], "full build must project every row");
 }
 
 #[test]
 fn phone_is_the_only_default_off_builtin() {
     let defaults = default_names();
     assert!(!defaults.contains(&"phone"));
-    assert_eq!(defaults.len(), EXPECTED_ORDER.len() - 1);
+    // Every default-on row except `phone` is instantiable here, and `python`
+    // is default-on but owned by `pir-core`, so it is absent from `defaults`.
+    assert_eq!(defaults.len(), EXPECTED_ORDER.len() - 2);
     let off: Vec<&str> = KNOWN_BUILTINS
         .iter()
         .filter(|row| !row.default_enabled)

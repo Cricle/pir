@@ -50,10 +50,11 @@ use super::source::{builtin_name, is_builtin_path, BUILTIN_PATH_PREFIX};
 ///
 /// The first two entries are ALWAYS applied — they are the existing
 /// `tool-repair`/`phone` single-face rules (two copies running the same repair
-/// pipeline or phone server would double-apply). The rest activate only under
-/// `PIR_PREFER_NATIVE=1`: those builtins are full native ports of their JS
-/// counterparts, but the default preserves upstream's first-wins behavior so
-/// a user who installs and explicitly selects a JS package keeps getting it.
+/// pipeline or phone server would double-apply). The rest are native-first by
+/// default: those builtins are full native ports of their JS counterparts, so
+/// running their unmodified JS packages instead would silently trade a native
+/// implementation for a scripted one. `PIR_PREFER_NATIVE=0` (also
+/// `false`/`off`) restores upstream's first-wins behavior for them.
 pub const NATIVE_PRECEDENCE: &[(&str, &str)] = &[
     ("tool-repair", "pi-tool-repair"),
     ("phone", "@malinamnam/pi-phone"),
@@ -65,16 +66,20 @@ pub const NATIVE_PRECEDENCE: &[(&str, &str)] = &[
     ("context-mode", "context-mode"),
 ];
 
-/// Whether the opt-in native-first set (beyond the always-on determinism rules)
-/// is active. `PIR_PREFER_NATIVE=1` loads native Rust ports in preference to
-/// their unmodified JS packages without any plugin source change.
+/// Whether the native-first set (beyond the always-on determinism rules) is
+/// active. Native-first is the DEFAULT; `PIR_PREFER_NATIVE=0` (also
+/// `false`/`off`) opts out and keeps upstream first-wins, for a user who
+/// deliberately wants the installed JS package to win.
 fn prefer_native_enabled() -> bool {
-    std::env::var_os("PIR_PREFER_NATIVE").is_some_and(|v| v == "1" || v == "true")
+    !matches!(
+        std::env::var("PIR_PREFER_NATIVE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
 }
 
 /// Whether the precedence table entry at `index` applies. The always-on
-/// single-face rules (tool-repair, phone) ignore the opt-in flag; the extra
-/// full-port pairs need `PIR_PREFER_NATIVE`.
+/// single-face rules (tool-repair, phone) ignore the opt-out flag; the extra
+/// full-port pairs follow it.
 pub fn native_precedence_applies(index: usize, prefer_native: bool) -> bool {
     index < 2 || prefer_native
 }
@@ -86,6 +91,26 @@ pub fn is_js_package_path(path: &Path, package: &str) -> bool {
         .replace('\\', "/")
         .split('/')
         .any(|component| component.eq_ignore_ascii_case(package))
+}
+
+/// [`native_precedence_applies`] for the precedence-table test: the table and
+/// its two always-on rules are process-global, so the test walks the index
+/// space instead of setting `PIR_PREFER_NATIVE`.
+#[doc(hidden)]
+pub fn native_precedence_for_tests(index: usize, prefer_native: bool) -> bool {
+    native_precedence_applies(index, prefer_native)
+}
+
+/// The precedence table's length, for the same test.
+#[doc(hidden)]
+pub fn native_precedence_len_for_tests() -> usize {
+    NATIVE_PRECEDENCE.len()
+}
+
+/// [`is_js_package_path`] for the precedence-table test.
+#[doc(hidden)]
+pub fn is_js_package_path_for_tests(path: &Path, package: &str) -> bool {
+    is_js_package_path(path, package)
 }
 
 /// Apply the native-first table to an effective path list in place.

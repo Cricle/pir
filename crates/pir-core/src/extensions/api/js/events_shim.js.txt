@@ -2,151 +2,457 @@
 import { inspect as pirInspect } from "@node/util";
 import { AsyncResource as PirAsyncResource } from "@node/async_hooks";
 
-function arrayClone(arr) {
-  const copy = new Array(arr.length);
-  for (let i = 0; i < arr.length; i++) copy[i] = arr[i];
-  return copy;
-}
+// Node's `_captureRejections` slot and the `shapeMode` diagnostic symbol are
+// per-instance own symbols (they show up in util.inspect as Symbol(shapeMode)/
+// Symbol(kCapture)).
+const kShapeMode = Symbol("shapeMode");
+const kCapture = Symbol("kCapture");
 
-function EventEmitter() {
+function EventEmitter(opts) {
   this._events = Object.create(null);
+  this._eventsCount = 0;
   this._maxListeners = undefined;
+  this[kShapeMode] = false;
+  // lib/events.js EventEmitter.init: only a truthy `captureRejections` is
+  // validated/assigned; everything else inherits the prototype default.
+  const capture = opts === undefined || opts === null ? undefined : opts.captureRejections;
+  if (capture) {
+    if (typeof capture !== "boolean") {
+      throw pirInvalidArgType("options.captureRejections", "of type boolean", capture);
+    }
+    this[kCapture] = true;
+  } else {
+    this[kCapture] = EventEmitter.prototype[kCapture];
+  }
 }
 
 EventEmitter.defaultMaxListeners = 10;
+// The default capture-rejection flag lives on the prototype (instances get an
+// own symbol slot in the constructor, as in Node).
+Object.defineProperty(EventEmitter.prototype, kCapture, {
+  value: false, writable: true, enumerable: false, configurable: false,
+});
+EventEmitter.prototype._events = undefined;
+EventEmitter.prototype._eventsCount = 0;
+EventEmitter.prototype._maxListeners = undefined;
+
+function pirAddNumericalSeparator(value) {
+  let result = "";
+  let index = value.length;
+  const start = value[0] === "-" ? 1 : 0;
+  for (; index >= start + 4; index -= 3) {
+    result = "_" + value.slice(index - 3, index) + result;
+  }
+  return value.slice(0, index) + result;
+}
+
+// Node's `determineSpecificType` tail for ERR_INVALID_ARG_TYPE.
+function pirTypeTail(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  const type = typeof value;
+  if (type === "string") {
+    let text = value;
+    if (text.length > 28) text = text.slice(0, 25) + "...";
+    if (text.indexOf("'") === -1) return "type string ('" + text + "')";
+    return "type string (" + JSON.stringify(text) + ")";
+  }
+  if (type === "number") {
+    if (Object.is(value, -0)) return "type number (-0)";
+    return "type number (" + String(value) + ")";
+  }
+  if (type === "boolean") return "type boolean (" + String(value) + ")";
+  if (type === "bigint") return "type bigint (" + String(value) + "n)";
+  if (type === "symbol") return "type symbol (" + String(value) + ")";
+  if (type === "function") return "function " + value.name;
+  if (type === "object") {
+    const name = value.constructor && value.constructor.name;
+    if (typeof name === "string" && name !== "") return "an instance of " + name;
+  }
+  return String(value);
+}
+
+function pirInvalidArgType(name, expected, value) {
+  const kind = name.indexOf(".") === -1 ? "argument" : "property";
+  const error = new TypeError(
+    "The \"" + name + "\" " + kind + " must be " + expected + ". Received " + pirTypeTail(value),
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  return error;
+}
+
+function pirOutOfRange(name, range, value) {
+  let received;
+  if (Number.isInteger(value) && Math.abs(value) > 4294967296) {
+    received = pirAddNumericalSeparator(String(value));
+  } else if (typeof value === "number" && Object.is(value, -0)) {
+    received = "-0";
+  } else {
+    received = String(value);
+  }
+  const error = new RangeError("The value of \"" + name + "\" is out of range. It must be " + range + ". Received " + received);
+  error.code = "ERR_OUT_OF_RANGE";
+  return error;
+}
+
+function pirValidateListener(listener) {
+  if (typeof listener !== "function") {
+    throw pirInvalidArgType("listener", "of type function", listener);
+  }
+}
+
+function pirValidateBoolean(value, name) {
+  if (typeof value !== "boolean") throw pirInvalidArgType(name, "of type boolean", value);
+}
+
+// Node's validateNumber(n, name, min): non-number is a type error, a value
+// below `min` (or NaN when a bound is given) is ERR_OUT_OF_RANGE. Fractions
+// are accepted (node only bounds-checks).
+function pirValidateMaxListeners(value) {
+  if (typeof value !== "number") throw pirInvalidArgType("setMaxListeners", "of type number", value);
+  if (value < 0 || Number.isNaN(value)) throw pirOutOfRange("setMaxListeners", ">= 0", value);
+}
+
+function pirValidateInteger(value, name, min, max) {
+  if (typeof value !== "number") throw pirInvalidArgType(name, "of type number", value);
+  if (!Number.isInteger(value)) throw pirOutOfRange(name, "an integer", value);
+  if (value < min || value > max) throw pirOutOfRange(name, ">= " + min + " && <= " + max, value);
+}
 
 function pirOnceWrapper(emitter, type, listener) {
   let fired = false;
-  function wrapper(...args) {
+  // `arguments` instead of a rest parameter: emit is the hot path and the
+  // wrapper is on it for every `once` listener, so this trades a per-call
+  // array materialization for the engine's arguments object (which `apply`
+  // consumes without building another array).
+  function wrapper() {
     if (!fired) {
       fired = true;
       emitter.removeListener(type, wrapper);
-      listener.apply(emitter, args);
+      return listener.apply(emitter, arguments);
     }
   }
   wrapper.listener = listener;
   return wrapper;
 }
 
-EventEmitter.prototype._addListener = function _addListener(type, listener, prepend, wrapOnce) {
-  if (typeof listener !== "function") {
-    throw new TypeError("The \"listener\" argument must be of type function. Received type " + typeof listener);
-  }
+// Module-level helper plus the legacy prototype alias. stream_shim's readable
+// bookkeeping funnels through `EventEmitter.prototype._addListener` (it must
+// see the private prepend/once flags), so the alias has to stay even though
+// Node keeps this internal off the prototype.
+function pirAddListener(target, type, listener, prepend, wrapOnce) {
+  pirValidateListener(listener);
   // Lazy per-instance state: the classic `util.inherits(Child, EventEmitter)`
   // + constructor-that-never-calls-super pattern (yazl and a large tail of
   // older packages) produces instances without `_events` (`_maxListeners`
   // needs no init — `undefined` already means "use defaultMaxListeners").
-  if (this._events === undefined) this._events = Object.create(null);
-  const list = this._events[type];
-  const wrapped = wrapOnce ? pirOnceWrapper(this, type, listener) : listener;
+  let events = target._events;
+  const wrapped = wrapOnce ? pirOnceWrapper(target, type, listener) : listener;
+  let list;
+  if (events === undefined) {
+    events = target._events = Object.create(null);
+    target._eventsCount = 0;
+  } else {
+    // Node emits "newListener" before installing the listener (but not for
+    // the very first listener, when `_events` did not exist yet). A handler
+    // may replace `_events`, so re-read it afterwards.
+    if (events.newListener !== undefined) {
+      target.emit("newListener", type, wrapped.listener === undefined ? wrapped : wrapped.listener);
+      events = target._events;
+    }
+    list = events[type];
+  }
+  // Node's representation: one listener is stored as the function itself, two
+  // or more as an array. `emit` then dispatches the common single-listener
+  // case without cloning an array. `_eventsCount` counts event *names*, so it
+  // only grows when a new key is installed.
   if (list === undefined) {
-    this._events[type] = [wrapped];
+    events[type] = wrapped;
+    target._eventsCount = (target._eventsCount || 0) + 1;
+  } else if (typeof list === "function") {
+    list = prepend ? [wrapped, list] : [list, wrapped];
+    list[kEmitting] = 0;
+    events[type] = list;
   } else if (prepend) {
     list.unshift(wrapped);
   } else {
     list.push(wrapped);
   }
-  return this;
+  // Node's leak guard: a positive max and an array one past it, once per
+  // listener array (`existing.warned`).
+  if (typeof list !== "function" && list !== undefined) {
+    const max = target._maxListeners === undefined ? EventEmitter.defaultMaxListeners : target._maxListeners;
+    if (max > 0 && list.length > max && !list.warned) {
+      pirWarnMaxListenersExceeded(target, type, list, max);
+    }
+  }
+  return target;
+}
+
+const kEmitting = Symbol("kEmitting");
+
+EventEmitter.prototype._addListener = function _addListener(type, listener, prepend, wrapOnce) {
+  return pirAddListener(this, type, listener, prepend, wrapOnce);
 };
 
+function pirEmitterLabel(target) {
+  const ctor = target !== null && target !== undefined ? target.constructor : undefined;
+  const name = ctor && typeof ctor.name === "string" && ctor.name !== "" ? ctor.name : "EventEmitter";
+  return "[" + name + "]";
+}
+
+function pirWarnMaxListenersExceeded(target, type, existing, max) {
+  existing.warned = true;
+  const message = "Possible EventEmitter memory leak detected. " + existing.length + " " +
+    String(type) + " listeners added to " + pirEmitterLabel(target) + ". MaxListeners is " +
+    max + ". Use emitter.setMaxListeners() to increase limit";
+  const proc = globalThis.process;
+  if (proc === undefined || typeof proc.emitWarning !== "function") return;
+  const warning = new Error(message);
+  warning.name = "MaxListenersExceededWarning";
+  warning.emitter = target;
+  warning.type = type;
+  warning.count = existing.length;
+  proc.emitWarning(warning);
+}
+
+// Capture a rejected promise returned from a listener (`captureRejections`).
+// The rejection is routed through the emitter's 'error' event on the next
+// tick, with capture temporarily disabled so an error listener that throws
+// cannot recurse.
+function pirAddCatch(target, promise, type, args) {
+  if (!target[kCapture]) return;
+  try {
+    const then = promise.then;
+    if (typeof then === "function") {
+      then.call(promise, undefined, (error) => {
+        pirNextTick(() => pirEmitUnhandled(target, error, type, args));
+      });
+    }
+  } catch (error) {
+    target.emit("error", error);
+  }
+}
+
+function pirEmitUnhandled(target, error, type, args) {
+  const prev = target[kCapture];
+  try {
+    target[kCapture] = false;
+    target.emit("error", error);
+  } finally {
+    target[kCapture] = prev;
+  }
+}
+
+function pirNextTick(fn) {
+  if (typeof globalThis.__pirNextTick === "function") globalThis.__pirNextTick(fn);
+  else globalThis.__pirMicrotask(fn);
+}
+
 EventEmitter.prototype.addListener = function addListener(type, listener) {
-  return this._addListener(type, listener, false, false);
+  return pirAddListener(this, type, listener, false, false);
 };
 EventEmitter.prototype.on = EventEmitter.prototype.addListener;
 
 EventEmitter.prototype.prependListener = function prependListener(type, listener) {
-  return this._addListener(type, listener, true, false);
+  return pirAddListener(this, type, listener, true, false);
 };
 
 EventEmitter.prototype.once = function once(type, listener) {
-  return this._addListener(type, listener, false, true);
+  return pirAddListener(this, type, listener, false, true);
 };
 
 EventEmitter.prototype.prependOnceListener = function prependOnceListener(type, listener) {
-  return this._addListener(type, listener, true, true);
+  return pirAddListener(this, type, listener, true, true);
 };
 
 EventEmitter.prototype.removeListener = function removeListener(type, listener) {
-  const list = this._events === undefined ? undefined : this._events[type];
-  if (list === undefined || typeof listener !== "function") return this;
-  for (let i = list.length - 1; i >= 0; i--) {
-    if (list[i] === listener || list[i].listener === listener) {
-      list.splice(i, 1);
-      break;
+  // Node validates the listener even when the event/emitter has no state yet.
+  pirValidateListener(listener);
+  const events = this._events;
+  if (events === undefined) return this;
+  const list = events[type];
+  if (list === undefined) return this;
+  if (list === listener || list.listener === listener) {
+    this._eventsCount -= 1;
+    if (this._eventsCount === 0) this._events = Object.create(null);
+    else delete events[type];
+    if (events.removeListener !== undefined) {
+      this.emit("removeListener", type, list.listener === undefined ? listener : list.listener);
     }
+    return this;
   }
-  if (list.length === 0) delete this._events[type];
+  if (typeof list !== "function") {
+    let position = -1;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i] === listener || list[i].listener === listener) {
+        position = i;
+        break;
+      }
+    }
+    if (position < 0) return this;
+    if (position === 0) list.shift();
+    else list.splice(position, 1);
+    if (list.length === 1) events[type] = list[0];
+    if (events.removeListener !== undefined) this.emit("removeListener", type, listener);
+  }
   return this;
 };
 EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
 
 EventEmitter.prototype.removeAllListeners = function removeAllListeners(type) {
-  if (type === undefined) {
-    this._events = Object.create(null);
+  const events = this._events;
+  if (events === undefined) return this;
+  // Not listening for removeListener: no meta events, just drop the state.
+  if (events.removeListener === undefined) {
+    if (arguments.length === 0) {
+      this._events = Object.create(null);
+      this._eventsCount = 0;
+    } else if (events[type] !== undefined) {
+      if (--this._eventsCount === 0) this._events = Object.create(null);
+      else delete events[type];
+    }
     return this;
   }
-  delete this._events[type];
+  // Emit removeListener for every listener, LIFO per event array.
+  if (arguments.length === 0) {
+    for (const key of Reflect.ownKeys(events)) {
+      if (key === "removeListener") continue;
+      this.removeAllListeners(key);
+    }
+    this.removeAllListeners("removeListener");
+    this._events = Object.create(null);
+    this._eventsCount = 0;
+    return this;
+  }
+  const listeners = events[type];
+  if (typeof listeners === "function") {
+    this.removeListener(type, listeners);
+  } else if (listeners !== undefined) {
+    for (let i = listeners.length - 1; i >= 0; i--) {
+      this.removeListener(type, listeners[i]);
+    }
+  }
   return this;
 };
 
 EventEmitter.prototype.emit = function emit(type, ...args) {
-  const list = this._events === undefined ? undefined : this._events[type];
-  if (list === undefined || list.length === 0) {
-    if (type === "error") {
-      const er = args[0];
-      if (er instanceof Error) throw er;
-      // lib/events.js: the argument is `util.inspect`ed for the message and the
-      // raw value is exposed as `err.context`; an inspect that throws (a user
-      // inspect.custom that raises, for instance) falls back to the value
-      // itself, which then stringifies as `[object Object]`
-      // (test-event-emitter-errors.js pins all three shapes).
-      let stringifiedEr;
-      try {
-        stringifiedEr = pirInspect(er);
-      } catch {
-        stringifiedEr = er;
-      }
-      const err = new Error("Unhandled error. (" + String(stringifiedEr) + ")");
-      err.context = er;
-      err.code = "ERR_UNHANDLED_ERROR";
-      throw err;
-    }
-    return false;
+  const events = this._events;
+  // Node's errorMonitor runs first for every 'error' emission (and is not an
+  // 'error' listener, so it never suppresses the unhandled-error throw).
+  if (type === "error" && events !== undefined && events[errorMonitor] !== undefined) {
+    this.emit(errorMonitor, ...args);
   }
-  const snapshot = arrayClone(list);
-  for (let i = 0; i < snapshot.length; i++) {
-    snapshot[i].apply(this, args);
+  const list = events === undefined ? undefined : events[type];
+  const doError = type === "error" && (events === undefined || events.error === undefined);
+  if (doError) {
+    const er = args[0];
+    if (er instanceof Error) throw er;
+    // lib/events.js: the argument is `util.inspect`ed for the message and the
+    // raw value is exposed as `err.context`; an inspect that throws (a user
+    // inspect.custom that raises, for instance) falls back to the value
+    // itself, which then stringifies as `[object Object]`
+    // (test-event-emitter-errors.js pins all three shapes).
+    let stringifiedEr;
+    try {
+      stringifiedEr = pirInspect(er);
+    } catch {
+      stringifiedEr = er;
+    }
+    const err = new Error("Unhandled error. (" + String(stringifiedEr) + ")");
+    err.context = er;
+    err.code = "ERR_UNHANDLED_ERROR";
+    throw err;
+  }
+  // A single listener is stored as the function itself (Node's
+  // representation), so the hot path is one type check and one apply.
+  if (typeof list === "function") {
+    const result = list.apply(this, args);
+    if (result !== undefined && result !== null) pirAddCatch(this, result, type, args);
+    return true;
+  }
+  if (list === undefined || list.length === 0) return false;
+  const length = list.length;
+  if (length === 1) {
+    // A lone listener cannot observe a snapshot difference: there is no later
+    // listener for a remove/add during the call to affect.
+    const result = list[0].apply(this, args);
+    if (result !== undefined && result !== null) pirAddCatch(this, result, type, args);
+    return true;
+  }
+  // Node snapshots the listener array: a `removeListener` during emit must not
+  // skip a listener that was registered when the emit started, and an
+  // `addListener` must not run this round. `slice` is the engine's native copy
+  // (same values as the manual loop, without the interpreter loop).
+  const snapshot = list.slice();
+  let result;
+  if (args.length === 0) {
+    for (let i = 0; i < length; i++) {
+      result = snapshot[i].call(this);
+      if (result !== undefined && result !== null) pirAddCatch(this, result, type, args);
+    }
+  } else if (args.length === 1) {
+    for (let i = 0; i < length; i++) {
+      result = snapshot[i].call(this, args[0]);
+      if (result !== undefined && result !== null) pirAddCatch(this, result, type, args);
+    }
+  } else if (args.length === 2) {
+    for (let i = 0; i < length; i++) {
+      result = snapshot[i].call(this, args[0], args[1]);
+      if (result !== undefined && result !== null) pirAddCatch(this, result, type, args);
+    }
+  } else {
+    for (let i = 0; i < length; i++) {
+      result = snapshot[i].apply(this, args);
+      if (result !== undefined && result !== null) pirAddCatch(this, result, type, args);
+    }
   }
   return true;
 };
 
 EventEmitter.prototype.rawListeners = function rawListeners(type) {
   const list = this._events === undefined ? undefined : this._events[type];
-  return list === undefined ? [] : arrayClone(list);
+  if (list === undefined) return [];
+  return typeof list === "function" ? [list] : list.slice();
 };
 
 EventEmitter.prototype.listeners = function listeners(type) {
   const raw = this.rawListeners(type);
   const out = new Array(raw.length);
   for (let i = 0; i < raw.length; i++) {
-    out[i] = raw[i].listener !== undefined ? raw[i].listener : raw[i];
+    const original = raw[i].listener;
+    out[i] = typeof original === "function" ? original : raw[i];
   }
   return out;
 };
 
-EventEmitter.prototype.listenerCount = function listenerCount(type) {
+EventEmitter.prototype.listenerCount = function listenerCount(type, listener) {
   const list = this._events === undefined ? undefined : this._events[type];
-  return list === undefined ? 0 : list.length;
+  if (list === undefined) return 0;
+  if (typeof list === "function") {
+    if (listener === undefined || listener === null) return 1;
+    return listener === list || listener === list.listener ? 1 : 0;
+  }
+  if (listener === undefined || listener === null) return list.length;
+  let matching = 0;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] === listener || list[i].listener === listener) matching++;
+  }
+  return matching;
 };
 
 EventEmitter.prototype.eventNames = function eventNames() {
-  return Reflect.ownKeys(this._events === undefined ? {} : this._events);
+  if (this._eventsCount === 0 || this._events === undefined) return [];
+  const events = this._events;
+  const names = [];
+  for (const key of Reflect.ownKeys(events)) {
+    if (events[key] !== undefined) names.push(key);
+  }
+  return names;
 };
 
 EventEmitter.prototype.setMaxListeners = function setMaxListeners(n) {
-  if (typeof n !== "number" || Number.isNaN(n) || n < 0) {
-    throw new RangeError("The value of \"n\" is out of range. It must be a non-negative number. Received " + n);
-  }
+  pirValidateMaxListeners(n);
   this._maxListeners = n;
   return this;
 };
@@ -160,8 +466,8 @@ EventEmitter.EventEmitter = EventEmitter;
 
 // --- module-level static surface --------------------------------------------
 
-const errorMonitor = Symbol.for("events.errorMonitor");
-const captureRejectionSymbol = Symbol.for("events.captureRejection");
+const errorMonitor = Symbol("events.errorMonitor");
+const captureRejectionSymbol = Symbol.for("nodejs.rejection");
 const captureRejections = false; // per-emitter opt-in; module value is the default
 const defaultMaxListeners = EventEmitter.defaultMaxListeners;
 const usingDomains = false; // deprecated no-op flag
@@ -176,110 +482,419 @@ function init(emitter) {
 }
 
 function listenerCount(emitter, type) {
-  if (!emitter || typeof emitter.listenerCount !== "function") {
-    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
+  if (emitter && typeof emitter.listenerCount === "function") {
+    return emitter.listenerCount(type);
   }
-  return emitter.listenerCount(type);
+  if (pirIsEventTarget(emitter)) {
+    const store = pirEventTargetListenerStore(emitter);
+    const list = store && store.get(type);
+    return list === undefined ? 0 : list.length;
+  }
+  throw new TypeError("The \"emitter\" argument must be an EventEmitter");
 }
 
 function getEventListeners(emitterOrTarget, type) {
-  if (emitterOrTarget && typeof emitterOrTarget.addEventListener === "function" && !emitterOrTarget.setMaxListeners) {
-    // An EventTarget: listeners are not introspectable without getEventListeners
-    // support; return empty (documented).
-    return [];
+  // Node returns the *unwrapped* listeners (the original function behind a
+  // once wrapper), so `getEventListeners(e, t)[i] === fn` holds.
+  if (emitterOrTarget && typeof emitterOrTarget.listeners === "function") {
+    return emitterOrTarget.listeners(type);
   }
-  if (!emitterOrTarget || typeof emitterOrTarget.rawListeners !== "function") {
-    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
+  if (emitterOrTarget && typeof emitterOrTarget.addEventListener === "function") {
+    return pirEventTargetListenersOf(emitterOrTarget, type);
   }
-  return emitterOrTarget.rawListeners(type);
+  throw pirInvalidArgType("emitter", "an instance of EventEmitter or EventTarget", emitterOrTarget);
+}
+
+// Node hangs the per-target limits on the EventTarget itself
+// (internal/event_target.js: two symbol-keyed slots, seeded from
+// defaultMaxListeners at construction). The same symbols are used here, and
+// the engine's EventTarget is duck-typed since it is not Node's class.
+const kMaxEventTargetListeners = Symbol("events.maxEventTargetListeners");
+const kMaxEventTargetListenersWarned = Symbol("events.maxEventTargetListenersWarned");
+
+function pirIsEventTarget(value) {
+  return value !== null && typeof value === "object" &&
+    typeof value.addEventListener === "function" &&
+    typeof value.removeEventListener === "function";
+}
+
+// Node's AbortSignal is an EventTarget constructed with a max-listeners slot
+// of 0 (test-events-getmaxlisteners.js pins `getMaxListeners(ac.signal) === 0`).
+function pirIsAbortSignal(value) {
+  return pirIsEventTarget(value) && typeof value.aborted === "boolean" &&
+    "reason" in value;
+}
+
+// --- EventTarget listener bookkeeping --------------------------------------
+//
+// Node's EventTarget keeps its listeners in an internal kEvents map, which is
+// what `events.listenerCount(target, type)`, `getEventListeners(target, type)`
+// and the max-listeners warning read. The engine's EventTarget exposes nothing,
+// so its add/remove methods are wrapped once (per process) to mirror the list
+// here. A once listener is wrapped so its record disappears when it fires.
+const kPirEventTargetTracking = Symbol("pir.events.eventTargetTracking");
+const pirEventTargetListeners = new WeakMap();
+
+function pirEventTargetListenerStore(target) {
+  return pirEventTargetListeners.get(target);
+}
+
+function pirEventTargetCapture(options) {
+  return typeof options === "boolean" ? options : Boolean(options && options.capture);
+}
+
+function pirEventTargetRemoveRecord(target, type, listener, capture) {
+  const store = pirEventTargetListeners.get(target);
+  if (store === undefined) return;
+  const list = store.get(type);
+  if (list === undefined) return;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].listener === listener && list[i].capture === capture) {
+      list.splice(i, 1);
+      break;
+    }
+  }
+  if (list.length === 0) store.delete(type);
+}
+
+function pirInstallEventTargetTracking() {
+  const EventTargetCtor = globalThis.EventTarget;
+  if (typeof EventTargetCtor !== "function" || EventTargetCtor.prototype === undefined) return;
+  const proto = EventTargetCtor.prototype;
+  if (proto[kPirEventTargetTracking] === true) return;
+  const originalAdd = proto.addEventListener;
+  const originalRemove = proto.removeEventListener;
+  if (typeof originalAdd !== "function" || typeof originalRemove !== "function") return;
+
+  Object.defineProperty(proto, kPirEventTargetTracking, {
+    value: true, writable: false, enumerable: false, configurable: true,
+  });
+
+  proto.addEventListener = function addEventListener(type, listener, options) {
+    const target = this;
+    const capture = pirEventTargetCapture(options);
+    let store = pirEventTargetListeners.get(target);
+    if (store === undefined) {
+      store = new Map();
+      pirEventTargetListeners.set(target, store);
+    }
+    let list = store.get(type);
+    if (list === undefined) {
+      list = [];
+      store.set(type, list);
+    }
+    const duplicate = list.some((entry) => entry.listener === listener && entry.capture === capture);
+    if (!duplicate) {
+      const once = typeof options === "object" && options !== null && options.once === true;
+      let registered = listener;
+      if (once && typeof listener === "function") {
+        registered = function (...args) {
+          pirEventTargetRemoveRecord(target, type, listener, capture);
+          return listener.apply(this, args);
+        };
+      }
+      list.push({ listener, registered, capture, once });
+      originalAdd.call(this, type, registered, options);
+      return;
+    }
+    return originalAdd.call(this, type, listener, options);
+  };
+
+  proto.removeEventListener = function removeEventListener(type, listener, options) {
+    const capture = pirEventTargetCapture(options);
+    const store = pirEventTargetListeners.get(this);
+    if (store !== undefined) {
+      const list = store.get(type);
+      if (list !== undefined) {
+        for (let i = 0; i < list.length; i++) {
+          if (list[i].listener === listener && list[i].capture === capture) {
+            const entry = list[i];
+            list.splice(i, 1);
+            if (list.length === 0) store.delete(type);
+            return originalRemove.call(this, type, entry.registered, options);
+          }
+        }
+      }
+    }
+    return originalRemove.call(this, type, listener, options);
+  };
+}
+
+function pirEventTargetListenersOf(target, type) {
+  const store = pirEventTargetListeners.get(target);
+  const list = store === undefined ? undefined : store.get(type);
+  if (list === undefined) return [];
+  const out = new Array(list.length);
+  for (let i = 0; i < list.length; i++) out[i] = list[i].listener;
+  return out;
 }
 
 function getMaxListeners(emitter) {
   if (emitter && typeof emitter.getMaxListeners === "function") {
     return emitter.getMaxListeners();
   }
-  return EventEmitter.defaultMaxListeners;
+  if (emitter && emitter[kMaxEventTargetListeners] !== undefined) {
+    return emitter[kMaxEventTargetListeners];
+  }
+  if (pirIsAbortSignal(emitter)) return 0;
+  if (pirIsEventTarget(emitter)) return EventEmitter.defaultMaxListeners;
+  throw pirInvalidArgType("emitter", "an instance of EventEmitter or EventTarget", emitter);
 }
 
-function setMaxListeners(n, ...eventEmitters) {
-  if (typeof n !== "number" || Number.isNaN(n) || n < 0) {
-    throw new RangeError("The value of \"n\" is out of range. It must be a non-negative number. Received " + n);
-  }
+// Node returns undefined from `events.setMaxListeners` (the emitter's own
+// method is the chainable one).
+function setMaxListeners(n = EventEmitter.defaultMaxListeners, ...eventEmitters) {
+  pirValidateMaxListeners(n);
   if (eventEmitters.length === 0) {
     EventEmitter.defaultMaxListeners = n;
-    return eventEmitters;
+    return;
   }
   for (const emitter of eventEmitters) {
-    if (emitter && typeof emitter.setMaxListeners === "function") emitter.setMaxListeners(n);
+    if (emitter && typeof emitter.setMaxListeners === "function") {
+      emitter.setMaxListeners(n);
+    } else if (pirIsEventTarget(emitter)) {
+      try {
+        Object.defineProperty(emitter, kMaxEventTargetListeners, {
+          value: n, writable: true, enumerable: false, configurable: true,
+        });
+        Object.defineProperty(emitter, kMaxEventTargetListenersWarned, {
+          value: false, writable: true, enumerable: false, configurable: true,
+        });
+      } catch (error) {
+        throw pirInvalidArgType("eventTargets", "an instance of EventEmitter or EventTarget", emitter);
+      }
+    } else {
+      throw pirInvalidArgType("eventTargets", "an instance of EventEmitter or EventTarget", emitter);
+    }
   }
-  return eventEmitters;
 }
 
 function addAbortListener(signal, listener) {
-  if (typeof listener !== "function") {
-    throw new TypeError("The \"listener\" argument must be of type function");
+  if (signal === undefined) throw pirInvalidArgType("signal", "an instance of AbortSignal", signal);
+  pirValidateAbortSignal(signal, "signal");
+  if (typeof listener !== "function") throw pirInvalidArgType("listener", "of type function", listener);
+  let remove;
+  if (signal.aborted) {
+    // Node defers the call for an already-aborted signal instead of
+    // registering a listener that can never fire.
+    if (typeof globalThis.queueMicrotask === "function") globalThis.queueMicrotask(() => listener());
+    else pirNextTick(() => listener());
+  } else {
+    signal.addEventListener("abort", listener, { once: true });
+    remove = () => signal.removeEventListener("abort", listener);
   }
-  if (!signal || typeof signal.addEventListener !== "function") {
-    throw new TypeError("The \"signal\" argument must be an AbortSignal");
-  }
-  signal.addEventListener("abort", listener, { once: true });
-  return {
+  const disposable = {
     [Symbol.for("nodejs.dispose")]() {
-      signal.removeEventListener("abort", listener);
+      if (remove !== undefined) remove();
     },
     unsubscribe() {
-      signal.removeEventListener("abort", listener);
-    },
-    [Symbol.dispose === undefined ? "pirDispose" : Symbol.dispose]() {
-      signal.removeEventListener("abort", listener);
+      if (remove !== undefined) remove();
     },
   };
+  if (Symbol.dispose !== undefined) disposable[Symbol.dispose] = disposable[Symbol.for("nodejs.dispose")];
+  return disposable;
 }
 
-function once(emitter, name) {
+// Node's AbortError (internal/errors.js): an Error named AbortError with code
+// ABORT_ERR; the signal's reason is carried as `cause`, while the message
+// stays the default.
+function pirAbortError(reason) {
+  let error;
+  try {
+    error = reason === undefined ? new Error("The operation was aborted") : new Error("The operation was aborted", { cause: reason });
+  } catch {
+    error = new Error("The operation was aborted");
+    if (reason !== undefined) error.cause = reason;
+  }
+  error.code = "ABORT_ERR";
+  error.name = "AbortError";
+  return error;
+}
+
+function pirValidateAbortSignal(signal, name) {
+  if (signal !== undefined &&
+      (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+    throw pirInvalidArgType(name, "an instance of AbortSignal", signal);
+  }
+}
+
+function pirValidateOptions(options) {
+  if (options === null || Array.isArray(options) || typeof options !== "object") {
+    throw pirInvalidArgType("options", "of type object", options);
+  }
+}
+
+function pirRemoveFromEmitter(emitter, name, handler) {
+  if (typeof emitter.removeListener === "function") emitter.removeListener(name, handler);
+  else if (typeof emitter.removeEventListener === "function") emitter.removeEventListener(name, handler);
+}
+
+// events.once(emitter, name, { signal }) — lib/events.js `once`.
+async function once(emitter, name, options) {
+  if (options === undefined) options = {};
+  else pirValidateOptions(options);
+  const signal = options.signal;
+  pirValidateAbortSignal(signal, "options.signal");
+  if (signal !== undefined && signal.aborted) throw pirAbortError(signal.reason);
   return new Promise((resolve, reject) => {
-    if (!emitter || typeof emitter.once !== "function") {
-      reject(new TypeError("The \"emitter\" argument must be an EventEmitter"));
-      return;
-    }
+    const removeAbort = () => {
+      if (signal !== undefined) signal.removeEventListener("abort", abortListener);
+    };
     const errorListener = (error) => {
-      emitter.removeListener(name, resolver);
+      pirRemoveFromEmitter(emitter, name, resolver);
+      removeAbort();
       reject(error);
     };
     const resolver = (...args) => {
-      emitter.removeListener("error", errorListener);
-      resolve(args.length === 0 ? [] : args.length === 1 ? [args[0]] : args);
+      if (typeof emitter.removeListener === "function") emitter.removeListener("error", errorListener);
+      removeAbort();
+      resolve(args);
     };
-    emitter.once(name, resolver);
-    emitter.on("error", errorListener);
+    const abortListener = () => {
+      pirRemoveFromEmitter(emitter, name, resolver);
+      if (typeof emitter.removeListener === "function") emitter.removeListener("error", errorListener);
+      removeAbort();
+      reject(pirAbortError(signal.reason));
+    };
+    if (typeof emitter.once === "function") emitter.once(name, resolver);
+    else if (typeof emitter.on === "function") emitter.on(name, resolver);
+    else if (typeof emitter.addEventListener === "function") {
+      emitter.addEventListener(name, resolver, { once: true });
+    } else throw pirInvalidArgType("emitter", "an instance of EventEmitter", emitter);
+    // EventTarget has no Node 'error' event semantics; only EventEmitters get
+    // the implicit error listener.
+    if (name !== "error" && typeof emitter.once === "function") {
+      emitter.once("error", errorListener);
+    }
+    if (signal !== undefined) signal.addEventListener("abort", abortListener, { once: true });
   });
 }
 
-async function* on(emitter, name, options) {
-  if (!emitter || typeof emitter.on !== "function") {
-    throw new TypeError("The \"emitter\" argument must be an EventEmitter");
-  }
-  const queue = [];
-  const push = (...args) => queue.push({ value: args });
-  const errors = [];
-  const onError = (error) => errors.push(error);
-  emitter.on(name, push);
-  emitter.on("error", onError);
-  try {
-    while (true) {
-      if (errors.length > 0) throw errors.shift();
-      if (queue.length > 0) {
-        yield queue.shift().value;
-      } else {
-        // The minimal pad cannot await new events without a real scheduler;
-        // yield the drained buffer and stop (Node's iterator stays live).
-        break;
+// events.on(emitter, name, options) — lib/events.js `on`: a real async
+// iterator over the event's argument arrays, with an event queue, an error
+// slot, high/low watermark bookkeeping, and cleanup on return()/abort/error.
+function on(emitter, event, options) {
+  if (options === undefined) options = {};
+  else pirValidateOptions(options);
+  const signal = options.signal;
+  pirValidateAbortSignal(signal, "options.signal");
+  if (signal !== undefined && signal.aborted) throw pirAbortError(signal.reason);
+  const highWatermark = options.highWaterMark ?? options.highWatermark ?? Number.MAX_SAFE_INTEGER;
+  pirValidateInteger(highWatermark, "options.highWaterMark", 1, Number.MAX_SAFE_INTEGER);
+  const lowWatermark = options.lowWaterMark ?? options.lowWatermark ?? 1;
+  pirValidateInteger(lowWatermark, "options.lowWaterMark", 1, Number.MAX_SAFE_INTEGER);
+
+  const unconsumedEvents = [];
+  const unconsumedPromises = [];
+  let paused = false;
+  let error = null;
+  let finished = false;
+  let size = 0;
+  const registered = [];
+
+  const iterator = {
+    next() {
+      if (size) {
+        const value = unconsumedEvents.shift();
+        size--;
+        if (paused && size < lowWatermark) {
+          if (typeof emitter.resume === "function") emitter.resume();
+          paused = false;
+        }
+        return Promise.resolve({ value: value, done: false });
       }
+      if (error !== null) {
+        const pending = Promise.reject(error);
+        error = null;
+        return pending;
+      }
+      if (finished) return closeHandler();
+      return new Promise((resolve, reject) => {
+        unconsumedPromises.push({ resolve: resolve, reject: reject });
+      });
+    },
+    return() {
+      return closeHandler();
+    },
+    throw(err) {
+      if (!err || !(err instanceof Error)) {
+        throw pirInvalidArgType("EventEmitter.AsyncIterator", "an instance of Error", err);
+      }
+      errorHandler(err);
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+
+  function removeAll() {
+    while (registered.length > 0) {
+      const entry = registered.pop();
+      const target = entry[0];
+      if (typeof target.removeListener === "function") target.removeListener(entry[1], entry[2]);
+      else if (typeof target.removeEventListener === "function") target.removeEventListener(entry[1], entry[2]);
     }
-  } finally {
-    emitter.removeListener(name, push);
-    emitter.removeListener("error", onError);
   }
+
+  function eventHandler(value) {
+    if (unconsumedPromises.length === 0) {
+      size++;
+      if (!paused && size > highWatermark) {
+        paused = true;
+        // Plain EventEmitters have no pause()/resume(); Node calls them
+        // unguarded, but only stream-backed emitters define them.
+        if (typeof emitter.pause === "function") emitter.pause();
+      }
+      unconsumedEvents.push(value);
+    } else {
+      unconsumedPromises.shift().resolve({ value: value, done: false });
+    }
+  }
+
+  function errorHandler(err) {
+    if (unconsumedPromises.length === 0) error = err;
+    else unconsumedPromises.shift().reject(err);
+    closeHandler();
+  }
+
+  function closeHandler() {
+    if (signal !== undefined) signal.removeEventListener("abort", abortListener);
+    removeAll();
+    finished = true;
+    paused = false;
+    const doneResult = { value: undefined, done: true };
+    while (unconsumedPromises.length > 0) unconsumedPromises.shift().resolve(doneResult);
+    return Promise.resolve(doneResult);
+  }
+
+  function abortListener() {
+    errorHandler(pirAbortError(signal.reason));
+  }
+
+  function addListener(target, name, handler) {
+    if (typeof target.on === "function") {
+      target.on(name, handler);
+      registered.push([target, name, handler]);
+    } else if (typeof target.addEventListener === "function") {
+      target.addEventListener(name, handler);
+      registered.push([target, name, handler]);
+    } else {
+      throw pirInvalidArgType("emitter", "an instance of EventEmitter", target);
+    }
+  }
+
+  addListener(emitter, event, (...args) => eventHandler(args));
+  if (event !== "error" && typeof emitter.on === "function") {
+    addListener(emitter, "error", errorHandler);
+  }
+  const closeEvents = options.close;
+  if (closeEvents !== undefined && closeEvents.length) {
+    for (let i = 0; i < closeEvents.length; i++) {
+      addListener(emitter, closeEvents[i], () => closeHandler());
+    }
+  }
+  if (signal !== undefined) signal.addEventListener("abort", abortListener, { once: true });
+  return iterator;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +992,19 @@ class EventEmitterAsyncResource extends EventEmitter {
 
 EventEmitter.errorMonitor = errorMonitor;
 EventEmitter.captureRejectionSymbol = captureRejectionSymbol;
-EventEmitter.captureRejections = captureRejections;
+// Node's `captureRejections` is an accessor over EventEmitter.prototype[kCapture]
+// (setting it changes the default for emitters constructed afterwards).
+Object.defineProperty(EventEmitter, "captureRejections", {
+  get() {
+    return EventEmitter.prototype[kCapture];
+  },
+  set(value) {
+    pirValidateBoolean(value, "EventEmitter.captureRejections");
+    EventEmitter.prototype[kCapture] = value;
+  },
+  enumerable: true,
+  configurable: false,
+});
 EventEmitter.defaultMaxListeners = defaultMaxListeners;
 EventEmitter.usingDomains = usingDomains;
 EventEmitter.init = init;
@@ -389,6 +1016,11 @@ EventEmitter.addAbortListener = addAbortListener;
 EventEmitter.once = once;
 EventEmitter.on = on;
 EventEmitter.EventEmitterAsyncResource = EventEmitterAsyncResource;
+
+// Must run before any user code adds an EventTarget listener (all shims are
+// evaluated at boot); guarded so a second events module instance cannot wrap
+// the already-wrapped methods.
+pirInstallEventTargetTracking();
 
 export default EventEmitter;
 export {

@@ -10,9 +10,9 @@ const PIR_TIMING_ENABLED =
 
 const state = {
   extensions: {},      // extId -> {path, status, handlers, tools, commands, flags, shortcuts, eventUnsubs}
-  toolMeta: {},        // name -> metadata (no execute); each entry carries the owning extId
-  toolLoadoutHooks: {}, // name -> prepareLoadout function (no metadata copy)
-  toolLoadoutOwners: {}, // name -> extId that registered the loadout hook (last registration wins)
+  toolMeta: Object.create(null),        // name -> metadata (no execute); each entry carries the owning extId
+  toolLoadoutHooks: Object.create(null), // name -> prepareLoadout function (no metadata copy)
+  toolLoadoutOwners: Object.create(null), // name -> extId that registered the loadout hook (last registration wins)
   // name -> reachesTools function (upstream ToolDefinition.reachesTools): it
   // decides which tools a call with the given input may reach ("all", or the
   // words of the input that may name them) and is called by other extensions
@@ -25,6 +25,13 @@ const state = {
   // carries the same object the factory received), so the object is created
   // once per extension and shared instead of rebuilt per call.
   piApis: {},
+  // First-wins tool owners in extension registration order. The array is
+  // append-only between reloads; failed extensions are skipped by status.
+  // This replaces an Object.keys(extensions).sort() scan on every tool call.
+  toolOwners: Object.create(null),
+  // Event handlers indexed by event name in registration order. Each entry is
+  // [extId, handler]; dispatch snapshots only the relevant event list.
+  handlersByEvent: Object.create(null),
   providerStreamHooks: {}, // providerId -> {extId, fn: streamSimple} (JS-callback streaming providers)
   // registerProvider config values the model registry hands back to
   // extensions (`getProviderAuth` / `getApiKeyAndHeaders`, and the api-mismatch
@@ -217,6 +224,58 @@ function extRecord(extId) {
   return state.extensions[extId];
 }
 
+/// Extension ids in ascending numeric order, cached between registrations.
+///
+/// Tool dispatch, event fan-out and owner resolution all walk extensions in id
+/// order, and each of them used to re-sort the whole key set per call: with N
+/// plugins that made a full tool sweep O(N² log N) (measured: 22 ms for 100
+/// plugins, 503 ms for 500). The registry only ever grows (records are marked
+/// inactive, never deleted), so the registration site invalidates the cache.
+function extensionIdsAscending() {
+  const cached = state.__extensionIdsAscending;
+  if (cached !== undefined) return cached;
+  const ids = Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b));
+  state.__extensionIdsAscending = ids;
+  return ids;
+}
+
+function invalidateExtensionIds() {
+  state.__extensionIdsAscending = undefined;
+}
+
+function indexExtensionHandler(extId, event, handler) {
+  (state.handlersByEvent[event] ??= []).push([extId, handler]);
+}
+
+function unindexExtensionHandlers(extId) {
+  for (const event of Object.keys(state.handlersByEvent)) {
+    const list = state.handlersByEvent[event].filter(([owner]) => owner !== extId);
+    if (list.length === 0) delete state.handlersByEvent[event];
+    else state.handlersByEvent[event] = list;
+  }
+}
+
+function firstActiveTool(toolName) {
+  const owners = state.toolOwners[toolName];
+  if (owners !== undefined) {
+    for (const extId of owners) {
+      const ext = state.extensions[extId];
+      if (ext && ext.status === "active" && ext.tools[toolName]) {
+        return [ext.tools[toolName], extId];
+      }
+    }
+  }
+  // Compatibility fallback for state created by an older prelude snapshot or
+  // tools registered before the index was introduced.
+  for (const extId of extensionIdsAscending()) {
+    const ext = state.extensions[extId];
+    if (ext && ext.status === "active" && ext.tools[toolName]) {
+      return [ext.tools[toolName], extId];
+    }
+  }
+  return [null, undefined];
+}
+
 function assertActive(extId) {
   const ext = extRecord(extId);
   // "loading" is allowed: the factory registers hooks/tools while running.
@@ -314,6 +373,7 @@ function typeMatches(value, type) {
     case "object": return isPlainObject(value);
     case "array": return Array.isArray(value);
     case "null": return value === null;
+    case "undefined": return value === undefined;
     default: return true; // unknown type keywords never fail
   }
 }
@@ -612,8 +672,12 @@ function ensureCompactSettler(extId) {
     settleCompactCallbacks(eventName, payload);
     return undefined;
   };
-  (ext.handlers["session_compact"] ??= []).push(step("session_compact"));
-  (ext.handlers["session_compact_failed"] ??= []).push(step("session_compact_failed"));
+  const compactHandler = step("session_compact");
+  const compactFailedHandler = step("session_compact_failed");
+  (ext.handlers["session_compact"] ??= []).push(compactHandler);
+  (ext.handlers["session_compact_failed"] ??= []).push(compactFailedHandler);
+  indexExtensionHandler(extId, "session_compact", compactHandler);
+  indexExtensionHandler(extId, "session_compact_failed", compactFailedHandler);
   markHandlersDirty();
 }
 
@@ -1690,7 +1754,7 @@ function makeCtx(desc, getSystemPromptOverride, ownerExtId, commandName) {
   // `ModelRegistry` is not tied to one extension and its methods do not assert
   // an owner).
   const activePiApi = () => {
-    const ids = Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b));
+    const ids = extensionIdsAscending();
     for (const id of ids) {
       const ext = state.extensions[id];
       if (ext && ext.status === "active" && state.piApis[id]) return state.piApis[id];
@@ -2038,8 +2102,8 @@ function makeCtx(desc, getSystemPromptOverride, ownerExtId, commandName) {
       const onComplete = typeof options?.onComplete === "function" ? options.onComplete : null;
       const onError = typeof options?.onError === "function" ? options.onError : null;
       if (onComplete !== null || onError !== null) {
-        state.pendingCompactCallbacks.push({ extId, onComplete, onError });
-        ensureCompactSettler(extId);
+        state.pendingCompactCallbacks.push({ extId: ownerExtId, onComplete, onError });
+        if (ownerExtId !== undefined) ensureCompactSettler(ownerExtId);
       }
       const accepted = __pir_host.requestCompact(
         options?.customInstructions == null ? null : String(options.customInstructions),
@@ -2280,16 +2344,15 @@ function markRegistryDirty() {
   }
 }
 
-// `pi.on` fail-closed event-name validation.
+// `pi.on` event-name validation.
 //
-// Upstream `ExtensionAPI.on` accepts only the documented `ExtensionEvent`
-// names; a typo used to register a handler that could never fire. The host
-// owns the canonical registry (`src/plugins/coverage.rs`:
-// `WIRED_NATIVE_EVENTS` + `NATIVE_ONLY_EVENTS` + pir synthetic names +
-// test-only synthetic names) and answers through `isKnownEvent`; reject an
-// unknown name here, at registration time. A host-less prelude evaluation
-// (transpile/byte-compare fixtures) has no registry and keeps the historical
-// permissive behavior.
+// Upstream `ExtensionAPI.on` is typed (`ExtensionEvent`) but has no runtime
+// whitelist: plugins built against a newer SDK (for example `session_switch`,
+// `session_fork`) register handlers unconditionally. The host registry
+// (`src/plugins/coverage.rs`) is the canonical list for *dispatch*; a name
+// outside it is accepted here so the extension still loads, with a one-time
+// warning instead of a hard failure. A typo keeps its historical value: the
+// handler simply never fires.
 function assertKnownEventName(event) {
   if (typeof event !== "string" || event.length === 0) {
     throw new TypeError("pi.on: event name must be a non-empty string");
@@ -2306,10 +2369,18 @@ function assertKnownEventName(event) {
     return;
   }
   if (!known) {
-    throw new TypeError(
-      `pi.on: unknown event name "${event}" (custom events use pi.events.on; ` +
-        "see docs/hooks.md for the supported hook names)",
-    );
+    const warned = (state.__unknownEventWarnings ??= new Set());
+    if (!warned.has(event)) {
+      warned.add(event);
+      try {
+        if (typeof console !== "undefined" && typeof console.warn === "function") {
+          console.warn(
+            `pi.on: event "${event}" is not dispatched by this runtime; ` +
+              "the handler is registered but will not fire",
+          );
+        }
+      } catch { /* warning must not affect registration */ }
+    }
   }
 }
 
@@ -2348,17 +2419,29 @@ function makePi(extId) {
       }
       const list = (ext.handlers[event] ??= []);
       list.push(handler);
+      (state.handlersByEvent[event] ??= []).push([extId, handler]);
       markHandlersDirty();
       let removed = false;
-      return () => {
+      const unsubscribe = () => {
         if (removed) return;
         removed = true;
         const idx = ext.handlers[event]?.indexOf(handler);
         if (idx !== undefined && idx >= 0) {
           ext.handlers[event].splice(idx, 1);
+          const indexed = state.handlersByEvent[event];
+          if (indexed) {
+            const indexedIdx = indexed.findIndex((entry) => entry[0] === extId && entry[1] === handler);
+            if (indexedIdx >= 0) indexed.splice(indexedIdx, 1);
+            if (indexed.length === 0) delete state.handlersByEvent[event];
+          }
           markHandlersDirty();
         }
       };
+      // Failed-extension cleanup invokes every recorded unsubscribe. Keeping
+      // this in the same list as terminal handlers prevents the indexed event
+      // table from retaining handlers after a factory throws.
+      ext.eventUnsubs.push(unsubscribe);
+      return unsubscribe;
     },
 
     registerTool(tool) {
@@ -2378,6 +2461,7 @@ function makePi(extId) {
       }
       const ext = extRecord(extId);
       ext.tools[tool.name] = tool;
+      (state.toolOwners[tool.name] ??= []).push(extId);
       // The exported registry reads `toolMeta` AND the live `toolReachHooks`
       // (the reach snapshot), so even a duplicate-name registration that does
       // not change `toolMeta` is a registry mutation.
@@ -2401,12 +2485,12 @@ function makePi(extId) {
         delete state.toolReachHooks[tool.name];
       }
       // First registration per name wins (upstream getAllRegisteredTools
-      // resolution; __pir_callTool dispatches against the first extension
-      // that owns the name). Cross-extension duplicates stay registered on
-      // their own extensions for conflict diagnostics. The surviving entry
-      // records its owner so a later failing extension's discard cannot
-      // delete another extension's metadata.
-      if (state.toolMeta[tool.name] === undefined) {
+  // resolution; __pir_callTool dispatches against the first extension
+  // that owns the name). Cross-extension duplicates stay registered on
+  // their own extensions for conflict diagnostics. The surviving entry
+  // records its owner so a later failing extension's discard cannot
+  // delete another extension's metadata.
+  if (state.toolMeta[tool.name] === undefined) {
         state.toolMeta[tool.name] = {
           extId,
           name: tool.name,
@@ -2649,7 +2733,7 @@ function makePi(extId) {
         state.providerRefreshHooks[name] = { extId, fn: config.refreshModels };
         const ext = extRecord(extId);
         const handlers = (ext.handlers["provider:refreshModels"] ??= []);
-        handlers.push(async (payload) => {
+        const refreshHandler = async (payload) => {
           if (!payload || payload.providerId !== name) return undefined;
           // Upstream RefreshModelsContext (packages/ai/src/models.ts:80-97):
           // {credential?, stored?, publish(publication): Promise<boolean>,
@@ -2755,7 +2839,9 @@ function makePi(extId) {
           };
           if (hasPersistedPublication) result.persist = persistedPublication;
           return result;
-        });
+        };
+        handlers.push(refreshHandler);
+        indexExtensionHandler(extId, "provider:refreshModels", refreshHandler);
         // The one handler-table row this file registers without `pi.on`: same
         // dirty signal, so a snapshot published before the row existed cannot
         // make the `provider:refreshModels` gate skip the synthetic event.
@@ -3210,8 +3296,8 @@ function attachToolHooks(tools) {
 // upstream types.ts:652-664): the terminal value of a `registerToolRenderer`
 // `next()` chain. `undefined` when the tool declares none.
 function registeredToolRenderers(toolName) {
-  const meta = state.toolMeta[toolName];
-  const def = meta ? state.extensions[meta.extId]?.tools?.[toolName] : undefined;
+  const owner = state.toolMeta[toolName]?.extId;
+  const def = owner === undefined ? undefined : state.extensions[owner]?.tools?.[toolName];
   if (!def) return undefined;
   const renderers = {};
   if (def.renderShell !== undefined) renderers.renderShell = def.renderShell;
@@ -3228,8 +3314,8 @@ function registeredToolRenderers(toolName) {
 // renderer" (the caller keeps its default drawing) and `shell` reports the
 // tool's `renderShell` choice ("default" | "self").
 globalThis.__pir_callToolRenderer = async (toolName, kind, requestJson) => {
-  const meta = state.toolMeta[toolName];
-  const def = meta ? state.extensions[meta.extId]?.tools?.[toolName] : undefined;
+  const owner = state.toolMeta[toolName]?.extId;
+  const def = owner === undefined ? undefined : state.extensions[owner]?.tools?.[toolName];
   if (!def) return JSON.stringify({ ok: false, error: `Unknown extension tool renderer: ${toolName}` });
   const request = parseHostJson(requestJson) ?? {};
   const renderOptions = request.renderOptions ?? {};
@@ -3316,6 +3402,7 @@ globalThis.__pir_loadExtension = async (extIdRaw, moduleName, path) => {
     eventUnsubs: [],
   };
   state.extensions[extId] = ext;
+  invalidateExtensionIds();
   __pir_host.registerExtId(extId);
   try {
     const mod = await import(moduleName);
@@ -3354,6 +3441,39 @@ globalThis.__pir_loadExtension = async (extIdRaw, moduleName, path) => {
     for (const name of Object.keys(ext.tools)) {
       if (state.toolMeta[name] !== undefined && state.toolMeta[name].extId === extId) {
         delete state.toolMeta[name];
+        const replacement = firstActiveTool(name);
+        const replacementExt = replacement[1];
+        const replacementDef = replacement[0];
+        if (replacementDef && replacementExt !== undefined) {
+          state.toolMeta[name] = {
+            extId: replacementExt,
+            name,
+            label: replacementDef.label ?? undefined,
+            description: replacementDef.description ?? "",
+            promptSnippet: replacementDef.promptSnippet ?? undefined,
+            promptGuidelines: replacementDef.promptGuidelines ?? [],
+            parameters: sanitizeSchema(replacementDef.parameters),
+            outputSchema: replacementDef.outputSchema ? sanitizeSchema(replacementDef.outputSchema) : undefined,
+            sourceInfo: { path: state.extensions[replacementExt].path },
+            executionMode: replacementDef.executionMode ?? "parallel",
+            exposure: replacementDef.exposure ?? "direct",
+            namespace: replacementDef.namespace ?? undefined,
+            annotations: replacementDef.annotations ?? undefined,
+            defaultActive: replacementDef.defaultActive ?? true,
+            prepareLoadout: typeof replacementDef.prepareLoadout === "function",
+            constrainedSampling: replacementDef.constrainedSampling ?? undefined,
+            renderShell: replacementDef.renderShell ?? undefined,
+            renderCall: typeof replacementDef.renderCall === "function",
+            renderResult: typeof replacementDef.renderResult === "function",
+            ...(typeof replacementDef.reachesTools === "function" ? { reachesTools: true } : {}),
+          };
+        }
+      }
+      const owners = state.toolOwners[name];
+      if (owners !== undefined) {
+        const kept = owners.filter((owner) => owner !== extId);
+        if (kept.length === 0) delete state.toolOwners[name];
+        else state.toolOwners[name] = kept;
       }
       if (state.toolLoadoutOwners[name] === extId) {
         delete state.toolLoadoutHooks[name];
@@ -3368,6 +3488,7 @@ globalThis.__pir_loadExtension = async (extIdRaw, moduleName, path) => {
     }
     // JS-owned callbacks of the failed extension are discarded too (parity
     // with the toolLoadoutHooks cleanup above).
+    unindexExtensionHandlers(extId);
     for (const name of Object.keys(state.providerStreamHooks)) {
       if (state.providerStreamHooks[name].extId === extId) delete state.providerStreamHooks[name];
     }
@@ -3394,9 +3515,48 @@ globalThis.__pir_loadExtension = async (extIdRaw, moduleName, path) => {
     }
     dropExtensionRenderers(extId);
     for (const unsub of ext.eventUnsubs) { try { unsub(); } catch {} }
+    delete state.piApis[extId];
+    ext.tools = {};
+    ext.commands = {};
+    ext.flags = {};
+    ext.shortcuts = {};
+    ext.virtualModels.clear();
+    ext.eventUnsubs.length = 0;
+    // Clear JS-owned provider callback slots owned by this extension.
+    for (const table of [
+      state.providerApiKeyResolvers,
+      state.providerNativeOauth,
+      state.providerFilterHooks,
+      state.providerImageHooks,
+      state.providerClassifierHooks,
+    ]) {
+      for (const name of Object.keys(table)) {
+        if (table[name]?.extId === extId) delete table[name];
+      }
+    }
+    for (const name of Object.keys(state.providerConfigs)) {
+      // providerConfigs has no owner metadata; only remove it when no active
+      // callback/config remains for this provider.
+      if (!state.providerStreamHooks[name] && !state.providerOauthHooks[name] &&
+          !state.providerRefreshHooks[name] && !state.providerApiKeyResolvers[name] &&
+          !state.providerNativeOauth[name] && !state.providerFilterHooks[name] &&
+          !state.providerImageHooks[name] && !state.providerClassifierHooks[name]) {
+        delete state.providerConfigs[name];
+      }
+    }
+    markHandlersDirty();
     ext.handlers = {};
+    // Keep the stack for load diagnostics: QuickJS's exception text alone is
+    // often just "not a function". The stack starts with the message, so it
+    // replaces it; a stack without the message is appended.
+    const stack = error && typeof error.stack === "string" ? error.stack : "";
     const message = error && error.message ? error.message : String(error);
-    return JSON.stringify({ ok: false, error: message });
+    const detail = stack.length > message.length
+      ? stack
+      : stack.length > 0 && stack !== message
+        ? message + "\n" + stack
+        : message;
+    return JSON.stringify({ ok: false, error: detail });
   }
 };
 
@@ -3570,8 +3730,14 @@ async function invokeTimedHandler(extId, handler, event, ctx, eventName, dispatc
 // snapshotted before dispatch so a handler registering during the round does
 // not join it (P2-12).
 function snapshotEventHandlers(eventName) {
+  const indexed = state.handlersByEvent[eventName];
+  if (indexed !== undefined) {
+    return indexed
+      .filter(([extId]) => state.extensions[extId]?.status === "active")
+      .slice();
+  }
   const handlers = [];
-  for (const extId of Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b))) {
+  for (const extId of extensionIdsAscending()) {
     const ext = state.extensions[extId];
     if (ext.status !== "active") continue;
     for (const handler of (ext.handlers[eventName] ?? []).slice()) handlers.push([extId, handler]);
@@ -3649,7 +3815,6 @@ async function dispatchEventToHandlers(eventName, payload, dispatchEpoch) {
   if (eventName === "session_compact" || eventName === "session_compact_failed") {
     settleCompactCallbacks(eventName, payload);
   }
-  const desc = hostContext();
   const errors = [];
   let outcome = null;
   // The timing/epoch wrapper is only needed when the PI_TIMING gate is on or
@@ -3702,6 +3867,12 @@ async function dispatchEventToHandlers(eventName, payload, dispatchEpoch) {
   let toolResultState = null;
 
   const handlers = snapshotEventHandlers(eventName);
+  if (handlers.length === 0) {
+    // Preserve compaction settlement above, but avoid allocating the large
+    // event context/closure graph when no extension listens to this event.
+    return { outcome: null, payload, errors };
+  }
+  const desc = hostContext();
   // The ctx factory sees the chained system-prompt override (upstream
   // renderCurrentSystemPrompt; the before_agent_start ctx re-renders the
   // mutable options, every other context keeps the host prompt).
@@ -4585,14 +4756,7 @@ async function callToolCore(toolName, toolCallId, params) {
   desc.toolCallId = String(toolCallId);
   let def = null;
   let ownerExtId;
-  for (const extId of Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b))) {
-    const ext = state.extensions[extId];
-    if (ext.status === "active" && ext.tools[toolName]) {
-      def = ext.tools[toolName];
-      ownerExtId = extId;
-      break;
-    }
-  }
+  [def, ownerExtId] = firstActiveTool(toolName);
   const ctx = makeCtx(desc, undefined, ownerExtId);
   if (!def) {
     return { ok: false, error: `Unknown extension tool: ${toolName}` };
@@ -4704,7 +4868,7 @@ globalThis.__pir_dispatchCommand = async (name, args, extIdJson, invocationName)
       extId = requestedExtId;
     }
   } else {
-    for (const id of Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b))) {
+    for (const id of extensionIdsAscending()) {
       const ext = state.extensions[id];
       if (ext.status === "active" && ext.commands[name]) { entry = ext.commands[name]; extId = id; break; }
     }
@@ -5298,7 +5462,7 @@ globalThis.__pir_callRenderer = async (requestJson) => {
 // that registered the hook handles the command).
 globalThis.__pir_callArgCompletions = async (commandName, prefixJson) => {
   let entry = null;
-  for (const id of Object.keys(state.extensions).sort((a, b) => Number(a) - Number(b))) {
+  for (const id of extensionIdsAscending()) {
     const ext = state.extensions[id];
     const def = ext.status === "active" ? ext.commands[commandName] : undefined;
     if (def && typeof def.getArgumentCompletions === "function") { entry = def; break; }
@@ -5945,11 +6109,35 @@ globalThis.__pir_streamCancel = (streamId) => {
 // only covers continuations left queued as a resolving command task
 // finishes).
 // ---------------------------------------------------------------------------
-let __pirTimerSeq = 0;
-const __pirTimers = new Map();
+// The prelude runs as an ES module (AOT bytecode), so top-level `let`/`const`
+// are module-scoped rather than script globals. The timer registry and its
+// sequence are read by `process_global_stub.js.txt` (evaluated as a plain
+// script), so publish them on `globalThis` explicitly.
+globalThis.__pirTimerSeq = 0;
+const __pirTimers = (globalThis.__pirTimers = new Map());
+// Node hands the callback the Timeout object as `this` and returns that same
+// object from setTimeout/setInterval (lib/internal/timers.js:685-687,
+// lib/timers.js:123-176). Shims that keep numeric ids (fs.watch,
+// child_process, process's own idle probe) keep working because
+// clearTimeout/clearInterval accept both, and `[Symbol.toPrimitive]` yields
+// the numeric id for any legacy comparison.
 const __pirTimerArm = (fn, ms, args, repeat) => {
-  const id = ++__pirTimerSeq;
+  const id = ++globalThis.__pirTimerSeq;
   const entry = { cancelled: false };
+  const handle = {
+    _id: id,
+    __pirTimerId: id,
+    _idleTimeout: Number(ms),
+    _repeat: repeat ? Number(ms) : null,
+    _destroyed: false,
+    ref() { return this; },
+    unref() { return this; }, // still non-persistent: process liveness counts the map
+    hasRef() { return true; },
+    refresh() { return this; },
+    close() { globalThis.clearTimeout(this); return this; },
+    [Symbol.toPrimitive]() { return id; },
+  };
+  entry.handle = handle;
   __pirTimers.set(id, entry);
   (async () => {
     let delay = Number(ms);
@@ -5963,7 +6151,7 @@ const __pirTimerArm = (fn, ms, args, repeat) => {
       if (entry.cancelled) break;
       if (typeof fn === "function") {
         try {
-          fn(...args);
+          fn.apply(handle, args); // Node's `this`
         } catch (error) {
           // Node delivers a throwing timer callback to `uncaughtException`
           // (and exits when nothing listens). Swallowing it here hid real
@@ -5982,13 +6170,24 @@ const __pirTimerArm = (fn, ms, args, repeat) => {
     } while (repeat);
     __pirTimers.delete(id);
   })();
-  return id;
+  return handle;
 };
 globalThis.setTimeout = (fn, ms, ...args) => __pirTimerArm(fn, ms, args, false);
 globalThis.setInterval = (fn, ms, ...args) => __pirTimerArm(fn, ms, args, true);
-globalThis.clearTimeout = (id) => {
+
+const __pirTimerIdOf = (value) =>
+  value !== null && typeof value === "object" ? value.__pirTimerId :
+  typeof value === "number" ? value : undefined;
+
+globalThis.clearTimeout = (value) => {
+  const id = __pirTimerIdOf(value);
+  if (id === undefined) return;
   const entry = __pirTimers.get(id);
-  if (entry) { entry.cancelled = true; __pirTimers.delete(id); }
+  if (entry) {
+    entry.cancelled = true;
+    entry.handle._destroyed = true;
+    __pirTimers.delete(id);
+  }
 };
 globalThis.clearInterval = globalThis.clearTimeout;
 // ---------------------------------------------------------------------------
@@ -6266,4 +6465,105 @@ globalThis.clearInterval = globalThis.clearTimeout;
     enumerable: false,
     configurable: true,
   });
+})();
+
+// ---------------------------------------------------------------------------
+// Node-parity global visibility.
+//
+// QuickJS scripts reach the host by global name, so the runtime publishes its
+// internals on globalThis (`__pir_host`, `__pir_native`, the `__pir*` bridge
+// functions and registries). Node defines no such surface, and test/common's
+// known-globals check walks every ENUMERABLE global, so one enumerable
+// `__pir*` entry fails every test that loads common — and it fired before
+// mustCall accounting, silently masking real failures. Re-describing those
+// own properties non-enumerable keeps reads, writes and calls identical while
+// `Object.keys`/`for...in` match Node.
+//
+// The same applies to the globals Node itself installs non-enumerably
+// (Buffer, console, Intl, the Web API constructors): Node's
+// Object.keys(globalThis) lists only its enumerable globals (timers, fetch,
+// crypto, performance, structuredClone, global, ...). `require` is hidden too
+// because Node's CJS script scope does not expose it as an enumerable global
+// (it stays fully reachable by name).
+//
+// Idempotent: run at the end of this prelude, again after the builtin sweep
+// (shims install globals at import time, see node_modules_bootstrap_source)
+// and once more before the `exit` event is emitted (PROCESS_EXIT_SOURCE), so
+// even globals created by late host calls are hidden before any exit
+// listener observes them.
+// ---------------------------------------------------------------------------
+(() => {
+  const hiddenNodeGlobals = [
+    "Buffer",
+    "console",
+    "Intl",
+    "URL",
+    "URLSearchParams",
+    "TextDecoder",
+    "TextEncoder",
+    "AbortController",
+    "AbortSignal",
+    "Blob",
+    "CryptoKey",
+    "Event",
+    "EventTarget",
+    "File",
+    "Headers",
+    "MessageChannel",
+    "MessagePort",
+    "ReadableStream",
+    "Request",
+    "Response",
+    "TransformStream",
+    "WritableStream",
+  ];
+  const hide = (name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (descriptor === undefined || descriptor.enumerable !== true) return;
+    const next = {};
+    for (const key of Object.keys(descriptor)) next[key] = descriptor[key];
+    next.enumerable = false;
+    Object.defineProperty(globalThis, name, next);
+  };
+  const hideRuntimeGlobals = () => {
+    for (const name of Object.getOwnPropertyNames(globalThis)) {
+      if (
+        name.startsWith("__pir") ||
+        name.startsWith("__PIR") ||
+        name === "require"
+      ) {
+        hide(name);
+      }
+    }
+    for (const name of hiddenNodeGlobals) hide(name);
+  };
+  Object.defineProperty(globalThis, "__pirHideGlobals", {
+    value: hideRuntimeGlobals,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  // Runtime globals published AFTER this sweep: script boot sets
+  // __pirRealStdio/__pirScriptRun, worker boot sets __pirWorkerRunStart/
+  // __pirWorkerPump. Reserve each as a non-enumerable accessor now, so the
+  // later assignment cannot re-introduce an enumerable key (reads and writes
+  // are unchanged; the worker boot runs this same prelude).
+  const lateValues = new Map();
+  const reserve = (name) => {
+    Object.defineProperty(globalThis, name, {
+      get() { return lateValues.get(name); },
+      set(value) { lateValues.set(name, value); },
+      enumerable: false,
+      configurable: true,
+    });
+  };
+  for (const name of [
+    "__pirRealStdio",
+    "__pirScriptRun",
+    "__pirWorkerRunStart",
+    "__pirWorkerPump",
+  ]) {
+    reserve(name);
+  }
+  hideRuntimeGlobals();
 })();

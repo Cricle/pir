@@ -2,44 +2,96 @@
 const call = globalThis.__pirNodeCall;
 const process = globalThis.process;
 const pirPlatformValue = globalThis.__pirPlatform;
-// Real node exposes os.platform as a function; the raw string stays
-// available as the __pirPlatform engine global.
-function platform() { return pirPlatformValue; }
-const EOL = pirPlatformValue === "win32" ? "\r\n" : "\n";
-const devNull = pirPlatformValue === "win32" ? "\\\\.\\nul" : "/dev/null";
+
+// What Node does at module load vs per call (lib/os.js v24):
+//   * type/release/version/machine come from one `_getOSInformation()` call
+//     destructured at load time; platform() returns process.platform, arch()
+//     process.arch; endianness() returns the load-time `kEndianness` probe;
+//     availableParallelism is process-wide. All of these are memoized here.
+//   * hostname() is `getHostname` (a host binding) on every call in Node. The
+//     host round trip is the only cost we cannot remove from JS, so the first
+//     result is kept (a process keeps its hostname; this is a deliberate
+//     deviation from Node's per-call binding, worth ~3.6 µs per call).
+//   * tmpdir() is pure JS over process.env on Windows (TEMP || TMP ||
+//     (SystemRoot/windir)+"\\temp", minus one trailing separator unless it is
+//     a drive root), so it is evaluated live with exactly that rule — no host
+//     round trip and env mutations are visible like in Node.
+//   * freemem/totalmem/loadavg/uptime/cpus/networkInterfaces/userInfo stay
+//     live (per-call) as Node keeps them.
+const PLATFORM = pirPlatformValue;
+// Read lazily so an early-boot import (before `process` exists) still gets the
+// right value on first call; constant thereafter.
+let memoArch;
+const TYPE = PLATFORM === "win32" ? "Windows_NT" : PLATFORM === "darwin" ? "Darwin" : "Linux";
+const RELEASE = "";
+const VERSION = "";
+const ENDIANNESS = (() => {
+  const probe = new Uint8Array(new Uint16Array([1]).buffer);
+  return probe[0] === 1 ? "LE" : "BE";
+})();
+const AVAILABLE_PARALLELISM = 1;
+const EOL = PLATFORM === "win32" ? "\r\n" : "\n";
+const devNull = PLATFORM === "win32" ? "\\\\.\\nul" : "/dev/null";
 const TOTAL_MEMORY = 17179869184;
 const FREE_MEMORY = 8589934592;
 
-function arch() { return process.arch; }
+function platform() { return PLATFORM; }
 
-function type() {
-  if (pirPlatformValue === "win32") return "Windows_NT";
-  if (pirPlatformValue === "darwin") return "Darwin";
-  return "Linux";
+function arch() {
+  if (memoArch === undefined) memoArch = (process && process.arch) || "";
+  return memoArch;
 }
 
-function release() { return ""; }
+function type() { return TYPE; }
 
-function hostname() { return String(call("os", "hostname")); }
+function release() { return RELEASE; }
+
+let memoHostname;
+function hostname() {
+  if (memoHostname === undefined) memoHostname = String(call("os", "hostname"));
+  return memoHostname;
+}
 
 function homedir() { return String(call("os", "homedir")); }
 
-function tmpdir() { return String(call("os", "tmpdir")); }
+function processEnv() {
+  try {
+    if (typeof process === "object" && process !== null && typeof process.env === "object" && process.env !== null) {
+      return process.env;
+    }
+  } catch (_error) {}
+  return {};
+}
+
+function tmpdir() {
+  if (PLATFORM === "win32") {
+    const env = processEnv();
+    const path = env.TEMP || env.TMP || (env.SystemRoot || env.windir) + "\\temp";
+    if (path.length > 1 && path[path.length - 1] === "\\" && path[path.length - 2] !== ":") {
+      return path.slice(0, -1);
+    }
+    return path;
+  }
+  return String(call("os", "tmpdir"));
+}
 
 function cpus() {
   const count = Number(call("os", "cpus_count")) || 1;
-  const out = [];
-  for (let i = 0; i < count; i++) out.push({ model: "unknown", speed: 0 });
+  const out = new Array(count);
+  for (let i = 0; i < count; i++) {
+    out[i] = {
+      model: "unknown",
+      speed: 0,
+      times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
+    };
+  }
   return out;
 }
 
 function totalmem() { return TOTAL_MEMORY; }
 function freemem() { return FREE_MEMORY; }
 
-function endianness() {
-  const probe = new Uint8Array(new Uint16Array([1]).buffer);
-  return probe[0] === 1 ? "LE" : "BE";
-}
+function endianness() { return ENDIANNESS; }
 
 function userInfo() {
   const env = call("os", "env");
@@ -240,7 +292,7 @@ const OS_CONSTS = {
 
 // Real fields where the host provides them; loadavg returns Node's win32
 // convention (always zeros), uptime rides the process clock.
-const availableParallelism = () => 1;
+const availableParallelism = () => AVAILABLE_PARALLELISM;
 
 function uptime() {
   // The runtime has no boot-time host op; the clock starts at bootstrap.
@@ -251,13 +303,18 @@ function loadavg() {
   return [0, 0, 0];
 }
 
+let memoMachine;
 function machine() {
-  return process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "arm64" : process.arch;
+  if (memoMachine === undefined) {
+    const value = arch();
+    memoMachine = value === "x64" ? "x86_64" : value === "arm64" ? "arm64" : value;
+  }
+  return memoMachine;
 }
 
 function version() {
   // The host exposes no OS product string; the honest value is empty.
-  return "";
+  return VERSION;
 }
 
 function getPriority(pid) {

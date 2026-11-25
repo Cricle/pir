@@ -471,9 +471,12 @@ impl ExtensionRuntime {
         self.ctx
             .async_with(async |ctx| {
                 let f: rquickjs::Function = ctx.globals().get(name)?;
-                let a = super::native_bridge::json_to_js(&ctx, &a)?;
-                let b = super::native_bridge::json_to_js(&ctx, &b)?;
-                let c = super::native_bridge::json_to_js(&ctx, &c)?;
+                // The clones above are owned by this future; hand them to the
+                // owning bridge so the tree is copied once, not twice (the
+                // borrowing `json_to_js` clones every container entry again).
+                let a = super::native_bridge::json_to_js_owned(&ctx, a)?;
+                let b = super::native_bridge::json_to_js_owned(&ctx, b)?;
+                let c = super::native_bridge::json_to_js_owned(&ctx, c)?;
                 let result: MaybePromise = f.call((a, b, c))?;
                 let value: rquickjs::Value = result.into_future().await?;
                 super::native_bridge::js_to_json(&value)

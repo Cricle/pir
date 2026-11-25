@@ -276,11 +276,7 @@ export default (pi) => {{
     // A read on a write-only descriptor is refused. Node's libuv says EBADF;
     // the host's Windows handle denial surfaces as EPERM (pre-existing fd-path
     // divergence, orthogonal to the numeric flags).
-    let read_denied = if cfg!(windows) {
-        "EPERM:HE"
-    } else {
-        "EBADF:HE"
-    };
+    let read_denied = "EBADF:HE";
     assert_eq!(
         v["wronly"],
         json!({ "ok": true, "value": read_denied }),
@@ -303,10 +299,19 @@ export default (pi) => {{
         v["createTrunc"]["value"], "made",
         "O_WRONLY|O_CREAT|O_TRUNC creates: {v}"
     );
-    assert_eq!(
-        v["truncRdwr"]["value"], "0",
-        "O_RDWR|O_TRUNC truncates: {v}"
-    );
+    // libuv's numeric form: O_TRUNC without O_CREAT is EINVAL on Windows
+    // (verified against node v24 on win32); the POSIX form truncates.
+    if cfg!(windows) {
+        assert_eq!(
+            v["truncRdwr"]["code"], "EINVAL",
+            "O_RDWR|O_TRUNC without O_CREAT is EINVAL on Windows: {v}"
+        );
+    } else {
+        assert_eq!(
+            v["truncRdwr"]["value"], "0",
+            "O_RDWR|O_TRUNC truncates: {v}"
+        );
+    }
     assert_eq!(
         v["createExcl"]["code"], "EEXIST",
         "O_CREAT|O_EXCL on an existing path is EEXIST: {v}"
@@ -475,7 +480,7 @@ export default (pi) => {{
     assert_eq!(
         v["badString"],
         json!({
-            "ok": false, "name": "Error", "code": "ERR_INVALID_ARG_VALUE",
+            "ok": false, "name": "TypeError", "code": "ERR_INVALID_ARG_VALUE",
             "message": "The argument 'flags' is invalid. Received 'rz'",
         }),
         "an unknown flag string keeps the host's validation: {v}"
@@ -623,7 +628,7 @@ export default (pi) => {{
         "an unknown flag string keeps node's message: {v}"
     );
     assert_eq!(
-        v["unknown"]["name"], "Error",
+        v["unknown"]["name"], "TypeError",
         "the string-flag error shape: {v}"
     );
 }

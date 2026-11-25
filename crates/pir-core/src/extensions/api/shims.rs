@@ -64,7 +64,7 @@ pub static SQLITE3_SHIM: Shim = Shim::new(
     include_bytes!("../../../assets/shims/sqlite3_shim.js.txt.deflate"),
 );
 /// `bcrypt` virtual package: the NAPI native addon's JS face over a host
-/// EksBlowfish implementation (`host_functions/bcrypt_fns.rs`), so
+/// EksBlowfish implementation (`crates/pir-node/src/modules/bcrypt.rs`), so
 /// `hashSync`/`compareSync`/`hash`/`compare`/`genSalt(Sync)`/`getRounds` run
 /// without the native binding (see `js/bcrypt_shim.js.txt`).
 pub static BCRYPT_SHIM: Shim = Shim::new(
@@ -156,197 +156,269 @@ pub static PI_DURABLE_THROWS_SHIM: Shim = Shim::new(
     include_bytes!("../../../assets/shims/pi_durable_throws_shim.js.txt.deflate"),
 );
 
+pub(crate) const VIRTUAL_KNOWN: &[(&str, &str)] = &[
+    ("typebox", "typebox"),
+    ("typebox/compile", "typebox/compile"),
+    ("typebox/value", "typebox/value"),
+    ("@sinclair/typebox", "typebox"),
+    ("@sinclair/typebox/compile", "typebox/compile"),
+    ("@sinclair/typebox/value", "typebox/value"),
+    (
+        "@earendil-works/pi-coding-agent",
+        "@earendil-works/pi-coding-agent",
+    ),
+    (
+        "@mariozechner/pi-coding-agent",
+        "@earendil-works/pi-coding-agent",
+    ),
+    (
+        "@earendil-works/pi-agent-core",
+        "@earendil-works/pi-agent-core",
+    ),
+    (
+        "@mariozechner/pi-agent-core",
+        "@earendil-works/pi-agent-core",
+    ),
+    ("@earendil-works/pi-ai", "@earendil-works/pi-ai"),
+    ("@earendil-works/pi-ai/compat", "@earendil-works/pi-ai"),
+    // Published subpaths of the pi-ai package (`package.json` exports):
+    // their surfaces are subsets of the compat bundle served for the root
+    // entry, so they resolve to the same virtual module.
+    ("@earendil-works/pi-ai/models", "@earendil-works/pi-ai"),
+    (
+        "@earendil-works/pi-ai/bedrock-provider",
+        "@earendil-works/pi-ai",
+    ),
+    ("@earendil-works/pi-ai/bun-oauth", "@earendil-works/pi-ai"),
+    ("@mariozechner/pi-ai", "@earendil-works/pi-ai"),
+    // Upstream virtual modules map the mariozechner compat entry to the
+    // compat bundle too (virtual-modules.ts:26-37); leaving it unmapped
+    // rejected the whole extension at dependency scan time.
+    ("@mariozechner/pi-ai/compat", "@earendil-works/pi-ai"),
+    ("@earendil-works/pi-ai/oauth", "@earendil-works/pi-ai/oauth"),
+    ("@mariozechner/pi-ai/oauth", "@earendil-works/pi-ai/oauth"),
+    (
+        "@earendil-works/pi-ai/providers/all",
+        "@earendil-works/pi-ai/providers/all",
+    ),
+    (
+        "@mariozechner/pi-ai/providers/all",
+        "@earendil-works/pi-ai/providers/all",
+    ),
+    ("@earendil-works/pi-tui", "@earendil-works/pi-tui"),
+    ("@mariozechner/pi-tui", "@earendil-works/pi-tui"),
+    ("@earendil-works/pi-codemode", "@earendil-works/pi-codemode"),
+    // Every published pi-codemode subpath entry resolves to the one shim
+    // module: `/declarations`, `/source` and `/worker` are its named
+    // subsets, `/portable` (inline + remote sandboxes) and `/cloudflare`
+    // (Wrangler CompiledWasm entry) add the runtime faces that throw.
+    (
+        "@earendil-works/pi-codemode/declarations",
+        "@earendil-works/pi-codemode",
+    ),
+    (
+        "@earendil-works/pi-codemode/source",
+        "@earendil-works/pi-codemode",
+    ),
+    (
+        "@earendil-works/pi-codemode/worker",
+        "@earendil-works/pi-codemode",
+    ),
+    (
+        "@earendil-works/pi-codemode/portable",
+        "@earendil-works/pi-codemode",
+    ),
+    (
+        "@earendil-works/pi-codemode/cloudflare",
+        "@earendil-works/pi-codemode",
+    ),
+    // better-sqlite3: virtual package over the host SQLite bridge (the
+    // real node_modules package is a native addon and can never load).
+    ("better-sqlite3", "better-sqlite3"),
+    // sqlite3: same situation, callback-style API (node_sqlite3.node).
+    ("sqlite3", "sqlite3"),
+    // bcrypt: NAPI native addon (bcrypt.node); the host carries the
+    // EksBlowfish implementation.
+    ("bcrypt", "bcrypt"),
+    // @earendil-works/pi-env: one published entry ("."); everything the
+    // client needs is in the single shim module.
+    ("@earendil-works/pi-env", "@earendil-works/pi-env"),
+    // @earendil-works/chord: the root and the two published subpaths whose
+    // surfaces are subsets of the one shim module; `./node` is its own
+    // throws-tier module and must not fold into the kernel.
+    ("@earendil-works/chord", "@earendil-works/chord"),
+    ("@earendil-works/chord/context", "@earendil-works/chord"),
+    ("@earendil-works/chord/delta", "@earendil-works/chord"),
+    ("@earendil-works/chord/node", "@earendil-works/chord/node"),
+    // @earendil-works/pi-durable: the ten real entries fold into the one
+    // kernel module (their surfaces are its published subsets); the five
+    // throws-tier entries (`/images`, `/images/node`, `/images/cloudflare`,
+    // `/testing`, `/storage/sqlite/cloudflare`) fold into the separate
+    // throws module.
+    ("@earendil-works/pi-durable", "@earendil-works/pi-durable"),
+    (
+        "@earendil-works/pi-durable/tools",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/env",
+        "@earendil-works/pi-durable/env",
+    ),
+    (
+        "@earendil-works/pi-durable/env/node",
+        "@earendil-works/pi-durable/env",
+    ),
+    (
+        "@earendil-works/pi-durable/tool-search",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/codemode",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/storage/memory",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/storage/jsonl",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/storage/jsonl/node",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/storage/sqlite",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/storage/sqlite/node",
+        "@earendil-works/pi-durable",
+    ),
+    (
+        "@earendil-works/pi-durable/images",
+        "@earendil-works/pi-durable/throws",
+    ),
+    (
+        "@earendil-works/pi-durable/images/node",
+        "@earendil-works/pi-durable/throws",
+    ),
+    (
+        "@earendil-works/pi-durable/images/cloudflare",
+        "@earendil-works/pi-durable/throws",
+    ),
+    (
+        "@earendil-works/pi-durable/testing",
+        "@earendil-works/pi-durable/throws",
+    ),
+    (
+        "@earendil-works/pi-durable/storage/sqlite/cloudflare",
+        "@earendil-works/pi-durable/throws",
+    ),
+    // The throws tier's own canonical name (the table maps the five
+    // published subpaths onto it above; the self-entry is what lets the
+    // loader find the module source when it is resolved by canonical name).
+    (
+        "@earendil-works/pi-durable/throws",
+        "@earendil-works/pi-durable/throws",
+    ),
+    // pi-ai `utils/*` subpaths the durable port imports (`utils/estimate` is
+    // deliberately absent: the pi-ai shim does not carry its two names, so
+    // the durable shim vendors that module — see its header).
+    (
+        "@earendil-works/pi-ai/utils/overflow",
+        "@earendil-works/pi-ai",
+    ),
+    ("@earendil-works/pi-ai/utils/retry", "@earendil-works/pi-ai"),
+    (
+        "@earendil-works/pi-ai/utils/transcript",
+        "@earendil-works/pi-ai",
+    ),
+    ("@earendil-works/pi-ai/utils/uuid", "@earendil-works/pi-ai"),
+    (
+        "@earendil-works/pi-ai/utils/validation",
+        "@earendil-works/pi-ai",
+    ),
+];
+
 pub fn canonical_virtual_name(name: &str) -> Option<&'static str> {
-    const KNOWN: &[(&str, &str)] = &[
-        ("typebox", "typebox"),
-        ("typebox/compile", "typebox/compile"),
-        ("typebox/value", "typebox/value"),
-        ("@sinclair/typebox", "typebox"),
-        ("@sinclair/typebox/compile", "typebox/compile"),
-        ("@sinclair/typebox/value", "typebox/value"),
-        (
-            "@earendil-works/pi-coding-agent",
-            "@earendil-works/pi-coding-agent",
-        ),
-        (
-            "@mariozechner/pi-coding-agent",
-            "@earendil-works/pi-coding-agent",
-        ),
-        (
-            "@earendil-works/pi-agent-core",
-            "@earendil-works/pi-agent-core",
-        ),
-        (
-            "@mariozechner/pi-agent-core",
-            "@earendil-works/pi-agent-core",
-        ),
-        ("@earendil-works/pi-ai", "@earendil-works/pi-ai"),
-        ("@earendil-works/pi-ai/compat", "@earendil-works/pi-ai"),
-        // Published subpaths of the pi-ai package (`package.json` exports):
-        // their surfaces are subsets of the compat bundle served for the root
-        // entry, so they resolve to the same virtual module.
-        ("@earendil-works/pi-ai/models", "@earendil-works/pi-ai"),
-        (
-            "@earendil-works/pi-ai/bedrock-provider",
-            "@earendil-works/pi-ai",
-        ),
-        ("@earendil-works/pi-ai/bun-oauth", "@earendil-works/pi-ai"),
-        ("@mariozechner/pi-ai", "@earendil-works/pi-ai"),
-        // Upstream virtual modules map the mariozechner compat entry to the
-        // compat bundle too (virtual-modules.ts:26-37); leaving it unmapped
-        // rejected the whole extension at dependency scan time.
-        ("@mariozechner/pi-ai/compat", "@earendil-works/pi-ai"),
-        ("@earendil-works/pi-ai/oauth", "@earendil-works/pi-ai/oauth"),
-        ("@mariozechner/pi-ai/oauth", "@earendil-works/pi-ai/oauth"),
-        (
-            "@earendil-works/pi-ai/providers/all",
-            "@earendil-works/pi-ai/providers/all",
-        ),
-        (
-            "@mariozechner/pi-ai/providers/all",
-            "@earendil-works/pi-ai/providers/all",
-        ),
-        ("@earendil-works/pi-tui", "@earendil-works/pi-tui"),
-        ("@mariozechner/pi-tui", "@earendil-works/pi-tui"),
-        ("@earendil-works/pi-codemode", "@earendil-works/pi-codemode"),
-        // Every published pi-codemode subpath entry resolves to the one shim
-        // module: `/declarations`, `/source` and `/worker` are its named
-        // subsets, `/portable` (inline + remote sandboxes) and `/cloudflare`
-        // (Wrangler CompiledWasm entry) add the runtime faces that throw.
-        (
-            "@earendil-works/pi-codemode/declarations",
-            "@earendil-works/pi-codemode",
-        ),
-        (
-            "@earendil-works/pi-codemode/source",
-            "@earendil-works/pi-codemode",
-        ),
-        (
-            "@earendil-works/pi-codemode/worker",
-            "@earendil-works/pi-codemode",
-        ),
-        (
-            "@earendil-works/pi-codemode/portable",
-            "@earendil-works/pi-codemode",
-        ),
-        (
-            "@earendil-works/pi-codemode/cloudflare",
-            "@earendil-works/pi-codemode",
-        ),
-        // better-sqlite3: virtual package over the host SQLite bridge (the
-        // real node_modules package is a native addon and can never load).
-        ("better-sqlite3", "better-sqlite3"),
-        // sqlite3: same situation, callback-style API (node_sqlite3.node).
-        ("sqlite3", "sqlite3"),
-        // bcrypt: NAPI native addon (bcrypt.node); the host carries the
-        // EksBlowfish implementation.
-        ("bcrypt", "bcrypt"),
-        // @earendil-works/pi-env: one published entry ("."); everything the
-        // client needs is in the single shim module.
-        ("@earendil-works/pi-env", "@earendil-works/pi-env"),
-        // @earendil-works/chord: the root and the two published subpaths whose
-        // surfaces are subsets of the one shim module; `./node` is its own
-        // throws-tier module and must not fold into the kernel.
-        ("@earendil-works/chord", "@earendil-works/chord"),
-        ("@earendil-works/chord/context", "@earendil-works/chord"),
-        ("@earendil-works/chord/delta", "@earendil-works/chord"),
-        ("@earendil-works/chord/node", "@earendil-works/chord/node"),
-        // @earendil-works/pi-durable: the ten real entries fold into the one
-        // kernel module (their surfaces are its published subsets); the five
-        // throws-tier entries (`/images`, `/images/node`, `/images/cloudflare`,
-        // `/testing`, `/storage/sqlite/cloudflare`) fold into the separate
-        // throws module.
-        ("@earendil-works/pi-durable", "@earendil-works/pi-durable"),
-        (
-            "@earendil-works/pi-durable/tools",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/env",
-            "@earendil-works/pi-durable/env",
-        ),
-        (
-            "@earendil-works/pi-durable/env/node",
-            "@earendil-works/pi-durable/env",
-        ),
-        (
-            "@earendil-works/pi-durable/tool-search",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/codemode",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/storage/memory",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/storage/jsonl",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/storage/jsonl/node",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/storage/sqlite",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/storage/sqlite/node",
-            "@earendil-works/pi-durable",
-        ),
-        (
-            "@earendil-works/pi-durable/images",
-            "@earendil-works/pi-durable/throws",
-        ),
-        (
-            "@earendil-works/pi-durable/images/node",
-            "@earendil-works/pi-durable/throws",
-        ),
-        (
-            "@earendil-works/pi-durable/images/cloudflare",
-            "@earendil-works/pi-durable/throws",
-        ),
-        (
-            "@earendil-works/pi-durable/testing",
-            "@earendil-works/pi-durable/throws",
-        ),
-        (
-            "@earendil-works/pi-durable/storage/sqlite/cloudflare",
-            "@earendil-works/pi-durable/throws",
-        ),
-        // The throws tier's own canonical name (the table maps the five
-        // published subpaths onto it above; the self-entry is what lets the
-        // loader find the module source when it is resolved by canonical name).
-        (
-            "@earendil-works/pi-durable/throws",
-            "@earendil-works/pi-durable/throws",
-        ),
-        // pi-ai `utils/*` subpaths the durable port imports (`utils/estimate` is
-        // deliberately absent: the pi-ai shim does not carry its two names, so
-        // the durable shim vendors that module — see its header).
-        (
-            "@earendil-works/pi-ai/utils/overflow",
-            "@earendil-works/pi-ai",
-        ),
-        ("@earendil-works/pi-ai/utils/retry", "@earendil-works/pi-ai"),
-        (
-            "@earendil-works/pi-ai/utils/transcript",
-            "@earendil-works/pi-ai",
-        ),
-        ("@earendil-works/pi-ai/utils/uuid", "@earendil-works/pi-ai"),
-        (
-            "@earendil-works/pi-ai/utils/validation",
-            "@earendil-works/pi-ai",
-        ),
-    ];
-    KNOWN
+    VIRTUAL_KNOWN
         .iter()
         .find(|(from, _)| *from == name)
         .map(|(_, canonical)| *canonical)
         .or_else(|| super::node_shims::canonical_node_name(name))
+}
+
+/// Shim handle for a canonical virtual package name.
+pub fn shim_for(canonical: &str) -> Option<&'static Shim> {
+    Some(match canonical {
+        "typebox" => &TYPEBOX_SHIM,
+        "typebox/compile" => &TYPEBOX_COMPILE_SHIM,
+        "typebox/value" => &TYPEBOX_VALUE_SHIM,
+        "@earendil-works/pi-coding-agent" => &PI_CODING_AGENT_SHIM,
+        "@earendil-works/pi-agent-core" => &PI_AGENT_CORE_SHIM,
+        "@earendil-works/pi-ai" => &PI_AI_SHIM,
+        "@earendil-works/pi-ai/oauth" => &PI_AI_OAUTH_SHIM,
+        "@earendil-works/pi-ai/providers/all" => &PI_AI_PROVIDERS_ALL_SHIM,
+        "@earendil-works/pi-tui" => &PI_TUI_SHIM,
+        "@earendil-works/pi-codemode" => &PI_CODEMODE_SHIM,
+        "@earendil-works/pi-env" => &PI_ENV_SHIM,
+        "@earendil-works/chord" => &PI_CHORD_SHIM,
+        "@earendil-works/chord/node" => &PI_CHORD_NODE_SHIM,
+        "@earendil-works/pi-durable" => &PI_DURABLE_SHIM,
+        "@earendil-works/pi-durable/env" => &PI_DURABLE_ENV_SHIM,
+        "@earendil-works/pi-durable/throws" => &PI_DURABLE_THROWS_SHIM,
+        "better-sqlite3" => &BETTER_SQLITE3_SHIM,
+        "sqlite3" => &SQLITE3_SHIM,
+        "bcrypt" => &BCRYPT_SHIM,
+        _ => return super::node_shims::shim_for(canonical),
+    })
+}
+
+/// Whether embedded AOT bytecode (`assets/bytecode/*.qc`) is used at all.
+///
+/// `PIR_EXT_BYTECODE=0` (also `false`/`off`) forces every shim through the
+/// source path. Development aid: the guard header records the payload, not the
+/// source, so editing a `src/extensions/api/js/*.js.txt` shim without
+/// regenerating the blobs would otherwise load stale code.
+pub fn bytecode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("PIR_EXT_BYTECODE").ok().as_deref(),
+            Some("0") | Some("false") | Some("off")
+        )
+    })
+}
+
+/// AOT bytecode payload for a virtual module specifier, when one was
+/// precompiled. Callers fall back to [`source_for`] when this returns `None`.
+pub fn bytecode_for(name: &str) -> Option<&'static [u8]> {
+    if !bytecode_enabled() {
+        return None;
+    }
+    let canonical = canonical_virtual_name(name)?;
+    let blob = super::bytecode::virtual_blob(canonical)?;
+    super::bytecode::payload(blob)
+}
+
+/// Every virtual module served from a file-backed shim, keyed by canonical
+/// name (aliases collapse onto one canonical). This is the AOT generator's
+/// input: the loader resolves every specifier to one of these names, so each
+/// needs bytecode compiled under exactly that module name.
+pub fn known_modules() -> Vec<(&'static str, &'static Shim)> {
+    let mut out: Vec<(&'static str, &'static Shim)> = Vec::new();
+    for (_, canonical) in VIRTUAL_KNOWN {
+        let canonical = *canonical;
+        if out.iter().any(|(name, _)| *name == canonical) {
+            continue;
+        }
+        if let Some(shim) = shim_for(canonical) {
+            out.push((canonical, shim));
+        }
+    }
+    out
 }
 
 pub fn source_for(canonical: &str) -> Option<String> {

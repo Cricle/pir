@@ -5,6 +5,24 @@ import path from "@node/path";
 
 
 const __platform = typeof globalThis.__pirPlatform === "string" ? globalThis.__pirPlatform : "linux";
+
+// Typed C-ABI entries (see host_functions/url_ops.rs). Present in the normal
+// runtime; when absent the pure-JS parsers below remain the whole
+// implementation, so a bare engine still gets Node-compatible behaviour.
+// `__pirUrlPayload` returns the eleven components joined by NUL (a code point
+// the WHATWG serializer always percent-encodes, so it cannot appear inside a
+// field): one string across the C-ABI instead of eleven, then a split.
+const pirNativeUrlPayload =
+  typeof globalThis.__pirUrlPayload === "function" ? globalThis.__pirUrlPayload : null;
+const pirNativeUrlParse =
+  typeof globalThis.__pirUrlParse === "function" ? globalThis.__pirUrlParse : null;
+const pirNativeUrlSearchParams =
+  typeof globalThis.__pirUrlSearchParams === "function" ? globalThis.__pirUrlSearchParams : null;
+const pirNativeFormStringify =
+  typeof globalThis.__pirUrlSearchParamsStringify === "function"
+    ? globalThis.__pirUrlSearchParamsStringify
+    : null;
+
 const C_SLASH = 47;
 const C_HASH = 35;
 const C_COLON = 58;
@@ -20,12 +38,51 @@ function pirPercentDecode(value) {
 
 function pirFormEncode(value) {
   return encodeURIComponent(String(value))
-    .replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())
+    .replace(/[!'()*~]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())
     .replace(/%20/g, "+");
 }
 
 function pirFormDecode(value) {
   return pirPercentDecode(String(value).replace(/\+/g, " "));
+}
+
+// WebIDL USVString: a lone surrogate becomes U+FFFD (a well-formed pair is
+// kept). Every URL-family argument conversion goes through this, so
+// `new URLSearchParams("a=\uD800")` stores "\uFFFD", as Node does.
+const PIR_SURROGATE_RE = /[\uD800-\uDFFF]/;
+
+function pirUSVString(text) {
+  if (!PIR_SURROGATE_RE.test(text)) return text;
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += text[i] + text[i + 1];
+        i += 1;
+      } else {
+        out += "\uFFFD";
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      out += "\uFFFD";
+    } else {
+      out += text[i];
+    }
+  }
+  return out;
+}
+
+// `String(value)` for the observable conversions, except that a Symbol goes
+// through the abstract ToString (throws TypeError), matching WebIDL.
+function pirToUSV(value) {
+  // WebIDL's ToString on a Symbol throws; the wording is observable through
+  // the error message, and the engine's own conversion phrase differs.
+  if (typeof value === "symbol") {
+    throw new TypeError("Cannot convert a Symbol value to a string");
+  }
+  const text = String(value);
+  return PIR_SURROGATE_RE.test(text) ? pirUSVString(text) : text;
 }
 
 // node's ERR_* constructors carry a `code` consumers branch on; the messages
@@ -39,6 +96,17 @@ function pirCodeError(ctor, code, message, fields) {
     }
   }
   return error;
+}
+
+// `decodeURIComponent` as Node's engine reports it: a bare URIError with the
+// "URI malformed" message (the QuickJS engine phrases its own decode errors
+// differently).
+function pirDecodeComponent(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    throw new URIError("URI malformed");
+  }
 }
 
 // node's ERR_INVALID_URL: message "Invalid URL" with the raw (untrimmed) input
@@ -178,7 +246,15 @@ function pirSplitTail(text) {
     query = rest.slice(queryIdx + 1);
     rest = rest.slice(0, queryIdx);
   }
-  return { path: rest, query: query, hash: hash };
+  // `hasQuery`/`hasHash` preserve the bare marker ("?" / "#") that the value
+  // alone cannot express (both are "" in Node's getters).
+  return {
+    path: rest,
+    query: query,
+    hash: hash,
+    hasQuery: queryIdx !== -1,
+    hasHash: hashIdx !== -1,
+  };
 }
 
 // Resolve a relative reference against an extension-module path
@@ -213,13 +289,14 @@ class PirURLSearchParamsIterator {
     this._index = 0;
   }
   next() {
+    // `_pairs` is flat [name, value, name, value, ...].
     const pairs = this._target._pairs;
-    if (this._index >= pairs.length) return { value: undefined, done: true };
-    const pair = pairs[this._index];
-    this._index += 1;
-    if (this._kind === 1) return { value: pair[0], done: false };
-    if (this._kind === 2) return { value: pair[1], done: false };
-    return { value: [pair[0], pair[1]], done: false };
+    const index = this._index;
+    if (index >= pairs.length) return { value: undefined, done: true };
+    this._index = index + 2;
+    if (this._kind === 1) return { value: pairs[index], done: false };
+    if (this._kind === 2) return { value: pairs[index + 1], done: false };
+    return { value: [pairs[index], pairs[index + 1]], done: false };
   }
   [Symbol.iterator]() { return this; }
 }
@@ -246,7 +323,8 @@ function pirNotIterableError() {
   return pirCodeError(TypeError, "ERR_ARG_NOT_ITERABLE", "Query pairs must be iterable");
 }
 
-// Parse an application/x-www-form-urlencoded string into `pairs`.
+// Parse an application/x-www-form-urlencoded string into a flat
+// [name, value, ...] list.
 function pirParseFormPairs(pairs, text) {
   const s = text.charCodeAt(0) === C_QMARK ? text.slice(1) : text;
   if (s.length === 0) return;
@@ -255,8 +333,16 @@ function pirParseFormPairs(pairs, text) {
     const eq = pair.indexOf("=");
     const name = eq === -1 ? pair : pair.slice(0, eq);
     const value = eq === -1 ? "" : pair.slice(eq + 1);
-    pairs.push([pirFormDecode(name), pirFormDecode(value)]);
+    pairs.push(pirFormDecode(name), pirFormDecode(value));
   }
+}
+
+// A fresh flat pair list from an application/x-www-form-urlencoded string
+// (used when a URL's query is replaced and a live `searchParams` follows).
+function pirFormPairList(text) {
+  const pairs = [];
+  pirParseFormPairs(pairs, text);
+  return pairs;
 }
 
 // One entry of an iterable init: an Array of exactly 2, or any other iterable
@@ -265,7 +351,7 @@ function pirTupleElements(pair) {
   if (pair === null) throw pirInvalidTupleError();
   if (Array.isArray(pair)) {
     if (pair.length !== 2) throw pirInvalidTupleError();
-    return [`${pair[0]}`, `${pair[1]}`];
+    return [pirToUSV(pair[0]), pirToUSV(pair[1])];
   }
   if ((typeof pair !== "object" && typeof pair !== "function") ||
       typeof pair[Symbol.iterator] !== "function") {
@@ -274,7 +360,7 @@ function pirTupleElements(pair) {
   const items = [];
   for (const element of pair) {
     if (items.length === 2) throw pirInvalidTupleError();
-    items.push(`${element}`);
+    items.push(pirToUSV(element));
   }
   if (items.length !== 2) throw pirInvalidTupleError();
   return items;
@@ -295,6 +381,7 @@ function pirEnumerableOwnKeys(target) {
   return keys;
 }
 
+
 class PirURLSearchParams {
   // The default parameter keeps `URLSearchParams.length === 0`, as in node.
   constructor(init = undefined) {
@@ -305,62 +392,93 @@ class PirURLSearchParams {
       const method = init[Symbol.iterator];
       if (method != null) {
         if (typeof method !== "function") throw pirNotIterableError();
-        for (const pair of init) this._pairs.push(pirTupleElements(pair));
+        for (const pair of init) {
+          const tuple = pirTupleElements(pair);
+          this._pairs.push(tuple[0], tuple[1]);
+        }
       } else {
-        for (const key of pirEnumerableOwnKeys(init)) this._pairs.push([`${key}`, `${init[key]}`]);
+        for (const key of pirEnumerableOwnKeys(init)) {
+          this._pairs.push(pirToUSV(key), pirToUSV(init[key]));
+        }
       }
     } else {
       // Strings AND the other primitives (number/boolean/bigint/null) take the
       // application/x-www-form-urlencoded path: `new URLSearchParams(5)` is
-      // "5=" in node. A symbol throws from the String conversion, as in node.
-      pirParseFormPairs(this._pairs, String(init));
+      // "5=" in node. A symbol throws from the ToString conversion, as in node.
+      let text = pirToUSV(init);
+      // Native form parser: flat [k1, v1, ...] in order, duplicates kept.
+      // `undefined` means the shape was not ours; a lone surrogate cannot
+      // cross the bridge, so retry on the USVString form before the JS scanner.
+      let nativePairs = pirNativeUrlSearchParams !== null
+        ? pirNativeUrlSearchParams(text)
+        : undefined;
+      if (nativePairs === undefined && PIR_SURROGATE_RE.test(text)) {
+        text = pirUSVString(text);
+        nativePairs = pirNativeUrlSearchParams !== null
+          ? pirNativeUrlSearchParams(text)
+          : undefined;
+      }
+      if (nativePairs !== undefined) {
+        // The native entry already returns exactly the flat representation,
+        // so adopt it instead of copying into pair arrays.
+        this._pairs = nativePairs;
+      } else {
+        pirParseFormPairs(this._pairs, text);
+      }
     }
   }
   append(name, value) {
     if (arguments.length < 2) throw pirMissingArgsError(["name", "value"]);
-    this._pairs.push([String(name), String(value)]);
+    this._pairs.push(pirToUSV(name), pirToUSV(value));
+    this._sync();
   }
   set(name, value) {
     if (arguments.length < 2) throw pirMissingArgsError(["name", "value"]);
-    const key = String(name);
+    const key = pirToUSV(name);
+    const replacement = pirToUSV(value);
     let replaced = false;
     const next = [];
-    for (const pair of this._pairs) {
-      if (pair[0] === key) {
+    const pairs = this._pairs;
+    for (let i = 0; i < pairs.length; i += 2) {
+      if (pairs[i] === key) {
         if (!replaced) {
-          next.push([key, String(value)]);
+          next.push(key, replacement);
           replaced = true;
         }
       } else {
-        next.push(pair);
+        next.push(pairs[i], pairs[i + 1]);
       }
     }
-    if (!replaced) next.push([key, String(value)]);
+    if (!replaced) next.push(key, replacement);
     this._pairs = next;
+    this._sync();
   }
   get(name) {
     if (arguments.length < 1) throw pirMissingArgsError(["name"]);
-    const key = String(name);
-    for (const pair of this._pairs) {
-      if (pair[0] === key) return pair[1];
+    const key = pirToUSV(name);
+    const pairs = this._pairs;
+    for (let i = 0; i < pairs.length; i += 2) {
+      if (pairs[i] === key) return pairs[i + 1];
     }
     return null;
   }
   getAll(name) {
     if (arguments.length < 1) throw pirMissingArgsError(["name"]);
-    const key = String(name);
+    const key = pirToUSV(name);
+    const pairs = this._pairs;
     const out = [];
-    for (const pair of this._pairs) {
-      if (pair[0] === key) out.push(pair[1]);
+    for (let i = 0; i < pairs.length; i += 2) {
+      if (pairs[i] === key) out.push(pairs[i + 1]);
     }
     return out;
   }
   has(name, value) {
     if (arguments.length < 1) throw pirMissingArgsError(["name"]);
-    const key = String(name);
-    const matchValue = value !== undefined ? String(value) : null;
-    for (const pair of this._pairs) {
-      if (pair[0] === key && (matchValue === null || pair[1] === matchValue)) return true;
+    const key = pirToUSV(name);
+    const matchValue = value !== undefined ? pirToUSV(value) : null;
+    const pairs = this._pairs;
+    for (let i = 0; i < pairs.length; i += 2) {
+      if (pairs[i] === key && (matchValue === null || pairs[i + 1] === matchValue)) return true;
     }
     return false;
   }
@@ -368,25 +486,54 @@ class PirURLSearchParams {
     // Declared with one parameter so `delete.length === 1` (node); the value
     // rides on `arguments` and an explicit undefined means the one-arg form.
     if (arguments.length < 1) throw pirMissingArgsError(["name"]);
-    const key = String(name);
+    const key = pirToUSV(name);
     const value = arguments[1];
-    const drop = value !== undefined ? String(value) : null;
-    this._pairs = this._pairs.filter((pair) => !(pair[0] === key && (drop === null || pair[1] === drop)));
+    const drop = value !== undefined ? pirToUSV(value) : null;
+    const pairs = this._pairs;
+    const next = [];
+    for (let i = 0; i < pairs.length; i += 2) {
+      if (!(pairs[i] === key && (drop === null || pairs[i + 1] === drop))) {
+        next.push(pairs[i], pairs[i + 1]);
+      }
+    }
+    this._pairs = next;
+    this._sync();
   }
   sort() {
     // WHATWG: sort by name (code-unit order) and keep the relative order of
     // equal names. Insertion sort is used so that stability does not depend on
     // the engine's Array#sort implementation.
     const pairs = this._pairs;
-    for (let i = 1; i < pairs.length; i++) {
-      const pair = pairs[i];
-      let j = i - 1;
-      while (j >= 0 && pairs[j][0] > pair[0]) {
-        pairs[j + 1] = pairs[j];
-        j -= 1;
+    for (let i = 2; i < pairs.length; i += 2) {
+      const key = pairs[i];
+      const value = pairs[i + 1];
+      let j = i - 2;
+      while (j >= 0 && pairs[j] > key) {
+        pairs[j + 2] = pairs[j];
+        pairs[j + 3] = pairs[j + 1];
+        j -= 2;
       }
-      pairs[j + 1] = pair;
+      pairs[j + 2] = key;
+      pairs[j + 3] = value;
     }
+    this._sync();
+  }
+
+  // Live binding to a `URL`: a mutation rewrites the URL's query (and drops
+  // the cached href), exactly like Node's `URL.searchParams`. The back
+  // reference lives in a WeakMap so the params object keeps no own surface
+  // beyond the pair list.
+  _sync() {
+    const state = pirParamsUrlState.get(this);
+    if (state === undefined) return;
+    state[PIR_URL_HREF] = null;
+    if (this._pairs.length === 0) {
+      state[PIR_URL_SEARCH] = "";
+      state.query = false;
+      return;
+    }
+    state[PIR_URL_SEARCH] = "?" + this.toString();
+    state.query = true;
   }
   forEach(callback) {
     // Declared with one parameter so `forEach.length === 1` (node); the
@@ -394,18 +541,28 @@ class PirURLSearchParams {
     if (typeof callback !== "function") throw pirInvalidArgTypeError("callback", "function", callback);
     const thisArg = arguments[1];
     // Live list, like node: entries appended by the callback are visited.
-    for (let i = 0; i < this._pairs.length; i++) {
-      const pair = this._pairs[i];
-      callback.call(thisArg, pair[1], pair[0], this);
+    for (let i = 0; i < this._pairs.length; i += 2) {
+      callback.call(thisArg, this._pairs[i + 1], this._pairs[i], this);
     }
   }
   entries() { return new PirURLSearchParamsIterator(this, 0); }
   keys() { return new PirURLSearchParamsIterator(this, 1); }
   values() { return new PirURLSearchParamsIterator(this, 2); }
   toString() {
-    return this._pairs.map((pair) => pirFormEncode(pair[0]) + "=" + pirFormEncode(pair[1])).join("&");
+    // `_pairs` is already flat for the native encoder.
+    if (pirNativeFormStringify !== null) {
+      const text = pirNativeFormStringify(this._pairs);
+      if (text !== undefined) return text;
+    }
+    const pairs = this._pairs;
+    let out = "";
+    for (let i = 0; i < pairs.length; i += 2) {
+      if (i !== 0) out += "&";
+      out += pirFormEncode(pairs[i]) + "=" + pirFormEncode(pairs[i + 1]);
+    }
+    return out;
   }
-  get size() { return this._pairs.length; }
+  get size() { return this._pairs.length / 2; }
   [Symbol.iterator]() { return this.entries(); }
 }
 // Node identity: `URLSearchParams.prototype[Symbol.iterator] === entries`.
@@ -421,13 +578,347 @@ Object.defineProperty(PirURLSearchParams.prototype, Symbol.toStringTag, {
 // reports "URLSearchParams".
 Object.defineProperty(PirURLSearchParams, "name", { value: "URLSearchParams", configurable: true });
 
+// URL state lives in a WeakMap, mirroring Node's private slots: there is no
+// own enumerable surface (`Object.keys(url)` is [], `{...url}` copies
+// nothing) and every component is a prototype accessor. The state is the flat
+// eleven-element field array produced by the native payload (indices below),
+// with the shim's bookkeeping flags hung off it as named properties. The
+// "?"/"#" flags distinguish an absent query/fragment from an empty one (both
+// make `url.search`/`url.hash` return "").
+const PIR_URL_HREF = 0;
+const PIR_URL_PROTOCOL = 1;
+const PIR_URL_USERNAME = 2;
+const PIR_URL_PASSWORD = 3;
+const PIR_URL_HOST = 4;
+const PIR_URL_HOSTNAME = 5;
+const PIR_URL_PORT = 6;
+const PIR_URL_PATHNAME = 7;
+const PIR_URL_SEARCH = 8;
+const PIR_URL_HASH = 9;
+const PIR_URL_ORIGIN = 10;
+
+const pirUrlStates = new WeakMap();
+
+// Markers and authority are not components, so they are derived from href.
+function pirPrimeUrlMarkers(state, href, protocol) {
+  state.hasAuthority = href.slice(protocol.length, protocol.length + 2) === "//";
+  // The bare "?"/"#" markers only survive in the serialized href.
+  const rest = href.slice(protocol.length);
+  const hashIndex = rest.indexOf(String.fromCharCode(C_HASH));
+  state.fragment = hashIndex !== -1;
+  const beforeHash = hashIndex === -1 ? rest : rest.slice(0, hashIndex);
+  state.query = beforeHash.indexOf("?") !== -1;
+  state.searchParams = null;
+}
+
+// A native parse stores the payload string itself (lazy): split it into the
+// field array only when a component is first touched, so `new URL(x).href`
+// never pays for the split. The array is cached in place afterwards.
+function pirUrlFields(url, payload) {
+  const fields = payload.split("\u0000");
+  pirPrimeUrlMarkers(fields, fields[PIR_URL_HREF], fields[PIR_URL_PROTOCOL]);
+  pirUrlStates.set(url, fields);
+  return fields;
+}
+
+// The field array (`pirUrlState`) or, before the first component access, the
+// raw payload string (`pirUrlValue`).
+function pirUrlValue(url) {
+  const value = pirUrlStates.get(url);
+  if (value === undefined) throw new TypeError("Illegal invocation");
+  return value;
+}
+
+function pirUrlState(url) {
+  const value = pirUrlValue(url);
+  if (typeof value === "string") return pirUrlFields(url, value);
+  return value;
+}
+
+function pirNewUrlState() {
+  const state = ["", "", "", "", "", "", "", "", "", "", ""];
+  state.hasAuthority = false;
+  state.query = false;
+  state.fragment = false;
+  state.searchParams = null;
+  return state;
+}
+
+// `search`/`hash` setters: "" removes the component (null in Node's state),
+// a bare "?"/"#" keeps it present-but-empty, everything else gains the
+// marker. `url.search` stays "" for an empty query, as in Node.
+function pirSetSearch(state, value) {
+  state[PIR_URL_HREF] = null;
+  const text = pirToUSV(value);
+  if (text === "") {
+    state.query = false;
+    state[PIR_URL_SEARCH] = "";
+    if (state.searchParams !== null) state.searchParams._pairs = [];
+    return;
+  }
+  state.query = true;
+  const stripped = text.charCodeAt(0) === C_QMARK ? text.slice(1) : text;
+  state[PIR_URL_SEARCH] = stripped === "" ? "" : "?" + stripped;
+  // Node's URL keeps one associated URLSearchParams whose list the search
+  // setter rewrites; keep the shim's cache in step.
+  if (state.searchParams !== null) {
+    state.searchParams._pairs = pirFormPairList(stripped);
+  }
+}
+
+function pirSetHash(state, value) {
+  state[PIR_URL_HREF] = null;
+  const text = pirToUSV(value);
+  if (text === "") {
+    state.fragment = false;
+    state[PIR_URL_HASH] = "";
+    return;
+  }
+  state.fragment = true;
+  const stripped = text.charCodeAt(0) === C_HASH ? text.slice(1) : text;
+  state[PIR_URL_HASH] = stripped === "" ? "" : "#" + stripped;
+}
+
+// Backing store for `URL.searchParams` liveness: params object -> URL state.
+// A WeakMap keeps URLSearchParams' own surface identical for standalone and
+// URL-owned instances.
+const pirParamsUrlState = new WeakMap();
+
+// WHATWG percent-encode sets, one predicate per component the setters can
+// write. Code points outside ASCII are always encoded (UTF-8).
+function pirIsC0Control(code) { return code <= 0x1f || code > 0x7e; }
+function pirFragmentSafe(code) {
+  return !(pirIsC0Control(code) || code === 0x20 || code === 0x22 ||
+           code === 0x3c || code === 0x3e || code === 0x60);
+}
+function pirQuerySafe(code) {
+  return !(pirIsC0Control(code) || code === 0x20 || code === 0x22 ||
+           code === 0x23 || code === 0x3c || code === 0x3e);
+}
+function pirPathSafe(code) {
+  return pirQuerySafe(code) && code !== 0x3f && code !== 0x60 &&
+    code !== 0x7b && code !== 0x7d;
+}
+function pirUserinfoSafe(code) {
+  return pirPathSafe(code) && code !== 0x2f && code !== 0x3a && code !== 0x3b &&
+    code !== 0x3d && code !== 0x40 && code !== 0x5b && code !== 0x5c &&
+    code !== 0x5d && code !== 0x5e && code !== 0x7c;
+}
+
+function pirPercentEncodeWith(text, safe) {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    let point = code;
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        point = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
+        i += 1;
+      } else {
+        point = 0xfffd;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      point = 0xfffd;
+    }
+    if (point < 0x80 && safe(point)) out += String.fromCharCode(point);
+    else out += pirPercentEncodeCodePoint(point);
+  }
+  return out;
+}
+
+// The URL standard's path dot-segment removal (state = path start/segment).
+function pirRemoveDotSegments(path) {
+  const segments = path.split("/");
+  const out = [];
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    const last = i === segments.length - 1;
+    if (segment === ".") {
+      if (last) out.push("");
+    } else if (segment === "..") {
+      if (out.length > 1) out.pop();
+      if (last) out.push("");
+    } else {
+      out.push(segment);
+    }
+  }
+  let joined = out.join("/");
+  if (path.charCodeAt(0) === C_SLASH && joined.charCodeAt(0) !== C_SLASH) {
+    joined = "/" + joined;
+  }
+  return joined;
+}
+
+const PIR_DEFAULT_PORTS = {
+  "http:": "80", "https:": "443", "ws:": "80", "wss:": "443", "ftp:": "21",
+};
+
+function pirSyncHost(state) {
+  state[PIR_URL_HOST] = state[PIR_URL_PORT] === ""
+    ? state[PIR_URL_HOSTNAME]
+    : state[PIR_URL_HOSTNAME] + ":" + state[PIR_URL_PORT];
+  state[PIR_URL_HREF] = null;
+}
+
+// Host state machine, shared by the `host` and `hostname` setters. The value
+// is consumed up to the first path/query/fragment delimiter (and '\\' for the
+// special schemes); a '@' or an empty special-scheme host is a parse error
+// (the assignment is ignored). `withPort` false is the `hostname` setter:
+// everything from ':' on is ignored.
+function pirSetHostValue(state, value, withPort) {
+  const special = PIR_SPECIAL_SCHEMES[state[PIR_URL_PROTOCOL]] === true;
+  const text = pirToUSV(value).replace(/[\t\n\r]/g, "");
+  let end = text.length;
+  let inBrackets = false;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0x5b /* [ */) {
+      inBrackets = true;
+    } else if (code === 0x5d /* ] */) {
+      inBrackets = false;
+    } else if (!inBrackets && code === C_COLON) {
+      // The hostname setter's host state ends at ':' (state override): Node
+      // ignores the whole assignment there, while the host setter treats it
+      // as the port separator (handled when splitting `authority` below).
+      if (!withPort) return;
+    } else if (code === C_SLASH || code === C_QMARK || code === C_HASH ||
+               (special && code === 92)) {
+      end = i;
+      break;
+    }
+  }
+  const authority = text.slice(0, end);
+  if (authority.indexOf("@") !== -1) return;
+  if (authority === "" && special) return;
+
+  let hostname = authority;
+  let portText = null;
+  if (withPort && authority !== "") {
+    if (authority.charCodeAt(0) === 0x5b /* [ */) {
+      const close = authority.indexOf("]");
+      if (close === -1) return;
+      hostname = authority.slice(0, close + 1);
+      const rest = authority.slice(close + 1);
+      if (rest !== "") {
+        if (rest.charCodeAt(0) !== C_COLON) return;
+        portText = rest.slice(1);
+      }
+    } else {
+      const colon = authority.indexOf(":");
+      if (colon !== -1) {
+        hostname = authority.slice(0, colon);
+        portText = authority.slice(colon + 1);
+      }
+    }
+  }
+
+  let ascii;
+  if (hostname.charCodeAt(0) === 0x5b /* [ */) {
+    if (!/^\[[0-9A-Fa-f:.]+\]$/.test(hostname) || hostname.indexOf(":") === -1) return;
+    ascii = hostname;
+  } else {
+    ascii = pirHostnameToASCII(hostname);
+    if (ascii === "" || /[\u0000-\u0020<>^|\[\]]/.test(ascii)) return;
+  }
+  state[PIR_URL_HOSTNAME] = ascii;
+
+  if (portText !== null && portText !== "") {
+    const digits = /^[0-9]+/.exec(portText);
+    if (digits !== null) {
+      const number = digits[0].replace(/^0+(?=[0-9])/, "");
+      if (Number(number) <= 65535) {
+        state[PIR_URL_PORT] = PIR_DEFAULT_PORTS[state[PIR_URL_PROTOCOL]] === number
+          ? ""
+          : number;
+      }
+    }
+  }
+  // An empty port ("host:") leaves the existing port alone, and an invalid
+  // port keeps the hostname change but not the port, as in the URL standard.
+  pirSyncHost(state);
+}
+
+
+// The `url` crate rejected a special-scheme input: Node rejects it too, so the
+// constructor must take the error path instead of the pad's looser parser.
+const PIR_SPECIAL_SCHEMES = {
+  "http:": true, "https:": true, "ws:": true, "wss:": true, "ftp:": true, "file:": true,
+};
+
+// Adopt the native payload string as the state (split lazily by
+// `pirUrlFields`).
+function pirInitUrlPayload(url, payload) {
+  pirUrlStates.set(url, payload);
+}
+
+// Fallback for a runtime that only has the object-returning entry.
+function pirInitUrlFromParts(url, parts) {
+  const state = pirNewUrlState();
+  state[PIR_URL_HREF] = parts.href;
+  state[PIR_URL_PROTOCOL] = parts.protocol;
+  state[PIR_URL_USERNAME] = parts.username;
+  state[PIR_URL_PASSWORD] = parts.password;
+  state[PIR_URL_HOST] = parts.host;
+  state[PIR_URL_HOSTNAME] = parts.hostname;
+  state[PIR_URL_PORT] = parts.port;
+  state[PIR_URL_PATHNAME] = parts.pathname;
+  state[PIR_URL_SEARCH] = parts.search;
+  state[PIR_URL_HASH] = parts.hash;
+  pirPrimeUrlMarkers(state, parts.href, parts.protocol);
+  pirUrlStates.set(url, state);
+}
+
 class PirURL {
-  constructor(input, base) {
+  constructor(input, base = undefined) {
     // node reports the RAW input string (untrimmed) on ERR_INVALID_URL, while
-    // the WHATWG parser works on the trimmed form.
-    const rawInput = `${input}`;
-    const rawBase = base === undefined || base === null ? undefined : `${base}`;
+    // the WHATWG parser works on the trimmed form. Any base other than
+    // `undefined` is stringified first: `new URL("http://x", null)` throws
+    // with base "null", exactly like Node.
+    let rawInput = pirToUSV(input);
+    let rawBase = base === undefined ? undefined : pirToUSV(base);
+    // Native fast path. The `url` crate implements the same WHATWG parser
+    // Node does; `pir-ext:` bases are not WHATWG bases, so relative
+    // references against them fall through to the JS tier's custom
+    // resolution below.
+    if (pirNativeUrlPayload !== null || pirNativeUrlParse !== null) {
+      let parts = pirNativeUrlPayload !== null
+        ? pirNativeUrlPayload(rawInput, rawBase)
+        : pirNativeUrlParse(rawInput, rawBase);
+      if (parts === undefined &&
+          (PIR_SURROGATE_RE.test(rawInput) ||
+           (rawBase !== undefined && PIR_SURROGATE_RE.test(rawBase)))) {
+        // WebIDL USVString conversion happens before parsing (and before the
+        // error's `.input`/`.base`): a lone surrogate becomes U+FFFD, so a
+        // retry on the sanitized pair is Node's own result.
+        rawInput = pirUSVString(rawInput);
+        if (rawBase !== undefined) rawBase = pirUSVString(rawBase);
+        parts = pirNativeUrlPayload !== null
+          ? pirNativeUrlPayload(rawInput, rawBase)
+          : pirNativeUrlParse(rawInput, rawBase);
+      }
+      if (parts !== undefined) {
+        if (pirNativeUrlPayload !== null) {
+          pirInitUrlPayload(this, parts);
+          return;
+        }
+        pirInitUrlFromParts(this, parts);
+        return;
+      }
+    }
     const text = rawInput.trim();
+    if (pirNativeUrlPayload !== null || pirNativeUrlParse !== null) {
+      const schemeMatch = /^([A-Za-z][A-Za-z0-9+.\-]*):/.exec(text);
+      if (schemeMatch !== null &&
+          PIR_SPECIAL_SCHEMES[schemeMatch[1].toLowerCase() + ":"] === true) {
+        // The native WHATWG parser rejected a special-scheme URL; Node rejects
+        // it too. Report Node's exact TypeError instead of letting the pad's
+        // looser parser accept shapes like "http://".
+        throw pirInvalidUrlError(rawInput, rawBase);
+      }
+    }
+    const state = pirNewUrlState();
+    pirUrlStates.set(this, state);
     let baseUrl = null;
     if (rawBase !== undefined) {
       if (base instanceof PirURL) {
@@ -477,37 +968,55 @@ class PirURL {
       }
     }
     const scheme = /^([A-Za-z][A-Za-z0-9+.\-]*:)/.exec(absolute);
-    this.protocol = scheme[1].toLowerCase();
+    state[PIR_URL_PROTOCOL] = scheme[1].toLowerCase();
     let rest = absolute.slice(scheme[1].length);
     const hashIdx = rest.indexOf(String.fromCharCode(C_HASH));
     let hash = "";
+    let hashPresent = hashIdx !== -1;
     if (hashIdx !== -1) {
       hash = rest.slice(hashIdx);
       rest = rest.slice(0, hashIdx);
     }
     const queryIdx = rest.indexOf("?");
     let search = "";
+    let queryPresent = queryIdx !== -1;
     if (queryIdx !== -1) {
       search = rest.slice(queryIdx + 1);
       rest = rest.slice(0, queryIdx);
     }
     if (relative !== null) {
-      // The reference's own query/fragment wins; a path-bearing reference
-      // drops the base's query, a query/fragment-only one keeps it (WHATWG
-      // relative-reference rules).
+      // The reference's own query/fragment wins (including its bare marker);
+      // a path-bearing reference drops the base's query, a query/fragment-only
+      // one inherits it (WHATWG relative-reference rules).
       const carryOver = relative.path === "";
-      if (relative.query !== "") search = relative.query;
-      else if (carryOver) search = baseUrl.search === "" ? "" : baseUrl.search.slice(1);
-      else search = "";
-      if (relative.hash !== "") hash = relative.hash;
-      else hash = carryOver ? baseUrl.hash : "";
+      const baseState = pirUrlState(baseUrl);
+      if (relative.hasQuery) {
+        search = relative.query;
+        queryPresent = true;
+      } else if (carryOver) {
+        search = baseState[PIR_URL_SEARCH].slice(1);
+        queryPresent = baseState.query;
+      } else {
+        search = "";
+        queryPresent = false;
+      }
+      if (relative.hasHash) {
+        hash = relative.hash;
+        hashPresent = true;
+      } else if (carryOver) {
+        hash = baseUrl.hash;
+        hashPresent = baseState.fragment;
+      } else {
+        hash = "";
+        hashPresent = false;
+      }
     }
-    this._hasAuthority = rest.charCodeAt(0) === C_SLASH && rest.charCodeAt(1) === C_SLASH;
+    state.hasAuthority = rest.charCodeAt(0) === C_SLASH && rest.charCodeAt(1) === C_SLASH;
     let host = "";
     let pathname = rest;
     let username = "";
     let password = "";
-    if (this._hasAuthority) {
+    if (state.hasAuthority) {
       const after = rest.slice(2);
       let authEnd = after.length;
       for (let i = 0; i < after.length; i++) {
@@ -539,47 +1048,265 @@ class PirURL {
     // "@" for the file scheme), and the host/port have to pass the forbidden
     // code point / escape / range checks — node reports all of these as
     // ERR_INVALID_URL.
-    if (this.protocol === "file:" && username !== "") throw pirInvalidUrlError(rawInput, rawBase);
+    if (state[PIR_URL_PROTOCOL] === "file:" && username !== "") throw pirInvalidUrlError(rawInput, rawBase);
     pirCheckHostname(hostname, rawInput, rawBase);
     if (port !== "" && (!/^[0-9]+$/.test(port) || Number(port) > 65535)) {
       throw pirInvalidUrlError(rawInput, rawBase);
     }
-    this.host = host.toLowerCase();
-    this.hostname = hostname;
-    this.port = port;
-    this.pathname = pathname;
-    this.username = username;
-    this.password = password;
-    this.search = search ? "?" + search : "";
-    this.hash = hash;
-    this._searchParams = new PirURLSearchParams(search);
-    // node's URL keeps its state off the own enumerable surface (accessors
-    // over private slots on the prototype), so `{...url}` copies nothing and
-    // `Object.keys(url)` is empty. The pad stores the state as own data
-    // properties; make them non-enumerable so the shape matches — writable
-    // and configurable so every existing assignment/delete path still works.
-    for (const key of ["protocol", "_hasAuthority", "host", "hostname", "port",
-                       "pathname", "username", "password", "search", "hash",
-                       "_searchParams"]) {
-      Object.defineProperty(this, key, {
-        value: this[key], writable: true, enumerable: false, configurable: true,
-      });
+    if (state.hasAuthority && hostname === "" &&
+        PIR_SPECIAL_SCHEMES[state[PIR_URL_PROTOCOL]] === true && state[PIR_URL_PROTOCOL] !== "file:") {
+      // Special-scheme URLs need a host (file: excepted).
+      throw pirInvalidUrlError(rawInput, rawBase);
+    }
+    state[PIR_URL_HOST] = host.toLowerCase();
+    state[PIR_URL_HOSTNAME] = hostname;
+    state[PIR_URL_PORT] = port;
+    state[PIR_URL_PATHNAME] = pathname;
+    state[PIR_URL_USERNAME] = username;
+    state[PIR_URL_PASSWORD] = password;
+    pirSetSearch(state, queryPresent ? "?" + search : "");
+    pirSetHash(state, hashPresent ? (hash === "" ? "#" : hash) : "");
+  }
+  // Node v24 statics: boolean / URL-or-null variants of the constructor that
+  // never throw. `= undefined` keeps `length === 1` like Node.
+  static canParse(input, base = undefined) {
+    try {
+      new PirURL(input, base);
+      return true;
+    } catch {
+      return false;
     }
   }
-  get href() {
-    let out = this.protocol;
-    if (this._hasAuthority) {
-      out += "//";
-      if (this.username) out += this.username + (this.password ? ":" + this.password : "") + "@";
-      out += this.host;
+  static parse(input, base = undefined) {
+    try {
+      return new PirURL(input, base);
+    } catch {
+      return null;
     }
-    out += this.pathname + this.search + this.hash;
+  }
+  // Object URLs are not backed by a Blob store here, but the WebIDL surface
+  // still validates its argument: the conversion is the whole observable
+  // behaviour (Symbol throws, a missing argument is ERR_MISSING_ARGS).
+  static revokeObjectURL(url) {
+    if (arguments.length < 1) throw pirMissingArgsError(["url"]);
+    pirToUSV(url);
+  }
+  get href() {
+    const value = pirUrlValue(this);
+    // Unsplit native payload: href is the first NUL-delimited field, so the
+    // hot `new URL(x).href` never pays for the component split.
+    if (typeof value === "string") {
+      return value.slice(0, value.indexOf("\u0000"));
+    }
+    const state = value;
+    let out = state[PIR_URL_HREF];
+    if (out !== null) return out;
+    out = state[PIR_URL_PROTOCOL];
+    if (state.hasAuthority) {
+      out += "//";
+      if (state[PIR_URL_USERNAME]) out += state[PIR_URL_USERNAME] + (state[PIR_URL_PASSWORD] ? ":" + state[PIR_URL_PASSWORD] : "") + "@";
+      out += state[PIR_URL_HOST];
+    }
+    out += state[PIR_URL_PATHNAME];
+    if (state[PIR_URL_SEARCH] !== "") out += state[PIR_URL_SEARCH];
+    else if (state.query) out += "?";
+    if (state[PIR_URL_HASH] !== "") out += state[PIR_URL_HASH];
+    else if (state.fragment) out += "#";
+    state[PIR_URL_HREF] = out;
     return out;
+  }
+  // `url.href = value` reparses from scratch (the URL standard's href setter);
+  // the components are adopted so live `searchParams` stays attached.
+  set href(value) {
+    const state = pirUrlState(this);
+    const parsed = new PirURL(pirToUSV(value));
+    const next = pirUrlState(parsed);
+    for (let i = 0; i <= PIR_URL_ORIGIN; i++) state[i] = next[i];
+    state.hasAuthority = next.hasAuthority;
+    state.query = next.query;
+    state.fragment = next.fragment;
+    if (state.searchParams !== null) {
+      state.searchParams._pairs = pirFormPairList(state[PIR_URL_SEARCH]);
+    }
+  }
+  // WHATWG origin: a tuple for the fetch schemes, "null" otherwise. Computed
+  // from the current components so a setter that changes protocol/host/port is
+  // reflected (matching Node) instead of returning a parse-time snapshot.
+  get origin() {
+    const state = pirUrlState(this);
+    const protocol = state[PIR_URL_PROTOCOL];
+    if (protocol === "http:" || protocol === "https:" ||
+        protocol === "ws:" || protocol === "wss:" || protocol === "ftp:") {
+      return protocol + "//" + state[PIR_URL_HOST];
+    }
+    if (protocol === "blob:") {
+      try {
+        return new PirURL(state[PIR_URL_PATHNAME]).origin;
+      } catch {
+        return "null";
+      }
+    }
+    return "null";
   }
   toString() { return this.href; }
   toJSON() { return this.href; }
-  get searchParams() { return this._searchParams; }
+  get searchParams() {
+    const state = pirUrlState(this);
+    let params = state.searchParams;
+    if (params === null) {
+      params = new PirURLSearchParams(state[PIR_URL_SEARCH]);
+      state.searchParams = params;
+      pirParamsUrlState.set(params, state);
+    }
+    return params;
+  }
 }
+
+// The URL component accessors. Node exposes these as accessors over private
+// slots; setters must keep the href serialization consistent (assigning
+// `port`/`hostname` updates `host`, and "" removes a query/fragment while a
+// bare "?"/"#" keeps it present-but-empty).
+Object.defineProperties(PirURL.prototype, {
+  protocol: {
+    get() { return pirUrlState(this)[PIR_URL_PROTOCOL]; },
+    set(value) {
+      const state = pirUrlState(this);
+      let text = pirToUSV(value);
+      if (text.charCodeAt(text.length - 1) !== C_COLON) text += ":";
+      if (!/^[A-Za-z][A-Za-z0-9+.\-]*:$/.test(text)) return;
+      const lower = text.toLowerCase();
+      const current = state[PIR_URL_PROTOCOL];
+      if (lower === current) return;
+      // Special and non-special schemes cannot be mixed; `file:` can only
+      // stay `file:` (the URL standard's scheme state).
+      const special = PIR_SPECIAL_SCHEMES[lower] === true;
+      if (special !== (PIR_SPECIAL_SCHEMES[current] === true)) return;
+      if (current === "file:" && lower !== "file:") return;
+      // A file: URL cannot carry credentials or a port (URL standard's
+      // scheme state, "file" special case).
+      if (lower === "file:" &&
+          (state[PIR_URL_USERNAME] !== "" || state[PIR_URL_PASSWORD] !== "" ||
+           state[PIR_URL_PORT] !== "")) return;
+      state[PIR_URL_PROTOCOL] = lower;
+      const defaultPort = PIR_DEFAULT_PORTS[lower];
+      if (defaultPort !== undefined && state[PIR_URL_PORT] === defaultPort) {
+        state[PIR_URL_PORT] = "";
+        pirSyncHost(state);
+      }
+      state[PIR_URL_HREF] = null;
+    },
+    enumerable: false, configurable: true,
+  },
+  username: {
+    get() { return pirUrlState(this)[PIR_URL_USERNAME]; },
+    set(value) {
+      const state = pirUrlState(this);
+      if (!state.hasAuthority || state[PIR_URL_PROTOCOL] === "file:") return;
+      state[PIR_URL_USERNAME] = pirPercentEncodeWith(pirToUSV(value), pirUserinfoSafe);
+      state[PIR_URL_HREF] = null;
+    },
+    enumerable: false, configurable: true,
+  },
+  password: {
+    get() { return pirUrlState(this)[PIR_URL_PASSWORD]; },
+    set(value) {
+      const state = pirUrlState(this);
+      if (!state.hasAuthority || state[PIR_URL_PROTOCOL] === "file:") return;
+      state[PIR_URL_PASSWORD] = pirPercentEncodeWith(pirToUSV(value), pirUserinfoSafe);
+      state[PIR_URL_HREF] = null;
+    },
+    enumerable: false, configurable: true,
+  },
+  host: {
+    get() { return pirUrlState(this)[PIR_URL_HOST]; },
+    set(value) { pirSetHostValue(pirUrlState(this), value, true); },
+    enumerable: false, configurable: true,
+  },
+  hostname: {
+    get() { return pirUrlState(this)[PIR_URL_HOSTNAME]; },
+    set(value) { pirSetHostValue(pirUrlState(this), value, false); },
+    enumerable: false, configurable: true,
+  },
+  port: {
+    get() { return pirUrlState(this)[PIR_URL_PORT]; },
+    set(value) {
+      const state = pirUrlState(this);
+      const text = pirToUSV(value);
+      if (text === "") {
+        if (state[PIR_URL_PORT] !== "") {
+          state[PIR_URL_PORT] = "";
+          pirSyncHost(state);
+        }
+        return;
+      }
+      if (!/^[0-9]/.test(text)) return;
+      const digits = /^[0-9]+/.exec(text)[0].replace(/^0+(?=[0-9])/, "");
+      if (Number(digits) > 65535) return;
+      state[PIR_URL_PORT] = PIR_DEFAULT_PORTS[state[PIR_URL_PROTOCOL]] === digits
+        ? ""
+        : digits;
+      pirSyncHost(state);
+    },
+    enumerable: false, configurable: true,
+  },
+  pathname: {
+    get() { return pirUrlState(this)[PIR_URL_PATHNAME]; },
+    set(value) {
+      const state = pirUrlState(this);
+      let text = pirPercentEncodeWith(pirToUSV(value), pirPathSafe);
+      if (state.hasAuthority) {
+        if (text.charCodeAt(0) !== C_SLASH) text = "/" + text;
+        text = pirRemoveDotSegments(text);
+        if (text === "") text = "/";
+      } else if (PIR_SPECIAL_SCHEMES[state[PIR_URL_PROTOCOL]] === true && text === "") {
+        text = "/";
+      }
+      state[PIR_URL_PATHNAME] = text;
+      state[PIR_URL_HREF] = null;
+    },
+    enumerable: false, configurable: true,
+  },
+  search: {
+    get() { return pirUrlState(this)[PIR_URL_SEARCH]; },
+    set(value) {
+      const state = pirUrlState(this);
+      const text = pirToUSV(value);
+      state[PIR_URL_HREF] = null;
+      if (text === "") {
+        state.query = false;
+        state[PIR_URL_SEARCH] = "";
+        if (state.searchParams !== null) state.searchParams._pairs = [];
+        return;
+      }
+      const stripped = text.charCodeAt(0) === C_QMARK ? text.slice(1) : text;
+      const encoded = pirPercentEncodeWith(stripped, pirQuerySafe);
+      state.query = true;
+      state[PIR_URL_SEARCH] = encoded === "" ? "" : "?" + encoded;
+      if (state.searchParams !== null) {
+        state.searchParams._pairs = pirFormPairList(stripped);
+      }
+    },
+    enumerable: false, configurable: true,
+  },
+  hash: {
+    get() { return pirUrlState(this)[PIR_URL_HASH]; },
+    set(value) {
+      const state = pirUrlState(this);
+      const text = pirToUSV(value);
+      state[PIR_URL_HREF] = null;
+      if (text === "") {
+        state.fragment = false;
+        state[PIR_URL_HASH] = "";
+        return;
+      }
+      const stripped = text.charCodeAt(0) === C_HASH ? text.slice(1) : text;
+      const encoded = pirPercentEncodeWith(stripped, pirFragmentSafe);
+      state.fragment = true;
+      state[PIR_URL_HASH] = encoded === "" ? "" : "#" + encoded;
+    },
+    enumerable: false, configurable: true,
+  },
+});
 
 // node's URL.prototype[Symbol.toStringTag] is the non-writable, non-enumerable
 // "URL" of the WHATWG spec: `Object.prototype.toString.call(url)` must say
@@ -600,11 +1327,91 @@ if (typeof globalThis.URL !== "function") {
 if (typeof globalThis.URLSearchParams !== "function") {
   globalThis.URLSearchParams = PirURLSearchParams;
 }
+// Node 22+/24 statics. Copy the shim's implementations onto an engine-native
+// URL constructor if it lacks them, so `URL.parse`/`URL.canParse`/
+// `URL.revokeObjectURL` are always callable as globals.
+for (const pirStatic of ["canParse", "parse", "revokeObjectURL"]) {
+  if (typeof EngineURL[pirStatic] !== "function") {
+    Object.defineProperty(EngineURL, pirStatic, {
+      value: PirURL[pirStatic], writable: true, enumerable: false, configurable: true,
+    });
+  }
+}
 
-function fileURLToPath(input) {
+// node's ERR_INVALID_FILE_URL_PATH carries the offending `URL` on `.input`.
+function pirInvalidFileUrlPath(reason, url) {
+  const error = pirCodeError(TypeError, "ERR_INVALID_FILE_URL_PATH", "File URL path " + reason);
+  error.input = url;
+  return error;
+}
+
+// The WHATWG file path state normalizes "C|" to "C:"; the Rust `url` crate
+// keeps the pipe, so the JS tier applies the same rewrite before inspecting a
+// drive letter (both path flavors see the normalized pathname).
+function pirFileDrivePipe(pathname) {
+  if (pathname.length >= 3 && pathname.charCodeAt(0) === C_SLASH &&
+      /[A-Za-z]/.test(pathname[1]) && pathname.charCodeAt(2) === 124 /* | */) {
+    return pathname.slice(0, 2) + ":" + pathname.slice(3);
+  }
+  return pathname;
+}
+
+function pirWindowsFilePath(url) {
+  const hostname = url.hostname || "";
+  let pathname = pirFileDrivePipe(url.pathname || "");
+  // An encoded separator would change the path's meaning on Windows (the
+  // Shift-JIS ambiguity node documents); node forbids it outright.
+  for (let n = 0; n < pathname.length; n++) {
+    if (pathname.charCodeAt(n) === 37 /* % */) {
+      const third = pathname.charCodeAt(n + 2) | 0x20;
+      if ((pathname.charCodeAt(n + 1) === 50 /* 2 */ && third === 102 /* f */) ||
+          (pathname.charCodeAt(n + 1) === 53 /* 5 */ && third === 99 /* c */)) {
+        throw pirInvalidFileUrlPath("must not include encoded \\ or / characters", url);
+      }
+    }
+  }
+  pathname = pathname.split("/").join("\\");
+  // Fast path: no percent-encoding at all.
+  if (pathname.indexOf("%") !== -1) pathname = pirDecodeComponent(pathname);
+  if (hostname !== "") {
+    // UNC path: the server name shown in Unicode (punycode decoded), the
+    // resource path already percent-decoded above.
+    return "\\\\" + pirDomainToUnicode(hostname) + pathname;
+  }
+  const letter = pathname.charCodeAt(1) | 0x20;
+  if (letter >= 97 && letter <= 122 && pathname.charCodeAt(2) === 58 /* : */) {
+    // Drive-letter form: drop the leading slash (C:/… instead of /C:/…).
+    return pathname.slice(1);
+  }
+  // Headless/synthetic file URLs such as `file:///meta.ts` have no drive
+  // letter. Node-style `createRequire(import.meta.url)` in the extension
+  // shims resolves siblings against them, so accept the slash-separated path
+  // instead of rejecting it (matches the pre-refactor behaviour).
+  return pathname;
+}
+
+function pirPosixFilePath(url) {
+  if ((url.hostname || "") !== "") {
+    throw pirCodeError(TypeError, "ERR_INVALID_FILE_URL_HOST",
+      "File URL host must be \"localhost\" or empty on " + __platform);
+  }
+  const pathname = pirFileDrivePipe(url.pathname || "");
+  for (let n = 0; n < pathname.length; n++) {
+    if (pathname.charCodeAt(n) === 37 /* % */) {
+      const third = pathname.charCodeAt(n + 2) | 0x20;
+      if (pathname.charCodeAt(n + 1) === 50 && third === 102) {
+        throw pirInvalidFileUrlPath("must not include encoded / characters", url);
+      }
+    }
+  }
+  return pathname.indexOf("%") !== -1 ? pirDecodeComponent(pathname) : pathname;
+}
+
+function fileURLToPath(input, options = undefined) {
   // node accepts a string or a URL instance and rejects anything else with
-  // ERR_INVALID_ARG_TYPE (its own two-type list, a brand check: `{}` or an
-  // array carrying a `protocol` property still throws).
+  // ERR_INVALID_ARG_TYPE (a brand check: `{}` or an array carrying a
+  // `protocol` property still throws). `options.windows` (node v24) picks the
+  // path flavour.
   let url;
   if (typeof input === "string") {
     url = new EngineURL(input);
@@ -624,23 +1431,11 @@ function fileURLToPath(input) {
   if (!url || url.protocol !== "file:") {
     throw pirCodeError(TypeError, "ERR_INVALID_URL_SCHEME", "The URL must be of scheme file");
   }
-  const hostname = url.hostname || "";
-  if (hostname !== "" && hostname !== "localhost") {
-    if (__platform !== "win32") {
-      throw pirCodeError(TypeError, "ERR_INVALID_FILE_URL_HOST",
-        "File URL host must be \"localhost\" or empty on " + __platform);
-    }
-    return ("\\\\" + hostname + pirPercentDecode(url.pathname || "")).split("/").join("\\");
-  }
-  let pathname = pirPercentDecode(url.pathname || "");
-  if (__platform === "win32") {
-    if (pathname.length >= 3 && pathname.charCodeAt(0) === C_SLASH &&
-        /[A-Za-z]/.test(pathname[1]) && pathname.charCodeAt(2) === C_COLON) {
-      pathname = pathname.slice(1);
-    }
-    return pathname.split("/").join("\\");
-  }
-  return pathname;
+  const windows = options !== null && options !== undefined && options.windows !== undefined &&
+      options.windows !== null
+    ? options.windows
+    : __platform === "win32";
+  return windows ? pirWindowsFilePath(url) : pirPosixFilePath(url);
 }
 
 // node's `pathToFileURL` host handling for UNC paths: the host candidate is
@@ -687,7 +1482,17 @@ function pathToFileURL(filepath, options) {
     }
     const hostname = resolved.slice(prefixLength, hostnameEndIndex);
     const source = resolved.slice(hostnameEndIndex);
-    return new EngineURL("file://" + pirFileURLHost(hostname) + encodeFilePath(source, true));
+    // Node builds the URL from the resource path with the server name as the
+    // base, so a forbidden host reports that pair (`input`/`base`), not the
+    // assembled "file://..." string.
+    try {
+      return new EngineURL("file://" + pirFileURLHost(hostname) + encodeFilePath(source, true));
+    } catch (error) {
+      if (error && error.code === "ERR_INVALID_URL") {
+        throw pirInvalidUrlError(source, hostname);
+      }
+      throw error;
+    }
   }
   // path.resolve strips trailing slashes — node adds one back when the raw
   // input ended with a separator.
@@ -709,140 +1514,1043 @@ const URLSearchParams = EngineURLSearchParams;
 
 
 // ===========================================================================
-// Surface completion: the legacy url API (format/parse/resolve) over the
-// minimal URL pad, plus the misc helpers. IDN/URLPattern are outside the
-// engine's reach and throw one documented error each.
+// Legacy url API (`url.parse` / `url.format` / `url.resolve` /
+// `url.resolveObject`) — a port of Node v24's lib/url.js. The WHATWG objects
+// above stay untouched; this section only reconstructs the deprecated value
+// object, its formatter and the RFC 2396 resolver, including the observable
+// quirks of the original implementation.
 // ===========================================================================
 
-// Legacy URL value object (Node's `url.Url` shape).
+// Legacy URL value object (Node's `url.Url` shape): the property set and its
+// order are observable (`Object.keys(new url.Url())`).
 class Url {
   constructor() {
-    this.href = null;
-    this.origin = null;
     this.protocol = null;
-    this.username = null;
-    this.password = null;
+    this.slashes = null;
+    this.auth = null;
     this.host = null;
-    this.hostname = null;
     this.port = null;
-    this.pathname = null;
-    this.search = null;
-    this.searchParams = null;
+    this.hostname = null;
     this.hash = null;
+    this.search = null;
+    this.query = null;
+    this.pathname = null;
+    this.path = null;
+    this.href = null;
   }
 }
 
-function pirParseUrl(input, parseQueryString, slashesDenoteHost) {
-  const url = new Url();
-  try {
-    const parsed = new URL(String(input));
-    url.href = parsed.href;
-    url.origin = parsed.origin;
-    url.protocol = parsed.protocol;
-    url.username = parsed.username;
-    url.password = parsed.password;
-    url.host = parsed.host;
-    url.hostname = parsed.hostname;
-    url.port = parsed.port === "" ? null : parsed.port;
-    url.pathname = parsed.pathname;
-    url.search = parsed.search === "" ? null : parsed.search;
-    url.hash = parsed.hash === "" ? null : parsed.hash;
-    url.searchParams = parsed.searchParams;
-    if (parseQueryString === true && parsed.search !== null) {
-      url.query = querystring.parse(parsed.search.replace(/^\?/, ""));
-    } else {
-      url.query = null;
+function pirHas(object, key) { return Object.prototype.hasOwnProperty.call(object, key); }
+
+const PIR_UNSAFE_PROTOCOLS = { "javascript": true, "javascript:": true };
+const PIR_HOSTLESS_PROTOCOLS = { "javascript": true, "javascript:": true };
+const PIR_SLASHED_PROTOCOLS = {
+  "http": true, "http:": true, "https": true, "https:": true,
+  "ftp": true, "ftp:": true, "gopher": true, "gopher:": true,
+  "file": true, "file:": true, "ws": true, "ws:": true,
+  "wss": true, "wss:": true,
+};
+
+// Copied once at module load, exactly like Node's `define these here so at
+// least they only have to be compiled once on the first module load`.
+const pirProtocolPattern = /^[a-z0-9.+-]+:/i;
+const pirPortPattern = /:[0-9]*$/;
+const pirHostPattern = /^\/\/[^@/]+@[^@/]+/;
+const pirSimplePathPattern = /^(\/\/?(?!\/)[^?\s]*)(\?[^\s]*)?$/;
+const PIR_HOSTNAME_MAX_LEN = 255;
+const pirForbiddenHostChars = /[\0\t\n\r #%/:<>?@[\\\]^|]/;
+const pirForbiddenHostCharsIpv6 = /[\0\t\n\r #%/<>?@\\^|]/;
+
+// ---------------------------------------------------------------------------
+// IDNA (UTS#46 subset) and punycode (RFC 3492)
+// ---------------------------------------------------------------------------
+
+const PIR_IDNA_IGNORABLE = /[\u00AD\u034F\u180B-\u180D\u200B-\u200D\u2060-\u2064\uFEFF]/g;
+
+// UTS#46 mapping as far as the engine's Unicode data allows: compatibility
+// decomposition, case folding, canonical composition, then removal of the
+// default-ignorable code points. Characters whose compatibility form carries
+// a forbidden host code point (e.g. U+2100 -> "a/c") therefore fail the host
+// checks exactly like Node's ada-backed toASCII.
+function pirIdnaMap(text) {
+  let mapped = text;
+  if (typeof mapped.normalize === "function") {
+    try { mapped = mapped.normalize("NFKD"); } catch { /* keep */ }
+  }
+  mapped = mapped.toLowerCase();
+  if (typeof mapped.normalize === "function") {
+    try { mapped = mapped.normalize("NFC"); } catch { /* keep */ }
+  }
+  return mapped.replace(PIR_IDNA_IGNORABLE, "");
+}
+
+const PIR_PUNY_BASE = 36;
+const PIR_PUNY_TMIN = 1;
+const PIR_PUNY_TMAX = 26;
+const PIR_PUNY_SKEW = 38;
+const PIR_PUNY_DAMP = 700;
+const PIR_PUNY_INITIAL_BIAS = 72;
+const PIR_PUNY_INITIAL_N = 128;
+const PIR_PUNY_MAX_INT = 0x7fffffff;
+const PIR_PUNY_SEPARATORS = /[\x2E\u3002\uFF0E\uFF61]/g;
+
+function pirPunyAdapt(delta, numPoints, firstTime) {
+  let k = 0;
+  delta = firstTime ? Math.floor(delta / PIR_PUNY_DAMP) : delta >> 1;
+  delta += Math.floor(delta / numPoints);
+  for (; delta > ((PIR_PUNY_BASE - PIR_PUNY_TMIN) * PIR_PUNY_TMAX) >> 1;
+       k += PIR_PUNY_BASE) {
+    delta = Math.floor(delta / (PIR_PUNY_BASE - PIR_PUNY_TMIN));
+  }
+  return Math.floor(k + (PIR_PUNY_BASE - PIR_PUNY_TMIN + 1) * delta /
+    (delta + PIR_PUNY_SKEW));
+}
+
+function pirPunyDigitToBasic(digit) {
+  return digit + 22 + 75 * (digit < 26 ? 1 : 0);
+}
+
+function pirPunyBasicToDigit(code) {
+  if (code >= 48 && code < 58) return code - 22;
+  if (code >= 65 && code < 91) return code - 65;
+  if (code >= 97 && code < 123) return code - 97;
+  return PIR_PUNY_BASE;
+}
+
+function pirStringToCodePoints(text) {
+  const points = [];
+  for (let i = 0; i < text.length; i++) {
+    const point = text.codePointAt(i);
+    points.push(point);
+    if (point > 0xffff) i += 1;
+  }
+  return points;
+}
+
+function pirCodePointsToString(points) {
+  let text = "";
+  for (let i = 0; i < points.length; i++) text += String.fromCodePoint(points[i]);
+  return text;
+}
+
+function pirPunyEncode(points) {
+  const output = [];
+  let n = PIR_PUNY_INITIAL_N;
+  let delta = 0;
+  let bias = PIR_PUNY_INITIAL_BIAS;
+  for (let i = 0; i < points.length; i++) {
+    if (points[i] < 0x80) output.push(points[i]);
+  }
+  const basicLength = output.length;
+  let handled = basicLength;
+  if (basicLength) output.push(45 /* - */);
+  while (handled < points.length) {
+    let m = PIR_PUNY_MAX_INT;
+    for (let i = 0; i < points.length; i++) {
+      if (points[i] >= n && points[i] < m) m = points[i];
     }
-  } catch {
-    url.href = String(input);
-    url.path = String(input);
-  }
-  if (slashesDenoteHost === true && url.protocol === null) {
-    // Legacy tolerance: "//host/path" is host-carrying.
-    url.protocol = null;
-  }
-  return url;
-}
-
-// node's `slashedProtocol` (internal/url): the schemes whose legacy
-// formatter emits a "//" authority even without a host.
-const PIR_SLASHED_PROTOCOLS = ["http:", "https:", "ftp:", "gopher:", "file:"];
-
-function format(input, options) {
-  // node: a string round-trips, anything that is neither a string nor an
-  // object is ERR_INVALID_ARG_TYPE (the old shim coerced every primitive to
-  // an empty object, so `url.format(undefined)` silently returned "").
-  if (typeof input === "string") return input;
-  if (input === null || typeof input !== "object") {
-    throw pirCodeError(TypeError, "ERR_INVALID_ARG_TYPE",
-      "The \"urlObject\" argument must be one of type object or string. Received " +
-      pirReceivedDescription(input));
-  }
-  const url = input;
-  if (typeof url.setHref === "function") return String(input.href);
-  let auth = "";
-  if (url.auth !== undefined && url.auth !== null && String(url.auth) !== "") {
-    auth = String(url.auth) + "@";
-  } else {
-    const username = url.username !== undefined && url.username !== null ? String(url.username) : "";
-    const password = url.password !== undefined && url.password !== null ? String(url.password) : "";
-    // Real node omits empty credentials entirely (no bare ":@" authority).
-    if (username !== "" || password !== "") auth = username + ":" + password + "@";
-  }
-  const protocol = url.protocol !== undefined && url.protocol !== null ? String(url.protocol) : "";
-  let host = url.host !== undefined && url.host !== null ? String(url.host) : url.hostname !== undefined && url.hostname !== null ? String(url.hostname) + (url.port ? ":" + url.port : "") : "";
-  let pathname = url.pathname !== undefined && url.pathname !== null ? String(url.pathname) : "";
-  const search = url.search !== undefined && url.search !== null ? String(url.search) : url.query && typeof url.query === "object" ? "?" + querystring.stringify(url.query) : "";
-  const hash = url.hash !== undefined && url.hash !== null ? String(url.hash) : "";
-  const fragment = options && options.fragment === false ? "" : hash;
-  // node's `Url.prototype.format` authority rule: the protocol gains its ':',
-  // and a "//" authority is emitted for the slashed protocols (or an object
-  // that declares `slashes`), with the file: no-host case keeping a bare "//".
-  // A bare `{}` therefore formats to "" rather than "//".
-  let protocolText = protocol;
-  if (protocolText !== "" && protocolText.charCodeAt(protocolText.length - 1) !== C_COLON) {
-    protocolText += ":";
-  }
-  const slashes = Boolean(url.slashes);
-  let authority = "";
-  if (slashes || PIR_SLASHED_PROTOCOLS.indexOf(protocolText) !== -1) {
-    if (slashes || host !== "") {
-      if (pathname !== "" && pathname.charCodeAt(0) !== C_SLASH) pathname = "/" + pathname;
-      authority = "//" + auth + host;
-    } else if (protocolText.charCodeAt(0) === 102 /* f */) {
-      authority = "//";
+    const increment = (m - n) * (handled + 1);
+    if (increment > PIR_PUNY_MAX_INT) throw new RangeError("overflow");
+    delta += increment;
+    n = m;
+    for (let i = 0; i < points.length; i++) {
+      if (points[i] < n) {
+        delta += 1;
+        if (delta > PIR_PUNY_MAX_INT) throw new RangeError("overflow");
+      }
+      if (points[i] === n) {
+        let q = delta;
+        for (let k = PIR_PUNY_BASE; ; k += PIR_PUNY_BASE) {
+          const t = k <= bias ? PIR_PUNY_TMIN
+            : k >= bias + PIR_PUNY_TMAX ? PIR_PUNY_TMAX : k - bias;
+          if (q < t) break;
+          const digit = t + (q - t) % (PIR_PUNY_BASE - t);
+          output.push(pirPunyDigitToBasic(digit));
+          q = Math.floor((q - t) / (PIR_PUNY_BASE - t));
+        }
+        output.push(pirPunyDigitToBasic(q));
+        bias = pirPunyAdapt(delta, handled + 1, handled === basicLength);
+        delta = 0;
+        handled += 1;
+      }
     }
+    delta += 1;
+    n += 1;
   }
-  return protocolText + authority + pathname + (options && options.search === false ? "" : search) + fragment;
+  return output;
 }
 
-function resolve(from, to) {
-  try {
-    return new URL(String(to), new URL(String(from))).href;
-  } catch {
-    // Fallback onto the pad's relative resolver for non-special schemes.
-    return String(to);
+function pirPunyDecode(input) {
+  const output = [];
+  let n = PIR_PUNY_INITIAL_N;
+  let i = 0;
+  let bias = PIR_PUNY_INITIAL_BIAS;
+  let basic = input.lastIndexOf(45 /* - */);
+  if (basic < 0) basic = 0;
+  for (let j = 0; j < basic; j++) {
+    if (input[j] >= 0x80) throw new RangeError("Illegal input");
+    output.push(input[j]);
   }
+  let index = basic > 0 ? basic + 1 : 0;
+  while (index < input.length) {
+    const oldi = i;
+    let w = 1;
+    for (let k = PIR_PUNY_BASE; ; k += PIR_PUNY_BASE) {
+      if (index >= input.length) throw new RangeError("Invalid input");
+      const digit = pirPunyBasicToDigit(input[index]);
+      index += 1;
+      if (digit >= PIR_PUNY_BASE) throw new RangeError("Invalid input");
+      if (digit > Math.floor((PIR_PUNY_MAX_INT - i) / w)) throw new RangeError("Overflow");
+      i += digit * w;
+      const t = k <= bias ? PIR_PUNY_TMIN
+        : k >= bias + PIR_PUNY_TMAX ? PIR_PUNY_TMAX : k - bias;
+      if (digit < t) break;
+      if (w > Math.floor(PIR_PUNY_MAX_INT / (PIR_PUNY_BASE - t))) {
+        throw new RangeError("Overflow");
+      }
+      w *= PIR_PUNY_BASE - t;
+    }
+    const out = output.length + 1;
+    bias = pirPunyAdapt(i - oldi, out, oldi === 0);
+    if (Math.floor(i / out) > PIR_PUNY_MAX_INT - n) throw new RangeError("Overflow");
+    n += Math.floor(i / out);
+    i %= out;
+    output.splice(i, 0, n);
+    i += 1;
+  }
+  return output;
 }
 
-function resolveObject(source, relative) {
-  const resolved = resolve(source, relative);
-  return pirParseUrl(resolved);
+function pirPunyToASCII(text) {
+  return String(text).replace(PIR_PUNY_SEPARATORS, ".")
+    .split(".")
+    .map((label) => {
+      if (!/[\x80-\uFFFF]/.test(label)) return label;
+      return "xn--" + pirCodePointsToString(pirPunyEncode(pirStringToCodePoints(label)));
+    })
+    .join(".");
 }
 
-function domainToASCII(domain) {
-  // No IDN host: ASCII domains pass through; non-ASCII lowercases only
-  // (real IDNA mapping needs the unicode tables the engine lacks).
-  const text = String(domain === undefined || domain === null ? "" : domain);
+function pirPunyToUnicode(text) {
+  return String(text).split(".")
+    .map((label) => {
+      if (!/^xn--/i.test(label)) return label;
+      try {
+        const points = pirPunyDecode(pirStringToCodePoints(label.slice(4).toLowerCase()));
+        return pirCodePointsToString(points);
+      } catch {
+        return label;
+      }
+    })
+    .join(".");
+}
+
+// `toASCII` as the legacy parser consumes it: "" means the host is invalid
+// (Node's binding answers an empty string there, which callers treat as a
+// parse failure).
+function pirHostnameToASCII(hostname) {
+  const text = String(hostname);
+  if (text === "") return "";
+  if (!/[\x80-\uFFFF]/.test(text)) return text.toLowerCase();
+  const mapped = pirIdnaMap(text);
+  if (mapped === "") return "";
+  let ascii;
   try {
-    return new URL("http://" + text).hostname;
+    ascii = pirPunyToASCII(mapped);
   } catch {
     return "";
   }
+  if (ascii === "" || pirForbiddenHostChars.test(ascii)) return "";
+  return ascii.toLowerCase();
+}
+
+// ---------------------------------------------------------------------------
+// Url.prototype.parse (Node v24 lib/url.js)
+// ---------------------------------------------------------------------------
+
+function pirIsIpv6Hostname(hostname) {
+  return hostname.charCodeAt(0) === 91 /* [ */ &&
+    hostname.charCodeAt(hostname.length - 1) === 93 /* ] */;
+}
+
+let pirUrlParseWarned = false;
+
+// Node suppresses DEP0169 when `url.parse` is called from inside a
+// node_modules directory (no warning for dependencies). The engine exposes
+// Error.stack, so the caller frames are enough for the same decision.
+function pirInsideNodeModules() {
+  try {
+    const stack = new Error().stack;
+    return typeof stack === "string" && /[\\/]node_modules[\\/]/.test(stack);
+  } catch {
+    return false;
+  }
+}
+
+function pirEmitUrlParseDeprecation() {
+  if (pirUrlParseWarned || pirInsideNodeModules()) return;
+  pirUrlParseWarned = true;
+  const proc = globalThis.process;
+  if (!proc || typeof proc.emitWarning !== "function") return;
+  proc.emitWarning(
+    "`url.parse()` behavior is not standardized and prone to errors that " +
+    "have security implications. Use the WHATWG URL API instead. CVEs are " +
+    "not issued for `url.parse()` vulnerabilities.",
+    "DeprecationWarning",
+    "DEP0169");
+}
+
+let pirWarnInvalidPort = true;
+
+function pirGetHostname(self, rest, hostname, url) {
+  for (let i = 0; i < hostname.length; i++) {
+    const code = hostname.charCodeAt(i);
+    const valid = code !== 47 /* / */ && code !== 92 /* \ */ &&
+      code !== 35 /* # */ && code !== 63 /* ? */ && code !== 58 /* : */;
+    if (!valid) {
+      if (pirWarnInvalidPort && code === 58 /* : */) {
+        const proc = globalThis.process;
+        if (proc && typeof proc.emitWarning === "function") {
+          proc.emitWarning(
+            "The URL " + url + " is invalid. Future versions of Node.js will throw an error.",
+            "DeprecationWarning",
+            "DEP0170");
+        }
+        pirWarnInvalidPort = false;
+      }
+      self.hostname = hostname.slice(0, i);
+      return "/" + hostname.slice(i) + rest;
+    }
+  }
+  return rest;
+}
+
+// Escaped characters for autoEscapeStr (empty slots stay untouched).
+const pirEscapedCodes = [
+  "", "", "", "", "", "", "", "", "", "%09",
+  "%0A", "", "", "%0D", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "",
+  "", "", "%20", "", "%22", "", "", "", "", "%27",
+  "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "",
+  "%3C", "", "%3E", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "",
+  "", "", "%5C", "", "%5E", "", "%60", "", "", "",
+  "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "", "", "", "", "", "", "",
+  "", "", "", "%7B", "%7C", "%7D",
+];
+
+function pirAutoEscapeStr(rest) {
+  let escaped = "";
+  let lastEscapedPos = 0;
+  for (let i = 0; i < rest.length; i++) {
+    const escapedChar = pirEscapedCodes[rest.charCodeAt(i)];
+    if (escapedChar) {
+      if (i > lastEscapedPos) escaped += rest.slice(lastEscapedPos, i);
+      escaped += escapedChar;
+      lastEscapedPos = i + 1;
+    }
+  }
+  if (lastEscapedPos === 0) return rest;
+  if (lastEscapedPos < rest.length) escaped += rest.slice(lastEscapedPos);
+  return escaped;
+}
+
+Url.prototype.parse = function parse(url, parseQueryString, slashesDenoteHost) {
+  if (typeof url !== "string") throw pirInvalidArgTypeError("url", "string", url);
+
+  // Chrome/IE backslash handling: backslashes before the query string become
+  // forward slashes. Trimming copies node's whitespace set (code < 33, NBSP,
+  // ZWNBSP).
+  let hasHash = false;
+  let hasAt = false;
+  let start = -1;
+  let end = -1;
+  let rest = "";
+  let lastPos = 0;
+  for (let i = 0, inWs = false, split = false; i < url.length; ++i) {
+    const code = url.charCodeAt(i);
+    const isWs = code < 33 || code === 0xA0 || code === 0xFEFF;
+    if (start === -1) {
+      if (isWs) continue;
+      lastPos = start = i;
+    } else if (inWs) {
+      if (!isWs) {
+        end = -1;
+        inWs = false;
+      }
+    } else if (isWs) {
+      end = i;
+      inWs = true;
+    }
+
+    if (!split) {
+      if (code === 64 /* @ */) {
+        hasAt = true;
+      } else if (code === 35 /* # */) {
+        hasHash = true;
+        split = true;
+      } else if (code === 63 /* ? */) {
+        split = true;
+      } else if (code === 92 /* \ */) {
+        if (i - lastPos > 0) rest += url.slice(lastPos, i);
+        rest += "/";
+        lastPos = i + 1;
+      }
+    } else if (!hasHash && code === 35 /* # */) {
+      hasHash = true;
+    }
+  }
+
+  if (start !== -1) {
+    if (lastPos === start) {
+      if (end === -1) {
+        rest = start === 0 ? url : url.slice(start);
+      } else {
+        rest = url.slice(start, end);
+      }
+    } else if (end === -1 && lastPos < url.length) {
+      rest += url.slice(lastPos);
+    } else if (end !== -1 && lastPos < end) {
+      rest += url.slice(lastPos, end);
+    }
+  }
+
+  if (!slashesDenoteHost && !hasHash && !hasAt) {
+    const simplePath = pirSimplePathPattern.exec(rest);
+    if (simplePath) {
+      this.path = rest;
+      this.href = rest;
+      this.pathname = simplePath[1];
+      if (simplePath[2]) {
+        this.search = simplePath[2];
+        this.query = parseQueryString
+          ? querystring.parse(this.search.slice(1))
+          : this.search.slice(1);
+      } else if (parseQueryString) {
+        this.search = null;
+        this.query = { __proto__: null };
+      }
+      return this;
+    }
+  }
+
+  let proto = pirProtocolPattern.exec(rest);
+  let lowerProto;
+  if (proto) {
+    proto = proto[0];
+    lowerProto = proto.toLowerCase();
+    this.protocol = lowerProto;
+    rest = rest.slice(proto.length);
+  }
+
+  let slashes;
+  if (slashesDenoteHost || proto || pirHostPattern.test(rest)) {
+    slashes = rest.charCodeAt(0) === 47 && rest.charCodeAt(1) === 47;
+    if (slashes && !(proto && PIR_HOSTLESS_PROTOCOLS[lowerProto] === true)) {
+      rest = rest.slice(2);
+      this.slashes = true;
+    }
+  }
+
+  if (PIR_HOSTLESS_PROTOCOLS[lowerProto] !== true &&
+      (slashes || (proto && PIR_SLASHED_PROTOCOLS[proto] !== true))) {
+    // There's a hostname: the first / ? ; or # ends it; the last @ picks the
+    // auth boundary unless a host-ending character comes first.
+    let hostEnd = -1;
+    let atSign = -1;
+    let nonHost = -1;
+    for (let i = 0; i < rest.length; ++i) {
+      const code = rest.charCodeAt(i);
+      if (code === 9 || code === 10 || code === 13) {
+        rest = rest.slice(0, i) + rest.slice(i + 1);
+        i -= 1;
+      } else if (code === 32 || code === 34 || code === 37 || code === 39 ||
+                 code === 59 || code === 60 || code === 62 || code === 92 ||
+                 code === 94 || code === 96 || code === 123 || code === 124 ||
+                 code === 125) {
+        if (nonHost === -1) nonHost = i;
+      } else if (code === 35 || code === 47 || code === 63) {
+        if (nonHost === -1) nonHost = i;
+        hostEnd = i;
+      } else if (code === 64) {
+        atSign = i;
+        nonHost = -1;
+      }
+      if (hostEnd !== -1) break;
+    }
+    start = 0;
+    if (atSign !== -1) {
+      this.auth = pirDecodeComponent(rest.slice(0, atSign));
+      start = atSign + 1;
+    }
+    if (nonHost === -1) {
+      this.host = rest.slice(start);
+      rest = "";
+    } else {
+      this.host = rest.slice(start, nonHost);
+      rest = rest.slice(nonHost);
+    }
+
+    this.parseHost();
+    if (typeof this.hostname !== "string") this.hostname = "";
+    const hostname = this.hostname;
+    const ipv6Hostname = pirIsIpv6Hostname(hostname);
+
+    if (!ipv6Hostname) rest = pirGetHostname(this, rest, hostname, url);
+
+    if (this.hostname.length > PIR_HOSTNAME_MAX_LEN) {
+      this.hostname = "";
+    } else {
+      this.hostname = this.hostname.toLowerCase();
+    }
+
+    if (this.hostname !== "") {
+      if (ipv6Hostname) {
+        if (pirForbiddenHostCharsIpv6.test(this.hostname)) {
+          throw pirInvalidUrlError(url);
+        }
+      } else {
+        this.hostname = pirHostnameToASCII(this.hostname);
+        if (this.hostname === "" || pirForbiddenHostChars.test(this.hostname)) {
+          throw pirInvalidUrlError(url);
+        }
+      }
+    }
+
+    const portText = this.port ? ":" + this.port : "";
+    this.host = (this.hostname || "") + portText;
+    if (ipv6Hostname) {
+      this.hostname = this.hostname.slice(1, -1);
+      if (rest[0] !== "/") rest = "/" + rest;
+    }
+  }
+
+  if (PIR_UNSAFE_PROTOCOLS[lowerProto] !== true) rest = pirAutoEscapeStr(rest);
+
+  let questionIdx = -1;
+  let hashIdx = -1;
+  for (let i = 0; i < rest.length; ++i) {
+    const code = rest.charCodeAt(i);
+    if (code === 35 /* # */) {
+      this.hash = rest.slice(i);
+      hashIdx = i;
+      break;
+    } else if (code === 63 /* ? */ && questionIdx === -1) {
+      questionIdx = i;
+    }
+  }
+
+  if (questionIdx !== -1) {
+    if (hashIdx === -1) {
+      this.search = rest.slice(questionIdx);
+      this.query = rest.slice(questionIdx + 1);
+    } else {
+      this.search = rest.slice(questionIdx, hashIdx);
+      this.query = rest.slice(questionIdx + 1, hashIdx);
+    }
+    if (parseQueryString) this.query = querystring.parse(this.query);
+  } else if (parseQueryString) {
+    this.search = null;
+    this.query = { __proto__: null };
+  }
+
+  const useQuestionIdx = questionIdx !== -1 && (hashIdx === -1 || questionIdx < hashIdx);
+  const firstIdx = useQuestionIdx ? questionIdx : hashIdx;
+  if (firstIdx === -1) {
+    if (rest.length > 0) this.pathname = rest;
+  } else if (firstIdx > 0) {
+    this.pathname = rest.slice(0, firstIdx);
+  }
+  if (PIR_SLASHED_PROTOCOLS[lowerProto] === true && this.hostname && !this.pathname) {
+    this.pathname = "/";
+  }
+
+  if (this.pathname || this.search) {
+    const p = this.pathname || "";
+    const s = this.search || "";
+    this.path = p + s;
+  }
+
+  this.href = this.format();
+  return this;
+};
+
+Url.prototype.parseHost = function parseHost() {
+  let host = this.host;
+  let port = pirPortPattern.exec(host);
+  if (port) {
+    port = port[0];
+    if (port !== ":") this.port = port.slice(1);
+    host = host.slice(0, host.length - port.length);
+  }
+  if (host) this.hostname = host;
+};
+
+// `noEscapeAuth`: `! ' ( ) * :` plus alphanumerics and `- . _ ~`.
+function pirAuthSafe(code) {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) || code === 33 || code === 39 ||
+    code === 40 || code === 41 || code === 42 || code === 45 ||
+    code === 46 || code === 58 || code === 95 || code === 126;
+}
+
+Url.prototype.format = function format() {
+  let auth = this.auth || "";
+  if (auth) {
+    auth = pirPercentEncodeWith(auth, pirAuthSafe) + "@";
+  }
+
+  let protocol = this.protocol || "";
+  if (protocol && protocol.charCodeAt(protocol.length - 1) !== 58 /* : */) {
+    protocol += ":";
+  }
+
+  let pathname = this.pathname || "";
+  let hash = this.hash || "";
+  let host = "";
+  let query = "";
+
+  if (this.host) {
+    host = auth + this.host;
+  } else if (this.hostname) {
+    host = auth + (
+      this.hostname.indexOf(":") !== -1 && !pirIsIpv6Hostname(this.hostname)
+        ? "[" + this.hostname + "]"
+        : this.hostname);
+    if (this.port) host += ":" + this.port;
+  }
+
+  if (this.query !== null && typeof this.query === "object") {
+    query = querystring.stringify(this.query);
+  }
+  let search = this.search || (query && "?" + query) || "";
+
+  if (pathname.indexOf("#") !== -1 || pathname.indexOf("?") !== -1) {
+    let newPathname = "";
+    let last = 0;
+    for (let i = 0; i < pathname.length; i++) {
+      const code = pathname.charCodeAt(i);
+      if (code === 35 /* # */ || code === 63 /* ? */) {
+        if (i > last) newPathname += pathname.slice(last, i);
+        newPathname += code === 35 ? "%23" : "%3F";
+        last = i + 1;
+      }
+    }
+    if (last < pathname.length) newPathname += pathname.slice(last);
+    pathname = newPathname;
+  }
+
+  if (this.slashes || PIR_SLASHED_PROTOCOLS[protocol] === true) {
+    if (this.slashes || host) {
+      if (pathname && pathname.charCodeAt(0) !== 47 /* / */) pathname = "/" + pathname;
+      host = "//" + host;
+    } else if (protocol.length >= 4 &&
+               protocol.charCodeAt(0) === 102 /* f */ &&
+               protocol.charCodeAt(1) === 105 /* i */ &&
+               protocol.charCodeAt(2) === 108 /* l */ &&
+               protocol.charCodeAt(3) === 101 /* e */) {
+      host = "//";
+    }
+  }
+
+  if (search.indexOf("#") !== -1) search = search.split("#").join("%23");
+  if (hash && hash.charCodeAt(0) !== 35) hash = "#" + hash;
+  if (search && search.charCodeAt(0) !== 63) search = "?" + search;
+
+  return protocol + host + pathname + search + hash;
+};
+
+function pirParseUrl(input, parseQueryString, slashesDenoteHost) {
+  pirEmitUrlParseDeprecation();
+  if (input instanceof Url) return input;
+  const urlObject = new Url();
+  urlObject.parse(input, parseQueryString, slashesDenoteHost);
+  return urlObject;
+}
+
+// Url.prototype.resolve / resolveObject: the RFC 2396 resolver node kept for
+// backwards compatibility.
+Url.prototype.resolve = function resolve(relative) {
+  return this.resolveObject(pirParseUrl(relative, false, true)).format();
+};
+
+function pirSpliceOne(array, index) {
+  for (let i = index; i < array.length - 1; i++) array[i] = array[i + 1];
+  array.pop();
+}
+
+Url.prototype.resolveObject = function resolveObject(relative) {
+  if (typeof relative === "string") {
+    const rel = new Url();
+    rel.parse(relative, false, true);
+    relative = rel;
+  }
+
+  const result = new Url();
+  Object.assign(result, this);
+
+  // A hash is always overridden, even by href="".
+  result.hash = relative.hash;
+  if (relative.href === "") {
+    result.href = result.format();
+    return result;
+  }
+
+  // "//foo/bar" always cuts to the protocol.
+  if (relative.slashes && !relative.protocol) {
+    for (const key of Object.keys(relative)) {
+      if (key !== "protocol") result[key] = relative[key];
+    }
+    if (PIR_SLASHED_PROTOCOLS[result.protocol] === true &&
+        result.hostname && !result.pathname) {
+      result.path = result.pathname = "/";
+    }
+    result.href = result.format();
+    return result;
+  }
+
+  if (relative.protocol && relative.protocol !== result.protocol) {
+    if (PIR_SLASHED_PROTOCOLS[relative.protocol] !== true) {
+      Object.assign(result, relative);
+      result.href = result.format();
+      return result;
+    }
+
+    result.protocol = relative.protocol;
+    if (!relative.host &&
+        !/^file:?$/.test(relative.protocol) &&
+        PIR_HOSTLESS_PROTOCOLS[relative.protocol] !== true) {
+      const relPath = (relative.pathname || "").split("/");
+      while (relPath.length && !(relative.host = relPath.shift()));
+      if (!relative.host) relative.host = "";
+      if (!relative.hostname) relative.hostname = "";
+      if (relPath[0] !== "") relPath.unshift("");
+      if (relPath.length < 2) relPath.unshift("");
+      result.pathname = relPath.join("/");
+    } else {
+      result.pathname = relative.pathname;
+    }
+    result.search = relative.search;
+    result.query = relative.query;
+    result.host = relative.host || "";
+    result.auth = relative.auth;
+    result.hostname = relative.hostname || relative.host;
+    result.port = relative.port;
+    if (result.pathname || result.search) {
+      result.path = (result.pathname || "") + (result.search || "");
+    }
+    if (!result.slashes) result.slashes = relative.slashes;
+    result.href = result.format();
+    return result;
+  }
+
+  const isSourceAbs = result.pathname && result.pathname.charAt(0) === "/";
+  const isRelAbs = relative.host ||
+    (relative.pathname && relative.pathname.charAt(0) === "/");
+  let mustEndAbs = isRelAbs || isSourceAbs || (result.host && relative.pathname);
+  const removeAllDots = mustEndAbs;
+  let srcPath = (result.pathname && result.pathname.split("/")) || [];
+  const relPath = (relative.pathname && relative.pathname.split("/")) || [];
+  const noLeadingSlashes = result.protocol &&
+    PIR_SLASHED_PROTOCOLS[result.protocol] !== true;
+
+  if (noLeadingSlashes) {
+    result.hostname = "";
+    result.port = null;
+    if (result.host) {
+      if (srcPath[0] === "") srcPath[0] = result.host;
+      else srcPath.unshift(result.host);
+    }
+    result.host = "";
+    if (relative.protocol) {
+      relative.hostname = null;
+      relative.port = null;
+      result.auth = null;
+      if (relative.host) {
+        if (relPath[0] === "") relPath[0] = relative.host;
+        else relPath.unshift(relative.host);
+      }
+      relative.host = null;
+    }
+    if (!(relPath[0] === "" || srcPath[0] === "")) mustEndAbs = false;
+  }
+
+  if (isRelAbs) {
+    if (relative.host || relative.host === "") {
+      if (result.host !== relative.host) result.auth = null;
+      result.host = relative.host;
+      result.port = relative.port;
+    }
+    if (relative.hostname || relative.hostname === "") {
+      if (result.hostname !== relative.hostname) result.auth = null;
+      result.hostname = relative.hostname;
+    }
+    result.search = relative.search;
+    result.query = relative.query;
+    srcPath = relPath;
+  } else if (relPath.length) {
+    if (!srcPath) srcPath = [];
+    srcPath.pop();
+    srcPath = srcPath.concat(relPath);
+    result.search = relative.search;
+    result.query = relative.query;
+  } else if (relative.search !== null && relative.search !== undefined) {
+    if (noLeadingSlashes) {
+      result.hostname = result.host = srcPath.shift();
+      const authInHost = result.host && result.host.indexOf("@") > 0 &&
+        result.host.split("@");
+      if (authInHost) {
+        result.auth = authInHost.shift();
+        result.host = result.hostname = authInHost.shift();
+      }
+    }
+    result.search = relative.search;
+    result.query = relative.query;
+    if (result.pathname !== null || result.search !== null) {
+      result.path = (result.pathname ? result.pathname : "") +
+        (result.search ? result.search : "");
+    }
+    result.href = result.format();
+    return result;
+  }
+
+  if (!srcPath.length) {
+    result.pathname = null;
+    if (result.search) result.path = "/" + result.search;
+    else result.path = null;
+    result.href = result.format();
+    return result;
+  }
+
+  let last = srcPath[srcPath.length - 1];
+  const hasTrailingSlash =
+    ((result.host || relative.host || srcPath.length > 1) &&
+     (last === "." || last === "..")) || last === "";
+
+  let up = 0;
+  for (let i = srcPath.length - 1; i >= 0; i--) {
+    last = srcPath[i];
+    if (last === ".") {
+      pirSpliceOne(srcPath, i);
+    } else if (last === "..") {
+      pirSpliceOne(srcPath, i);
+      up++;
+    } else if (up) {
+      pirSpliceOne(srcPath, i);
+      up--;
+    }
+  }
+
+  if (!mustEndAbs && !removeAllDots) {
+    while (up--) srcPath.unshift("..");
+  }
+
+  if (mustEndAbs && srcPath[0] !== "" &&
+      (!srcPath[0] || srcPath[0].charAt(0) !== "/")) {
+    srcPath.unshift("");
+  }
+
+  const joinedPath = srcPath.join("/");
+  if (hasTrailingSlash && joinedPath.charAt(joinedPath.length - 1) !== "/") {
+    srcPath.push("");
+  }
+
+  const isAbsolute = srcPath[0] === "" ||
+    (srcPath[0] && srcPath[0].charAt(0) === "/");
+
+  if (noLeadingSlashes) {
+    result.hostname = result.host = isAbsolute ? ""
+      : srcPath.length ? srcPath.shift() : "";
+    const authInHost = result.host && result.host.indexOf("@") > 0
+      ? result.host.split("@")
+      : false;
+    if (authInHost) {
+      result.auth = authInHost.shift();
+      result.host = result.hostname = authInHost.shift();
+    }
+  }
+
+  if (result.host && srcPath.length) mustEndAbs = true;
+
+  if (mustEndAbs && !isAbsolute) srcPath.unshift("");
+
+  if (!srcPath.length) {
+    result.pathname = null;
+    result.path = null;
+  } else {
+    result.pathname = srcPath.join("/");
+  }
+
+  if (result.pathname !== null || result.search !== null) {
+    result.path = (result.pathname ? result.pathname : "") +
+      (result.search ? result.search : "");
+  }
+  result.auth = relative.auth || result.auth;
+  if (!result.slashes) result.slashes = relative.slashes;
+  result.href = result.format();
+  return result;
+};
+
+function resolve(from, to) {
+  return pirParseUrl(from, false, true).resolve(to);
+}
+
+function resolveObject(source, relative) {
+  if (!source) return relative;
+  return pirParseUrl(source, false, true).resolveObject(relative);
+}
+
+// ---------------------------------------------------------------------------
+// url.format
+// ---------------------------------------------------------------------------
+
+function pirFormatWhatwg(url, options) {
+  let fragment = true;
+  let unicode = false;
+  let search = true;
+  let auth = true;
+  if (options) {
+    if (typeof options !== "object" && typeof options !== "function") {
+      throw pirInvalidArgTypeError("options", "object", options);
+    }
+    if (options.fragment !== undefined && options.fragment !== null) {
+      fragment = Boolean(options.fragment);
+    }
+    if (options.unicode !== undefined && options.unicode !== null) {
+      unicode = Boolean(options.unicode);
+    }
+    if (options.search !== undefined && options.search !== null) {
+      search = Boolean(options.search);
+    }
+    if (options.auth !== undefined && options.auth !== null) {
+      auth = Boolean(options.auth);
+    }
+  }
+
+  let out = String(url.href);
+  if (!fragment) {
+    const index = out.indexOf("#");
+    if (index !== -1) out = out.slice(0, index);
+  }
+  if (!search) {
+    const hashIndex = out.indexOf("#");
+    const queryIndex = out.indexOf("?");
+    if (queryIndex !== -1 && (hashIndex === -1 || queryIndex < hashIndex)) {
+      out = out.slice(0, queryIndex) + (hashIndex === -1 ? "" : out.slice(hashIndex));
+    }
+  }
+
+  const protocol = String(url.protocol);
+  const authorityStart = out.slice(protocol.length, protocol.length + 2) === "//"
+    ? protocol.length + 2
+    : -1;
+  if (authorityStart !== -1) {
+    let authorityEnd = out.length;
+    for (let i = authorityStart; i < out.length; i++) {
+      const code = out.charCodeAt(i);
+      if (code === 47 /* / */ || code === 63 /* ? */ || code === 35 /* # */) {
+        authorityEnd = i;
+        break;
+      }
+    }
+    const authority = out.slice(authorityStart, authorityEnd);
+    const at = authority.indexOf("@");
+    const userinfo = at !== -1 ? authority.slice(0, at) : "";
+    const hostStart = authorityStart + (at !== -1 ? at + 1 : 0);
+    let hostSearchStart = authorityStart;
+    if (!auth && at !== -1) {
+      out = out.slice(0, authorityStart) + out.slice(hostStart);
+      authorityEnd -= at + 1;
+    } else if (at !== -1) {
+      hostSearchStart = hostStart;
+    }
+    if (unicode) {
+      const hostname = String(url.hostname || "");
+      if (hostname !== "" && hostname.charCodeAt(0) !== 91 /* [ */) {
+        const decoded = pirDomainToUnicode(hostname);
+        if (decoded !== hostname) {
+          const index = out.indexOf(hostname, hostSearchStart);
+          if (index !== -1 && index < authorityEnd) {
+            out = out.slice(0, index) + decoded + out.slice(index + hostname.length);
+          }
+        }
+      }
+    }
+    // `userinfo` is only read to keep the structure obvious; the string
+    // surgery above already removed it when `auth` is false.
+    void userinfo;
+  }
+  return out;
+}
+
+function format(input, options) {
+  if (typeof input === "string") {
+    input = pirParseUrl(input);
+  } else if (input === null || typeof input !== "object") {
+    throw pirCodeError(TypeError, "ERR_INVALID_ARG_TYPE",
+      "The \"urlObject\" argument must be one of type object or string. Received " +
+      pirReceivedDescription(input));
+  } else if (input instanceof EngineURL || input instanceof PirURL) {
+    return pirFormatWhatwg(input, options);
+  }
+  return Url.prototype.format.call(input);
+}
+
+// ---------------------------------------------------------------------------
+// IDN helpers on the public surface
+// ---------------------------------------------------------------------------
+
+function pirDomainText(domain) {
+  if (typeof domain === "symbol") {
+    throw new TypeError("Cannot convert a Symbol value to a string");
+  }
+  return domain === undefined || domain === null ? "" : String(domain);
+}
+
+// Node's domainToASCII/domainToUnicode run the host parser in "no scheme"
+// mode: the value ends at the first '/', '?', '#'; '%XX' is decoded; '@',
+// ':', '\', spaces, '<>|^' and brackets make the host invalid (""). The
+// mapped/punycoded form is what both URL flavors expose.
+function pirDomainToASCII(domain) {
+  const text = pirDomainText(domain);
+  if (text === "") return "";
+  let end = text.length;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code === C_SLASH || code === C_QMARK || code === C_HASH) {
+      end = i;
+      break;
+    }
+  }
+  let host = text.slice(0, end);
+  if (host === "") return "";
+  if (/[\u0000-\u0020<>^|\\@:\[\]]/.test(host)) return "";
+  if (host.indexOf("%") !== -1) {
+    try {
+      host = decodeURIComponent(host);
+    } catch {
+      return "";
+    }
+    if (/[\u0000-\u0020<>^|\\@:\[\]]/.test(host)) return "";
+  }
+  return pirHostnameToASCII(host);
+}
+
+function domainToASCII(domain) {
+  return pirDomainToASCII(domain);
+}
+
+function pirDomainToUnicode(domain) {
+  const ascii = pirDomainToASCII(domain);
+  if (ascii === "") return "";
+  return pirPunyToUnicode(ascii);
 }
 
 function domainToUnicode(domain) {
-  return String(domain === undefined || domain === null ? "" : domain);
+  return pirDomainToUnicode(domain);
 }
 
 function urlToHttpOptions(url) {
@@ -870,23 +2578,109 @@ function urlToHttpOptions(url) {
   });
   if (port !== "") options.port = Number(port);
   if (username || password) {
-    options.auth = decodeURIComponent(username) + ":" + decodeURIComponent(password);
+    options.auth = pirDecodeComponent(username) + ":" + pirDecodeComponent(password);
   }
   return options;
 }
 
-function fileURLToPathBuffer(input) {
-  return globalThis.Buffer.from(fileURLToPath(input), "utf8");
+// `fileURLToPathBuffer`: unlike the string variant, encoded separators are
+// legal — the point is to keep non-UTF-8 percent-encoded bytes intact — so the
+// path is percent-decoded byte-wise (invalid escapes stay literal) and handed
+// back as a Buffer.
+function pirHexValue(byte) {
+  if (byte >= 48 && byte <= 57) return byte - 48;
+  if (byte >= 65 && byte <= 70) return byte - 55;
+  if (byte >= 97 && byte <= 102) return byte - 87;
+  return -1;
+}
+
+function pirPercentDecodeBuffer(text) {
+  const BufferCtor = globalThis.Buffer;
+  const input = BufferCtor.from(text, "utf8");
+  const output = BufferCtor.allocUnsafe(input.length);
+  let written = 0;
+  for (let i = 0; i < input.length; i++) {
+    if (input[i] !== 37 /* % */) {
+      output[written++] = input[i];
+      continue;
+    }
+    if (i + 2 < input.length) {
+      const high = pirHexValue(input[i + 1]);
+      const low = pirHexValue(input[i + 2]);
+      if (high >= 0 && low >= 0) {
+        output[written++] = (high << 4) | low;
+        i += 2;
+        continue;
+      }
+    }
+    output[written++] = input[i];
+  }
+  return output.slice(0, written);
+}
+
+function pirWindowsFileBuffer(url) {
+  const BufferCtor = globalThis.Buffer;
+  const hostname = url.hostname || "";
+  const pathname = pirFileDrivePipe(url.pathname || "").split("/").join("\\");
+  const decoded = pirPercentDecodeBuffer(pathname);
+  if (hostname !== "") {
+    return BufferCtor.concat([
+      BufferCtor.from("\\\\", "ascii"),
+      BufferCtor.from(pirDomainToUnicode(hostname), "utf8"),
+      decoded,
+    ]);
+  }
+  const letter = decoded.length > 1 ? decoded[1] | 0x20 : 0;
+  if (letter >= 97 && letter <= 122 && decoded.length > 2 && decoded[2] === 58 /* : */) {
+    return decoded.slice(1);
+  }
+  // No drive letter (e.g. `file:///meta.ts`): accept the converted path,
+  // matching the string-form fileURLToPath behaviour above.
+  return decoded;
+}
+
+function pirPosixFileBuffer(url) {
+  if ((url.hostname || "") !== "") {
+    throw pirCodeError(TypeError, "ERR_INVALID_FILE_URL_HOST",
+      "File URL host must be \"localhost\" or empty on " + __platform);
+  }
+  return pirPercentDecodeBuffer(url.pathname || "");
+}
+
+function fileURLToPathBuffer(input, options = undefined) {
+  let url;
+  if (typeof input === "string") {
+    url = new EngineURL(input);
+  } else if (input instanceof EngineURL || input instanceof PirURL) {
+    url = input;
+  } else {
+    throw pirInvalidArgTypeError("path", "string or an instance of URL", input);
+  }
+  if (!url || url.protocol !== "file:") {
+    throw pirCodeError(TypeError, "ERR_INVALID_URL_SCHEME", "The URL must be of scheme file");
+  }
+  const windows = options !== null && options !== undefined && options.windows !== undefined &&
+      options.windows !== null
+    ? options.windows
+    : __platform === "win32";
+  return windows ? pirWindowsFileBuffer(url) : pirPosixFileBuffer(url);
 }
 
 class URLPattern {
-  constructor(_input, _baseURL, _options) {
+  constructor(_input = undefined, _baseURL = undefined, _options = undefined) {
     // The engine ships no URLPattern; the class exists so instanceof paths
     // link and the constructor throws with the honest reason.
     const error = new Error("URLPattern is not supported by the pir extension runtime");
     error.code = "ERR_NOT_SUPPORTED";
     throw error;
   }
+}
+
+// Node exposes URLPattern as a global too (`globalThis.URLPattern ===
+// require('url').URLPattern`). The stub is installed for feature checks and
+// identity; construction still reports ERR_NOT_SUPPORTED.
+if (typeof globalThis.URLPattern !== "function") {
+  globalThis.URLPattern = URLPattern;
 }
 
 export { URL, URLSearchParams, fileURLToPath, pathToFileURL };

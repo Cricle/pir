@@ -24,6 +24,15 @@ use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext
 // Harness
 // ---------------------------------------------------------------------------
 
+/// The embedded QuickJS runtime (js_vm) serializes user code behind a
+/// process-wide execution lock, and cargo runs this binary's tests
+/// concurrently. Without this gate a script can spend its whole per-script
+/// deadline queued behind another test's script (the batch then reports
+/// "timed out while queued" instead of the behavior under test). Hold it
+/// for one whole tool call so every call's budget starts only once the
+/// shared runtime is free.
+static PYTHON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 /// Self-cleaning temp directory.
@@ -94,6 +103,9 @@ impl Harness {
     }
 
     async fn run(&self, name: &str, args: Value) -> ToolResult {
+        // Every tool call may reach the shared runtime; holding the gate
+        // across the call keeps the per-script deadlines honest.
+        let _serial = PYTHON_TEST_LOCK.lock().await;
         self.tool(name)
             .run(&args, &ToolContext::new(self.cwd.clone()))
             .await

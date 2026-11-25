@@ -1,59 +1,644 @@
+// node:stream/promises — pipeline() and finished(), plus the callback/two-form
+// surface `node:stream` aliases (`stream.finished(stream[, options], cb)`).
+//
+// The implementation is self-contained (duck-typed streams; the Readable used
+// to wrap async iterables is resolved lazily from the builtin registry) so this
+// module can serve both `import { finished } from "stream/promises"` and
+// `stream.finished` without a cycle through the stream shim.
 
-function finished(stream, options) {
-  if (!stream || typeof stream.on !== "function") {
-    throw new TypeError("The \"stream\" argument must be a stream");
+function pirTick(fn) {
+  const tick = globalThis.__pirNextTick;
+  if (typeof tick === "function") tick(fn);
+  else Promise.resolve().then(fn);
+}
+
+function pirDescribeValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "string") {
+    const text = value.length > 28 ? value.slice(0, 25) + "..." : value;
+    return "type string ('" + text + "')";
   }
-  return new Promise((resolve, reject) => {
-    if (stream.readableEnded || stream.writableEnded || stream.finished) {
-      resolve();
-      return;
+  if (typeof value === "number") return "type number (" + String(value) + ")";
+  if (typeof value === "boolean") return "type boolean (" + String(value) + ")";
+  if (typeof value === "bigint") return "type bigint (" + String(value) + "n)";
+  if (typeof value === "symbol") return "type symbol (" + String(value) + ")";
+  if (typeof value === "function") return "function " + (value.name || "");
+  const name = value.constructor && value.constructor.name;
+  return name ? "an instance of " + name : "an instance of Object";
+}
+
+// Node's internal errors stringify as `TypeError [ERR_CODE]: message`, so
+// String(err) (what assert.throws regexes test) carries the code suffix.
+function pirCodedError(Ctor, code, message) {
+  const error = new Ctor(message);
+  error.code = code;
+  Object.defineProperty(error, "toString", {
+    value: function () { return this.name + " [" + String(this.code) + "]: " + this.message; },
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return error;
+}
+
+function pirInvalidArgType(name, expected, value) {
+  const kind = name.indexOf(".") === -1 ? "argument" : "property";
+  return pirCodedError(TypeError, "ERR_INVALID_ARG_TYPE",
+    "The \"" + name + "\" " + kind + " must be " + expected + ". Received " +
+    pirDescribeValue(value));
+}
+
+function pirPrematureClose() {
+  const error = new Error("Premature close");
+  error.code = "ERR_STREAM_PREMATURE_CLOSE";
+  return error;
+}
+
+function pirAbortError(reason) {
+  let error;
+  try {
+    error = reason === undefined
+      ? new Error("The operation was aborted")
+      : new Error("The operation was aborted", { cause: reason });
+  } catch (_) {
+    error = new Error("The operation was aborted");
+    if (reason !== undefined) error.cause = reason;
+  }
+  error.code = "ABORT_ERR";
+  error.name = "AbortError";
+  return error;
+}
+
+function pirIsNodeStream(value) {
+  if (value === null || typeof value !== "object" || typeof value.on !== "function") return false;
+  // A Writable-only stream (e.g. fs.WriteStream) has no pipe()/read(); a
+  // Readable-only one has no write(). Any of the three marks a node stream.
+  return typeof value.pipe === "function" || typeof value.read === "function" ||
+    typeof value.write === "function";
+}
+
+function pirIsIterable(value) {
+  // Strings are iterable in node's `isIterable` (pipeline('', ...)); the
+  // symbol lookups work on the boxed primitive, so keep the typeof check.
+  return value !== null && value !== undefined &&
+    (typeof value === "object" || typeof value === "string") &&
+    (typeof value[Symbol.asyncIterator] === "function" ||
+     typeof value[Symbol.iterator] === "function");
+}
+
+function pirGetReadableCtor() {
+  const mods = globalThis.__pirNodeModules;
+  const streamModule = mods && mods.stream;
+  if (streamModule === undefined || streamModule === null) return null;
+  const ctor = streamModule.Readable ||
+    (streamModule.default && streamModule.default.Readable);
+  return typeof ctor === "function" ? ctor : null;
+}
+
+// ---------------------------------------------------------------------------
+// finished
+// ---------------------------------------------------------------------------
+
+function finished(stream, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = undefined;
+  }
+  if (options === undefined || options === null) {
+    options = {};
+  } else if (typeof options !== "object") {
+    if (typeof callback === "function") {
+      throw pirInvalidArgType("options", "of type object", options);
     }
-    const cleanup = () => {
-      stream.removeListener("end", onEnd);
-      stream.removeListener("finish", onFinish);
-      stream.removeListener("close", onClose);
-      stream.removeListener("error", onError);
-    };
-    const settle = (error) => {
-      cleanup();
-      if (error === undefined) resolve();
-      else reject(error);
-    };
-    const onEnd = () => settle();
-    const onFinish = () => settle();
-    const onClose = () => settle();
-    const onError = (error) => settle(error === undefined ? new Error("stream error") : error);
+    throw pirInvalidArgType("callback", "of type function", options);
+  }
+  if (callback !== undefined && typeof callback !== "function") {
+    throw pirInvalidArgType("callback", "of type function", callback);
+  }
+  for (const booleans of ["cleanup", "readable", "writable"]) {
+    if (options[booleans] !== undefined && typeof options[booleans] !== "boolean") {
+      throw pirInvalidArgType("options." + booleans, "of type boolean", options[booleans]);
+    }
+  }
+  if (!pirIsNodeStream(stream)) {
+    throw pirInvalidArgType("stream", "an instance of Stream", stream);
+  }
+
+  const signal = options.signal;
+  if (signal !== undefined &&
+      (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+    throw pirInvalidArgType("options.signal", "an instance of AbortSignal", signal);
+  }
+
+  const watchReadable = options.readable !== false &&
+    (stream.readable !== false && (typeof stream.read === "function" ||
+      stream.readable === true || stream._readableState !== undefined));
+  const watchWritable = options.writable !== false &&
+    (stream.writable !== false && (typeof stream.write === "function" ||
+      stream.writable === true || stream._writableState !== undefined));
+  // Node's eos leaves its listeners installed unless cleanup is true
+  // (default false; test-stream-promises asserts listenerCount('end') === 1).
+  const cleanupListeners = options.cleanup === true;
+
+  // A compose() facade that exposes neither side (source + sink bodies) has no
+  // end/finish to observe; Node's completed pipeline destroys it, so 'close'
+  // is the completion signal.
+  const composedNoSides = stream._pirComposed === true && !watchReadable && !watchWritable;
+
+  const readableState = stream._readableState;
+  const writableState = stream._writableState;
+
+  const readableSettled = () =>
+    stream.readableEnded === true ||
+    (readableState !== undefined && readableState.endEmitted === true) ||
+    // `ended` means push(null) happened: no more data will arrive. Buffered
+    // bytes that nobody consumed are not pending work for `finished()` — a
+    // PassThrough whose write side ended is a completed stream even if its
+    // readable buffer was never drained (this is what `finished(done)` after
+    // `done.end("x")` relies on).
+    (readableState !== undefined && readableState.ended === true);
+  const writableSettled = () =>
+    stream.writableFinished === true ||
+    (writableState !== undefined && writableState.finished === true) ||
+    // Node's finish may still be queued when destroy() lands; an ending stream
+    // with nothing in flight is complete (test-stream-finished's end+destroy
+    // case resolves cleanly).
+    (writableState !== undefined && writableState.ending === true &&
+     writableState.writing === false && writableState.errored === null &&
+     writableState.length === 0 &&
+     writableState.buffered.length <= writableState.bufferedIndex);
+
+  let readableDone = !watchReadable && !composedNoSides;
+  let writableDone = !watchWritable && !composedNoSides;
+  if (watchReadable && readableSettled()) readableDone = true;
+  if (watchWritable && writableSettled()) writableDone = true;
+  let settled = false;
+  let cancelled = false;
+  let abortListener = null;
+
+  const done = () => readableDone && writableDone;
+
+  const removeListeners = () => {
+    stream.removeListener("end", onEnd);
+    stream.removeListener("finish", onFinish);
+    stream.removeListener("close", onClose);
+    stream.removeListener("error", onError);
+    if (signal !== undefined && abortListener !== null) {
+      signal.removeEventListener("abort", abortListener);
+      abortListener = null;
+    }
+  };
+
+  let promise;
+  const settle = (error) => {
+    if (settled || cancelled) return;
+    settled = true;
+    if (cleanupListeners) removeListeners();
+    if (typeof callback === "function") callback(error);
+    else if (error === undefined || error === null) promiseResolve();
+    else promiseReject(error);
+  };
+
+  let promiseResolve;
+  let promiseReject;
+  if (typeof callback !== "function") {
+    promise = new Promise((resolve, reject) => {
+      promiseResolve = resolve;
+      promiseReject = reject;
+    });
+  } else {
+    promise = Promise.resolve();
+  }
+
+  const check = () => {
+    if (done()) settle();
+  };
+
+  function onEnd() {
+    readableDone = true;
+    check();
+  }
+  function onFinish() {
+    writableDone = true;
+    check();
+  }
+  function onError(error) {
+    settle(error === undefined ? new Error("stream error") : error);
+  }
+  function onClose() {
+    if (settled || cancelled) return;
+    // push(null) followed by an immediate 'close' still counts as a clean end
+    // (test-stream-finished: "Should not trigger an error").
+    if (!readableDone && readableSettled()) readableDone = true;
+    if (!writableDone && writableSettled()) writableDone = true;
+    if (done() || composedNoSides) settle();
+    else settle(pirPrematureClose());
+  }
+
+  if (signal !== undefined && signal.aborted) {
+    pirTick(() => settle(pirAbortError(signal.reason)));
+  } else if (stream.destroyed) {
+    // Attached after destroy completed: report the error that caused it, or
+    // the terminal state (Node distinguishes "already closed cleanly" from
+    // "closed before end/finish").
+    pirTick(() => {
+      if (stream.errored !== undefined && stream.errored !== null) settle(stream.errored);
+      else settle(done() ? undefined : pirPrematureClose());
+    });
+  } else if (done()) {
+    pirTick(() => settle());
+  } else {
+    // Event-only readable streams (fs.ReadStream here) start their producer on
+    // resume()/data listeners only. Node's eos relies on such streams having
+    // already started (their open error is reported in the constructor). For
+    // those, start the pump so an open failure can reach 'error' instead of
+    // hanging finished() forever.
+    if (watchReadable && !watchWritable && stream._readableState === undefined &&
+        typeof stream.resume === "function" && stream.readableEnded !== true) {
+      try { stream.resume(); } catch (_) { /* the error listeners below see it */ }
+    }
     stream.on("end", onEnd);
     stream.on("finish", onFinish);
     stream.on("close", onClose);
     stream.on("error", onError);
+    if (signal !== undefined) {
+      abortListener = () => settle(pirAbortError(signal.reason));
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
+  }
+
+  const dispose = () => {
+    if (settled) return;
+    cancelled = true;
+    removeListeners();
+  };
+  if (typeof callback === "function") return dispose;
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
+// pipeline
+// ---------------------------------------------------------------------------
+
+function pipeline(...args) {
+  return pirPipelineImpl(args).promise;
+}
+
+function pirGetPassThroughCtor() {
+  const mods = globalThis.__pirNodeModules;
+  const streamModule = mods && mods.stream;
+  if (streamModule === undefined || streamModule === null) return null;
+  const ctor = streamModule.PassThrough ||
+    (streamModule.default && streamModule.default.PassThrough);
+  return typeof ctor === "function" ? ctor : null;
+}
+
+// Wait for backpressure relief without losing the error path: a destroyed
+// destination must reject rather than hang the pump.
+function pirWaitDrain(writable, signal) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      if (typeof writable.removeListener === "function") {
+        writable.removeListener("drain", onDrain);
+        writable.removeListener("error", onError);
+        writable.removeListener("close", onClose);
+      }
+    };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onError = (error) => { cleanup(); reject(error); };
+    const onClose = () => { cleanup(); reject(pirPrematureClose()); };
+    if (typeof writable.once === "function") {
+      writable.once("drain", onDrain);
+      writable.once("error", onError);
+      writable.once("close", onClose);
+    } else {
+      resolve();
+      return;
+    }
+    if (signal !== undefined && signal.aborted) {
+      cleanup();
+      reject(pirAbortError(signal.reason));
+    }
   });
 }
 
-function pipeline(...args) {
-  let callback;
-  if (typeof args[args.length - 1] === "function") callback = args.pop();
-  if (args.length === 0) {
-    throw new TypeError("pipeline requires at least one stream");
+async function pirPumpInto(iterable, writable, signal) {
+  for await (const chunk of iterable) {
+    if (signal !== undefined && signal.aborted) throw pirAbortError(signal.reason);
+    if (writable.destroyed) throw pirPrematureClose();
+    if (writable.write(chunk) === false) await pirWaitDrain(writable, signal);
   }
-  for (let i = 0; i + 1 < args.length; i++) {
-    args[i].pipe(args[i + 1]);
+  writable.end();
+}
+
+// Feed `iterable` into `stream` while yielding the stream's readable side
+// concurrently, so a small transform HWM cannot deadlock the pump.
+async function* pirThroughStream(iterable, stream, signal) {
+  let pumping = true;
+  const pump = pirPumpInto(iterable, stream, signal).then(
+    () => { pumping = false; },
+    (error) => {
+      pumping = false;
+      if (!stream.destroyed && typeof stream.destroy === "function") stream.destroy(error);
+    },
+  );
+  pump.catch(() => {});
+  try {
+    for await (const chunk of stream) yield chunk;
+  } finally {
+    if (pumping && !stream.destroyed && typeof stream.destroy === "function") stream.destroy();
+    pump.catch(() => {});
   }
-  const settled = new Promise((resolve, reject) => {
-    let done = false;
-    const fail = (error) => {
-      if (!done) { done = true; reject(error); }
+}
+
+// Function stages: node calls a source function with `{ signal }`, a transform
+// function with (asyncIterable, { signal }), and turns a trailing function into
+// a PassThrough proxy returned to the caller (so pipeline(...) always returns a
+// stream). This path is only taken when a function stage is present; the
+// plain-stream pipe path below stays byte-for-byte identical.
+function pirRunFunctionPipeline(streams, options, signal) {
+  // Node's pipeline attaches an error listener to every node stage; the async
+  // iterators do too, but only once pumping starts. This early listener also
+  // satisfies listenerCount checks for sources (test-stream-pipeline-listeners).
+  const guardError = (stream) => {
+    if (stream !== null && stream !== undefined && typeof stream.on === "function") {
+      stream.on("error", () => {});
+    }
+  };
+  const first = streams[0];
+  let iterable;
+  if (pirIsNodeStream(first)) {
+    iterable = first;
+    guardError(first);
+  } else if (typeof first === "function") {
+    const produced = first({ signal });
+    if (!pirIsIterable(produced) && !pirIsNodeStream(produced)) {
+      throw pirInvalidArgType("val", "Iterable, AsyncIterable or Stream", produced);
+    }
+    iterable = produced;
+  } else {
+    iterable = first;
+  }
+
+  for (let i = 1; i < streams.length; i++) {
+    const stage = streams[i];
+    const isLast = i === streams.length - 1;
+    if (typeof stage === "function") {
+      const produced = stage(iterable, { signal });
+      if (!isLast) {
+        if (!pirIsIterable(produced) && !pirIsNodeStream(produced)) {
+          throw pirInvalidArgType("val", "AsyncIterable", produced);
+        }
+        iterable = produced;
+        continue;
+      }
+      const PassThrough = pirGetPassThroughCtor();
+      if (PassThrough === null) {
+        const error = new TypeError("The PassThrough constructor is unavailable");
+        error.code = "ERR_INVALID_STATE";
+        return { stream: null, promise: Promise.reject(error) };
+      }
+      const proxy = new PassThrough({ objectMode: true });
+      // Keep an early error from becoming uncaught before `finished` attaches;
+      // node removes every pipeline listener from this proxy on completion.
+      const proxyErrorWatch = () => {};
+      proxy.on("error", proxyErrorWatch);
+      const promise = (async () => {
+        try {
+          if (pirIsIterable(produced) || pirIsNodeStream(produced)) {
+            await pirPumpInto(produced, proxy, signal);
+          } else if (produced !== null && produced !== undefined &&
+                     (typeof produced === "object" || typeof produced === "function") &&
+                     typeof produced.then === "function") {
+            const value = await produced;
+            if (value !== null && value !== undefined) proxy.write(value);
+            proxy.end();
+          } else {
+            throw pirInvalidArgType("val", "AsyncIterable or Promise", produced);
+          }
+          const completion = finished(proxy, { readable: false, writable: true, cleanup: true });
+          completion.catch(() => {});
+          await completion;
+        } catch (error) {
+          proxy.destroy(error);
+          throw error;
+        } finally {
+          proxy.removeListener("error", proxyErrorWatch);
+        }
+      })();
+      return { stream: proxy, promise };
+    }
+    if (pirIsNodeStream(stage)) {
+      if (!isLast) guardError(stage);
+      if (isLast) {
+        const lastIsReadable = stage.readable !== false && typeof stage.read === "function";
+        const lastWatch = () => {};
+        stage.on("error", lastWatch);
+        const promise = (async () => {
+          const completion = finished(stage, { readable: false, writable: true });
+          completion.catch(() => {});
+          try {
+            await pirPumpInto(iterable, stage, signal);
+          } catch (error) {
+            if (!stage.destroyed && typeof stage.destroy === "function") stage.destroy(error);
+            throw error;
+          }
+          await completion;
+          if (lastIsReadable && typeof stage.removeListener === "function") {
+            stage.removeListener("error", lastWatch);
+          }
+        })();
+        return { stream: stage, promise };
+      }
+      iterable = pirThroughStream(iterable, stage, signal);
+      continue;
+    }
+    // A plain iterable in a middle position replaces the current source.
+    iterable = stage;
+  }
+
+  const promise = (async () => {
+    for await (const _chunk of iterable) { /* drain */ }
+  })();
+  return { stream: null, promise };
+}
+
+// Returns { stream, promise }: the callback-form pipeline in the stream shim
+// needs node's returned stream (the destination, or the proxy created for a
+// trailing function), while `node:stream/promises` exposes only the promise.
+function pirPipelineImpl(args) {
+  let streams;
+  if (args.length === 1 && Array.isArray(args[0])) streams = args[0].slice();
+  else streams = args.slice();
+  if (streams.length === 0) {
+    throw new TypeError("The \"streams\" argument must be specified");
+  }
+  // Optional trailing `{ signal }` options object (node's pipeline options).
+  let options = null;
+  if (streams.length > 1) {
+    const candidate = streams[streams.length - 1];
+    if (candidate !== null && typeof candidate === "object" && !Array.isArray(candidate) &&
+        !pirIsNodeStream(candidate) && !pirIsIterable(candidate)) {
+      options = candidate;
+      streams.pop();
+    }
+  }
+  if (streams.length === 1 && Array.isArray(streams[0])) streams = streams[0].slice();
+  if (streams.length === 0) {
+    throw new TypeError("The \"streams\" argument must be specified");
+  }
+  if (streams.length === 1) {
+    const error = new TypeError("The \"streams\" argument must be specified");
+    error.code = "ERR_MISSING_ARGS";
+    throw error;
+  }
+
+  const signal = options === null ? undefined : options.signal;
+  if (signal !== undefined &&
+      (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+    throw pirInvalidArgType("options.signal", "an instance of AbortSignal", signal);
+  }
+
+  const usesFunctionStage = streams.some((stream) => typeof stream === "function");
+  if (usesFunctionStage) {
+    return pirRunFunctionPipeline(streams, options, signal);
+  }
+
+  // Node wraps an async-iterable source in Readable.from.
+  if (!pirIsNodeStream(streams[0])) {
+    if (!pirIsIterable(streams[0])) {
+      throw pirInvalidArgType(
+        "val",
+        "an instance of Readable, Iterable, or AsyncIterable",
+        streams[0],
+      );
+    }
+    const ReadableCtor = pirGetReadableCtor();
+    if (ReadableCtor === null || typeof ReadableCtor.from !== "function") {
+      throw pirInvalidArgType(
+        "val",
+        "an instance of Readable, Iterable, or AsyncIterable",
+        streams[0],
+      );
+    }
+    streams[0] = ReadableCtor.from(streams[0]);
+  }
+
+  const last = streams[streams.length - 1];
+  if (!pirIsNodeStream(last) ||
+      (last.writable === false && typeof last.write !== "function")) {
+    throw pirInvalidArgType(
+      "val",
+      "an instance of Readable, Iterable, or AsyncIterable",
+      last,
+    );
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    let settled = false;
+    let abortListener = null;
+    const detachSignal = () => {
+      if (signal !== undefined && abortListener !== null) {
+        signal.removeEventListener("abort", abortListener);
+        abortListener = null;
+      }
     };
-    for (const stream of args) stream.on("error", fail);
-    finished(args[args.length - 1]).then(() => {
-      if (!done) { done = true; resolve(); }
-    }, fail);
+    const destroyAll = (error) => {
+      for (const stream of streams) {
+        if (stream !== undefined && stream !== null && !stream.destroyed &&
+            typeof stream.destroy === "function") {
+          try { stream.destroy(error); } catch (_) { /* keep the first error */ }
+        }
+      }
+    };
+    const onError = (error) => {
+      if (settled) return;
+      settled = true;
+      detachSignal();
+      destroyAll(error);
+      reject(error);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      const error = pirAbortError(signal.reason);
+      detachSignal();
+      destroyAll(error);
+      reject(error);
+    };
+    // Node removes its listeners from a readable last stage once the pipeline
+    // completes; writable-only and source streams keep theirs (eos default).
+    const lastIsReadable = last.readable !== false &&
+      (typeof last.read === "function" && last._readableState !== undefined);
+    const watchings = [];
+    let completion = null;
+    for (let i = 0; i < streams.length; i++) {
+      const stream = streams[i];
+      if (stream !== undefined && stream !== null && typeof stream.on === "function") {
+        stream.on("error", onError);
+        // Node's pipeline watches each stage through the side it is used on
+        // (internal/streams/pipeline.js `pipe()`): sources readable-only,
+        // the last stage writable-only, middles from both ends. Watching the
+        // last stage's readable side deadlocks every sink whose output is
+        // never consumed (test-stream-pipeline-listeners/-with-empty-string).
+        const options = {};
+        if (i === 0) options.writable = false;
+        if (i === streams.length - 1) options.readable = false;
+        if (stream === last && lastIsReadable) options.cleanup = true;
+        const watching = finished(stream,
+          Object.keys(options).length === 0 ? undefined : options);
+        watching.catch(onError);
+        watchings.push(watching);
+        if (stream === last) completion = watching;
+      }
+    }
+    // node's pipeline `pipe()` reports ERR_STREAM_PREMATURE_CLOSE when a
+    // destination closes before the source feeding it ended (this is what
+    // rejects a pipeline that reuses one stream, test-stream-pipeline-duplex).
+    for (let i = 0; i + 1 < streams.length; i++) {
+      const src = streams[i];
+      const dst = streams[i + 1];
+      if (typeof src.on === "function" && typeof dst.on === "function") {
+        let sourceEnded = src.readableEnded === true;
+        if (!sourceEnded) src.once("end", () => { sourceEnded = true; });
+        dst.once("close", () => {
+          if (!sourceEnded) onError(pirPrematureClose());
+        });
+      }
+    }
+    for (let i = 0; i + 1 < streams.length; i++) {
+      streams[i].pipe(streams[i + 1]);
+    }
+    if (signal !== undefined) {
+      abortListener = onAbort;
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
+    if (signal !== undefined && signal.aborted) {
+      // Error listeners are installed above, so the teardown's 'error' emits
+      // have a consumer.
+      onAbort();
+      return;
+    }
+    completion.then(() => {
+      // node completes only after every stage's eos settled (finishCount 0);
+      // waiting here also lets a destination's close-before-source-end check
+      // above reject first (errors are already routed through onError).
+      return Promise.all(watchings.map((watching) =>
+        watching.then(() => undefined, () => undefined)));
+    }).then(() => {
+      if (settled) return;
+      settled = true;
+      detachSignal();
+      if (lastIsReadable && typeof last.removeListener === "function") {
+        last.removeListener("error", onError);
+      }
+      resolve();
+    }, onError);
   });
-  if (callback) {
-    settled.then(() => callback(null), (error) => callback(error));
-  }
-  return settled;
+  return { stream: last, promise };
 }
 
 export default { finished: finished, pipeline: pipeline };
 export { finished, pipeline };
+export { pirPipelineImpl as pipelineImpl };

@@ -249,6 +249,24 @@ pub const BUILTIN_EXTENSION_FACTORIES: &[BuiltinExtensionDef] = &[
         rewire: None,
         default_enabled: true,
     },
+    // pir-only: the `python` tool (no upstream counterpart — upstream reaches
+    // Python by spawning the user's native `python3` through bash). The name is
+    // kept for Settings/tool-selection compatibility; the interpreter behind it
+    // is the embedded QuickJS runtime (`js_vm`), so model/script code is
+    // JavaScript. Persistent per-session runtime, host-side deadline
+    // interrupts. Replaceable: a user extension registering a `python` tool
+    // omits this builtin; the `pythonTool` setting (via
+    // `PythonPlugin::with_config`) or `disabledBuiltinExtensions: ["python"]`
+    // disables it. Absent in a build without the `python` feature, so
+    // `builtin:python` reports the unknown-builtin error there.
+    #[cfg(feature = "python")]
+    BuiltinExtensionDef {
+        name: "python",
+        replaceable: true,
+        factory: new_python_plugin,
+        rewire: None,
+        default_enabled: true,
+    },
     // The native `context-mode` port: "think in code" execution
     // (`ctx_execute` / `ctx_execute_file`: only stdout enters context) plus an
     // FTS5/BM25 knowledge base (`ctx_index` / `ctx_search` /
@@ -527,6 +545,29 @@ pub use super::codemode::{namespace_matches, script_reach, CODEMODE_TOOL_NAME};
 
 #[cfg(feature = "context-mode")]
 pub mod context_mode;
+
+/// The `python` builtin's execution engine: a lazily-started QuickJS session.
+///
+/// Shared with the CLI's `pir python` (`native_cli::python`). Declared here,
+/// next to the tool, because both the plugin and the CLI drive the same
+/// session contract. Model/script code is JavaScript; the tool name is the
+/// only thing left of the Python surface.
+#[cfg(feature = "python")]
+pub mod js_vm;
+
+/// Public re-export of the `python` builtin's integration surface (tests and
+/// embedders). The tool name and the plugin type only; the interpreter behind
+/// it is the shared `js_vm` session, not a Python VM.
+#[cfg(feature = "python")]
+pub mod python;
+
+#[cfg(feature = "python")]
+pub use python::{PythonPlugin, PythonSession, PYTHON_TOOL_NAME};
+
+#[cfg(feature = "python")]
+fn new_python_plugin() -> Arc<dyn AgentPlugin> {
+    python::PythonPlugin::new_plugin()
+}
 
 /// The registered `tool_search` tool name (upstream `TOOL_SEARCH_TOOL_NAME`).
 ///

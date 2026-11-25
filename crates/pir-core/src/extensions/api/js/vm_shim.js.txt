@@ -62,6 +62,36 @@ var VM_INTRINSIC_NAMES = [
 
 var VM_ID_RX = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
+// `options.filename` for the same-realm runner. QuickJS names eval frames
+// `<input>`, so the filename is published while the code runs; the Buffer
+// deprecation shim is the consumer that must tell a node_modules call site
+// from a user one (test-buffer-constructor-outside-node-modules). Kept
+// non-enumerable so the global-visibility sweep never sees it.
+if (Object.getOwnPropertyDescriptor(globalThis, "__pirVmFilename") === undefined) {
+  Object.defineProperty(globalThis, "__pirVmFilename", {
+    value: undefined, writable: true, enumerable: false, configurable: true,
+  });
+}
+
+function vmWithFilename(options, run) {
+  if (options === undefined || options === null || typeof options.filename !== "string") {
+    return run();
+  }
+  const previous = globalThis.__pirVmFilename;
+  globalThis.__pirVmFilename = options.filename;
+  try {
+    return run();
+  } finally {
+    globalThis.__pirVmFilename = previous;
+  }
+}
+
+const vmDiagnosticHost = globalThis.__pir_host;
+
+function gc() {
+  vmDiagnosticHost.runVmGc();
+}
+
 function vmSnapshotGlobals() {
   const seeded = Object.create(null);
   const host = globalThis;
@@ -70,6 +100,9 @@ function vmSnapshotGlobals() {
     if (name === "globalThis") continue; // always shadowed by the view proxy
     if (name in host) seeded[name] = host[name];
   }
+  // Only contexts created after v8.setFlagsFromString('--expose-gc') see
+  // this intrinsic. An explicit sandbox property still takes precedence.
+  if (vmDiagnosticHost?.vmGcEnabled) seeded.gc = gc;
   return Object.freeze(seeded);
 }
 
@@ -202,18 +235,20 @@ function vmResolveContext(contextified) {
 }
 
 function runInContext(code, contextified, options) {
-  return vmRunnerFor(vmResolveContext(contextified))(code);
+  const run = vmRunnerFor(vmResolveContext(contextified));
+  return vmWithFilename(options, () => run(code));
 }
 
 function runInNewContext(code, sandbox, options) {
   const contextified = createContext(sandbox);
-  return vmRunnerFor(contextified)(code);
+  const run = vmRunnerFor(contextified);
+  return vmWithFilename(options, () => run(code));
 }
 
 function runInThisContext(code, options) {
   // Real Node semantics: run as a Program in the *current* global. Indirect
   // eval is the closest same-realm equivalent (completion value included).
-  return (0, eval)(code);
+  return vmWithFilename(options, () => (0, eval)(code));
 }
 
 // ---------------------------------------------------------------------------

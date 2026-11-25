@@ -1002,8 +1002,9 @@ pub fn has_module_syntax(source: &str) -> bool {
                         }
                     } else if last_word == "export" && !member_access {
                         match next {
-                            // Object key (`{ export: fn }`) is not ESM syntax.
-                            Some(':') => {}
+                            // Object keys and method names (`export: x`,
+                            // `export(...) {}`) are valid CommonJS, not ESM.
+                            Some(':') | Some('(') | Some('=') => {}
                             _ => return true,
                         }
                     }

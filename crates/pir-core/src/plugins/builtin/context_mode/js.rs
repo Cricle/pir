@@ -504,10 +504,20 @@ async fn run_job(
         .await
         .map_err(|error| format!("context-mode: JS sandbox reset failed: {error}"))?;
 
-    // A fresh module name per call: the module cache is append-only, and the
-    // name lives in the session directory so relative imports resolve there.
-    let module_path = job.cwd.join(name);
-    let module_name = crate::extensions::loader::module_name_for(&module_path);
+    // A fresh module id per call: QuickJS's module cache is append-only, so
+    // reusing one id would run the previous script.
+    //
+    // The id stays RELATIVE on purpose. An absolute id names a disk path, and
+    // the loader requires a real file behind such an id
+    // (`seeded_disk_sources_pass_the_same_check_at_load_time`); a per-call
+    // script exists only in memory, so an absolute spelling would be rejected
+    // before the seed was consulted. Sandbox scripts reach the filesystem
+    // through `fs`, not through relative ESM imports, so they lose nothing by
+    // having no importer directory.
+    let module_name = format!(
+        "{}context-mode/{name}",
+        crate::extensions::loader::EXT_MODULE_PREFIX
+    );
     js.seed_module_js(&module_name, &source)?;
 
     let deadline = js.arm_deadline_for(timeout);

@@ -101,7 +101,7 @@ and never logged.
 
 | Variable | Meaning |
 |---|---|
-| `PIR_PREFER_NATIVE=1` | Drop the JS package from the load plan when a full native port exists (`subagent`, `mcp`, `codemode`, `tool-search`, `todo`, `context-mode`). Off by default, keeping upstream first-wins (an installed/selected JS package still wins). The `tool-repair` and `phone` single-face rules always apply |
+| `PIR_PREFER_NATIVE=0` | Opt OUT of native-first: keep an installed/selected JS package over its full native port (`subagent`, `mcp`, `codemode`, `tool-search`, `todo`, `context-mode`). On by default, because the point of a native port is that the unmodified plugin gets native throughput. The `tool-repair` and `phone` single-face rules apply regardless |
 | `PIR_SYSTEM_PROMPT_FILE` | Read the system prompt from this file instead of the discovered `SYSTEM.md`. A failed read aborts a print run (see [`system-prompt-audit.md`](system-prompt-audit.md) B17) |
 | `PIR_TOOL_MAX_SOURCE_BYTES` | Ceiling for a tool read that must materialize a whole file (`edit`, image decode, grep context); default 64 MiB. Malformed or `0` falls back to the default instead of disabling the guard |
 

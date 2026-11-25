@@ -646,6 +646,31 @@
     }
   }
 
+  // The WHATWG Response exposes its state through prototype accessors, so
+  // packages feature-detect them (`Object.getOwnPropertyDescriptor(Response
+  // .prototype, "status")`, `"bodyUsed" in Response.prototype`). Back each
+  // accessor with a private slot: a getter that reads `this[key]` would recurse
+  // into itself, and the constructor's `this.status = ...` assignments would
+  // never terminate.
+  for (const key of ["status", "statusText", "headers", "ok", "body", "bodyUsed", "url"]) {
+    if (Object.getOwnPropertyDescriptor(Response.prototype, key) === undefined) {
+      const slot = "__pirResponse_" + key;
+      Object.defineProperty(Response.prototype, key, {
+        get() { return this[slot]; },
+        set(value) {
+          Object.defineProperty(this, slot, {
+            value,
+            writable: true,
+            configurable: true,
+            enumerable: false,
+          });
+        },
+        enumerable: false,
+        configurable: true,
+      });
+    }
+  }
+
   globalThis.Headers ?? (globalThis.Headers = Headers);
   globalThis.Request ?? (globalThis.Request = Request);
   globalThis.Response ?? (globalThis.Response = Response);

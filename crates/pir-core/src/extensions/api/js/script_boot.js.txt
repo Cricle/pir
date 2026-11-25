@@ -28,6 +28,16 @@
   proc.argv0 = proc.argv.length > 0 ? proc.argv[0] : "pir";
   proc.execPath = __PIR_SCRIPT_EXEC_PATH__;
 
+  // --- execArgv -----------------------------------------------------------
+  // The Node options this process was started with. `pir <flags> <script>`
+  // ignores the ones this runtime cannot honor, but they must still be
+  // reported: Node's own `test/common` re-execs `process.execPath` once per
+  // flag and stops only when `process.execArgv` already contains it, so an
+  // empty execArgv makes such a script re-spawn itself forever. Same in-place
+  // splice as argv (node:process exports the array object).
+  proc.execArgv.length = 0;
+  for (const flag of __PIR_SCRIPT_EXEC_ARGV__) proc.execArgv.push(flag);
+
   // --- real process stdio for the console --------------------------------
   // node:console resolves its default streams per write; this flag tells it a
   // script host is draining process.stdout/stderr (see script_boot's header
@@ -46,6 +56,14 @@
     if (typeof exitCode !== "number" || Number.isNaN(exitCode)) exitCode = 0;
     exitCode = Math.trunc(exitCode);
     proc.exitCode = exitCode;
+    // Node sets `_exiting` before running exit listeners: a `process.exit`
+    // from inside one terminates without re-emitting `exit` (common's
+    // mustCall check does exactly that on failure).
+    if (proc._exiting === true) {
+      __pir_host.exitProcess(exitCode);
+      return;
+    }
+    proc._exiting = true;
     try { proc.emit("exit", exitCode); } catch { /* listener errors die with us */ }
     __pir_host.exitProcess(exitCode);
   };
@@ -58,6 +76,32 @@
       await import(moduleName);
       return JSON.stringify({ ok: true });
     } catch (error) {
+      // Node routes an uncaught module-evaluation exception through
+      // `process.on('uncaughtException')` when a listener is installed; only
+      // an unhandled one becomes the process failure.
+      if (proc.listenerCount("uncaughtException") > 0) {
+        try {
+          // QuickJS module evaluation wraps a thrown value with a synthetic
+          // `<file>: ` message and a stack whose header repeats it. Node hands
+          // the handler the original error: strip the location-only message
+          // and rebuild the V8-shaped header (test-events-uncaught-exception-stack
+          // asserts the exact first line and 4-space frames).
+          if (error && typeof error === "object") {
+            const message = typeof error.message === "string" ? error.message : "";
+            const locationOnly = /(^|[\\/])[^\\/]+\.(?:[cm]?[jt]s)\s*:\s*$/.test(message);
+            const frames = String(error.stack || "")
+              .split("\n")
+              .filter((line) => /^\s+at /.test(line));
+            const head = (error.name || "Error") + (locationOnly || !message ? "" : ": " + message);
+            error.message = locationOnly ? "" : message;
+            error.stack = frames.length > 0 ? head + "\n" + frames.join("\n") : head;
+          }
+          proc.emit("uncaughtException", error);
+          return JSON.stringify({ ok: true });
+        } catch (handlerError) {
+          error = handlerError;
+        }
+      }
       const message = error && error.message !== undefined ? String(error.message) : String(error);
       // QuickJS module stacks do not always carry the `Error: message`
       // header; the runner prints one block on stderr, so stitch the

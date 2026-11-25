@@ -16,12 +16,14 @@
 // Symbol.hasInstance fixup for the global console.
 //
 // Documented deviations (engine/host limits, minimal tier):
-//   * `table` lays rows out as `key  value` text lines instead of
-//     internal/cli_table's column grid (no cli_table module here).
+//   * `table` renders node's internal/cli_table grid (the unicode box is
+//     reproduced below); widths use the same code-unit measure as inspect's
+//     `getStringWidth` rather than V8's full-width table. Map/Set iterator
+//     previews are materialized with their public iterator (node reads the
+//     internal entries preview without consuming the iterator).
 //   * `profile`/`profileEnd`/`timeStamp` are no-ops (no inspector host);
 //     `createTask` throws the unified not-supported error; `context()`
 //     returns the console itself (no per-async-context output routing).
-//   * `clear()` never emits ANSI cursor codes (no readline cursor host).
 //   * `countReset`'s "does not exist" path goes through process.emitWarning
 //     (real) instead of internal trace events (no trace host); the TypeError
 //     for a Symbol label is preserved (the template literal still coerces).
@@ -42,7 +44,7 @@
 //     path, which the TUI drains.
 // A Console built with an explicit stream always writes to exactly that
 // stream, as in node.
-import { formatWithOptions, inspect } from "@node/util";
+import { formatWithOptions, inspect, stripVTControlCharacters, types } from "@node/util";
 
 // ---------------------------------------------------------------------------
 // Error factories — node internal/errors.js message templates, restricted to
@@ -122,6 +124,17 @@ function errInvalidArgType(name, expected, actual) {
     "ERR_INVALID_ARG_TYPE",
     'The "' + name + '" ' + kind + " must be of type " + expectedText +
       ". Received " + determineSpecificType(actual),
+  );
+}
+
+/// node's `validateArray`: ERR_INVALID_ARG_TYPE words a constructor check as
+/// "must be an instance of Array" (not "of type Array").
+function errInvalidArgArray(name, actual) {
+  return codedError(
+    TypeError,
+    "ERR_INVALID_ARG_TYPE",
+    'The "' + name + '" argument must be an instance of Array. Received ' +
+      determineSpecificType(actual),
   );
 }
 
@@ -309,7 +322,8 @@ function Console(options /* or: stdout, stderr, ignoreErrors = true */) {
     for (const entry of inspectOptionsMap.values()) {
       if (entry.colors !== undefined && options.colorMode !== undefined) {
         const error = new TypeError(
-          'The "options.colorMode" and "options.inspectOptions.color" options are mutually exclusive.',
+          'Option "options.inspectOptions.color" cannot be used in combination ' +
+          'with option "colorMode"',
         );
         error.code = "ERR_INCOMPATIBLE_OPTION_PAIR";
         throw error;
@@ -577,6 +591,119 @@ function timeLogImpl(consoleRef, label, formatted, args) {
   }
 }
 
+// --- internal/cli_table.js -------------------------------------------------
+
+const pirTableChars = {
+  middleMiddle: "─",
+  rowMiddle: "┼",
+  topRight: "┐",
+  topLeft: "┌",
+  leftMiddle: "├",
+  topMiddle: "┬",
+  bottomRight: "┘",
+  bottomLeft: "└",
+  bottomMiddle: "┴",
+  rightMiddle: "┤",
+  left: "│ ",
+  right: " │",
+  middle: " │ ",
+};
+
+// Unicode East Asian Wide/Fullwidth ranges (the code-point ranges V8's
+// getStringWidth renders as two cells). Ambiguous-width characters (¥ U+00A5)
+// stay narrow, matching node's default `ambiguousIsNarrow`.
+function pirIsFullWidth(code) {
+  return (code >= 0x1100 && code <= 0x115f) ||
+    code === 0x2329 || code === 0x232a ||
+    (code >= 0x2e80 && code <= 0x303e) ||
+    (code >= 0x3041 && code <= 0x33ff) ||
+    (code >= 0x3400 && code <= 0x4dbf) ||
+    (code >= 0x4e00 && code <= 0x9fff) ||
+    (code >= 0xa000 && code <= 0xa4cf) ||
+    (code >= 0xa960 && code <= 0xa97f) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f300 && code <= 0x1f64f) ||
+    (code >= 0x1f900 && code <= 0x1f9ff) ||
+    (code >= 0x20000 && code <= 0x3fffd);
+}
+
+/// node internal/util/inspect getStringWidth: ANSI-stripped display width.
+function pirTableWidth(value) {
+  const text = stripVTControlCharacters(String(value));
+  let width = 0;
+  for (const ch of text) width += pirIsFullWidth(ch.codePointAt(0)) ? 2 : 1;
+  return width;
+}
+
+function pirTableRenderRow(row, columnWidths) {
+  let out = pirTableChars.left;
+  for (let i = 0; i < row.length; i++) {
+    const cell = row[i];
+    const len = pirTableWidth(cell);
+    const needed = columnWidths[i] - len;
+    // round(needed) + ceil(needed) adds up to the spaces needed while
+    // left-justifying the output.
+    out += cell + " ".repeat(Math.ceil(needed));
+    if (i !== row.length - 1) out += pirTableChars.middle;
+  }
+  out += pirTableChars.right;
+  return out;
+}
+
+// Port of internal/cli_table.js: `head` is the header row, `columns` the
+// per-column arrays (a column may be shorter than the table).
+function pirTable(head, columns) {
+  const rows = [];
+  const columnWidths = head.map((h) => pirTableWidth(h));
+  const longestColumn = Math.max(...columns.map((a) => a.length));
+
+  for (let i = 0; i < head.length; i++) {
+    const column = columns[i];
+    for (let j = 0; j < longestColumn; j++) {
+      if (rows[j] === undefined) rows[j] = [];
+      const value = rows[j][i] =
+        Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "";
+      const width = columnWidths[i] || 0;
+      const counted = pirTableWidth(value);
+      columnWidths[i] = Math.max(width, counted);
+    }
+  }
+
+  const divider = columnWidths.map((i) =>
+    pirTableChars.middleMiddle.repeat(i + 2));
+  let result = pirTableChars.topLeft +
+    divider.join(pirTableChars.topMiddle) +
+    pirTableChars.topRight + "\n" +
+    pirTableRenderRow(head, columnWidths) + "\n" +
+    pirTableChars.leftMiddle +
+    divider.join(pirTableChars.rowMiddle) +
+    pirTableChars.rightMiddle + "\n";
+  for (let i = 0; i < rows.length; i++) {
+    result += pirTableRenderRow(rows[i], columnWidths) + "\n";
+  }
+  return result +
+    pirTableChars.bottomLeft +
+    divider.join(pirTableChars.bottomMiddle) +
+    pirTableChars.bottomRight;
+}
+
+const kTableKey = "Key";
+const kTableValuesKey = "Values";
+const kTableIndexKey = "(index)";
+const kTableIterKey = "(iteration index)";
+
+// node's `isArray` inside table: arrays, typed arrays and Buffers take the
+// short depth window.
+function isTableArray(value) {
+  return Array.isArray(value) || types.isTypedArray(value) ||
+    (typeof Buffer === "function" && Buffer.isBuffer(value));
+}
+
 // --- the console methods (node's consoleMethods object) --------------------
 
 const consoleMethods = {
@@ -668,8 +795,11 @@ const consoleMethods = {
 
   // https://console.spec.whatwg.org/#clear
   clear() {
-    // Only meaningful for a TTY; the ANSI cursor pair needs a readline host,
-    // which this runtime does not carry.
+    // Only meaningful for a TTY. node delegates to internal/readline callbacks
+    // (cursorTo(0,0) + clearScreenDown), whose byte sequence is fixed.
+    if (this._stdout.isTTY && process.env.TERM !== "dumb") {
+      this._stdout.write("\u001b[1;1H\u001b[0J");
+    }
   },
 
   // https://console.spec.whatwg.org/#count
@@ -716,45 +846,134 @@ const consoleMethods = {
     );
   },
 
-  // https://console.spec.whatwg.org/#table (minimal: rows as `key  value`)
+  // https://console.spec.whatwg.org/#table
+  // Port of node's Console.prototype.table (lib/internal/console/constructor.js
+  // v24): the columns are built here and handed to `pirTable`, which is
+  // internal/cli_table.js.
   table(tabularData, properties) {
-    if (properties !== undefined) {
-      if (!Array.isArray(properties)) {
-        throw errInvalidArgType("properties", "Array", properties);
-      }
+    if (properties !== undefined && !Array.isArray(properties)) {
+      throw errInvalidArgArray("properties", properties);
     }
 
     if (tabularData === null || typeof tabularData !== "object") {
-      this.log(tabularData);
-      return;
+      return this.log(tabularData);
     }
 
-    const entries = [];
-    if (tabularData instanceof Map) {
-      for (const [key, value] of tabularData) entries.push([key, value]);
-    } else if (Array.isArray(tabularData)) {
-      for (let i = 0; i < tabularData.length; i++) entries.push([i, tabularData[i]]);
-    } else {
-      for (const key of Object.keys(tabularData)) entries.push([key, tabularData[key]]);
-    }
+    const final = (head, columns) => this.log(pirTable(head, columns));
 
-    for (const [rowKey, value] of entries) {
-      const depth = value !== null && typeof value === "object" &&
-        !Array.isArray(value) && Object.keys(value).length > 2 ? -1 : 0;
+    const inspectValue = (value) => {
+      const depth = value !== null &&
+          typeof value === "object" &&
+          !isTableArray(value) &&
+          Object.keys(value).length > 2 ? -1 : 0;
       const options = {
         depth,
         maxArrayLength: 3,
         breakLength: Infinity,
         ...this[kGetInspectOptions](this._stdout),
       };
-      if (properties !== undefined && value !== null && typeof value === "object") {
-        for (const column of properties) {
-          this.log(String(column) + "  " + inspect(value[column], options));
-        }
-        continue;
-      }
-      this.log(String(rowKey) + "  " + inspect(value, options));
+      return inspect(value, options);
+    };
+    const indexArray = (length) => Array.from({ length }, (_, i) => inspectValue(i));
+
+    const mapIter = types.isMapIterator(tabularData);
+    let i = 0;
+    let mapIterPairs = false;
+    if (mapIter) {
+      // node reads the iterator's internal entry preview without consuming it;
+      // the public iterator is the only view available here. `keys()` and
+      // `values()` yield bare values while `entries()` yields [key, value]
+      // pairs; probe the yielded shape (an empty iterator is treated as
+      // entries, matching node's preview flag for the common case).
+      tabularData = Array.from(tabularData);
+      mapIterPairs = tabularData.length === 0 ||
+        tabularData.every((entry) => Array.isArray(entry) && entry.length === 2);
     }
+
+    if (mapIter || types.isMap(tabularData)) {
+      const keys = [];
+      const values = [];
+      let length = 0;
+      if (mapIter && mapIterPairs) {
+        for (; i < tabularData.length; ++i) {
+          // Materialized Map entries are [key, value] pairs.
+          const pair = tabularData[i];
+          keys.push(inspectValue(pair[0]));
+          values.push(inspectValue(pair[1]));
+          length++;
+        }
+        return final(
+          [kTableIterKey, kTableKey, kTableValuesKey],
+          [indexArray(length), keys, values],
+        );
+      }
+      if (mapIter) {
+        for (; i < tabularData.length; ++i) {
+          values.push(inspectValue(tabularData[i]));
+          length++;
+        }
+        return final([kTableIterKey, kTableValuesKey], [indexArray(length), values]);
+      }
+      for (const [key, value] of tabularData) {
+        keys.push(inspectValue(key));
+        values.push(inspectValue(value));
+        length++;
+      }
+      return final(
+        [kTableIterKey, kTableKey, kTableValuesKey],
+        [indexArray(length), keys, values],
+      );
+    }
+
+    const setIter = types.isSetIterator(tabularData);
+    if (setIter) tabularData = Array.from(tabularData);
+
+    if (setIter || types.isSet(tabularData)) {
+      const values = [];
+      let length = 0;
+      for (const value of tabularData) {
+        values.push(inspectValue(value));
+        length++;
+      }
+      return final([kTableIterKey, kTableValuesKey], [indexArray(length), values]);
+    }
+
+    const map = { __proto__: null };
+    let hasPrimitives = false;
+    const valuesKeyArray = [];
+    const indexKeyArray = Object.keys(tabularData);
+
+    for (; i < indexKeyArray.length; i++) {
+      const item = tabularData[indexKeyArray[i]];
+      const primitive = item === null ||
+        (typeof item !== "function" && typeof item !== "object");
+      if (properties === undefined && primitive) {
+        hasPrimitives = true;
+        valuesKeyArray[i] = inspectValue(item);
+      } else {
+        const keys = properties || Object.keys(item);
+        for (const key of keys) {
+          if (map[key] === undefined) map[key] = [];
+          if ((primitive && properties) ||
+              !Object.prototype.hasOwnProperty.call(item, key)) {
+            map[key][i] = "";
+          } else {
+            map[key][i] = inspectValue(item[key]);
+          }
+        }
+      }
+    }
+
+    const keys = Object.keys(map);
+    const values = Object.values(map);
+    if (hasPrimitives) {
+      keys.push(kTableValuesKey);
+      values.push(valuesKeyArray);
+    }
+    keys.unshift(kTableIndexKey);
+    values.unshift(indexKeyArray);
+
+    return final(keys, values);
   },
 };
 

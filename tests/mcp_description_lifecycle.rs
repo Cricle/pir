@@ -39,8 +39,12 @@ fn repeated_reloads_with_changed_descriptions_do_not_grow_live_text() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let manager = McpManager::without_log(Path::new("."));
+    // The live-text counters are process-global. `STATS_LOCK` serializes the
+    // tests that assert on them, but other MCP suites in the same merged
+    // harness may still hold bridges registered before this one runs, so the
+    // baseline is a snapshot to measure DELTAS from — never an expectation of
+    // zero live bridges.
     let baseline = McpToolBridge::live_text_stats();
-    assert_eq!(baseline, (0, 0), "test starts with no live bridges");
 
     let mut observed_bytes = Vec::new();
     for generation in 0..64 {
@@ -49,9 +53,18 @@ fn repeated_reloads_with_changed_descriptions_do_not_grow_live_text() {
         let description = format!("generation {generation:03} {}", "x".repeat(8 * 1024));
         let bridge = bridge(Arc::clone(&manager), description.clone());
         let (entries, bytes) = McpToolBridge::live_text_stats();
-        assert_eq!(entries, 1, "one live bridge after rebuild {generation}");
-        assert_eq!(bytes, bridge.name().len() + bridge.description().len());
-        observed_bytes.push(bytes);
+        assert_eq!(
+            (entries, bytes),
+            (
+                baseline.0 + 1,
+                baseline.1 + bridge.name().len() + bridge.description().len()
+            ),
+            "exactly one live bridge after rebuild {generation}"
+        );
+        // The DELTA is what this test measures: the 64 generations keep the
+        // same live-text size, so the old pool's per-reload growth cannot hide
+        // behind whatever bridges another suite already registered.
+        observed_bytes.push(bytes - baseline.1);
 
         // Dropping the old generation (what registry replacement does) must
         // release all of its text before the next generation is built.

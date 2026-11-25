@@ -9,18 +9,20 @@
 //! - fetch redirect policy (`file://` redirects rejected, local redirects
 //!   followed, hop cap),
 //! - database path selection from the pushed session cwd,
-//! - write-time stdout/stderr capping.
+//! - the Python-lock starvation valve policy.
 //!
 //! Hermetic: temp DBs via `with_db_path`/`with_db_base_dir`; the fetch tests
 //! serve their own pages from loopback listeners.
 
-use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
 
 use pir::agent::tool_batch::ToolResult;
 use pir::agent::tool_execution::{AgentTool, ToolContext};
@@ -36,6 +38,15 @@ use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext
 // ---------------------------------------------------------------------------
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+/// The embedded RustPython VM serializes user code behind a process-wide
+/// execution lock (`src/plugins/builtin/js_vm.rs`), and cargo runs this
+/// binary's tests concurrently. A call that has to queue behind another test's
+/// long script burns its own deadline there (default 30s for `ctx_execute`),
+/// which is what made the write-cap tests flaky under load. Hold this gate for
+/// one whole tool call so every call's budget starts only once the shared
+/// interpreter is free.
+static PYTHON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Self-cleaning temp directory.
 struct TestDir(PathBuf);
@@ -92,6 +103,11 @@ impl Harness {
     }
 
     async fn run(&self, name: &str, args: Value) -> ToolResult {
+        // Only the exec tools reach the shared interpreter, but every test
+        // here is cheap except the two write-cap scripts; serializing one
+        // tool call at a time is the smallest gate that keeps the shared
+        // lock out of the per-call deadline.
+        let _serial = PYTHON_TEST_LOCK.lock().await;
         let tool = self
             .tools
             .get(name)
@@ -649,13 +665,13 @@ fn database_path_prefers_the_pushed_session_cwd() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn execute_print_loop_is_capped_at_write_time() {
+async fn execute_stdout_loop_is_capped_at_write_time() {
     let harness = Harness::new("cap-loop");
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "for (let i = 0; i < 500000; i += 1) console.log('x'.repeat(100));",
+                "code": "for (var i = 0; i < 500000; i++) { console.log(\"x\".repeat(100)); }",
                 "timeout": 120
             }),
         )
@@ -695,7 +711,7 @@ async fn execute_single_huge_write_is_capped() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "console.log('y'.repeat(1_500_000))" }),
+            json!({ "code": "console.log('y'.repeat(1500000))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -716,13 +732,15 @@ async fn execute_stderr_is_capped_at_write_time() {
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "process.stderr.write('z'.repeat(1_500_000)); throw new Error('boom');"
+                "code": "console.error('z'.repeat(1500000))\nthrow new Error('boom')"
             }),
         )
         .await;
     assert!(result.is_error, "the thrown error is still reported");
     // The captured stream is capped at `MAX_OUTPUT_CHARS`; the extra budget
-    // covers the truncation marker appended after the cut, not extra output.
+    // covers the truncation marker appended after the cut plus the thrown
+    // error's stack (the error path appends it to the captured stderr), not
+    // extra output.
     assert!(
         result.content.len() <= MAX_OUTPUT_CHARS + 512,
         "stderr is capped at write time, got {} chars",

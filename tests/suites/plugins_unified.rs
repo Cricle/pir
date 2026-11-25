@@ -1337,12 +1337,13 @@ fn builtin_paths_partition_filter_and_order() {
     // file paths (upstream `package-manager.ts:986-1001` adds the builtin loop
     // after every file resource, so a file extension wins first-wins
     // conflicts). `builtin:subagent` in the list above is the real builtin;
-    // the factory order is subagent, mode, mcp, codemode,
+    // the factory order is subagent, mode, mcp, codemode, python,
     // context-mode, tool-search, tool-repair, todo — mode is the foreman
-    // companion, context-mode is the Code Mode port, `todo` is the npm
-    // `@juicesharp/rpiv-todo` port appended last, and `phone` stays
-    // default-disabled (not inserted), see `src/plugins/builtin.rs` and
-    // `docs/todo-builtin.md`.
+    // companion, python keeps its Settings/tool-selection name over the
+    // embedded QuickJS engine, context-mode is the Code Mode port, `todo` is
+    // the npm `@juicesharp/rpiv-todo` port appended last, and `phone` stays
+    // default-disabled (not inserted), see `crates/pir-core/src/plugins/
+    // builtin.rs` and `docs/todo-builtin.md`.
 
     let ordered = order_extension_paths(
         &[PathBuf::from("cli.ts")],
@@ -1358,6 +1359,7 @@ fn builtin_paths_partition_filter_and_order() {
             PathBuf::from("builtin:mode"),
             PathBuf::from("builtin:mcp"),
             PathBuf::from("builtin:codemode"),
+            PathBuf::from("builtin:python"),
             PathBuf::from("builtin:context-mode"),
             PathBuf::from("builtin:tool-search"),
             PathBuf::from("builtin:tool-repair"),

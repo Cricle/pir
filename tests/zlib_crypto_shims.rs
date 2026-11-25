@@ -26,6 +26,7 @@
 //! hygiene gate forbids tracked `.ts` files).
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use pir::extensions::{ExtensionConfig, ExtensionRuntime};
 use serde_json::{json, Value};
@@ -298,19 +299,76 @@ export default (pi: any) => {
 const CRYPTO_CONTRACT_TS: &str = r#"
 import crypto from "@node/crypto";
 import assert from "node:assert";
+import { EventEmitter } from "@node/events";
 
 export default (pi: any) => {
   pi.on("session_start", async () => {
     const out: any = {};
 
-    // --- digests the host backend does not serve -------------------------
+    // --- the wider digest set ---------------------------------------------
     out.sha224 = crypto.createHash("sha224").update("abc").digest("hex");
     out.sha384 = crypto.createHash("sha384").update("abc").digest("hex");
     out.sha3_256 = crypto.createHash("sha3-256").update("abc").digest("hex");
     out.sha3_384 = crypto.createHash("sha3-384").update("aoeu").digest("hex");
     out.sha3_512 = crypto.createHash("sha3-512").update("aoeu").digest("hex");
-    // getHashes stays the host backend's four (tests/node_shims.rs pins that
-    // list); the JS digests above are computed but not advertised yet.
+    // Encoded digests are rendered host-side for hex/base64/base64url; the
+    // "buffer" spelling still returns the raw bytes.
+    out.digestBase64 = crypto.createHash("sha256").update("abc").digest("base64");
+    out.digestBase64url = crypto.createHash("sha256").update("abc").digest("base64url");
+    out.digestBufferIsBuffer = Buffer.isBuffer(crypto.createHash("sha256").update("abc").digest("buffer"));
+    // Multi-chunk update() streams through the Rust state (no concatenation)
+    // and must equal the one-shot digest.
+    out.multiChunk = crypto.createHash("sha256").update("a").update("b").update("c").digest("hex");
+    out.multiChunkMatchesOneShot = crypto.createHash("sha256").update("abc").digest("hex") === out.multiChunk;
+    // copy() clones a live streaming state, not just buffered chunks.
+    const copySource = crypto.createHash("sha256").update("a").update("b");
+    const copyClone = copySource.copy();
+    copySource.update("c");
+    out.copySourceDigest = copySource.digest("hex");
+    out.copyCloneDigest = copyClone.update("c").digest("hex");
+    const freshHash = crypto.createHash("sha256");
+    const freshClone = freshHash.copy();
+    freshHash.update("abc");
+    freshClone.update("abc");
+    out.copyFreshMatches = freshClone.digest("hex") === freshHash.digest("hex");
+    // The lazy-EventEmitter prototype link still satisfies the stream class
+    // relationship Node exposes.
+    const streamIdentity = crypto.createHash("sha256");
+    out.hashIsEventEmitter = streamIdentity instanceof EventEmitter;
+    out.hashHasOn = typeof streamIdentity.on === "function";
+    out.hmacMultiChunk = crypto.createHmac("sha256", "key").update("da").update("ta").digest("base64");
+    // update() snapshots its input: mutating the caller's buffer afterwards
+    // must not change the digest (Node ingests the bytes immediately).
+    const mutation = Buffer.from("abc");
+    const mutationHash = crypto.createHash("sha256").update(mutation);
+    mutation.fill(0x78);
+    out.updateSnapshot = mutationHash.digest("hex");
+    // Small-chunk -> large-chunk and large-chunk -> small-chunk transitions
+    // (the large one enters the streaming state) must both match a single
+    // concatenated digest.
+    const partSmall = Buffer.alloc(4096, 0x61);
+    const partLarge = Buffer.alloc(70 * 1024, 0x62);
+    const mixedForward = crypto.createHash("sha256").update(partSmall).update(partLarge).digest("hex");
+    const mixedForwardRef = crypto.createHash("sha256").update(Buffer.concat([partSmall, partLarge])).digest("hex");
+    const mixedReverse = crypto.createHash("sha256").update(partLarge).update(partSmall).digest("hex");
+    const mixedReverseRef = crypto.createHash("sha256").update(Buffer.concat([partLarge, partSmall])).digest("hex");
+    out.mixedChunkOrder =
+      mixedForward === mixedForwardRef && mixedReverse === mixedReverseRef;
+    out.uuidShape = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID());
+    const randomErrors: any = {};
+    try {
+      crypto.randomBytes(-1);
+    } catch (e: any) {
+      randomErrors.negative = { name: e.name, code: e.code, message: e.message };
+    }
+    try {
+      (crypto.randomBytes as any)("x");
+    } catch (e: any) {
+      randomErrors.string = { name: e.name, code: e.code, message: e.message };
+    }
+    out.randomByteErrors = randomErrors;
+    // getHashes advertises every host-backed digest (pinned here and in
+    // tests/node_shims.rs).
     out.getHashes = crypto.getHashes().join(",");
     let unknownDigest: any;
     try {
@@ -671,6 +729,146 @@ async fn zlib_tables_options_and_info_contract() {
     );
 }
 
+/// Same-profile microbenchmark for the crypto hot paths. Ignored by default,
+/// and a no-op unless `PIR_CRYPTO_BENCH=1`, so the normal (even
+/// `--include-ignored`) suite runs do not pay for timing loops. Prints one
+/// `BENCH <name> <ns/op>` line per operation.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "timing probe: set PIR_CRYPTO_BENCH=1 to run"]
+async fn crypto_hot_path_bench() {
+    if std::env::var("PIR_CRYPTO_BENCH").ok().as_deref() != Some("1") {
+        println!("[skip] set PIR_CRYPTO_BENCH=1 to run the crypto timing probe");
+        return;
+    }
+    let dir = write_temp_fixture("crypto-bench", &[]);
+    let rt = new_runtime_at(&dir).await;
+
+    async fn measure(rt: &ExtensionRuntime, name: &str, body: &str, iters: u32) {
+        let script = format!(
+            "(() => {{ const dir = globalThis.process.cwd(); \
+               const crypto = globalThis.__pirRequireFrom(dir, \"crypto\"); \
+               const small = Buffer.alloc(4096, 0x61); \
+               const big = Buffer.alloc(1024 * 1024, 0x62); \
+               let sink = 0; const n = {iters}; \
+               for (let i = 0; i < n; i++) {{ {body} }} \
+               return JSON.stringify(sink); }})()"
+        );
+        // Warm up the IC/parse paths before timing the loop.
+        let _ = rt.eval_json(&script).await;
+        let started = Instant::now();
+        let value = rt.eval_json(&script).await.expect("bench script");
+        let elapsed = started.elapsed().as_secs_f64();
+        println!("BENCH {name} {:.1}", elapsed * 1e9 / f64::from(iters));
+        std::hint::black_box(value);
+    }
+
+    measure(
+        &rt,
+        "sha256-4k-hex",
+        "sink += crypto.createHash(\"sha256\").update(small).digest(\"hex\").length;",
+        20_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "sha256-4k-raw",
+        "sink += crypto.createHash(\"sha256\").update(small).digest().length;",
+        20_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "hmac-4k-b64",
+        "sink += crypto.createHmac(\"sha256\", \"key\").update(small).digest(\"base64\").length;",
+        20_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "hmac-4k-raw",
+        "sink += crypto.createHmac(\"sha256\", \"key\").update(small).digest().length;",
+        20_000,
+    )
+    .await;
+    measure(&rt, "uuid", "sink += crypto.randomUUID().length;", 50_000).await;
+    measure(
+        &rt,
+        "random-32",
+        "sink += crypto.randomBytes(32).length;",
+        50_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "sha256-1m",
+        "sink += crypto.createHash(\"sha256\").update(big).digest().length;",
+        200,
+    )
+    .await;
+    // Component probes (same-profile attribution for the fixed cost).
+    measure(
+        &rt,
+        "probe-buffer-from-4k",
+        "sink += Buffer.from(small).length;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-concat-4k",
+        "sink += Buffer.concat([small]).length;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-hex32",
+        "sink += Buffer.alloc(32).toString(\"hex\").length;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-hash-ctor",
+        "sink += crypto.createHash(\"sha256\") === null ? 1 : 0;",
+        40_000,
+    )
+    .await;
+    measure(&rt, "probe-hash-ctor-update", "const h = crypto.createHash(\"sha256\"); h.update(small); sink += h._handle === null ? 1 : 0;", 40_000).await;
+    measure(
+        &rt,
+        "probe-native-digest",
+        "sink += globalThis.__pirCryptoDigest(\"sha256\", small).byteLength;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-native-random",
+        "sink += globalThis.__pirCryptoRandom(32).byteLength;",
+        40_000,
+    )
+    .await;
+    measure(&rt, "probe-native-new", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); sink += h; globalThis.__pirCryptoHashRelease(h);", 40_000).await;
+    measure(
+        &rt,
+        "probe-copy-4k",
+        "sink += new Uint8Array(small).byteLength;",
+        40_000,
+    )
+    .await;
+    measure(
+        &rt,
+        "probe-slice-4k",
+        "sink += small.slice().byteLength;",
+        40_000,
+    )
+    .await;
+    measure(&rt, "probe-native-new-update", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); globalThis.__pirCryptoHashUpdate(h, small); globalThis.__pirCryptoHashRelease(h); sink += h;", 40_000).await;
+    measure(&rt, "probe-native-final-raw", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); globalThis.__pirCryptoHashUpdate(h, small); sink += globalThis.__pirCryptoHashFinal(h).byteLength;", 40_000).await;
+    measure(&rt, "probe-native-final-hex", "const h = globalThis.__pirCryptoHashNew(\"sha256\"); globalThis.__pirCryptoHashUpdate(h, small); sink += globalThis.__pirCryptoHashFinal(h, \"hex\").length;", 40_000).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn crypto_digests_hmac_streams_and_subtle_contract() {
     let (_rt, v) = run_fixture("crypto-contract", CRYPTO_CONTRACT_TS, "__cryptoContract").await;
@@ -699,13 +897,68 @@ async fn crypto_digests_hmac_streams_and_subtle_contract() {
         "36a38a2a35e698974d4e5791a3f05b05198235381e864f91a0e8cd6a26b677ecdcde8e2b069bd7355fabd68abd6fc80119659f25e92f8efc961ee3a7c815c758",
         "{v}"
     );
+    // Node's encodings for SHA-256("abc") and the streaming/copy contracts.
     assert_eq!(
-        v["getHashes"], "md5,sha1,sha256,sha512",
-        "getHashes advertises the host backend's set: {v}"
+        v["digestBase64"], "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
+        "{v}"
     );
     assert_eq!(
+        v["digestBase64url"], "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0",
+        "{v}"
+    );
+    assert_eq!(v["digestBufferIsBuffer"], true, "{v}");
+    assert_eq!(
+        v["multiChunk"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "{v}"
+    );
+    assert_eq!(v["multiChunkMatchesOneShot"], true, "{v}");
+    assert_eq!(
+        v["copySourceDigest"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "{v}"
+    );
+    assert_eq!(v["copyCloneDigest"], v["copySourceDigest"], "{v}");
+    assert_eq!(v["copyFreshMatches"], true, "{v}");
+    assert_eq!(v["hashIsEventEmitter"], true, "{v}");
+    assert_eq!(v["hashHasOn"], true, "{v}");
+    assert_eq!(
+        v["hmacMultiChunk"], "UDH+PZicbRU3oBP6bnOdojRj/a7DtwE32Cjjas4iG9A=",
+        "{v}"
+    );
+    assert_eq!(
+        v["updateSnapshot"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "update() must snapshot its input: {v}"
+    );
+    assert_eq!(v["mixedChunkOrder"], true, "{v}");
+    assert_eq!(v["uuidShape"], true, "randomUUID format: {v}");
+    assert_eq!(
+        v["randomByteErrors"]["negative"],
+        json!({
+            "name": "RangeError",
+            "code": "ERR_OUT_OF_RANGE",
+            "message": "The value of \"size\" is out of range. It must be >= 0 && <= 2147483647. Received -1",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["randomByteErrors"]["string"],
+        json!({
+            "name": "TypeError",
+            "code": "ERR_INVALID_ARG_TYPE",
+            "message": "The \"size\" argument must be of type number. Received type string ('x')",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["getHashes"],
+        "md5,sha1,sha224,sha256,sha384,sha512,sha3-224,sha3-256,sha3-384,sha3-512,shake128,shake256",
+        "getHashes advertises every host-backed digest: {v}"
+    );
+    // Node's Hash constructor reports an unknown digest as a plain Error with
+    // no `code` and this exact text (createHmac keeps
+    // ERR_CRYPTO_INVALID_DIGEST, checked below).
+    assert_eq!(
         v["unknownDigest"],
-        json!({ "code": "ERR_CRYPTO_INVALID_DIGEST", "message": "Invalid digest: sha7" }),
+        json!({ "message": "Digest method not supported" }),
         "{v}"
     );
     assert_eq!(v["hashDoubleDigest"], "ERR_CRYPTO_HASH_FINALIZED", "{v}");
@@ -762,9 +1015,11 @@ async fn crypto_digests_hmac_streams_and_subtle_contract() {
     );
     assert_eq!(v["secretKeyEqualsBuffer"], true, "{v}");
 
-    // Cipher output encoding (test-crypto-encoding-validation-error).
+    // Cipher output encoding (test-crypto-encoding-validation-error): Node
+    // reports the StringDecoder's normalized label ("utf8", not "utf-8").
     assert_eq!(
-        v["cipherErrors"]["changeEncoding"]["message"], "Cannot change encoding",
+        v["cipherErrors"]["changeEncoding"]["message"],
+        "The argument 'outputEncoding' cannot be changed from 'utf8'. Received 'hex'",
         "{v}"
     );
     assert_eq!(
@@ -812,4 +1067,508 @@ async fn crypto_digests_hmac_streams_and_subtle_contract() {
     assert_eq!(v["generatedKeyBytes"], 32, "{v}");
     assert_eq!(v["keyObjectFrom"], 32, "{v}");
     assert_eq!(v["cryptoKeyGlobal"], true, "{v}");
+}
+
+// ---------------------------------------------------------------------------
+// Node v24.22.1 parity for the crypto surface the read-only differential
+// audit flagged: ArrayBufferView handling in `update()`, the string decoder
+// rules, one-shot `crypto.hash()` output, and the random/RNG validation.
+//
+// Every expectation below was captured from node v24.22.1 running the same
+// script; no node is needed at test time. The fixtures stay whole-file
+// (rather than per-assertion) so the test pins the exact observable JSON.
+// ---------------------------------------------------------------------------
+
+const CRYPTO_VIEW_ENCODING_PARITY_TS: &str = r#"
+import crypto from "@node/crypto";
+
+export default (pi: any) => {
+  pi.on("session_start", async () => {
+    const out: any = {};
+    function grab(fn: any) {
+      try {
+        const r = fn();
+        return { ok: Buffer.isBuffer(r) ? "buffer:" + r.toString("hex") : String(r) };
+      } catch (e: any) {
+        return { name: e.name, code: e.code, message: e.message };
+      }
+    }
+    const sha = (d: any) => crypto.createHash("sha256").update(d).digest("hex");
+
+    // --- ArrayBufferView / ArrayBuffer inputs -----------------------------
+    out.dataViewOnly = sha(new DataView(new Uint8Array([0x64]).buffer));
+    out.dataViewOffset = sha(new DataView(new Uint8Array([0x61, 0x62, 0x63]).buffer, 1, 1));
+    out.dataViewMixed = crypto.createHash("sha256")
+      .update("a")
+      .update(Buffer.from("b"))
+      .update(new Uint8Array([0x63]))
+      .update(new DataView(new Uint8Array([0x64]).buffer))
+      .digest("hex");
+    out.arrayBuffer = grab(() => crypto.createHash("sha256").update(new Uint8Array([1]).buffer));
+    out.sharedArrayBuffer = grab(() => crypto.createHash("sha256").update(new SharedArrayBuffer(1)));
+    out.numberInput = grab(() => crypto.createHash("sha256").update(42));
+
+    // --- update(data, encoding) decoder rules -----------------------------
+    out.oddHex = grab(() => crypto.createHash("sha256").update("abc", "hex"));
+    out.badHex = crypto.createHash("sha256").update("zz", "hex").digest("hex");
+    out.badBase64 = crypto.createHash("sha256").update("!!!!", "base64").digest("hex");
+    out.unknownEncodingTreatsAsUtf8 =
+      crypto.createHash("sha256").update("\u00e9\u2603", "bogus").digest("hex") === sha("\u00e9\u2603");
+    out.latin1 = crypto.createHash("sha256").update("\u00e9", "latin1").digest("hex");
+
+    // --- one-shot crypto.hash(algorithm, data, outputEncoding) -------------
+    out.hashDefault = [typeof crypto.hash("sha256", "abc"), crypto.hash("sha256", "abc")];
+    out.hashBuffer = Buffer.isBuffer(crypto.hash("sha256", "abc", "buffer"));
+    out.hashObjectBuffer = Buffer.isBuffer(crypto.hash("sha256", "abc", { outputEncoding: "buffer" }));
+    out.hashBadEncoding = grab(() => crypto.hash("sha256", "abc", "bogus"));
+    out.hashArrayBuffer = grab(() => crypto.hash("sha256", new Uint8Array([97]).buffer));
+    out.hashBadAlgorithm = grab(() => crypto.hash("nope", "abc"));
+    out.hashDataView = crypto.hash("sha256", new DataView(new Uint8Array([97]).buffer));
+
+    // --- finalized state ---------------------------------------------------
+    const h = crypto.createHash("sha256").update("z");
+    h.digest();
+    out.updateAfterDigest = grab(() => h.update("x"));
+    out.copyAfterDigest = grab(() => h.copy());
+
+    // --- timingSafeEqual error shapes --------------------------------------
+    out.timingSafeLength = grab(() => crypto.timingSafeEqual(Buffer.from("a"), Buffer.from("bb")));
+    out.timingSafeType = grab(() => crypto.timingSafeEqual("a", "a"));
+    out.timingSafeView = crypto.timingSafeEqual(
+      new DataView(new Uint8Array([1, 2]).buffer), new Uint8Array([1, 2]));
+
+    // --- streaming-handle regressions (must stay green) --------------------
+    out.hmacStream = (() => {
+      const hm = crypto.createHmac("sha256", "key").update("da").update("ta");
+      return hm.digest("base64");
+    })();
+    out.hashStream = (() => {
+      const hs = crypto.createHash("sha3-512");
+      let chunk: any = null;
+      hs.on("data", (c: any) => { chunk = c; });
+      hs.setEncoding("hex");
+      hs.write("aoeu");
+      hs.end();
+      const want = crypto.createHash("sha3-512").update("aoeu").digest("hex");
+      return { chunk: chunk === want, afterEnd: hs.digest("hex") === want };
+    })();
+    out.copyState = (() => {
+      const src = crypto.createHash("sha256").update("a").update("b");
+      const clone = src.copy();
+      src.update("c");
+      return { src: src.digest("hex"), clone: clone.update("c").digest("hex") };
+    })();
+    out.updateSnapshot = (() => {
+      const buf = Buffer.from("abc");
+      const hh = crypto.createHash("sha256").update(buf);
+      buf.fill(0x78);
+      return hh.digest("hex");
+    })();
+
+    globalThis.__cryptoViewEncoding = out;
+  });
+};
+"#;
+
+const CRYPTO_RANDOM_PARITY_TS: &str = r#"
+import crypto from "@node/crypto";
+
+export default (pi: any) => {
+  pi.on("session_start", async () => {
+    const out: any = {};
+    function grab(fn: any) {
+      try {
+        return { ok: fn() };
+      } catch (e: any) {
+        return { name: e.name, code: e.code, message: e.message };
+      }
+    }
+
+    // --- randomInt overloads + validation ---------------------------------
+    out.intOneArg = grab(() => {
+      const n = crypto.randomInt(5);
+      return Number.isSafeInteger(n) && n >= 0 && n < 5;
+    });
+    out.intRange = grab(() => {
+      const n = crypto.randomInt(2, 4);
+      return n === 2 || n === 3;
+    });
+    out.intFloat = grab(() => crypto.randomInt(1.5, 3));
+    out.intBig = grab(() => crypto.randomInt(1n, 3n));
+    out.intNaN = grab(() => crypto.randomInt(NaN, 3));
+    out.intMaxEq = grab(() => crypto.randomInt(5, 5));
+    out.intRangeBig = grab(() => crypto.randomInt(0, 2 ** 48 + 1));
+    out.intRangeBigOneArg = grab(() => crypto.randomInt(2 ** 48 + 1));
+    out.intThirdArg = grab(() => crypto.randomInt(0, 10, 3));
+    out.intFourArgs = grab(() => crypto.randomInt(5, 6, 7, () => {}));
+    out.intMaxSafe = grab(() => {
+      const n = crypto.randomInt(Number.MAX_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER);
+      return n === Number.MAX_SAFE_INTEGER - 1;
+    });
+
+    // --- getRandomValues types and the 64 KiB quota -----------------------
+    out.gvInteger = grab(() => {
+      const a = new Uint8Array(4);
+      return crypto.getRandomValues(a) === a && a.byteLength === 4;
+    });
+    out.gvBigInt = grab(() => {
+      const a = new BigInt64Array(2);
+      return crypto.getRandomValues(a) === a && a.byteLength === 16;
+    });
+    out.gvFloat64 = grab(() => crypto.getRandomValues(new Float64Array(2)));
+    out.gvFloat32 = grab(() => crypto.getRandomValues(new Float32Array(2)));
+    out.gvDataView = grab(() => crypto.getRandomValues(new DataView(new ArrayBuffer(4))));
+    out.gvArrayBuffer = grab(() => crypto.getRandomValues(new ArrayBuffer(4)));
+    out.gvPlainArray = grab(() => crypto.getRandomValues([1, 2]));
+    out.gvNull = grab(() => crypto.getRandomValues(null));
+    out.gvQuota = grab(() => crypto.getRandomValues(new Uint8Array(65537)));
+    out.gvUint16Quota = grab(() => crypto.getRandomValues(new Uint16Array(32769)));
+    out.gvMax = grab(() => crypto.getRandomValues(new Uint8Array(65536)).byteLength);
+
+    // --- randomFillSync bounds, ArrayBuffer/SharedArrayBuffer, DataView -----
+    out.rfOffset = grab(() => { const b = Buffer.alloc(2); crypto.randomFillSync(b, 3); return 0; });
+    out.rfNegOffset = grab(() => { const b = Buffer.alloc(4); crypto.randomFillSync(b, -1); return 0; });
+    out.rfSize = grab(() => { const b = Buffer.alloc(4); crypto.randomFillSync(b, 0, 5); return 0; });
+    out.rfU16Size = grab(() => { const b = new Uint16Array(4); crypto.randomFillSync(b, 0, 5); return 0; });
+    out.rfArrayBuffer = grab(() => {
+      const b = new ArrayBuffer(4);
+      return crypto.randomFillSync(b, 1, 2) === b;
+    });
+    out.rfSharedArrayBuffer = grab(() => {
+      const b = new SharedArrayBuffer(4);
+      return crypto.randomFillSync(b, 1, 2) === b;
+    });
+    out.rfDataView = grab(() => {
+      const b = new DataView(new ArrayBuffer(4));
+      return crypto.randomFillSync(b, 1, 2) === b;
+    });
+    out.rfNaN = grab(() => { const b = Buffer.alloc(4); crypto.randomFillSync(b, NaN); return 0; });
+    out.rfPlain = grab(() => crypto.randomFillSync([1, 2]));
+    out.rfNoArg = grab(() => crypto.randomFillSync());
+    out.rfStringOffset = grab(() => { const b = Buffer.alloc(4); crypto.randomFillSync(b, "1"); return 0; });
+
+    // --- randomBytes digit grouping / randomUUID option validation ---------
+    out.randomBytesHuge = grab(() => crypto.randomBytes(Number.MAX_SAFE_INTEGER));
+    out.uuidBad = grab(() => crypto.randomUUID("bad"));
+    out.uuidFlagBad = grab(() => crypto.randomUUID({ disableEntropyCache: 1 }));
+    out.uuidNoCache = grab(() => crypto.randomUUID({ disableEntropyCache: true }).length);
+
+    globalThis.__cryptoRandomParity = out;
+  });
+};
+"#;
+
+#[tokio::test]
+async fn crypto_shim_view_encoding_and_oneshot_hash_parity() {
+    let (_rt, v) = run_fixture(
+        "crypto-view-encoding",
+        CRYPTO_VIEW_ENCODING_PARITY_TS,
+        "__cryptoViewEncoding",
+    )
+    .await;
+
+    // DataView-only input used to hash zero bytes; any view is now its own
+    // byte range.
+    assert_eq!(
+        v["dataViewOnly"], "18ac3e7343f016890c510e93f935261169d9e3f565436429830faf0934f4f8e4",
+        "DataView-only update() must hash its bytes: {v}"
+    );
+    assert_eq!(
+        v["dataViewOffset"], "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+        "a DataView must respect byteOffset/byteLength: {v}"
+    );
+    assert_eq!(
+        v["dataViewMixed"], "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+        "string/Buffer/Uint8Array/DataView chunks hash as \"abcd\": {v}"
+    );
+    assert_eq!(
+        v["arrayBuffer"],
+        json!({
+            "name": "TypeError",
+            "code": "ERR_INVALID_ARG_TYPE",
+            "message": "The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["sharedArrayBuffer"]["message"],
+        "The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of SharedArrayBuffer",
+        "{v}"
+    );
+    assert_eq!(
+        v["numberInput"]["message"],
+        "The \"data\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (42)",
+        "{v}"
+    );
+
+    // String decoding: odd hex throws up front, an invalid digit run decodes
+    // to empty exactly like Buffer.from, an unknown encoding falls back to
+    // UTF-8 (not ERR_UNKNOWN_ENCODING).
+    assert_eq!(
+        v["oddHex"],
+        json!({
+            "name": "TypeError",
+            "code": "ERR_INVALID_ARG_VALUE",
+            "message": "The argument 'encoding' is invalid for data of length 3. Received 'hex'",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["badHex"], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "invalid hex decodes what it can (nothing): {v}"
+    );
+    assert_eq!(
+        v["badBase64"], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "invalid base64 decodes what it can (nothing): {v}"
+    );
+    assert_eq!(v["unknownEncodingTreatsAsUtf8"], true, "{v}");
+    assert_eq!(
+        v["latin1"], "de2e331d891ae267a7009cb45b4e8830f170e0c937288ea2731a1941c7a53b0d",
+        "latin1 decodes to one byte: {v}"
+    );
+
+    // One-shot hash defaults to hex; "buffer"/an options object keep bytes.
+    assert_eq!(
+        v["hashDefault"],
+        json!([
+            "string",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        ]),
+        "crypto.hash() must default to hex: {v}"
+    );
+    assert_eq!(v["hashBuffer"], true, "{v}");
+    assert_eq!(v["hashObjectBuffer"], true, "{v}");
+    assert_eq!(
+        v["hashBadEncoding"],
+        json!({
+            "name": "TypeError",
+            "code": "ERR_INVALID_ARG_VALUE",
+            "message": "The argument 'outputEncoding' is invalid. Received 'bogus'",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["hashArrayBuffer"]["message"],
+        "The \"input\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer",
+        "{v}"
+    );
+    assert_eq!(v["hashBadAlgorithm"]["name"], "Error", "{v}");
+    assert_eq!(
+        v["hashBadAlgorithm"]["message"], "Digest method nope is not supported",
+        "oneShotDigest's message differs from createHash: {v}"
+    );
+    assert_eq!(
+        v["hashDataView"], "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+        "crypto.hash accepts DataView: {v}"
+    );
+
+    assert_eq!(
+        v["updateAfterDigest"],
+        json!({
+            "name": "Error",
+            "code": "ERR_CRYPTO_HASH_FINALIZED",
+            "message": "Digest already called",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["copyAfterDigest"],
+        json!({
+            "name": "Error",
+            "code": "ERR_CRYPTO_HASH_FINALIZED",
+            "message": "Digest already called",
+        }),
+        "{v}"
+    );
+
+    assert_eq!(
+        v["timingSafeLength"],
+        json!({
+            "name": "RangeError",
+            "code": "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
+            "message": "Input buffers must have the same byte length",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["timingSafeType"],
+        json!({
+            "name": "TypeError",
+            "code": "ERR_INVALID_ARG_TYPE",
+            "message": "The \"buf1\" argument must be an instance of ArrayBuffer, Buffer, TypedArray, or DataView.",
+        }),
+        "{v}"
+    );
+    assert_eq!(v["timingSafeView"], true, "{v}");
+
+    // Existing streaming/copy behaviour must remain intact.
+    assert_eq!(
+        v["hmacStream"], "UDH+PZicbRU3oBP6bnOdojRj/a7DtwE32Cjjas4iG9A=",
+        "{v}"
+    );
+    assert_eq!(
+        v["hashStream"],
+        json!({ "chunk": true, "afterEnd": true }),
+        "{v}"
+    );
+    assert_eq!(
+        v["copyState"],
+        json!({
+            "src": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "clone": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        }),
+        "{v}"
+    );
+    assert_eq!(
+        v["updateSnapshot"], "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "{v}"
+    );
+}
+
+#[tokio::test]
+async fn crypto_shim_random_int_and_rng_validation_parity() {
+    let (_rt, v) = run_fixture(
+        "crypto-random-parity",
+        CRYPTO_RANDOM_PARITY_TS,
+        "__cryptoRandomParity",
+    )
+    .await;
+
+    // randomInt(max) is the single-argument overload, not an error.
+    assert_eq!(v["intOneArg"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["intRange"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["intMaxSafe"], json!({ "ok": true }), "{v}");
+
+    let type_error = |message: &str| json!({ "name": "TypeError", "code": "ERR_INVALID_ARG_TYPE", "message": message });
+    let out_of_range = |message: &str| json!({ "name": "RangeError", "code": "ERR_OUT_OF_RANGE", "message": message });
+    assert_eq!(
+        v["intFloat"],
+        type_error("The \"min\" argument must be a safe integer. Received type number (1.5)"),
+        "{v}"
+    );
+    assert_eq!(
+        v["intBig"],
+        type_error("The \"min\" argument must be a safe integer. Received type bigint (1n)"),
+        "bigint bounds are rejected with the `n` suffix: {v}"
+    );
+    assert_eq!(
+        v["intNaN"],
+        type_error("The \"min\" argument must be a safe integer. Received type number (NaN)"),
+        "{v}"
+    );
+    assert_eq!(
+        v["intMaxEq"],
+        out_of_range("The value of \"max\" is out of range. It must be greater than the value of \"min\" (5). Received 5"),
+        "{v}"
+    );
+    assert_eq!(
+        v["intRangeBig"],
+        out_of_range("The value of \"max - min\" is out of range. It must be <= 281474976710655. Received 281_474_976_710_657"),
+        "{v}"
+    );
+    assert_eq!(
+        v["intRangeBigOneArg"],
+        out_of_range("The value of \"max\" is out of range. It must be <= 281474976710655. Received 281_474_976_710_657"),
+        "the one-arg form names the parameter \"max\": {v}"
+    );
+    assert_eq!(
+        v["intThirdArg"],
+        type_error("The \"callback\" argument must be of type function. Received type number (3)"),
+        "{v}"
+    );
+    assert_eq!(
+        v["intFourArgs"],
+        type_error("The \"callback\" argument must be of type function. Received type number (7)"),
+        "{v}"
+    );
+
+    let type_mismatch = json!({
+        "name": "TypeMismatchError",
+        "code": 17,
+        "message": "The data argument must be an integer-type TypedArray",
+    });
+    assert_eq!(v["gvInteger"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["gvBigInt"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["gvFloat64"], type_mismatch, "{v}");
+    assert_eq!(v["gvFloat32"], type_mismatch, "{v}");
+    assert_eq!(v["gvDataView"], type_mismatch, "{v}");
+    assert_eq!(v["gvArrayBuffer"], type_mismatch, "{v}");
+    assert_eq!(v["gvPlainArray"], type_mismatch, "{v}");
+    assert_eq!(v["gvNull"], type_mismatch, "{v}");
+    let quota = json!({
+        "name": "QuotaExceededError",
+        "code": 22,
+        "message": "The requested length exceeds 65,536 bytes",
+    });
+    assert_eq!(v["gvQuota"], quota, "{v}");
+    assert_eq!(v["gvUint16Quota"], quota, "{v}");
+    assert_eq!(v["gvMax"], json!({ "ok": 65536 }), "{v}");
+
+    assert_eq!(
+        v["rfOffset"],
+        out_of_range(
+            "The value of \"offset\" is out of range. It must be >= 0 && <= 2. Received 3"
+        ),
+        "{v}"
+    );
+    assert_eq!(
+        v["rfNegOffset"],
+        out_of_range(
+            "The value of \"offset\" is out of range. It must be >= 0 && <= 4. Received -1"
+        ),
+        "{v}"
+    );
+    assert_eq!(
+        v["rfSize"],
+        out_of_range("The value of \"size + offset\" is out of range. It must be <= 4. Received 5"),
+        "{v}"
+    );
+    assert_eq!(
+        v["rfU16Size"],
+        out_of_range(
+            "The value of \"size + offset\" is out of range. It must be <= 8. Received 10"
+        ),
+        "elementSize applies to the Uint16Array bounds: {v}"
+    );
+    assert_eq!(v["rfArrayBuffer"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["rfSharedArrayBuffer"], json!({ "ok": true }), "{v}");
+    assert_eq!(v["rfDataView"], json!({ "ok": true }), "{v}");
+    assert_eq!(
+        v["rfNaN"],
+        out_of_range(
+            "The value of \"offset\" is out of range. It must be >= 0 && <= 4. Received NaN"
+        ),
+        "{v}"
+    );
+    assert_eq!(
+        v["rfPlain"],
+        type_error("The \"buf\" argument must be an instance of ArrayBuffer or ArrayBufferView. Received an instance of Array"),
+        "{v}"
+    );
+    assert_eq!(
+        v["rfNoArg"],
+        type_error("The \"buf\" argument must be an instance of ArrayBuffer or ArrayBufferView. Received undefined"),
+        "{v}"
+    );
+    assert_eq!(
+        v["rfStringOffset"],
+        type_error("The \"offset\" argument must be of type number. Received type string ('1')"),
+        "{v}"
+    );
+    assert_eq!(
+        v["randomBytesHuge"],
+        out_of_range("The value of \"size\" is out of range. It must be >= 0 && <= 2147483647. Received 9_007_199_254_740_991"),
+        "{v}"
+    );
+    assert_eq!(
+        v["uuidBad"],
+        type_error("The \"options\" argument must be of type object. Received type string ('bad')"),
+        "{v}"
+    );
+    assert_eq!(
+        v["uuidFlagBad"],
+        type_error("The \"options.disableEntropyCache\" property must be of type boolean. Received type number (1)"),
+        "{v}"
+    );
+    assert_eq!(v["uuidNoCache"], json!({ "ok": 36 }), "{v}");
 }

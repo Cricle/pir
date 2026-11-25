@@ -30,19 +30,24 @@ crates/pir-core/src/env_daemon/pty.rs 9 0 0  # ConPTY and Unix pty/termios FFI
 crates/pir-core/src/env_daemon/sys/unix.rs 5 0 0  # libc process/session/filesystem FFI
 crates/pir-core/src/env_daemon/sys/windows.rs 10 0 0  # Win32 process/console/filesystem FFI
 crates/pir-core/src/env_daemon/watch.rs 2 0 0  # libc statfs/name-to-handle watcher FFI
+crates/pir-core/src/extensions/loader.rs 1 0 0  # rquickjs Module::load of a transpiled module source
 crates/pir-core/src/extensions/runtime/exec.rs 1 0 0  # libc::kill on a child this process spawned
-crates/pir-core/src/extensions/runtime/host_functions/buffer_ops.rs 3 0 0  # QuickJS raw typed-array accessors
-crates/pir-core/src/extensions/runtime/host_functions.rs 0 0 1  # rquickjs JsLifetime for static Rust-only userdata (SAFETY comment at the site)
-# child_fns: one reviewed Unix block (`libc::kill`). The Windows
-# `WaitForSingleObject` block was removed in favour of safe `Child::try_wait`
-# polling; keep this ceiling at 1, do not raise it for that block again.
-crates/pir-core/src/extensions/runtime/host_functions/child_fns.rs 1 0 0  # libc::kill on a child this process spawned
-crates/pir-core/src/extensions/runtime/host_functions/node_fns.rs 3 0 0  # Win32 GetProcessTimes + libc getrusage out-parameters
+crates/pir-core/src/extensions/runtime/host_functions.rs 0 0 2  # rquickjs JsLifetime for static Rust-only userdata (SAFETY comment at the site)
+crates/pir-core/src/extensions/runtime/host_functions/buffer_ops.rs 4 0 0  # QuickJS raw typed-array accessors
+crates/pir-core/src/extensions/runtime/host_functions/bytes_ops.rs 1 0 1  # QuickJS raw typed-array bytes + JsLifetime for the hash registry userdata
+crates/pir-core/src/extensions/runtime/host_functions/inspect_ops.rs 11 0 0  # QuickJS reflective inspection (JS_FreeAtom/JS_GetClassID/raw value reads)
+crates/pir-core/src/extensions/runtime/host_functions/sqlite_ops.rs 2 0 0  # QuickJS typed-array bytes for SQLite blob bind/read
+crates/pir-core/src/extensions/runtime/host_functions/system_ops.rs 1 0 0  # QuickJS typed-array bytes for the process/os host ops
+crates/pir-core/src/extensions/runtime/host_functions/v8_diagnostics.rs 1 0 0  # JS_GetRuntime/JS_ComputeMemoryUsage out-buffer walk
+crates/pir-core/src/extensions/runtime/qjs_alloc.rs 16 3 1  # QuickJS custom allocator (std::alloc slab) + arena accounting; the one reviewed allocator island
+crates/pir-core/src/extensions/runtime/runtime.rs 1 0 0  # rquickjs Module::load of the prelude/runtime module source
+crates/pir-core/src/file_identity.rs 4 0 0  # Win32 FILE_ID_INFO identity probe via GetFileInformationByHandleEx + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle); moved out of session_manager/mod.rs so the spill exception shares the same implementation
 crates/pir-core/src/jobs.rs 16 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes + macOS proc_pidinfo(PROC_PIDTBSDINFO) start token (all with SAFETY notes)
 crates/pir-core/src/mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
+crates/pir-core/src/pir_node/modules/buffer.rs 5 0 0  # QuickJS typed-array bytes -> String::from_utf8_unchecked (validated first)
+crates/pir-core/src/pir_node/modules/fs.rs 4 0 0  # Win32 GetDiskFreeSpaceW out-pointers + reparse-point-aware path FFI
 crates/pir-core/src/plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
 crates/pir-core/src/plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
-crates/pir-core/src/file_identity.rs 4 0 0  # Win32 FILE_ID_INFO identity probe via GetFileInformationByHandleEx + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle); moved out of session_manager/mod.rs so the spill exception shares the same implementation
 crates/pir-core/src/session_manager/retention.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes (the start-token probe is now delegated to jobs.rs instead of duplicated)
 crates/pir-core/src/session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
 crates/pir-tui/src/alloc_trace.rs 0 4 1  # process-global GlobalAlloc delegation (R62 counters moved from lib to bin; PIR-BIN-022 zero-size fallback stays inside the impl)
@@ -51,4 +56,4 @@ crates/pir-tui/src/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios F
 crates/pir-tui/src/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
 crates/pir-tui/src/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
 
-# total: 26 file(s), 150 unsafe block(s), 5 unsafe fn, 2 unsafe impl/trait
+# total: 34 file(s), 189 unsafe block(s), 8 unsafe fn, 5 unsafe impl/trait
