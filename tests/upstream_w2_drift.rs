@@ -107,6 +107,8 @@ fn test_config_at(cwd: &Path, label: &str) -> ExtensionConfig {
         system_prompt: "base system prompt".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -309,6 +311,7 @@ fn session_with_extension_options(
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     }));
     SessionFixture { session, captured }
 }

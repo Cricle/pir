@@ -6,6 +6,183 @@ Post-0.3.2 backlog closure: every verified `reproduced` item in the local issue
 board was fixed against upstream pi, the upstream tree was audited through
 v1.5.2, and the generated test harnesses were rebuilt.
 
+### QuickJS AOT host (merged from `master`)
+
+- The embedded JS engine now boots from ahead-of-time QuickJS bytecode instead
+  of parsing the shims per runtime: `pir-gen-bytecode` compiles the prelude,
+  the assembled Node-compat globals bundle, the builtin-import bootstrap and
+  every virtual module (`@node/*`, `@juiceshark/*`, `typebox`, …) into guarded
+  `.qc` blobs under `crates/pir-core/assets/bytecode/`, and
+  `extensions::api::bytecode` embeds them. The inflated-source path remains as
+  the `PIR_EXT_BYTECODE=0` fallback.
+- `pir-node` (the structured Node/npm runtime surface behind the C-ABI bridge)
+  moved into `pir-core` as `pir_node`: an unpublished `pir-node` path
+  dependency blocks `cargo package`, so the source now lives in the package as
+  a private module behind `extensions`. Its 20 modules, the `fs`/`http`/child
+  process/worker host ops and the allocator moved with it.
+- RustPython is gone for good: `context-mode` and the `python` builtin both run
+  on the shared embedded QuickJS runtime (`plugins/builtin/js_vm.rs`), so the
+  sandbox, the extension host and `pir js` share one engine, one module loader
+  and one Node compatibility suite. The `python` tool name is kept for
+  Settings/tool-selection compatibility; only the interpreter changed.
+- Corrections made while landing the merge:
+  - `__pir_host.exitProcess` is registered only when
+    `ExtensionConfig::allow_process_exit` is set. It used to be unconditional,
+    which let any extension, context-mode script or worker tear down the host
+    agent through `process.exit(0)`; only the standalone `pir js` runner opts
+    in.
+  - `fs.truncateSync`/`ftruncateSync`/`truncate`/`ftruncate` reject a negative
+    length with `ERR_OUT_OF_RANGE` instead of clamping it to `0`, which silently
+    emptied the file.
+  - The prelude keeps `ctx.sessionManager.getSessionDir()` (upstream
+    `ReadonlySessionManager`); the merge had dropped it while the host accessor
+    `getSessionDirJson` was still wired.
+  - `pir-gen-bytecode` writes to `crates/pir-core/assets/bytecode` — the
+    directory `include_bytes!` actually reads — instead of the repository root,
+    and the ignored `regenerate_shim_deflate` test normalizes CRLF to LF like
+    `scripts/gen_shims_deflate.py`, so a Windows-checkout regeneration still
+    matches Linux CI.
+  - The shim-deflate gate paths follow the crate layout
+    (`crates/pir-core/src/extensions/api/js`, `crates/pir-core/assets/shims`).
+  - `pir-builtins::KNOWN_BUILTINS` gained the `python` row (and the engine
+    factory table is pinned against it); `pir-builtins` projects every row it
+    owns a factory for and documents that `python`'s factory stays in
+    `pir-core`, which is the only crate that can see the agent traits.
+  - Native-first plugin precedence is the default (opt out with
+    `PIR_PREFER_NATIVE=0`); the `tool-repair` and `phone` single-face rules
+    apply regardless.
+
+### builtin extraction (pure logic in publishable crates)
+
+- The pure half of every builtin now lives in an engine-free, published crate:
+  `pir-plugin-api` (protocol), `pir-builtins` (catalog/order), and one
+  `pir-builtin-*` package per builtin (`subagent`, `mode`, `mcp`, `codemode`,
+  `context-mode`, `tool-search`, `tool-repair`, `todo`, `memory`, `phone`).
+  Each depends only on `pir-plugin-api` and third-party crates — never on
+  `pir-core`, `pir-sdk` or `pir-tui`. `pir-core` keeps the runtime halves
+  (QuickJS, SQLite/FTS5, rmcp transports, `AgentSession`, tool registration) and
+  re-exports the crate modules at the historical `pir::plugins::...` paths, so
+  no embedder or test had to change and there is exactly ONE implementation of
+  each rule (the previous in-core copies are deleted).
+- New seam `pir-core/src/plugins/builtin_bridge.rs`: `BuiltinPluginAdapter`
+  presents an engine-free `pir_plugin_api::BuiltinPlugin` as an engine
+  `AgentPlugin` (identity, session snapshot, event outcome). Catalog metadata
+  has one source of truth (`pir_builtins::KNOWN_BUILTINS`), which the engine's
+  factory table is pinned against by test.
+- Host↔builtin needs the generic plugin hooks cannot express are now capability
+  traits in `plugins/capabilities.rs` (`McpCapability`, `PhoneCapability`,
+  `ToolRepairCapability`), reached through defaulted `AgentPlugin` accessors.
+  Every concrete builtin downcast is gone from the host, the SDK builder,
+  `mcp_reach`, print and the phone session path.
+- Publishing order is dependency-ordered in the release workflow:
+  `pir-plugin-api` → `pir-builtin-*` → `pir-builtins` → `pir-core` → `pir-tui`
+  → `pir-sdk`, with a per-crate crates.io probe, a `.crate` size guard and an
+  index-propagation retry, so a partially published release resumes instead of
+  failing.
+- CI runs the new crates' own test suites (they were previously compiled by
+  `--all-targets` but never executed); the unsafe gate scans all 20 member
+  source roots and the source-hygiene gate all 20 (the relay and the native
+  shell were the last two missing, which is how seven inline `#[cfg(test)]`
+  modules survived — they now live in each crate's `tests/`);
+  `version_consistency` checks workspace-member version inheritance,
+  path-dependency versions and "no publishable crate depends on an unpublished
+  one"; `scripts/feature_matrix.sh` compiles every support crate standalone
+  (no-default and all-features).
+- Fixed while extracting: `mcp`/`memory` were re-rooted with the agent directory
+  as the session cwd (the `rewire` hook's two paths were passed transposed);
+  `PluginHost::build_with_agent_dir` discarded its own `agent_dir`; the
+  `codemode` identifier helper dropped a leading digit instead of prefixing it;
+  the subagent parallel summary used a blank line instead of the upstream
+  horizontal rule between task blocks; the config loader had a second
+  hand-copied `PIR_CODEMODE_MEMORY_MB` parser.
+
+### workspace split (engine / TUI / facade)
+
+- The workspace is split into a three-way engine/TUI/facade surface: `pir-core`
+  (UI-agnostic engine), `pir-tui` (terminal front end), and `pir-sdk` facade;
+  the workspace also contains opt-in `pir-native-shell` and `pir-phone-server`
+  support crates. `cargo install pir-sdk` publishing requires the versioned
+  support crates to be available first.
+- Engine paths that need a UI half (export palette, theme registration, the
+  migration keypress pause) go through `pir_core::host_hooks`; the terminal
+  implementations live in `pir-tui` and are installed at startup.
+- `session_pick`/`bug_report` moved to `pir-tui` (still reachable at
+  `pir::coding_agent::*` through the facade), and the SDK's terminal parity
+  helpers live in `pir_tui::sdk_parity`.
+- Embedded shims/agent presets moved with the engine to
+  `crates/pir-core/assets/`; source-hygiene and unsafe gates scan every source
+  root (facade, engine, TUI, phone server, native shell, and the twelve
+  plugin/builtin crates).
+
+- Embedded RustPython and the `pir python` surface were removed; context-mode
+  continues through the QuickJS/code-mode path. The feature matrix and docs now
+  reflect the removal.
+
+- Added the opt-in `pir-native-shell` workspace crate. Its headless
+  `GuiState`/`NativeShellBridge` reducer consumes `pir_core::sdk::SdkEvent` and
+  is testable without desktop libraries; the `desktop` feature embeds a
+  Native Shell/NSH GPUI window and JSON `nsh/host` boundary. The crate is
+  workspace-only experimental and is not re-exported or published through
+  `pir-sdk`.
+
+### deduplication
+
+- Tool loadout assembly has one implementation
+  (`from_registry`, `from_active` and `rust_hook_changes`), and the declared /
+  hidden prompt tool sets live once in `agent_session::prompt_tools` (the
+  session build, session-context snapshot, subagent child and print mode all
+  call it).
+- The `find`/`grep` abort-watcher guard moved to
+  `coding_agent::tools::abort_watcher`; each tool keeps its own liveness
+  counter for the cancellation tests.
+- The shell tools share one result finalizer
+  (`finalize_shell_result_with_limits`) and one wait/stream/drain driver
+  (`drive_shell_to_exit`), replacing the duplicated bash/powershell bodies.
+- TUI selectors generate their list navigation from one macro
+  (`selector_list_methods!`) and share `click_select_row`; the dialog input and
+  editor share one editing-key dispatcher.
+- `ls` and `find` share their result assembly; the classifier answer parser,
+  partial-JSON number scanner, live-tool-update identity extraction, background
+  control view, durable `TableName`/ID-claim rules, provider identity methods,
+  legacy single-model synthesis, SQLite task indexes and the display-name API
+  key auth entry each exist once.
+
+### builtin:context-mode
+
+- Added `ctx_execute_tool`: a restricted proxy that invokes one registered
+  callable tool through the current call's nested scheduler, inheriting the
+  exposure gate, mutation locks, hooks, abort signal and depth limit. It
+  refuses `ctx_*` tools and is only available from inside a running tool call.
+  `ctx_execute` keeps its original name (the proxy was briefly registered under
+  the same name).
+- Every session's stored material is now bounded per session, newest-survives:
+  journal 2,000 rows / 32 MiB / 7 days, chunks 4,000 rows / 64 MiB, and the
+  project fetch cache 256 rows / 64 MiB. Trimming happens inside the write
+  transaction, so the SQLite database and its WAL cannot grow without bound.
+  `ctx_doctor`/`ctx_stats` report the limits and the session's `overLimit`
+  state; `IndexReport.evictedChunks` says what a write removed.
+- Auto-indexed `tool_result` text can no longer collide across sessions: a
+  write replaces only the same `(source, session)` rows, and plain-text
+  chunking now splits by size even without blank lines.
+
+### extensions (upstream v1.5.2 parity)
+
+- `ctx.sessionManager.getSessionDir()` exists (upstream
+  `ReadonlySessionManager`); it reads a dedicated scalar host function, so the
+  accessor does not parse the whole session envelope. The host pushes the
+  session directory from the session manager, and print mode does the same.
+- `registerMarkdownTransformer(fn, { messageTypes })` honors the upstream
+  surface filter (#11756): a transformer runs only on the named surfaces
+  (`user`/`assistant`/`assistant-thinking`/`custom`/`summary`/`changelog`),
+  defaulting to the transcript trio. The named form accepts the same option.
+- `ctx.ui.custom(factory, { blocked: { kind, message } })` reports OSC 7501
+  program status while the component waits for the user (#11471), for both
+  inline components and floating overlays, and it stays reported while
+  `setHidden()` hides the component. An unknown `kind` degrades to `question`.
+- Per-session retention measures stored UTF-8 BYTES: SQLite's `LENGTH()` counts
+  characters for TEXT, so the caps now cast to BLOB before measuring (a CJK body
+  previously counted about a third of its real size).
+
 ### upstream parity (v1.5.2 follow-ups)
 
 - Overflow/retry classification learns LiteLLM's pre-call
@@ -130,6 +307,40 @@ v1.5.2, and the generated test harnesses were rebuilt.
   `EntryRenderOptions`, so a user's `app.tools.expand` or `tui.select.*` override
   renders instead of an extension-local static table (`#11630`).
 
+### security / hardening
+
+- The spill-file exemption (`is_registered_spill`) records each file's OS
+  identity AT CREATION and compares it against a fresh probe of the requested
+  path, so deleting a registered spill and writing a new file at the same name
+  no longer inherits the outside-workspace read exemption (SPILL-1). The
+  registry previously stored bare paths, which made the comparison read the
+  same current path twice and always match. Identity is now the crate's single
+  implementation, `pir_core::file_identity` (Unix `dev`/`ino`, Win32
+  `FILE_ID_INFO` through `GetFileInformationByHandleEx`): `Metadata::created()`
+  and `BY_HANDLE_FILE_INFORMATION`'s 64-bit file index were both measured
+  identical after a delete-then-recreate on NTFS, so neither could detect the
+  replacement; only the 128-bit id (record number plus the reuse sequence
+  number) differs. The session manager's append-cache staleness check uses the
+  same module, which removed its private copy of the probe (that file now has
+  no `unsafe` and its gate entry is gone), and the Windows probe opens with
+  `FILE_READ_ATTRIBUTES` only (~60 µs vs ~17 ms for a data read under a filter
+  driver) because it runs on the append hot path.
+- `jobs` and the session retention path share one `process_start_token`: macOS
+  reads `libc::proc_pidinfo(PROC_PIDTBSDINFO)` instead of degrading to pid-only
+  identity, and the duplicate probe in `session_manager::retention` (a second
+  `/proc` parser plus its own `GetProcessTimes` call) is deleted — that copy is
+  why macOS had silently degraded in both places (JOBS-1).
+- The shell pool caches each member's root pid at spawn, so `terminate()` still
+  signals the process group after `Child::wait()` has moved the inner child to
+  its `Done` state and `id()` returns `None` forever (JOBS-2). A 20 ms
+  size-only probe ticker, the lowest-priority arm of the wait loop, stops a
+  runaway command whose output exceeds the cap without waiting for the next
+  chunk (JOBS-3).
+- Durable storage: the in-memory backend now discards a superseded submission
+  when a different id claims the same `(conversation, request_id)` key, matching
+  the SQLite and JSONL backends instead of leaving an orphaned record in the
+  scans (P2-7).
+
 ### correctness
 
 - Extension/RPC stream events use upstream's camelCase carrier fields
@@ -179,6 +390,38 @@ v1.5.2, and the generated test harnesses were rebuilt.
 - `docs/upstream-drift-status.md` records the v1.5.2 audit: 641 commits, 130
   touching ported source (12 Landed / 22 Partial / 54 Open / 40 N/A / 2
   Unverified), with the follow-up list and deferred feature families.
+- Merged-harness env isolation (TEST-2): suites that re-point the process-global
+  `PIR_AGENT_DIR` now share ONE per-binary lock
+  (`tests/common::agent_dir_env_lock`) instead of a dozen private mutexes, so a
+  sibling suite can no longer move the variable mid-test. Fixed:
+  `d23_reach_consumption` (was completely unlocked — it is what made
+  `codemode_exposure`'s `/reload` settings-load count read 1 instead of 2 on
+  every full run), `bash_tree_kill_prompt`, `mcp_builtin_tools`,
+  `mcp_builtin_tools_e2e`, `extensions_runtime`, `session_manager_ext`.
+  `zz_merged_4` went from "a different test fails each run" to 799/799 on three
+  consecutive runs. `session_resolve_units` additionally gets a file-local lock
+  for the process-global `session_list_file_reads` counter.
+- `bash_eviction_utf8` no longer poisons the process temp directory for every
+  concurrent suite. It re-pointed `TMP`/`TEMP`/`TMPDIR` at a regular file for
+  its whole run, so `std::env::temp_dir()` handed a blocked path to anything
+  else running in `zz_merged_5` and their `create_dir_all` failed with EEXIST —
+  311 of 806 tests red, spanning `fs_watch_real`, `builtin_disable_w13`,
+  `ai_proxy`, `bash_abort_set`, `tui_search_whole_history` and more. Two
+  narrower replacements were tried and rejected on measurement (a process-level
+  spill-root override broke the other spill tests; a thread-local one is not
+  carried into the context where the bash tool creates the spill file). The
+  suite is now gated on an exclusive process, which is what `cargo nextest`
+  gives it in CI, and `zz_merged_5` reaches 803/806 parallel and 804/804
+  serialized.
+- Two tests still need an exclusive process `cargo test --test` cannot provide
+  (`plugin_services_hardening::has_auth_serves_warm_cache...` because the
+  background refresh calls `load_pi_environment`, which resolves the agent dir
+  from `PIR_AGENT_DIR` only and accepts no override; and
+  `mcp_integration::reload_leaves_connections_lazy...`). Both pass alone and
+  under `--test-threads=1`, and CI runs nextest (one process per test). Making
+  them share-process safe needs an explicit agent dir threaded into
+  `load_pi_environment` — a production-signature change, recorded in TEST-2
+  rather than taken in a test pass.
 
 ## 0.3.2 (2026-11-15)
 

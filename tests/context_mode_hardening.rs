@@ -661,33 +661,17 @@ fn database_path_prefers_the_pushed_session_cwd() {
 }
 
 // ---------------------------------------------------------------------------
-// Python lock starvation valve policy
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "tests the removed Python worker exec lock"]
-fn python_exec_lock_starvation_valve_allows_two_deadline_ceiling() {
-    let threshold = ContextModePlugin::python_exec_lock_wedged_after();
-    assert_eq!(
-        threshold,
-        Duration::from_secs(240),
-        "the valve must allow 2x the 120s hard deadline ceiling"
-    );
-    assert!(threshold >= Duration::from_secs(2 * 120));
-}
-
-// ---------------------------------------------------------------------------
 // Write-time output cap
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn execute_print_loop_is_capped_at_write_time() {
+async fn execute_stdout_loop_is_capped_at_write_time() {
     let harness = Harness::new("cap-loop");
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
             json!({
-                "code": "for (var i = 0; i < 500000; i++) { print(\"x\".repeat(100)); }",
+                "code": "for (var i = 0; i < 500000; i++) { console.log(\"x\".repeat(100)); }",
                 "timeout": 120
             }),
         )
@@ -714,7 +698,7 @@ async fn execute_print_loop_is_capped_at_write_time() {
     let after = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('still alive')" }),
+            json!({ "code": "console.log('still alive')" }),
         )
         .await;
     assert!(!after.is_error, "{}", after.content);
@@ -727,7 +711,7 @@ async fn execute_single_huge_write_is_capped() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('y'.repeat(1500000))" }),
+            json!({ "code": "console.log('y'.repeat(1500000))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -752,9 +736,13 @@ async fn execute_stderr_is_capped_at_write_time() {
             }),
         )
         .await;
-    assert!(result.is_error, "the ZeroDivisionError is still reported");
+    assert!(result.is_error, "the thrown error is still reported");
+    // The captured stream is capped at `MAX_OUTPUT_CHARS`; the extra budget
+    // covers the truncation marker appended after the cut plus the thrown
+    // error's stack (the error path appends it to the captured stderr), not
+    // extra output.
     assert!(
-        result.content.len() <= MAX_OUTPUT_CHARS + 100,
+        result.content.len() <= MAX_OUTPUT_CHARS + 512,
         "stderr is capped at write time, got {} chars",
         result.content.len()
     );

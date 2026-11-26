@@ -1574,6 +1574,24 @@ fn repair_harness_with_model(
     respond: LoopResponder,
     model: Model,
 ) -> RepairHarness {
+    repair_harness_at(plugins, extensions, respond, model, None)
+}
+
+/// [`repair_harness_with_model`] bound to an EXPLICIT agent directory.
+///
+/// `agent_dir` is where the session's agent-scoped reads go (settings, the
+/// `tool-repair` builtin's `extensions/pi-tool-repair.json` config). `None`
+/// uses the harness's own scratch `LoopTempDir`, which is what every caller
+/// wants except one: the grammar-recovery test writes its config into a
+/// directory of its own choosing, and passing it here keeps that test off the
+/// process environment (`PIR_AGENT_DIR`) instead of pinning it.
+fn repair_harness_at(
+    plugins: Vec<Arc<dyn AgentPlugin>>,
+    extensions: Option<pir::extensions::ExtensionHandle>,
+    respond: LoopResponder,
+    model: Model,
+    agent_dir: Option<&Path>,
+) -> RepairHarness {
     let dir = LoopTempDir::new("loop");
     let received = Arc::new(Mutex::new(Vec::new()));
     let mut tools = ToolRegistry::new();
@@ -1606,11 +1624,19 @@ fn repair_harness_with_model(
         event_stream: Some(loop_stream_override(registry, model)),
         extensions,
         tool_selection: None,
+        phone_child: None,
     };
     let session = if plugins.is_empty() {
-        Arc::new(AgentSession::new(config))
+        Arc::new(AgentSession::new_with_agent_dir(
+            config,
+            agent_dir.unwrap_or(&dir.0),
+        ))
     } else {
-        Arc::new(AgentSession::new_with_plugins(config, plugins))
+        Arc::new(AgentSession::new_with_plugins_and_agent_dir(
+            config,
+            plugins,
+            agent_dir.unwrap_or(&dir.0),
+        ))
     };
     RepairHarness {
         session,
@@ -1629,6 +1655,14 @@ fn repair_harness_with_model(
 fn tool_repair_builtin() -> Arc<dyn AgentPlugin> {
     instantiate_builtin("tool-repair")
         .expect("builtin:tool-repair must be registered (src/plugins/builtin.rs:114)")
+}
+
+/// The `tool-repair` builtin reading its `extensions/pi-tool-repair.json` from
+/// an EXPLICIT agent directory (the factory-table shape, but scoped): a test
+/// that configures the grammar repair writes its file into its own scratch dir
+/// and names it here instead of pinning `PIR_AGENT_DIR` process-wide.
+fn tool_repair_builtin_at(agent_dir: &Path) -> Arc<dyn AgentPlugin> {
+    pir::plugins::new_tool_repair_plugin_at(agent_dir)
 }
 
 /// A loaded plugin that is NOT `tool-repair`: it keeps the session's plugin
@@ -1887,6 +1921,8 @@ async fn session_js_message_end_and_native_hook_share_one_ordered_chain() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = runtime
@@ -2570,8 +2606,10 @@ async fn anchor_bleed_through_the_loop() {
 
 #[tokio::test]
 async fn grammar_recovery_through_the_loop() {
-    let guard = crate::common::AgentDirEnvGuard::scratch("tool-repair-grammar", None).await;
-    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    // The builtin's config file lives in a scratch agent dir handed to the
+    // session as an argument: no process pin, no lock.
+    let agent_dir = LoopTempDir::new("tool-repair-grammar");
+    let dir = agent_dir.0.clone();
     std::fs::create_dir_all(dir.join("extensions")).expect("extensions dir");
     std::fs::write(
         dir.join("extensions").join("pi-tool-repair.json"),
@@ -2591,7 +2629,13 @@ async fn grammar_recovery_through_the_loop() {
             loop_assistant(vec![loop_text("done")], StopReason::Stop)
         }
     });
-    let harness = repair_harness(vec![tool_repair_builtin()], respond);
+    let harness = repair_harness_at(
+        vec![tool_repair_builtin_at(&dir)],
+        None,
+        respond,
+        loop_model(),
+        Some(&dir),
+    );
     let terminal = harness
         .session
         .prompt("leaked call", noop_events())

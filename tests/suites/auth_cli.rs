@@ -184,29 +184,58 @@ fn print_bearer_token_resolves_provider_from_model_pattern() {
 // Upstream credential-print.ts error surface (round-2 parity wave)
 // ---------------------------------------------------------------------------
 
-/// Acquire the SHARED process-global agent-dir lock for a sync test.
+/// A scratch agent dir plus a current-thread runtime for a sync test.
 ///
-/// `PIR_AGENT_DIR` is process-wide, and this binary merges several suites into
-/// one link unit whose tests run in parallel. A mutex declared in this module
-/// only excludes this module's tests: `ai_codex_ws_w13` pins `PIR_AGENT_DIR`
-/// through [`crate::common::AgentDirEnvGuard`] (the shared tokio mutex in
-/// `tests/common/mod.rs`), so a suite-local lock here let that suite restore
-/// its saved agent dir underneath this one mid-test. The shared guard both
-/// serializes the mutation and restores the previous value on drop.
-fn env_guard(label: &str) -> (tokio::runtime::Runtime, crate::common::AgentDirEnvGuard) {
+/// The credential CLI takes the agent dir as an argument
+/// ([`pir::ai::auth::cli::print_api_key_in`],
+/// [`pir::ai::auth::cli::resolve_printable_credential_in`],
+/// [`pir::ai::auth::cli::resolve_provider_from_flags_in`]), so these tests
+/// write and read their own directory and neither pin `PIR_AGENT_DIR` nor take
+/// the binary-wide lock.
+fn env_guard(label: &str) -> (tokio::runtime::Runtime, ScratchAgentDir) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime");
-    let guard = runtime.block_on(crate::common::AgentDirEnvGuard::scratch(label, None));
-    (runtime, guard)
+    (runtime, ScratchAgentDir::new(label))
+}
+
+/// A scratch agent dir, removed on drop.
+struct ScratchAgentDir(std::path::PathBuf);
+
+impl ScratchAgentDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "pir-auth-cli-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch agent dir");
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchAgentDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// An explicit `--provider` naming no known provider errors with the
 /// upstream text (credential-print.ts:57-59).
 #[test]
 fn unknown_provider_errors_with_upstream_text() {
-    let error = pir::ai::auth::cli::resolve_provider_from_flags(
+    let agent_dir = ScratchAgentDir::new("auth-cli-unknown-provider");
+    let error = pir::ai::auth::cli::resolve_provider_from_flags_in(
+        agent_dir.path(),
         Some("definitely-not-a-provider-xyz"),
         None,
         "unused requirement",
@@ -221,8 +250,13 @@ fn unknown_provider_errors_with_upstream_text() {
 
     // A known catalog provider still resolves.
     assert_eq!(
-        pir::ai::auth::cli::resolve_provider_from_flags(Some("anthropic"), None, "unused")
-            .expect("a known provider resolves"),
+        pir::ai::auth::cli::resolve_provider_from_flags_in(
+            agent_dir.path(),
+            Some("anthropic"),
+            None,
+            "unused",
+        )
+        .expect("a known provider resolves"),
         "anthropic"
     );
 }
@@ -232,10 +266,10 @@ fn unknown_provider_errors_with_upstream_text() {
 /// (credential-print.ts:92-94, 110-112).
 #[test]
 fn print_api_key_rejects_oauth_configured_providers() {
-    let (runtime, guard) = env_guard("auth-cli-oauth-print");
+    let (runtime, agent_dir) = env_guard("auth-cli-oauth-print");
 
     // Store an OAuth credential for a known provider.
-    pir::ai::auth::FileAuthStorage::default_storage()
+    pir::ai::auth::FileAuthStorage::in_agent_dir(agent_dir.path())
         .store(
             "anthropic",
             pir::ai::auth::StoredCredential::OAuth(pir::ai::auth::OAuthCredential::new(
@@ -247,7 +281,11 @@ fn print_api_key_rejects_oauth_configured_providers() {
         .expect("store oauth credential");
 
     let error = runtime
-        .block_on(pir::ai::auth::cli::print_api_key(Some("anthropic"), None))
+        .block_on(pir::ai::auth::cli::print_api_key_in(
+            agent_dir.path(),
+            Some("anthropic"),
+            None,
+        ))
         .expect_err("print-api-key must refuse an OAuth-configured provider");
     assert!(
         error
@@ -255,15 +293,14 @@ fn print_api_key_rejects_oauth_configured_providers() {
             .contains("Provider \"anthropic\" is configured with OAuth, not an API key",),
         "upstream credential-print.ts:110-112 text, got: {error}"
     );
-    drop(guard);
 }
 
 /// A model pattern that resolves under several configured credentials errors
 /// with the upstream ambiguity text (credential-print.ts:84-85).
 #[test]
 fn model_pattern_matching_multiple_configured_providers_errors() {
-    let (_runtime, guard) = env_guard("auth-cli-multi-match");
-    let agent_dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let (_runtime, agent_dir) = env_guard("auth-cli-multi-match");
+    let agent_dir = agent_dir.path().to_path_buf();
 
     // Two custom providers, each defining the same unique model id (the id is
     // unique enough that no built-in catalog model fuzzy-matches it).
@@ -287,7 +324,7 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
         }"#,
     )
     .expect("write models.json");
-    let storage = pir::ai::auth::FileAuthStorage::default_storage();
+    let storage = pir::ai::auth::FileAuthStorage::in_agent_dir(&agent_dir);
     for provider in ["zz-prov-a", "zz-prov-b"] {
         storage
             .store(
@@ -299,7 +336,8 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
             .expect("store api-key credential");
     }
 
-    let error = pir::ai::auth::cli::resolve_provider_from_flags(
+    let error = pir::ai::auth::cli::resolve_provider_from_flags_in(
+        &agent_dir,
         None,
         Some("zz-shared-model-xyz"),
         "unused requirement",
@@ -315,7 +353,8 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
     // With only one configured credential the same pattern resolves.
     storage.delete("zz-prov-b").expect("delete one credential");
     assert_eq!(
-        pir::ai::auth::cli::resolve_provider_from_flags(
+        pir::ai::auth::cli::resolve_provider_from_flags_in(
+            &agent_dir,
             None,
             Some("zz-shared-model-xyz"),
             "unused requirement"
@@ -328,7 +367,8 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
     // configured credential (pir's existing canonical shortcut).
     storage.delete("zz-prov-a").expect("delete last credential");
     assert_eq!(
-        pir::ai::auth::cli::resolve_provider_from_flags(
+        pir::ai::auth::cli::resolve_provider_from_flags_in(
+            &agent_dir,
             None,
             Some("zz-prov-a/zz-shared-model-xyz"),
             "unused requirement"
@@ -336,7 +376,6 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
         .expect("canonical reference resolves"),
         "zz-prov-a"
     );
-    drop(guard);
 }
 
 /// PIR-BIN-033: a models.json provider `apiKey` is the credential the request
@@ -345,8 +384,8 @@ fn model_pattern_matching_multiple_configured_providers_errors() {
 /// runtime).
 #[test]
 fn models_json_api_key_is_a_printable_credential() {
-    let (runtime, guard) = env_guard("auth-models-json-key");
-    let agent_dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let (runtime, agent_dir) = env_guard("auth-models-json-key");
+    let agent_dir = agent_dir.path().to_path_buf();
     std::fs::write(
         agent_dir.join("models.json"),
         r#"{
@@ -364,15 +403,16 @@ fn models_json_api_key_is_a_printable_credential() {
     .expect("write models.json");
 
     let resolved = runtime
-        .block_on(pir::ai::auth::cli::resolve_printable_credential(
-            "zz-gw", true,
+        .block_on(pir::ai::auth::cli::resolve_printable_credential_in(
+            &agent_dir, "zz-gw", true,
         ))
         .expect("credential resolution")
         .expect("models.json apiKey must resolve");
     assert_eq!(resolved.0, "sk-gw-key");
     assert_eq!(resolved.1, "api_key");
     assert_eq!(
-        pir::ai::auth::cli::resolve_provider_from_flags(
+        pir::ai::auth::cli::resolve_provider_from_flags_in(
+            &agent_dir,
             None,
             Some("zz-gw-model"),
             "unused requirement"
@@ -380,7 +420,6 @@ fn models_json_api_key_is_a_printable_credential() {
         .expect("the models.json provider is a configured credential"),
         "zz-gw"
     );
-    drop(guard);
 }
 
 /// Upstream #11787: the auth lock resolves the path, so every alias of

@@ -18,6 +18,38 @@ use crate::protocol::{
 use crate::registry::{ClientId, PendingReply};
 use crate::state::AppState;
 
+const MAX_OUTBOUND_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const OUTBOUND_FRAME_OVERHEAD_BYTES: usize = 64 * 1024;
+/// Typical streamed frame size assumed when converting the byte budget into
+/// a QUEUE SLOT count.
+///
+/// The budget cannot be divided by `max_message_bytes`: that is the ceiling a
+/// single message may reach (8 MiB by default), and dividing by it left a
+/// 7-slot queue — one burst of transcript deltas then looked like a slow
+/// client and the subscriber was dropped (`broadcast_to` sheds a full queue).
+/// A transcript delta is a few hundred bytes, so the guard is sized on that and
+/// stays a guard: the real bound on memory is `max_agent_queue` slots times the
+/// largest frame a client actually received.
+const OUTBOUND_TYPICAL_FRAME_BYTES: usize = 4 * 1024;
+
+fn outbound_queue_capacity(configured: usize, max_message_bytes: usize) -> usize {
+    // Guard against a pathological configuration in which every queued frame
+    // could be the maximum message size: such a queue must not exceed the byte
+    // budget.
+    let worst_case_per_frame = max_message_bytes
+        .saturating_add(OUTBOUND_FRAME_OVERHEAD_BYTES)
+        .max(1);
+    let worst_case_slots = (MAX_OUTBOUND_QUEUE_BYTES / worst_case_per_frame).max(1);
+    // The realistic bound the burst behavior needs: a streamed transcript
+    // delta is a few hundred bytes, so a queue of `configured` slots is well
+    // inside the budget.
+    let typical_per_frame = OUTBOUND_TYPICAL_FRAME_BYTES
+        .saturating_add(OUTBOUND_FRAME_OVERHEAD_BYTES)
+        .max(1);
+    let typical_slots = (MAX_OUTBOUND_QUEUE_BYTES / typical_per_frame).max(1);
+    configured.clamp(worst_case_slots, typical_slots)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     pub ticket: Option<String>,
@@ -56,7 +88,11 @@ pub async fn agent_ws(
 
 async fn agent_loop(state: AppState, auth: AuthContext, socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<Arc<str>>(state.config.max_agent_queue);
+    let queue_capacity = outbound_queue_capacity(
+        state.config.max_agent_queue,
+        state.config.max_ws_message_bytes,
+    );
+    let (tx, mut rx) = mpsc::channel::<Arc<str>>(queue_capacity);
     Metrics::incr(&state.metrics.ws_connections);
 
     let writer = tokio::spawn(async move {
@@ -115,6 +151,16 @@ async fn agent_loop(state: AppState, auth: AuthContext, socket: WebSocket) {
     if hello.version != crate::protocol::PROTOCOL_VERSION {
         let _ = tx
             .send(json_line(json!({"type":"hello-error","error":{"code":"version-mismatch","message":"unsupported protocol version"}})))
+            .await;
+        drop(tx);
+        let _ = writer.await;
+        return;
+    }
+    if let Err(message) = crate::protocol::validate_agent_hello(&hello) {
+        let _ = tx
+            .send(json_line(
+                json!({"type":"hello-error","error":{"code":"invalid-hello","message":message}}),
+            ))
             .await;
         drop(tx);
         let _ = writer.await;
@@ -180,9 +226,26 @@ async fn agent_loop(state: AppState, auth: AuthContext, socket: WebSocket) {
         return;
     }
     let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
-    let (session_ids, connection_id) = {
+    let registration = {
         let mut registry = state.registry.write().await;
-        registry.register_device(&auth.user_id, &hello, tx.clone(), Some(close_tx))
+        if registry.can_add_sessions(
+            &auth.user_id,
+            &hello.device_id,
+            &hello.sessions,
+            state.config.max_sessions_per_user,
+        ) {
+            Some(registry.register_device(&auth.user_id, &hello, tx.clone(), Some(close_tx)))
+        } else {
+            None
+        }
+    };
+    let Some((session_ids, connection_id)) = registration else {
+        let _ = tx
+            .send(json_line(json!({"type":"hello-error","error":{"code":"session-quota","message":"user session quota exceeded"}})))
+            .await;
+        drop(tx);
+        let _ = writer.await;
+        return;
     };
     if let Err(error) =
         state
@@ -281,6 +344,7 @@ async fn agent_loop(state: AppState, auth: AuthContext, socket: WebSocket) {
         broadcast_catalog(&state, &auth.user_id).await;
     }
     drop(tx);
+    writer.abort();
     let _ = writer.await;
 }
 
@@ -365,11 +429,34 @@ async fn handle_agent_text(
             // streaming state. Keep the catalog row fresh without requiring a
             // separate metadata message.
             if let Some(descriptor) = descriptor_from_status(&payload, &local_id) {
+                if let Err(message) = crate::protocol::validate_session_descriptor(&descriptor) {
+                    tracing::debug!(
+                        device_id,
+                        local_id,
+                        message,
+                        "agent status metadata rejected"
+                    );
+                    return;
+                }
                 let changed = {
                     let mut registry = state.registry.write().await;
-                    registry
-                        .upsert_session(&auth.user_id, device_id, &descriptor, true)
-                        .1
+                    match registry.upsert_session_limited(
+                        &auth.user_id,
+                        device_id,
+                        &descriptor,
+                        true,
+                        state.config.max_sessions_per_user,
+                    ) {
+                        Some((_, changed)) => changed,
+                        None => {
+                            tracing::warn!(
+                                device_id,
+                                local_id,
+                                "agent status exceeded session quota"
+                            );
+                            return;
+                        }
+                    }
                 };
                 if changed {
                     let _ = state
@@ -426,11 +513,34 @@ async fn handle_agent_text(
         }
         "session-upsert" => {
             if let Some(descriptor) = envelope.session {
+                if let Err(message) = crate::protocol::validate_session_descriptor(&descriptor) {
+                    tracing::debug!(
+                        device_id,
+                        session_id = descriptor.id.as_str(),
+                        message,
+                        "agent session metadata rejected"
+                    );
+                    return;
+                }
                 let changed = {
                     let mut registry = state.registry.write().await;
-                    registry
-                        .upsert_session(&auth.user_id, device_id, &descriptor, true)
-                        .1
+                    match registry.upsert_session_limited(
+                        &auth.user_id,
+                        device_id,
+                        &descriptor,
+                        true,
+                        state.config.max_sessions_per_user,
+                    ) {
+                        Some((_, changed)) => changed,
+                        None => {
+                            tracing::warn!(
+                                device_id,
+                                session_id = descriptor.id.as_str(),
+                                "agent session quota exceeded"
+                            );
+                            return;
+                        }
+                    }
                 };
                 tracing::debug!(
                     device_id,
@@ -454,6 +564,7 @@ async fn handle_agent_text(
                 {
                     let mut registry = state.registry.write().await;
                     registry.remove_session(device_id, &session_id);
+                    registry.remove_pending_for_session(&catalog_id);
                 }
                 broadcast_catalog(state, &auth.user_id).await;
             }
@@ -484,13 +595,39 @@ pub async fn client_ws(
         return StatusCode::FORBIDDEN.into_response();
     }
     let user_id = if let Some(ticket) = query.ticket.as_deref() {
-        match state.tickets.redeem(ticket) {
-            Some(user_id) => user_id,
+        let identity = match state.tickets.redeem(ticket) {
+            Some(identity) => identity,
             None => {
                 return crate::http::error_response(
                     StatusCode::UNAUTHORIZED,
                     "invalid-ticket",
                     "invalid or expired WebSocket ticket",
+                )
+            }
+        };
+        match state.store.find_token_by_id(&identity.token_id) {
+            Ok(Some(row)) if row.user_id == identity.user_id && row.kind == "user" => {
+                if row.revoked_at.is_some()
+                    || state
+                        .store
+                        .find_user_by_id(&identity.user_id)
+                        .ok()
+                        .flatten()
+                        .is_none_or(|user| user.disabled_at.is_some())
+                {
+                    return crate::http::error_response(
+                        StatusCode::FORBIDDEN,
+                        "unauthorized",
+                        "ticket credential is no longer active",
+                    );
+                }
+                identity.user_id
+            }
+            _ => {
+                return crate::http::error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "ticket credential is invalid",
                 )
             }
         }
@@ -531,7 +668,11 @@ pub async fn client_ws(
 
 async fn client_loop(state: AppState, user_id: String, socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<Arc<str>>(state.config.max_client_queue);
+    let queue_capacity = outbound_queue_capacity(
+        state.config.max_client_queue,
+        state.config.max_ws_message_bytes,
+    );
+    let (tx, mut rx) = mpsc::channel::<Arc<str>>(queue_capacity);
     Metrics::incr(&state.metrics.ws_connections);
     let writer = tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
@@ -598,6 +739,7 @@ async fn client_loop(state: AppState, user_id: String, socket: WebSocket) {
         registry.remove_client(client_id);
     }
     drop(tx);
+    writer.abort();
     let _ = writer.await;
 }
 
@@ -780,6 +922,15 @@ async fn forward_command(
 
     if value.get("kind").and_then(Value::as_str) == Some("rpc") {
         original_id = apply_forward_id(&mut value, &forward_id);
+    } else if value.get("kind").and_then(Value::as_str) == Some("local-command") {
+        // The phone bridge reads the correlation id from the forwarded line;
+        // without this field it invents a cli-N id and the relay pending entry
+        // can never be matched.
+        original_id = value
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        value["requestId"] = Value::String(forward_id.clone());
     } else if value.get("kind").and_then(Value::as_str) == Some("load-earlier-messages") {
         if let Some(existing) = value
             .get("requestId")
@@ -858,7 +1009,7 @@ async fn forward_command(
 /// agent unchanged (the phone bridge and the extension runtime both match on
 /// it). The correlation id travels as the envelope's `requestId` instead; the
 /// phone bridge reads it back when emitting the response.
-fn apply_forward_id(value: &mut Value, forward_id: &str) -> Option<String> {
+pub fn apply_forward_id(value: &mut Value, forward_id: &str) -> Option<String> {
     let original_id;
     let keep_dialog_id;
     {
@@ -1050,7 +1201,7 @@ async fn build_catalog(
 /// `hasPendingUiRequest` (`sheets-view.js`), so both are always present:
 /// `lastActivityAt` falls back to the relay's `updatedAt`, and
 /// `hasPendingUiRequest` defaults to false when the agent does not report it.
-fn catalog_row(session: &crate::protocol::SessionRow, online: bool) -> Value {
+pub fn catalog_row(session: &crate::protocol::SessionRow, online: bool) -> Value {
     let model = match (session.model_provider.clone(), session.model_id.clone()) {
         (Some(provider), id) => Some(json!({
             "provider": provider,
@@ -1080,7 +1231,7 @@ fn catalog_row(session: &crate::protocol::SessionRow, online: bool) -> Value {
     })
 }
 
-fn descriptor_from_status(payload: &Value, local_id: &str) -> Option<SessionDescriptor> {
+pub fn descriptor_from_status(payload: &Value, local_id: &str) -> Option<SessionDescriptor> {
     if payload.get("channel").and_then(Value::as_str) != Some("server")
         || payload.get("event").and_then(Value::as_str) != Some("status")
     {
@@ -1139,97 +1290,4 @@ fn server_error(code: &str, message: &str) -> Arc<str> {
         "event": "error",
         "data": { "code": code, "message": message }
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::SessionRow;
-
-    fn row(session_id: Option<&str>, pending: Option<bool>, last: Option<i64>) -> SessionRow {
-        SessionRow {
-            id: "device-a:parent-session".to_owned(),
-            user_id: "user-a".to_owned(),
-            device_id: "device-a".to_owned(),
-            local_id: "parent-session".to_owned(),
-            session_id: session_id.map(str::to_owned),
-            has_pending_ui_request: pending,
-            last_activity_at: last,
-            label: Some("CLI session".to_owned()),
-            kind: "parent".to_owned(),
-            cwd: Some("/work".to_owned()),
-            model_provider: Some("mock".to_owned()),
-            model_id: Some("mock-1".to_owned()),
-            model_name: Some("Mock".to_owned()),
-            thinking_level: Some("medium".to_owned()),
-            is_streaming: false,
-            is_compacting: false,
-            message_count: 3,
-            last_error: None,
-            online: true,
-            created_at: 1000,
-            updated_at: 2000,
-            last_seen_at: Some(2000),
-            deleted_at: None,
-        }
-    }
-
-    #[test]
-    fn catalog_row_carries_pwa_fields_and_falls_back_to_updated_at() {
-        let with_agent = catalog_row(&row(Some("native-session"), Some(true), Some(1500)), true);
-        assert_eq!(with_agent["sessionId"], "native-session");
-        assert_eq!(with_agent["hasPendingUiRequest"], true);
-        assert_eq!(with_agent["lastActivityAt"], 1500);
-
-        // Older agent descriptors omit the fields: the row must still be
-        // renderable (PWA reads these directly).
-        let fallback = catalog_row(&row(None, None, None), false);
-        assert!(fallback["sessionId"].is_null());
-        assert_eq!(fallback["hasPendingUiRequest"], false);
-        assert_eq!(fallback["lastActivityAt"], 2000);
-    }
-
-    #[test]
-    fn descriptor_from_status_picks_up_pwa_fields() {
-        let status = json!({
-            "channel": "server",
-            "event": "status",
-            "data": {
-                "sessionId": "native-session",
-                "sessionName": "Mock session",
-                "hasPendingUiRequest": true,
-                "lastActivityAt": 1729000000000i64,
-                "isStreaming": false
-            }
-        });
-        let descriptor = descriptor_from_status(&status, "parent-session").expect("status");
-        assert_eq!(descriptor.session_id.as_deref(), Some("native-session"));
-        assert_eq!(descriptor.has_pending_ui_request, Some(true));
-        assert_eq!(descriptor.last_activity_at, Some(1729000000000));
-    }
-
-    #[test]
-    fn extension_ui_response_keeps_dialog_id_and_uses_request_id_for_correlation() {
-        let mut dialog = json!({
-            "kind": "rpc",
-            "command": {"type": "extension_ui_response", "id": "ui-1", "confirmed": true},
-        });
-        assert_eq!(
-            apply_forward_id(&mut dialog, "f-7-1").as_deref(),
-            Some("ui-1")
-        );
-        assert_eq!(dialog["command"]["id"], "ui-1");
-        assert_eq!(dialog["requestId"], "f-7-1");
-
-        let mut prompt = json!({
-            "kind": "rpc",
-            "command": {"type": "prompt", "id": "p-1", "message": "hi"},
-        });
-        assert_eq!(
-            apply_forward_id(&mut prompt, "f-7-2").as_deref(),
-            Some("p-1")
-        );
-        assert_eq!(prompt["command"]["id"], "f-7-2");
-        assert!(prompt.get("requestId").is_none());
-    }
 }

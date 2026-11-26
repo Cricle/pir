@@ -4,8 +4,8 @@
 //! the intent-driven auto-index path.
 //!
 //! All tests are hermetic: the knowledge base lives in a per-test temp
-//! directory (`ContextModePlugin::with_db_path`) and the Python worker is the
-//! embedded RustPython interpreter (no system Python, no network).
+//! directory (`ContextModePlugin::with_db_path`) and the sandbox is the
+//! embedded QuickJS runtime with the node compatibility suite (no network).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,10 +19,10 @@ use pir::agent::tool_batch::ToolResult;
 use pir::agent::tool_execution::{AgentTool, ToolContext};
 use pir::extensions::SessionContextSnapshot;
 use pir::plugins::builtin::{
-    ContextModePlugin, CTX_BATCH_EXECUTE_TOOL_NAME, CTX_DOCTOR_TOOL_NAME,
-    CTX_EXECUTE_FILE_TOOL_NAME, CTX_EXECUTE_TOOL_NAME, CTX_FETCH_AND_INDEX_TOOL_NAME,
-    CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
-    MAX_OUTPUT_CHARS,
+    ContextModePlugin, CTX_BATCH_EXECUTE_TOOL_NAME, CTX_BATCH_TOOL_NAME, CTX_DOCTOR_TOOL_NAME,
+    CTX_EXECUTE_FILE_TOOL_NAME, CTX_EXECUTE_TOOL_NAME, CTX_EXECUTE_TOOL_PROXY_NAME,
+    CTX_FETCH_AND_INDEX_TOOL_NAME, CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_RESUME_TOOL_NAME,
+    CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME, MAX_OUTPUT_CHARS,
 };
 use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext, ToolBackend};
 
@@ -120,23 +120,35 @@ fn parse_json(result: &ToolResult) -> Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn registers_exactly_the_nine_context_mode_tools() {
+fn registers_exactly_the_twelve_context_mode_tools() {
     let harness = Harness::new("registration");
     let names: Vec<&str> = harness.tools.keys().map(String::as_str).collect();
     assert_eq!(
         names,
         vec![
+            CTX_BATCH_TOOL_NAME,
             CTX_BATCH_EXECUTE_TOOL_NAME,
             CTX_DOCTOR_TOOL_NAME,
             CTX_EXECUTE_TOOL_NAME,
             CTX_EXECUTE_FILE_TOOL_NAME,
+            CTX_EXECUTE_TOOL_PROXY_NAME,
             CTX_FETCH_AND_INDEX_TOOL_NAME,
             CTX_INDEX_TOOL_NAME,
             CTX_PURGE_TOOL_NAME,
+            CTX_RESUME_TOOL_NAME,
             CTX_SEARCH_TOOL_NAME,
             CTX_STATS_TOOL_NAME,
         ],
-        "exactly the nine ctx_* tools are registered"
+        "exactly the twelve ctx_* tools are registered"
+    );
+
+    // The proxy and the JS sandbox are distinct tools: the proxy must not
+    // shadow `ctx_execute` (they were once registered under the same name).
+    let proxy = harness.tool(CTX_EXECUTE_TOOL_PROXY_NAME);
+    assert_eq!(proxy.name(), "ctx_execute_tool");
+    assert_eq!(
+        proxy.parameters().expect("proxy schema")["required"],
+        json!(["name", "args"])
     );
 
     let execute = harness.tool(CTX_EXECUTE_TOOL_NAME);
@@ -165,7 +177,7 @@ fn registers_exactly_the_nine_context_mode_tools() {
     assert!(required.contains(&json!("code")));
     assert!(parameters["properties"]["timeout"].is_object());
     assert!(parameters["properties"]["intent"].is_object());
-    assert!(execute_file.description().contains("FILE_CONTENT"));
+    assert!(execute_file.description().contains("CTX_FILE"));
     assert!(
         execute_file
             .description()
@@ -250,11 +262,11 @@ fn builtin_factory_list_carries_context_mode() {
 }
 
 #[tokio::test]
-async fn python_worker_and_index_are_lazy() {
+async fn js_worker_and_index_are_lazy() {
     let harness = Harness::new("lazy");
-    // Construction (and registration) must not spawn the VM.
-    assert!(!harness.plugin.has_python_worker());
-    assert_eq!(harness.plugin.python_spawn_count(), 0);
+    // Construction (and registration) must not spawn the runtime.
+    assert!(!harness.plugin.has_js_worker());
+    assert_eq!(harness.plugin.js_spawn_count(), 0);
 
     // Pure knowledge-base calls use SQLite only.
     let indexed = harness
@@ -265,32 +277,38 @@ async fn python_worker_and_index_are_lazy() {
         .await;
     assert!(!indexed.is_error, "{}", indexed.content);
     assert!(
-        !harness.plugin.has_python_worker(),
-        "ctx_index must not start the interpreter"
+        !harness.plugin.has_js_worker(),
+        "ctx_index must not start the JS runtime"
     );
     let searched = harness
         .run(CTX_SEARCH_TOOL_NAME, json!({ "queries": ["marker"] }))
         .await;
     assert!(!searched.is_error, "{}", searched.content);
     assert!(
-        !harness.plugin.has_python_worker(),
-        "ctx_search must not start the interpreter"
+        !harness.plugin.has_js_worker(),
+        "ctx_search must not start the JS runtime"
     );
-    assert_eq!(harness.plugin.python_spawn_count(), 0);
+    assert_eq!(harness.plugin.js_spawn_count(), 0);
 
     // The first execute starts exactly one worker; later calls reuse it.
     let first = harness
-        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "print('one')" }))
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "code": "console.log('one')" }),
+        )
         .await;
     assert!(!first.is_error, "{}", first.content);
-    assert!(harness.plugin.has_python_worker());
-    assert_eq!(harness.plugin.python_spawn_count(), 1);
+    assert!(harness.plugin.has_js_worker());
+    assert_eq!(harness.plugin.js_spawn_count(), 1);
     let second = harness
-        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "print('two')" }))
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "code": "console.log('two')" }),
+        )
         .await;
     assert!(!second.is_error, "{}", second.content);
     assert_eq!(
-        harness.plugin.python_spawn_count(),
+        harness.plugin.js_spawn_count(),
         1,
         "the worker is reused across calls"
     );
@@ -306,7 +324,7 @@ async fn execute_prints_only_findings_not_reprs() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "var values = [1, 2, 3, 4]\nprint(values.reduce((a, b) => a + b, 0))" }),
+            json!({ "code": "const values = [1, 2, 3, 4];\nconsole.log(values.reduce((a, b) => a + b, 0));\nvalues;" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -316,23 +334,26 @@ async fn execute_prints_only_findings_not_reprs() {
         "only stdout enters context; bare expressions are not echoed"
     );
     assert!(
-        !result.content.contains("[1, 2, 3, 4]"),
+        !result.content.contains("[1,2,3,4]") && !result.content.contains("[ 1, 2, 3, 4 ]"),
         "the data never enters the result: {}",
         result.content
     );
 }
 
 #[tokio::test]
-async fn fresh_namespace_per_call_but_interpreter_reused() {
+async fn fresh_scope_per_call_but_runtime_reused() {
     let harness = Harness::new("fresh-scope");
     let first = harness
-        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "var leaked = 41" }))
+        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "let leaked = 41;" }))
         .await;
     assert!(!first.is_error, "{}", first.content);
     assert_eq!(first.content, "(no output)");
 
     let second = harness
-        .run(CTX_EXECUTE_TOOL_NAME, json!({ "code": "print(leaked)" }))
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "code": "console.log(leaked)" }),
+        )
         .await;
     assert!(
         second.is_error,
@@ -340,32 +361,28 @@ async fn fresh_namespace_per_call_but_interpreter_reused() {
         second.content
     );
     assert!(
-        second.content.contains("leaked is not defined"),
-        "error present, got: {}",
+        second.content.contains("leaked") && second.content.contains("not defined"),
+        "reference error present, got: {}",
         second.content
     );
     assert_eq!(
-        harness.plugin.python_spawn_count(),
+        harness.plugin.js_spawn_count(),
         1,
-        "the namespace is fresh; the interpreter is reused"
+        "the module is fresh; the runtime is reused"
     );
 }
 
 #[tokio::test]
-async fn uncaught_exception_returns_traceback() {
-    let harness = Harness::new("traceback");
+async fn uncaught_exception_returns_stack() {
+    let harness = Harness::new("stack");
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('before')\nthrow new Error('division by zero')" }),
+            json!({ "code": "console.log('before');\nthrow new Error('boom');" }),
         )
         .await;
     assert!(result.is_error);
-    assert!(
-        result.content.contains("division by zero"),
-        "got: {}",
-        result.content
-    );
+    assert!(result.content.contains("boom"), "got: {}", result.content);
     assert!(
         result.content.contains("before"),
         "partial stdout is kept, got: {}",
@@ -402,7 +419,7 @@ async fn oversized_output_is_capped() {
     let result = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('x'.repeat(1100000))" }),
+            json!({ "code": "console.log('x'.repeat(1_100_000))" }),
         )
         .await;
     assert!(!result.is_error, "{}", result.content);
@@ -433,11 +450,11 @@ async fn empty_code_is_rejected() {
 async fn intent_auto_indexes_large_stdout_instead_of_dumping_it() {
     let harness = Harness::new("intent");
     let code = r#"
-var lines = [];
-for (var i = 0; i < 200; i++) {
-  lines.push("entry " + String(i).padStart(3, "0") + ": needle value " + i + " " + "x".repeat(24));
+const lines = [];
+for (let i = 0; i < 200; i += 1) {
+  lines.push(`entry ${String(i).padStart(3, "0")}: needle value ${i} ` + "x".repeat(24));
 }
-print(lines.join("\n"));
+console.log(lines.join("\n"));
 "#;
     let result = harness
         .run(
@@ -472,7 +489,7 @@ print(lines.join("\n"));
     let search = harness
         .run(
             CTX_SEARCH_TOOL_NAME,
-            json!({ "queries": ["needle"], "source": "execute:python" }),
+            json!({ "queries": ["needle"], "source": "execute:js" }),
         )
         .await;
     assert!(!search.is_error, "{}", search.content);
@@ -488,7 +505,7 @@ print(lines.join("\n"));
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn execute_file_injects_file_content_and_returns_only_prints() {
+async fn execute_file_exposes_the_path_and_returns_only_prints() {
     let harness = Harness::new("file-inject");
     std::fs::write(harness.cwd.join("data.txt"), "TOP_SECRET_abc\n42\n")
         .unwrap_or_else(|error| panic!("write fixture: {error}"));
@@ -498,7 +515,7 @@ async fn execute_file_injects_file_content_and_returns_only_prints() {
             CTX_EXECUTE_FILE_TOOL_NAME,
             json!({
                 "path": "data.txt",
-                "code": "print(FILE_CONTENT.split('\\n').length - 1)\nprint(FILE_PATH.endsWith('data.txt'))\nprint(FILE_CONTENT.length)"
+                "code": "const fs = require('node:fs');\nconst text = fs.readFileSync(process.env.CTX_FILE, 'utf8');\nconsole.log(text.split('\\n').length - 1);\nconsole.log(FILE_PATH.endsWith('data.txt'));\nconsole.log(text.length);"
             }),
         )
         .await;
@@ -513,8 +530,41 @@ async fn execute_file_injects_file_content_and_returns_only_prints() {
         "FILE_PATH is the resolved absolute path: {}",
         result.content
     );
-    // Two newlines, so three lines in the file.
+    // Two newlines, so two split separators.
     assert!(result.content.contains('2'), "got: {}", result.content);
+}
+
+#[tokio::test]
+async fn execute_accepts_upstream_file_and_timeout_ms() {
+    let harness = Harness::new("file-upstream");
+    std::fs::write(harness.cwd.join("upstream.txt"), "one\ntwo\nthree\n")
+        .unwrap_or_else(|error| panic!("write fixture: {error}"));
+
+    let result = harness
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({
+                "file": "upstream.txt",
+                "timeoutMs": 5_000,
+                "code": "const fs = require('node:fs');\nconst lines = fs.readFileSync(process.env.CTX_FILE, 'utf8').trim().split('\\n');\nconsole.log(lines.length);\nconsole.log(FILE_PATH.endsWith('upstream.txt'));"
+            }),
+        )
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert!(result.content.contains('3'), "got: {}", result.content);
+    assert!(
+        result.content.contains("true"),
+        "FILE_PATH is exposed for the upstream `file` form: {}",
+        result.content
+    );
+
+    let escaped = harness
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "file": "../outside.txt", "code": "console.log(1)" }),
+        )
+        .await;
+    assert!(escaped.is_error, "{}", escaped.content);
 }
 
 #[tokio::test]
@@ -526,7 +576,7 @@ async fn execute_file_rejects_escapes_and_non_files() {
     let absolute = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": outside.to_string_lossy(), "code": "print(FILE_CONTENT.length)" }),
+            json!({ "path": outside.to_string_lossy(), "code": "console.log(1)" }),
         )
         .await;
     assert!(absolute.is_error, "absolute escape must be rejected");
@@ -539,7 +589,7 @@ async fn execute_file_rejects_escapes_and_non_files() {
     let relative = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": "../outside.txt", "code": "print(FILE_CONTENT.length)" }),
+            json!({ "path": "../outside.txt", "code": "console.log(1)" }),
         )
         .await;
     assert!(relative.is_error, "`..` escape must be rejected");
@@ -552,7 +602,7 @@ async fn execute_file_rejects_escapes_and_non_files() {
     let directory = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": ".", "code": "print(1)" }),
+            json!({ "path": ".", "code": "console.log(1)" }),
         )
         .await;
     assert!(directory.is_error, "a directory is not a file");
@@ -565,7 +615,7 @@ async fn execute_file_rejects_escapes_and_non_files() {
     let missing = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": "does-not-exist.txt", "code": "print(1)" }),
+            json!({ "path": "does-not-exist.txt", "code": "console.log(1)" }),
         )
         .await;
     assert!(missing.is_error, "a missing file must be rejected");
@@ -598,7 +648,7 @@ fn execute_file_rejects_symlink_escape_when_supported() {
         .unwrap_or_else(|error| panic!("runtime: {error}"));
     let result = runtime.block_on(harness.run(
         CTX_EXECUTE_FILE_TOOL_NAME,
-        json!({ "path": "link.txt", "code": "print(FILE_CONTENT.length)" }),
+        json!({ "path": "link.txt", "code": "console.log(1)" }),
     ));
     assert!(result.is_error, "symlink escape must be rejected");
     assert!(
@@ -618,7 +668,7 @@ async fn execute_file_rejects_files_over_32_mib() {
     let result = harness
         .run(
             CTX_EXECUTE_FILE_TOOL_NAME,
-            json!({ "path": "huge.bin", "code": "print(FILE_CONTENT.length)" }),
+            json!({ "path": "huge.bin", "code": "console.log(1)" }),
         )
         .await;
     assert!(result.is_error);
@@ -833,5 +883,154 @@ async fn cjk_substring_queries_match_through_the_like_fallback() {
             .as_array()
             .is_some_and(|hits| !hits.is_empty()),
         "ASCII query broke: {ascii}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ctx_execute_tool: the restricted nested-call proxy
+// ---------------------------------------------------------------------------
+
+use pir::agent::nested_tool_calls::{
+    NestedEventSink, NestedShared, NestedSharedConfig, NestedToolExecutor,
+};
+use pir::agent::tool_execution::ToolRegistry;
+
+struct EchoTool;
+
+impl AgentTool for EchoTool {
+    fn name(&self) -> &'static str {
+        "echo_probe"
+    }
+    fn description(&self) -> &'static str {
+        "echo back the message"
+    }
+    fn parameters(&self) -> Option<Value> {
+        Some(json!({
+            "type": "object",
+            "properties": { "message": { "type": "string" } },
+            "required": ["message"],
+            "additionalProperties": false
+        }))
+    }
+    fn run(
+        &self,
+        args: &Value,
+        _ctx: &ToolContext,
+    ) -> pir::agent::tool_execution::BoxFuture<'static, ToolResult> {
+        let message = args
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Box::pin(async move { ToolResult::ok(format!("echo:{message}")) })
+    }
+}
+
+/// A context whose `nested` executor can call `echo_probe` — the shape the
+/// agent loop hands a tool call.
+fn nested_context(harness: &Harness) -> ToolContext {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    let sink: NestedEventSink = Arc::new(|_event| Box::pin(async {}));
+    let shared = NestedShared::new(NestedSharedConfig {
+        registry: Arc::new(registry),
+        scheduler: pir::agent::tool_scheduler::ToolScheduler::new(Default::default()),
+        hooks: None,
+        extensions: None,
+        cwd: harness.cwd.clone(),
+        signal: None,
+        sequential: false,
+        sink,
+        session_env: None,
+        callable: None,
+    });
+    ToolContext {
+        cwd: harness.cwd.clone(),
+        signal: None,
+        nested: Some(Arc::new(NestedToolExecutor::root(shared))),
+        session_env: None,
+        held_mutation_keys: None,
+        on_update: None,
+        background: false,
+        agent_dir: None,
+    }
+}
+
+#[tokio::test]
+async fn execute_tool_forwards_one_registered_call() {
+    let harness = Harness::new("proxy-forward");
+    let context = nested_context(&harness);
+    let result = harness
+        .tool(CTX_EXECUTE_TOOL_PROXY_NAME)
+        .run(
+            &json!({ "name": "echo_probe", "args": { "message": "hello" } }),
+            &context,
+        )
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert_eq!(result.content, "echo:hello");
+    // The nested call id is attached for correlation.
+    let details = result.details.expect("nested call details");
+    assert!(
+        details["nestedToolCallId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{details}"
+    );
+}
+
+#[tokio::test]
+async fn execute_tool_refuses_context_mode_tools() {
+    let harness = Harness::new("proxy-recursion");
+    let context = nested_context(&harness);
+    for name in ["ctx_execute_tool", "ctx_execute", "ctx_search"] {
+        let result = harness
+            .tool(CTX_EXECUTE_TOOL_PROXY_NAME)
+            .run(&json!({ "name": name, "args": {} }), &context)
+            .await;
+        assert!(result.is_error, "`{name}` must be refused");
+        assert!(
+            result.content.contains("cannot invoke context-mode tools"),
+            "{}",
+            result.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn execute_tool_requires_a_running_tool_call() {
+    let harness = Harness::new("proxy-detached");
+    // A plain context has no nested executor: the proxy must refuse instead of
+    // reaching for a host bypass.
+    let result = harness
+        .tool(CTX_EXECUTE_TOOL_PROXY_NAME)
+        .run(
+            &json!({ "name": "echo_probe", "args": { "message": "x" } }),
+            &ToolContext::new(harness.cwd.clone()),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(
+        result
+            .content
+            .contains("only available inside a running tool call"),
+        "{}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn execute_tool_surfaces_the_target_tools_error() {
+    let harness = Harness::new("proxy-target-error");
+    let context = nested_context(&harness);
+    let result = harness
+        .tool(CTX_EXECUTE_TOOL_PROXY_NAME)
+        .run(&json!({ "name": "no_such_tool", "args": {} }), &context)
+        .await;
+    assert!(result.is_error, "unknown nested tools report an error");
+    assert!(
+        result.content.contains("no_such_tool"),
+        "the reply names the target: {}",
+        result.content
     );
 }

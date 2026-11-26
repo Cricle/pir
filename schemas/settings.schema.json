@@ -721,11 +721,6 @@
       "additionalProperties": false,
       "description": "QuickJS resource limits of the extension runtime. Global settings scope only: project .pi/settings.json cannot loosen these. PI_EXT_* environment variables override them."
     },
-    "pythonTool": {
-      "type": "boolean",
-      "description": "Register the embedded RustPython 3 `python` tool (pir-only). Set false to skip it — for example when a custom `python` extension or the native-python path is preferred. `disabledBuiltinExtensions: [\"python\"]` removes the builtin at the loader layer regardless.",
-      "default": true
-    },
     "memory": {
       "type": "object",
       "description": "Settings for the embedded `memory` builtin (cm-memory engine).",

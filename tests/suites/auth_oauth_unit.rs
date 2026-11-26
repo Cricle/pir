@@ -172,6 +172,13 @@ fn copilot_normalizes_enterprise_domains() {
 }
 
 #[test]
+fn copilot_rejects_userinfo_ports_and_non_http_domains() {
+    assert_eq!(normalize_domain("github.com@attacker.example"), None);
+    assert_eq!(normalize_domain("https://company.ghe.com:8443"), None);
+    assert_eq!(normalize_domain("file:///tmp/enterprise"), None);
+}
+
+#[test]
 fn copilot_untrusted_verification_uri_rejected() {
     assert!(trusted_http_url("file:///etc/passwd").is_err());
     assert!(trusted_http_url("https://github.com/login/device").is_ok());

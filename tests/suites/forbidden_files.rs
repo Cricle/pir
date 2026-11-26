@@ -41,12 +41,13 @@ fn tracked_repository_contains_no_forbidden_upstream_artifacts() {
             // The built-in phone UI ships hand-written JS assets embedded by
             // `include_bytes!`/`include_dir!`; they are product source, not
             // upstream Node artifacts. The tree moved from
-            // `src/plugins/builtin/phone/assets/` to `clients/pi-phone-pwa/`
+            // `crates/pir-core/src/plugins/builtin/phone/assets/` to `clients/pi-phone-pwa/`
             // (built into `pir-phone-server` via `include_dir!`), so exempt
             // both roots; the matching `.gitignore` exception keeps them
             // tracked.
-            if path.starts_with("src/plugins/builtin/phone/assets/")
+            if path.starts_with("crates/pir-core/src/plugins/builtin/phone/assets/")
                 || path.starts_with("clients/pi-phone-pwa/")
+                || path.starts_with("crates/pir-native-shell/assets/")
             {
                 return false;
             }

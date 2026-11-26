@@ -39,8 +39,8 @@ use pir::env_daemon::frame::{self, Frame, CANCEL, ERROR, EVENT, PING, REQUEST, R
 use pir::mcp::error::McpError;
 use pir::mcp::manager::{ConnectionState, McpManager};
 use pir::mcp::oauth::{
-    authorization_issuer_mismatch, parse_www_authenticate, step_up_scope,
-    AuthorizationServerMetadata, McpOAuthState,
+    authorization_issuer_mismatch, parse_www_authenticate, secure_discovered_endpoint,
+    step_up_scope, AuthorizationServerMetadata, McpOAuthState,
 };
 use pir::mcp::protocol::CallToolResult;
 use pir::mcp::registry::{McpServerEntry, McpServerSource};
@@ -402,6 +402,23 @@ fn without_metadata_any_presented_iss_is_rejected() {
 // ---------------------------------------------------------------------------
 // MCP: WWW-Authenticate, step-up scope, persisted OAuth state
 // ---------------------------------------------------------------------------
+
+#[test]
+fn discovered_oauth_endpoints_are_public_https_only() {
+    assert!(secure_discovered_endpoint("https://auth.example/token", "token").is_ok());
+    for url in [
+        "http://auth.example/token",
+        "https://127.0.0.1/token",
+        "https://10.0.0.4/token",
+        "https://[::1]/token",
+        "https://localhost/token",
+    ] {
+        assert!(
+            secure_discovered_endpoint(url, "token").is_err(),
+            "unsafe discovered endpoint accepted: {url}"
+        );
+    }
+}
 
 #[test]
 fn www_authenticate_carries_the_documented_parameters() {

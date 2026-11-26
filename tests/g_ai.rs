@@ -27,16 +27,10 @@ mod ai_codex_ws_w10;
 mod ai_codex_ws_w13;
 #[path = "suites/ai_copilot_headers.rs"]
 mod ai_copilot_headers;
-#[path = "suites/ai_error.rs"]
-mod ai_error;
-#[path = "suites/ai_event_stream.rs"]
-mod ai_event_stream;
-#[path = "suites/ai_event_stream_backpressure.rs"]
-mod ai_event_stream_backpressure;
-#[path = "suites/ai_event_stream_drop_w13.rs"]
-mod ai_event_stream_drop_w13;
-#[path = "suites/ai_event_stream_ext.rs"]
-mod ai_event_stream_ext;
+// ai_error / ai_event_stream{,_backpressure,_drop_w13,_ext} moved to
+// `crates/pir-ai-types/tests/`: they import only `ai::error`,
+// `ai::event_stream`, `ai::types` and `ai::util`, so they exercise the
+// extracted crate and belong where `cargo test -p pir-ai-types` runs them.
 #[path = "suites/ai_google.rs"]
 mod ai_google;
 #[path = "suites/ai_http.rs"]
@@ -105,5 +99,3 @@ mod provider_config_units;
 mod quality_type_modeling;
 #[path = "suites/schema_catalog_w11.rs"]
 mod schema_catalog_w11;
-#[path = "suites/telemetry_core_w10.rs"]
-mod telemetry_core_w10;

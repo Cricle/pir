@@ -48,6 +48,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         // Explicit defaults keep a developer's global settings / PI_EXT_*
         // overrides out of the measurement.
         limits: Some(Default::default()),
+        ..ExtensionConfig::default()
     }
 }
 

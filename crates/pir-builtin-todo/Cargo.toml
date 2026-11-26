@@ -1,0 +1,18 @@
+[package]
+name = "pir-builtin-todo"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Host-neutral todo domain for the pir coding agent: task state machine, dependency graph, reducer, formatting and session store"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

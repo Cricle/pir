@@ -64,6 +64,11 @@ fn balanced_profile_keeps_historical_defaults() {
     assert_eq!(settings.effective_hard_turn_budget(), 0);
     assert_eq!(settings.effective_max_total_tokens(), 0);
     assert_eq!(settings.effective_context_files_max_bytes(), 0);
+    assert_eq!(
+        settings.effective_subagent_max_turns(),
+        pir::plugins::subagent::DEFAULT_SUBAGENT_MAX_TURNS
+    );
+    assert_eq!(settings.effective_subagent_max_total_tokens(), 0);
     assert!(settings.prompt_cache_enabled());
 }
 
@@ -73,11 +78,13 @@ fn efficient_profile_has_bounded_defaults_and_overrides_win() {
         profile: Some(PerformanceProfile::Efficient),
         ..Default::default()
     };
-    assert_eq!(settings.effective_tool_result_max_bytes(), 32 * 1024);
+    assert_eq!(settings.effective_tool_result_max_bytes(), 24 * 1024);
     assert_eq!(settings.effective_soft_turn_budget(), 24);
     assert_eq!(settings.effective_hard_turn_budget(), 48);
     assert_eq!(settings.effective_max_total_tokens(), 250_000);
     assert_eq!(settings.effective_context_files_max_bytes(), 64 * 1024);
+    assert_eq!(settings.effective_subagent_max_turns(), 100);
+    assert_eq!(settings.effective_subagent_max_total_tokens(), 100_000);
 
     let overridden = PerformanceSettings {
         profile: Some(PerformanceProfile::Efficient),
@@ -87,11 +94,24 @@ fn efficient_profile_has_bounded_defaults_and_overrides_win() {
         max_total_tokens: Some(4),
         context_files_max_bytes: Some(5),
         prompt_cache: Some(PromptCacheMode::Off),
+        subagent_max_turns: Some(6),
+        subagent_max_total_tokens: Some(7),
     };
     assert_eq!(overridden.effective_tool_result_max_bytes(), 1);
     assert_eq!(overridden.effective_soft_turn_budget(), 2);
     assert_eq!(overridden.effective_hard_turn_budget(), 3);
     assert_eq!(overridden.effective_max_total_tokens(), 4);
     assert_eq!(overridden.effective_context_files_max_bytes(), 5);
+    assert_eq!(overridden.effective_subagent_max_turns(), 6);
+    assert_eq!(overridden.effective_subagent_max_total_tokens(), 7);
     assert!(!overridden.prompt_cache_enabled());
+
+    // `0` is the documented "unlimited" spelling for both subagent knobs.
+    let unlimited = PerformanceSettings {
+        subagent_max_turns: Some(0),
+        subagent_max_total_tokens: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(unlimited.effective_subagent_max_turns(), usize::MAX);
+    assert_eq!(unlimited.effective_subagent_max_total_tokens(), 0);
 }

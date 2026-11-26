@@ -446,6 +446,7 @@ fn fixture_with(
             event_stream: None,
             extensions: None,
             tool_selection,
+            phone_child: None,
         },
         vec![
             Arc::new(ToolSearchPlugin::new()) as Arc<dyn AgentPlugin>,

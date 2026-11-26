@@ -1893,6 +1893,7 @@ async fn compaction_summarizer_request_carries_the_context_clamped_budget() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     let handler: pir::agent_session::EventHandler = Arc::new(|_event| {});
     agent
@@ -1958,6 +1959,7 @@ async fn compaction_summarizer_keeps_the_model_budget_on_a_large_window() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     let handler: pir::agent_session::EventHandler = Arc::new(|_event| {});
     agent

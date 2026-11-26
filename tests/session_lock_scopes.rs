@@ -111,6 +111,8 @@ fn extension_config(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -152,14 +154,14 @@ fn js_path(path: &Path) -> String {
     serde_json::to_string(&path.to_string_lossy().replace('\\', "/")).expect("path literal")
 }
 
+/// Wait for `path` to appear, event-driven.
+///
+/// Was a 2 ms `sleep` poll; the producer creates the marker and this blocks on
+/// a directory watch instead (the crate behind `fs.watch`), so the wait costs
+/// nothing on an idle machine and cannot be too short under load.
 fn wait_for_file(path: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    let found = crate::common::wait_for_file(path, timeout, || path.exists().then_some(true));
+    debug_assert!(found, "wait_for_file only returns after the path exists");
     path.exists()
 }
 
@@ -648,8 +650,10 @@ fn sqlite_statement_on_one_database_does_not_block_another_database() {
         wait_for_file(&marker, Duration::from_secs(10)),
         "the blocked INSERT never started"
     );
-    // Let the INSERT enter SQLite's busy wait before the quick statement.
-    std::thread::sleep(Duration::from_millis(100));
+    // The marker is written by the statement IMMEDIATELY BEFORE the blocking
+    // INSERT, so its appearance already proves that INSERT is in flight (and
+    // therefore inside SQLite's busy wait). No `sleep` is needed to "let it
+    // enter": the assertion below observes the blocking directly.
     assert!(
         a_result_rx.try_recv().is_err(),
         "the INSERT on database A must still be blocked by the locker's transaction"

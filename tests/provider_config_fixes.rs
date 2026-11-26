@@ -16,11 +16,11 @@ use pir::ai::auth::oauth::openai_chatgpt::{
 use pir::ai::auth::oauth::radius::{device_poll_decision, RadiusOAuthError, RadiusTokenError};
 use pir::ai::auth::{env_api_keys, ApiKeyAuth, MapAuthContext};
 use pir::ai::providers::config_value::{
-    clear_config_value_cache, execute_command_with_timeout, resolve_config_value,
+    clear_config_value_cache, execute_command_with_timeout, resolve_config_value_in,
 };
 use pir::ai::providers::{
-    catalog, load_pi_config_with, load_pi_environment, merge_pi_config, parse_pi_config,
-    CatalogProviderEntry,
+    catalog, load_pi_config_with, load_pi_config_with_in, load_pi_environment_in, merge_pi_config,
+    parse_models_json_layer_at, parse_pi_config, CatalogProviderEntry,
 };
 use pir::ai::types::{Model, ModelCost, ModelCostRates};
 
@@ -28,77 +28,28 @@ use pir::ai::types::{Model, ModelCost, ModelCostRates};
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// Gate + explicit environment for the tests whose property IS the process
+/// environment: the agent-dir precedence
+/// (`PIR_AGENT_DIR` → `PIR_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR`), the
+/// `PI_OAUTH_CALLBACK_HOST` override, and the `!command` cache's stamp check.
+///
+/// The precedence cannot be expressed with an explicit argument — the whole
+/// point is that `agent_dir()` reads these three names in order — so those
+/// tests pin them instead, and each one asks
+/// [`crate::common::skip_without_nextest`] first so the pin only ever lands
+/// while this process runs a single test. The three `models.json` loading
+/// tests below take the explicit `*_in` seam instead and need neither.
+///
+/// Clears every agent-dir override, then applies `pins`; previous values are
+/// restored on drop, panic included.
+fn agent_dir_env(pins: &[(&'static str, &str)]) -> crate::common::ProcessEnvPin {
+    crate::common::ProcessEnvPin::isolate(&crate::common::AGENT_DIR_ENV_VARS, pins)
 }
 
 fn set_env(key: &str, value: Option<&str>) {
     match value {
         Some(value) => std::env::set_var(key, value),
         None => std::env::remove_var(key),
-    }
-}
-
-/// The three variables `ai::providers::settings::agent_dir()` consults, in
-/// precedence order.
-const AGENT_DIR_VARS: [&str; 3] = [
-    "PIR_AGENT_DIR",
-    "PIR_CODING_AGENT_DIR",
-    "PI_CODING_AGENT_DIR",
-];
-
-/// Serialized, fully explicit control of the agent-dir environment for ONE
-/// test.
-///
-/// Constructed under the module env lock, it CLEARS every agent-dir override
-/// and restores the previous values (absence included) on drop, panic
-/// included. A test that asserts a resolution therefore states the complete
-/// environment it depends on instead of inheriting one: a host (or CI) that
-/// exports `PIR_AGENT_DIR` can no longer redirect the load, and a sibling
-/// suite can no longer leave a pin behind for this test to observe.
-struct AgentDirEnv {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl AgentDirEnv {
-    fn clear() -> Self {
-        Self::scoped(&[])
-    }
-
-    /// Clear every agent-dir override, then apply `pins` (name/value pairs).
-    fn scoped(pins: &[(&'static str, &str)]) -> Self {
-        let lock = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let saved = AGENT_DIR_VARS
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in AGENT_DIR_VARS {
-            std::env::remove_var(key);
-        }
-        for (key, value) in pins {
-            debug_assert!(
-                AGENT_DIR_VARS.contains(key),
-                "{key} is not an agent-dir variable"
-            );
-            std::env::set_var(key, value);
-        }
-        Self { _lock: lock, saved }
-    }
-}
-
-impl Drop for AgentDirEnv {
-    fn drop(&mut self) {
-        // Reverse order so a variable restored twice unwinds to its original.
-        for (key, previous) in self.saved.drain(..).rev() {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 }
 
@@ -372,18 +323,16 @@ fn padded_models_json(total_bytes: usize) -> String {
 
 #[test]
 fn models_json_over_limit_is_treated_as_absent() {
-    let _guard = env_lock().lock().unwrap();
-    let previous = std::env::var("PIR_AGENT_DIR").ok();
     let dir = temp_dir("models-json-over-limit");
     let contents = padded_models_json(9 * 1024 * 1024);
     assert_eq!(contents.len(), 9 * 1024 * 1024);
     std::fs::write(dir.join("models.json"), &contents).expect("write models.json");
     drop(contents);
 
-    set_env("PIR_AGENT_DIR", Some(dir.to_str().unwrap()));
-    let configured = load_pi_config_with(None).expect("load must not fail");
-    let environment = load_pi_environment(None).expect("environment load must not fail");
-    set_env("PIR_AGENT_DIR", previous.as_deref());
+    // The explicit-dir seam: both loaders read THIS directory's models.json,
+    // so the cap is proved without touching the process environment.
+    let configured = load_pi_config_with_in(&dir, None).expect("load must not fail");
+    let environment = load_pi_environment_in(&dir, None).expect("environment load must not fail");
 
     assert!(
         configured.is_none(),
@@ -401,16 +350,12 @@ fn models_json_over_limit_is_treated_as_absent() {
 
 #[test]
 fn models_json_under_limit_still_parses() {
-    let _guard = env_lock().lock().unwrap();
-    let previous = std::env::var("PIR_AGENT_DIR").ok();
     let dir = temp_dir("models-json-small");
     let contents = padded_models_json(1024);
     assert_eq!(contents.len(), 1024);
     std::fs::write(dir.join("models.json"), &contents).expect("write models.json");
 
-    set_env("PIR_AGENT_DIR", Some(dir.to_str().unwrap()));
-    let configured = load_pi_config_with(None).expect("load must not fail");
-    set_env("PIR_AGENT_DIR", previous.as_deref());
+    let configured = load_pi_config_with_in(&dir, None).expect("load must not fail");
 
     let configured = configured.expect("a 1 KiB models.json must still parse");
     assert_eq!(configured.model.provider, "acme");
@@ -459,25 +404,22 @@ fn wrong_typed_models_json_fields_report_pi_schema_errors() {
 
     // Through the real loader the same file degrades to the empty layer plus
     // the recorded pi-text warning (PIR-BIN-098): no invented model id, no
-    // error return.
-    let _guard = env_lock().lock().unwrap();
-    let previous = std::env::var("PIR_AGENT_DIR").ok();
+    // error return. `parse_models_json_layer_at` is the loader's own seam with
+    // the file path supplied explicitly, so this reads neither the process
+    // environment nor the process-global "last load error" slot — a sibling
+    // suite's load cannot clobber the value under test.
     let dir = temp_dir("models-json-schema");
-    std::fs::write(
-        dir.join("models.json"),
-        r#"{"providers":{"x":{"models":"nope"}}}"#,
-    )
-    .expect("write models.json");
+    let models_path = dir.join("models.json");
+    std::fs::write(&models_path, r#"{"providers":{"x":{"models":"nope"}}}"#)
+        .expect("write models.json");
 
-    set_env("PIR_AGENT_DIR", Some(dir.to_str().unwrap()));
-    let configured = load_pi_config_with(None).expect("a schema error must not abort the load");
-    set_env("PIR_AGENT_DIR", previous.as_deref());
-
+    let (layer, recorded) =
+        parse_models_json_layer_at(&models_path, r#"{"providers":{"x":{"models":"nope"}}}"#);
     assert!(
-        configured.is_none(),
+        layer.providers.is_empty(),
         "a schema-invalid models.json must not invent a configured model"
     );
-    let recorded = pir::ai::providers::models_json_load_error().expect("recorded error");
+    let recorded = recorded.expect("recorded error");
     assert!(
         recorded.starts_with("Invalid models.json schema:"),
         "{recorded}"
@@ -487,8 +429,16 @@ fn wrong_typed_models_json_fields_report_pi_schema_errors() {
         "{recorded}"
     );
     assert!(
-        recorded.contains(&format!("File: {}", dir.join("models.json").display())),
+        recorded.contains(&format!("File: {}", models_path.display())),
         "{recorded}"
+    );
+
+    // The directory-based loader agrees: same empty layer, no error return.
+    let configured =
+        load_pi_config_with_in(&dir, None).expect("a schema error must not abort the load");
+    assert!(
+        configured.is_none(),
+        "a schema-invalid models.json must not invent a configured model"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -499,12 +449,19 @@ fn wrong_typed_models_json_fields_report_pi_schema_errors() {
 
 #[test]
 fn chatgpt_redirect_uri_follows_callback_host_env() {
-    let _guard = env_lock().lock().unwrap();
-    set_env("PI_OAUTH_CALLBACK_HOST", None);
+    if crate::common::skip_without_nextest(
+        "provider_config_fixes::chatgpt_redirect_uri_follows_callback_host_env",
+    ) {
+        return;
+    }
+    // `callback_host()` is deliberately a plain `std::env::var` read — that IS
+    // the contract (an operator overrides the OAuth redirect host from the
+    // shell, for a container port-forward) — so this pins the variable instead
+    // of adding an argument that production would never pass.
+    let _pin = crate::common::ProcessEnvPin::isolate(&["PI_OAUTH_CALLBACK_HOST"], &[]);
     assert_eq!(redirect_uri(), "http://127.0.0.1:1455/auth/callback");
-    set_env("PI_OAUTH_CALLBACK_HOST", Some("localhost"));
+    std::env::set_var("PI_OAUTH_CALLBACK_HOST", "localhost");
     assert_eq!(redirect_uri(), "http://localhost:1455/auth/callback");
-    set_env("PI_OAUTH_CALLBACK_HOST", None);
 }
 
 // ---------------------------------------------------------------------------
@@ -696,8 +653,16 @@ fn models_json_entries_default_to_text_only_input() {
 // P1-3: the agent-dir env overrides drive models.json resolution
 // ---------------------------------------------------------------------------
 
+/// The property is the PRECEDENCE of the three spellings, so this pins them
+/// rather than passing a directory: an explicit `*_in(agent_dir, ..)` call
+/// cannot show which variable wins.
 #[test]
 fn models_json_resolves_under_pir_coding_agent_dir() {
+    if crate::common::skip_without_nextest(
+        "provider_config_fixes::models_json_resolves_under_pir_coding_agent_dir",
+    ) {
+        return;
+    }
     let dir = temp_dir("agent-dir");
     std::fs::create_dir_all(&dir).expect("agent dir");
     std::fs::write(
@@ -714,12 +679,13 @@ fn models_json_resolves_under_pir_coding_agent_dir() {
         }"#,
     )
     .expect("write models.json");
+    let dir_str = dir.to_str().unwrap();
 
     // Case 1: PIR_CODING_AGENT_DIR alone (every other override cleared). This
     // is the documented "second" variable, so it must resolve when nothing
     // outranks it — regardless of what the host exports.
     {
-        let _env = AgentDirEnv::scoped(&[("PIR_CODING_AGENT_DIR", dir.to_str().unwrap())]);
+        let _env = agent_dir_env(&[("PIR_CODING_AGENT_DIR", dir_str)]);
         let configured = load_pi_config_with(None)
             .expect("load")
             .expect("models.json resolved under PIR_CODING_AGENT_DIR");
@@ -731,7 +697,7 @@ fn models_json_resolves_under_pir_coding_agent_dir() {
     // Case 2: PIR_AGENT_DIR pointing at the SAME directory resolves too (the
     // higher-precedence variable names the same file; nothing changes).
     {
-        let _env = AgentDirEnv::scoped(&[("PIR_AGENT_DIR", dir.to_str().unwrap())]);
+        let _env = agent_dir_env(&[("PIR_AGENT_DIR", dir_str)]);
         let configured = load_pi_config_with(None)
             .expect("load")
             .expect("models.json resolved under PIR_AGENT_DIR");
@@ -748,9 +714,9 @@ fn models_json_resolves_under_pir_coding_agent_dir() {
     let empty = temp_dir("agent-dir-empty");
     std::fs::create_dir_all(&empty).expect("empty agent dir");
     {
-        let _env = AgentDirEnv::scoped(&[
+        let _env = agent_dir_env(&[
             ("PIR_AGENT_DIR", empty.to_str().unwrap()),
-            ("PIR_CODING_AGENT_DIR", dir.to_str().unwrap()),
+            ("PIR_CODING_AGENT_DIR", dir_str),
         ]);
         let configured = load_pi_config_with(None).expect("load");
         assert_ne!(
@@ -761,21 +727,26 @@ fn models_json_resolves_under_pir_coding_agent_dir() {
         );
     }
 
-    // After every guard drops, the environment is back to the host's shape
-    // (an exported PIR_AGENT_DIR, if any, is visible again).
+    // After every pin drops, the environment is back to the host's shape (an
+    // exported PIR_AGENT_DIR, if any, is visible again).
     let _ = std::fs::remove_dir_all(&empty);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Another precedence property: each spelling resolves when it is the only one
+/// set, and the documented order decides when several are.
 #[test]
 fn agent_dir_honors_every_override_variable() {
-    let _guard = env_lock().lock().unwrap();
+    if crate::common::skip_without_nextest(
+        "provider_config_fixes::agent_dir_honors_every_override_variable",
+    ) {
+        return;
+    }
     let dir = temp_dir("agent-dir-vars");
     let dir_str = dir.to_str().unwrap();
 
-    set_env("PIR_AGENT_DIR", None);
-    set_env("PIR_CODING_AGENT_DIR", None);
-    set_env("PI_CODING_AGENT_DIR", None);
+    // Nothing set: the `~/.pi/agent` fallback.
+    let _cleared = crate::common::ProcessEnvPin::isolate(&crate::common::AGENT_DIR_ENV_VARS, &[]);
     assert!(
         pir::ai::providers::agent_dir().ends_with(".pi\\agent")
             || pir::ai::providers::agent_dir().ends_with(".pi/agent")
@@ -790,13 +761,6 @@ fn agent_dir_honors_every_override_variable() {
     set_env("PIR_AGENT_DIR", Some(dir_str));
     assert_eq!(pir::ai::providers::agent_dir(), dir);
 
-    for key in [
-        "PIR_AGENT_DIR",
-        "PIR_CODING_AGENT_DIR",
-        "PI_CODING_AGENT_DIR",
-    ] {
-        set_env(key, None);
-    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -806,13 +770,15 @@ fn agent_dir_honors_every_override_variable() {
 /// keybindings settings).
 #[test]
 fn session_and_theme_dirs_honor_pir_agent_dir_only() {
-    let _guard = env_lock().lock().unwrap();
+    if crate::common::skip_without_nextest(
+        "provider_config_fixes::session_and_theme_dirs_honor_pir_agent_dir_only",
+    ) {
+        return;
+    }
     let dir = temp_dir("agent-dir-alias");
     let dir_str = dir.to_str().unwrap();
 
-    set_env("PIR_CODING_AGENT_DIR", None);
-    set_env("PI_CODING_AGENT_DIR", None);
-    set_env("PIR_AGENT_DIR", Some(dir_str));
+    let _pin = agent_dir_env(&[("PIR_AGENT_DIR", dir_str)]);
 
     // Session dir (feeds the SDK + session discovery).
     assert_eq!(pir::session_manager::agent_dir(), dir);
@@ -821,7 +787,6 @@ fn session_and_theme_dirs_honor_pir_agent_dir_only() {
     // TUI global dir (custom themes `<dir>/themes` + keybindings settings).
     assert_eq!(pir::tui::terminal::global_agent_dir(), dir);
 
-    set_env("PIR_AGENT_DIR", None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -962,11 +927,11 @@ fn command_values_over_the_output_cap_resolve_to_none() {
 
 #[test]
 fn command_values_are_cached_per_command() {
-    // The cache is keyed by (resolved agent dir, command) and validated against
-    // that dir's config stamps, so a concurrent `PIR_AGENT_DIR` mutation from a
-    // sibling test would show up as a MISS and re-run this command. Hold the
-    // same lock the env-mutating tests use.
-    let _guard = env_lock().lock().unwrap();
+    // The cache is keyed by `(resolved agent dir, command)` and validated
+    // against THAT dir's config stamps, so a scratch agent dir plus the
+    // explicit `resolve_config_value_in` seam makes this hermetic: no sibling
+    // test can move the cache key out from under it, and no lock is needed.
+    let agent_dir = crate::common::scratch_agent_dir("command-cache", None);
     clear_config_value_cache();
     let path = temp_dir("command-cache").join("hits.txt");
     // The command appends a marker to a file (each execution is observable)
@@ -977,9 +942,10 @@ fn command_values_are_cached_per_command() {
     let command = format!("echo run >> {path_arg}; echo ok");
 
     let config = format!("!{command}");
-    assert_eq!(resolve_config_value(&config, None).as_deref(), Some("ok"));
+    let resolve = || resolve_config_value_in(agent_dir.path(), &config, None);
+    assert_eq!(resolve().as_deref(), Some("ok"));
     // Second resolution hits the cache: no second execution.
-    assert_eq!(resolve_config_value(&config, None).as_deref(), Some("ok"));
+    assert_eq!(resolve().as_deref(), Some("ok"));
     let contents = std::fs::read_to_string(&path).expect("command ran");
     assert_eq!(
         contents.matches("run").count(),
@@ -989,7 +955,7 @@ fn command_values_are_cached_per_command() {
 
     // Clearing the cache re-executes.
     clear_config_value_cache();
-    assert_eq!(resolve_config_value(&config, None).as_deref(), Some("ok"));
+    assert_eq!(resolve().as_deref(), Some("ok"));
     let contents = std::fs::read_to_string(&path).expect("command ran again");
     assert_eq!(contents.matches("run").count(), 2);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());

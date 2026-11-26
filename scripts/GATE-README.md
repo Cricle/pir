@@ -41,12 +41,12 @@ tens of minutes and prove nothing while an earlier one is red.
 | 3 | clippy | `cargo clippy --all-targets --all-features -- -D warnings` | zero warnings across every target and feature combination | 4–105 s depending on cache (`logs/acc-final/*/summary.txt`) |
 | 4 | build | `cargo build --all-targets --all-features` | every target links with every feature on | 206–344 s (`logs/acc-final/*/summary.txt`) |
 | 5 | targeted suites | `powershell -NoProfile -File scripts/test_select.ps1` | the suites mapped to the changed files, plus the `pir`+`cli` smoke pair | ~1–2 min for a small subset (*lane-reported; not re-measured here*) |
-| 6 | full suite | `powershell -NoProfile -File scripts/test_fast.ps1` | **every** test binary, run concurrently, with load-flaky suites separated from real failures | 621–706 s = build 303–333 s + parallel 283–298 s across 253 suites at run time (`logs/test_fast3.log`, `logs/test_fast2.log`); the current tree has **14 test targets** (8 merged `zz_merged_*` harnesses + 5 standalone targets + the lib unit target; `cargo metadata --no-deps`) |
+| 6 | full suite | `powershell -NoProfile -File scripts/test_fast.ps1` | **every** test binary, run concurrently, with load-flaky suites separated from real failures | 621–706 s = build 303–333 s + parallel 283–298 s across 253 suites at run time (`logs/test_fast3.log`, `logs/test_fast2.log`); the current tree has **16 test targets** for `pir-sdk` (8 merged `zz_merged_*` harnesses + 8 standalone targets; `cargo metadata --no-deps`) plus the per-crate suites the crate-test step runs |
 | 7 | doctests | `cargo test --doc` | the doc examples in `src/**` still compile and run | 16.3 s, 27 passed / 6 ignored (`logs/doctests2.log`) |
 | 8 | feature matrix | `bash scripts/feature_matrix.sh` | 72 documented configurations (51 lib + 11 bin + 2 SDK consumer + 8 smoke) each compile; the script's asserted header is the source of truth (see §2) | *unmeasured end-to-end*; individual rows from the lane sweep below |
 | 9 | ConPTY battery | `python scripts/tui_conpty/run_battery.py` | the TUI works on a real pseudo-console: rendering, quit/restore, clipboard, streaming | 31 scenarios ≈ 543 s (`scripts/tui_conpty/out/sdk-battery-rerun/report.md`); 6 scenarios ≈ 105 s (`out/recon_before_subset/report.md`) |
 | 10 | memory + soak | see `scripts/soak/GATE-RUNBOOK.md` | the 20 MB/100 MB-session budget and long-run stability | per runbook |
-| 11 | release | `cargo build --release` | the shipped artifact builds (fat LTO, `codegen-units=1`) | 8 m 51 s (`logs/perf/20261016-firstbyte/release_build.log`) |
+| 11 | release | `cargo build --release` | the shipped artifact builds (thin LTO, `codegen-units=4`) | 8 m 51 s was the fat-LTO figure (`logs/perf/20261016-firstbyte/release_build.log`); thin is markedly faster |
 | 12 | A/B | see `scripts/perf/AB-RUNBOOK.md` | quality/latency vs `pi` under a pinned model | per runbook |
 
 `scripts/acc_final.ps1` runs **gates 2–4** in one command into
@@ -243,7 +243,7 @@ not hidden.
 
 | Fact | Source |
 |---|---|
-| full suite 621 s / 706 s (253 suites at run time; current tree: 258 test targets) | `logs/test_fast3.log`, `logs/test_fast2.log` |
+| full suite 621 s / 706 s (253 suites at run time; `pir-sdk` now declares 16 test targets + the per-crate suites) | `logs/test_fast3.log`, `logs/test_fast2.log` |
 | fmt/clippy/build RCs and seconds | `logs/acc-final/*/summary.txt` |
 | doctests 27 passed / 16.3 s | `logs/doctests2.log` |
 | `check --tests` 1 m 37 s | `logs/check_tests3.log` |

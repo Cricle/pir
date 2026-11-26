@@ -1,4 +1,4 @@
-import { encodeWsToken, getServerBase, storeStoredToken } from "./config.js";
+import { encodeWsToken, storeStoredToken } from "./config.js";
 import { renderLoadEarlier } from "./messages.js";
 import { state } from "./state.js";
 import { openTokenModal, renderHeader, renderQuota, showBanner, showToast } from "./ui.js";
@@ -9,7 +9,7 @@ import { openTokenModal, renderHeader, renderQuota, showBanner, showToast } from
  * relay instead.
  */
 export function apiUrl(path) {
-  return `${getServerBase()}${path}`;
+  return `${state.serverBase}${path}`;
 }
 
 export function wsUrl(path) {
@@ -249,7 +249,7 @@ export async function loadHealth() {
   });
   if (response.status === 401) {
     state.token = "";
-    storeStoredToken("");
+    storeStoredToken("", state.serverBase);
     openTokenModal();
     throw new Error("Access token rejected. Enter it again.");
   }

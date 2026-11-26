@@ -16,7 +16,6 @@
 //! (contents and modes), follow every agent-dir override, and never fail the
 //! process on an IO error.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,17 +176,19 @@ fn bootstrap_is_best_effort_on_io_failure() {
 /// `bootstrap_default_agent_dir` resolves the process agent dir, so every
 /// supported override (`PIR_AGENT_DIR`, `PIR_CODING_AGENT_DIR`,
 /// `PI_CODING_AGENT_DIR`) is honored.
+///
+/// The resolution IS the property under test — the function takes no directory
+/// argument — so this pins the variables, which is only race-free when the
+/// process runs a single test: hence the nextest guard.
 #[tokio::test]
 async fn bootstrap_default_agent_dir_honors_each_override() {
-    use crate::common::agent_dir_env_lock;
-
-    let _lock = agent_dir_env_lock().lock().await;
-    let vars = [
-        "PIR_AGENT_DIR",
-        "PIR_CODING_AGENT_DIR",
-        "PI_CODING_AGENT_DIR",
-    ];
-    let _env = EnvVarsGuard::isolate(&vars);
+    if crate::common::skip_without_nextest(
+        "agent_bootstrap::bootstrap_default_agent_dir_honors_each_override",
+    ) {
+        return;
+    }
+    let vars = crate::common::AGENT_DIR_ENV_VARS;
+    let _env = crate::common::ProcessEnvPin::isolate(&vars, &[]);
     let scratch = ScratchDir::new("env");
 
     for (index, var) in vars.iter().enumerate() {
@@ -207,37 +208,6 @@ async fn bootstrap_default_agent_dir_honors_each_override() {
             "{var} must select the bootstrap target"
         );
         std::env::remove_var(var);
-    }
-}
-
-/// RAII restore for process env mutations (drop runs while the caller's
-/// [`agent_dir_env_lock`](crate::common::agent_dir_env_lock) guard is still
-/// alive, because locals drop in reverse declaration order).
-struct EnvVarsGuard {
-    saved: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl EnvVarsGuard {
-    fn isolate(vars: &[&'static str]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|var| (*var, std::env::var_os(var)))
-            .collect();
-        for var in vars {
-            std::env::remove_var(var);
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvVarsGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.saved.drain(..) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 }
 

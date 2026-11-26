@@ -199,6 +199,7 @@ async fn definition_changes_invalidate_a_kept_name_and_cache_hits_do_not_rebuild
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin.clone() as Arc<dyn AgentPlugin>],
     );

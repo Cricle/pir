@@ -27,20 +27,8 @@ use pir::plugins::builtin::McpPlugin;
 use pir::plugins::{AgentPlugin, PluginHost, ToolBackend};
 
 // ---------------------------------------------------------------------------
-// Env serialization + temp dirs (copied from tests/mcp_builtin_tools.rs)
+// Fixtures (temp dirs; the agent dir is passed explicitly, never via the env)
 // ---------------------------------------------------------------------------
-
-/// `PIR_AGENT_DIR` is process-wide; the MCP plugin reads it in `register()`.
-/// Every env-mutating test in this binary serializes on this lock.
-async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    use tokio::sync::OnceCell;
-    static ENV_LOCK: OnceCell<tokio::sync::Mutex<()>> = OnceCell::const_new();
-    ENV_LOCK
-        .get_or_init(|| async { tokio::sync::Mutex::new(()) })
-        .await
-        .lock()
-        .await
-}
 
 struct TempDir(PathBuf);
 
@@ -191,7 +179,11 @@ fn write_mcp_json(agent_dir: &Path, document: Value) {
 
 fn build_host(agent_dir: &Path, cwd: &Path) -> (Arc<McpPlugin>, PluginHost) {
     let plugin = Arc::new(McpPlugin::with_cwd(agent_dir, cwd));
-    let host = PluginHost::build(None, vec![plugin.clone() as Arc<dyn AgentPlugin>]);
+    let host = PluginHost::build_with_agent_dir(
+        None,
+        vec![plugin.clone() as Arc<dyn AgentPlugin>],
+        Some(agent_dir),
+    );
     (plugin, host)
 }
 
@@ -291,10 +283,8 @@ fn called_text(result: &pir::extensions::ToolResult) -> String {
 
 #[tokio::test(flavor = "current_thread")]
 async fn default_direct_connects_and_declares_the_tool_to_the_model() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("default-direct");
     let cwd = TempDir::new("default-direct-cwd");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
     write_mcp_json(
         &agent.0,
         json!({ "mcpServers": { "mock": server_config() } }),
@@ -344,10 +334,8 @@ async fn default_direct_connects_and_declares_the_tool_to_the_model() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn builtin_tools_false_hides_the_tool_from_the_direct_list() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("builtin-false");
     let cwd = TempDir::new("builtin-false-cwd");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
     write_mcp_json(
         &agent.0,
         json!({
@@ -406,10 +394,8 @@ async fn builtin_tools_false_hides_the_tool_from_the_direct_list() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn explicit_hidden_stays_hidden_under_builtin_tools() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("explicit-hidden");
     let cwd = TempDir::new("explicit-hidden-cwd");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
     let mut config = server_config();
     config["exposure"] = json!("hidden");
     write_mcp_json(
@@ -455,10 +441,8 @@ async fn explicit_hidden_stays_hidden_under_builtin_tools() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tool_exposure_override_hides_one_tool_and_keeps_the_other_direct() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("tool-override");
     let cwd = TempDir::new("tool-override-cwd");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
     let mut config = server_config();
     config["toolExposure"] = json!({ "echo": "hidden" });
     write_mcp_json(

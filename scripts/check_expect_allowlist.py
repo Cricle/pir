@@ -14,7 +14,11 @@ import pathlib
 
 MARKERS = (".expect(", ".expect::<", ".expect (")
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SRC = ROOT / "src"
+SOURCE_ROOTS = (
+    ROOT / "src",
+    ROOT / "crates" / "pir-core" / "src",
+    ROOT / "crates" / "pir-tui" / "src",
+)
 HYGIENE = ROOT / "tests" / "suites" / "source_hygiene.rs"
 
 
@@ -40,7 +44,7 @@ def main():
     # Cache each file's expect line numbers once.
     cache = {}
     for rel, _ in entries:
-        p = SRC / rel
+        p = ROOT / rel
         if rel not in cache:
             cache[rel] = expect_lines(p.read_text(encoding="utf-8")) if p.exists() else []
 
@@ -54,12 +58,13 @@ def main():
         print(f"  {rel}:{n} -> file has expects at {actual}")
 
     unguarded = []
-    for p in SRC.rglob("*.rs"):
-        rel = p.relative_to(SRC).as_posix()
-        allowed = {int(l) for r, l in entries if r == rel}
-        for n in expect_lines(p.read_text(encoding="utf-8", errors="replace")):
-            if n not in allowed:
-                unguarded.append(f"{rel}:{n}")
+    for source_root in SOURCE_ROOTS:
+        for p in source_root.rglob("*.rs"):
+            rel = p.relative_to(ROOT).as_posix()
+            allowed = {int(l) for r, l in entries if r == rel}
+            for n in expect_lines(p.read_text(encoding="utf-8", errors="replace")):
+                if n not in allowed:
+                    unguarded.append(f"{rel}:{n}")
     print(f"\nUNGUARDED sites: {len(unguarded)}")
     for u in unguarded:
         print("  ", u)

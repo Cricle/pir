@@ -169,6 +169,8 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -182,9 +184,25 @@ async fn new_runtime() -> ExtensionRuntime {
         .expect("runtime construction")
 }
 
-// ---------------------------------------------------------------------------
-// Spike-level smoke: TS string → transpile → QuickJS → host `pi` object
-// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "current_thread")]
+async fn extension_runtime_cannot_reach_hard_process_exit_bridge() {
+    let rt = new_runtime().await;
+    // `eval_json` returns the parsed JSON value, so a `JSON.stringify(..)`
+    // result is a JSON string (not a Rust `String`).
+    let exit_bridge_type = rt
+        .eval_json("JSON.stringify(typeof globalThis.__pir_host.exitProcess)")
+        .await
+        .expect("inspect host surface");
+    assert_eq!(exit_bridge_type, serde_json::json!("undefined"));
+
+    let process_exit = rt
+        .eval_json(
+            "JSON.stringify((() => { try { process.exit(0); } catch (_) { return 'throws'; } })())",
+        )
+        .await
+        .expect("extension process.exit remains catchable");
+    assert_eq!(process_exit, serde_json::json!("throws"));
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn spike_ts_extension_registers_session_start_hook() {
@@ -1337,62 +1355,36 @@ async fn exec_rejects_invalid_max_buffer_before_spawning() {
 // getAgentDir resolves through the host
 // ---------------------------------------------------------------------------
 
-/// Serializes every test that mutates the agent-dir env vars (process-global).
-static AGENT_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// The three variables `ai::providers::settings::agent_dir()` consults, in
-/// precedence order.
-const AGENT_DIR_ENV_VARS: [&str; 3] = [
-    "PIR_AGENT_DIR",
-    "PIR_CODING_AGENT_DIR",
-    "PI_CODING_AGENT_DIR",
-];
-
-/// Fully explicit agent-dir environment for ONE test: holds the binary's
-/// agent-dir lock, CLEARS every override, applies `pins`, and restores every
-/// touched variable (absence included) on drop, panic included.
+/// Fully explicit agent-dir environment for ONE test: CLEARS every override,
+/// applies `pins`, and restores every touched variable (absence included) on
+/// drop, panic included.
 ///
 /// `getAgentDir()` resolves the process environment on every call, so a host
 /// that exports `PIR_AGENT_DIR` (the release-harness isolation variable) or a
 /// sibling suite that pins one would otherwise decide what these tests
 /// observe. Stating the environment here makes each test deterministic on CI
 /// and on any developer machine; no mutation outlives the test.
-struct AgentDirEnvGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl AgentDirEnvGuard {
-    /// Clear the agent-dir overrides plus every name in `pins`, and set
-    /// `pins`.
-    fn scoped(pins: &[(&'static str, &str)]) -> Self {
-        let lock = AGENT_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut saved = Vec::with_capacity(AGENT_DIR_ENV_VARS.len() + pins.len());
-        for key in AGENT_DIR_ENV_VARS {
-            saved.push((key, std::env::var_os(key)));
-            std::env::remove_var(key);
-        }
-        for (key, value) in pins {
-            if !saved.iter().any(|(saved_key, _)| saved_key == key) {
-                saved.push((*key, std::env::var_os(key)));
-            }
-            std::env::set_var(key, value);
-        }
-        Self { _lock: lock, saved }
+///
+/// These two probes assert HOW THE JS SURFACE RESOLVES THE PROCESS
+/// ENVIRONMENT — the ambient value is the property under test, and the JS
+/// `getAgentDir()` binding takes no argument that could carry a directory — so
+/// they cannot be rewritten around an explicit agent dir. They therefore run
+/// only under a process-per-test runner (nextest in CI and the pre-push gate)
+/// or when the operator opts in. The gate is therefore the whole mechanism:
+/// there is no lock, because a lock can only serialize this file against
+/// itself while leaving every other suite in the binary free to re-point the
+/// variable (TEST-2 in `.audit/review-2026-11-23/findings.jsonl`).
+/// Clear the agent-dir overrides plus every name in `pins`, set `pins`, and
+/// restore everything on drop. Returns `None` when the process is shared with
+/// other suites and the operator has not opted in (the caller then skips).
+fn agent_dir_env(pins: &[(&'static str, &str)]) -> Option<crate::common::ProcessEnvPin> {
+    if crate::common::skip_without_nextest("extensions_runtime::getAgentDir probe") {
+        return None;
     }
-}
-
-impl Drop for AgentDirEnvGuard {
-    fn drop(&mut self) {
-        for (key, previous) in self.saved.drain(..).rev() {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
+    Some(crate::common::ProcessEnvPin::isolate(
+        &crate::common::AGENT_DIR_ENV_VARS,
+        pins,
+    ))
 }
 
 /// The default agent dir is `<home>/.pi/agent`. The test pins `HOME` (the
@@ -1401,7 +1393,6 @@ impl Drop for AgentDirEnvGuard {
 /// instead of a substring guess a host env could satisfy by accident. No
 /// mutation outlives the test.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn get_agent_dir_resolves_to_host_path() {
     let home = std::env::temp_dir().join(format!(
         "pir-ext-agent-dir-home-{}-{}",
@@ -1415,7 +1406,10 @@ async fn get_agent_dir_resolves_to_host_path() {
     std::fs::create_dir_all(&home).expect("create scratch home");
     let home_str = home.to_str().expect("temp path is UTF-8");
 
-    let _env = AgentDirEnvGuard::scoped(&[("HOME", home_str), ("USERPROFILE", home_str)]);
+    let Some(_env) = agent_dir_env(&[("HOME", home_str), ("USERPROFILE", home_str)]) else {
+        let _ = std::fs::remove_dir_all(&home);
+        return;
+    };
 
     let rt = new_runtime().await;
     rt.seed_module(
@@ -1449,13 +1443,22 @@ async fn get_agent_dir_resolves_to_host_path() {
 /// the same alias the session dir and the TUI themes dir honor (upstream
 /// parity: one agent-dir resolution across every host surface).
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn get_agent_dir_honors_pir_agent_dir_alias() {
-    let _guard = AGENT_DIR_ENV_LOCK.lock().unwrap();
-    let previous = std::env::var("PIR_AGENT_DIR").ok();
-    let dir = std::env::temp_dir().join("pir-ext-agent-dir-alias");
+    let dir = std::env::temp_dir().join(format!(
+        "pir-ext-agent-dir-alias-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create agent dir");
+
+    let Some(_env) = agent_dir_env(&[]) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    };
     std::env::set_var("PIR_AGENT_DIR", &dir);
 
     let rt = new_runtime().await;
@@ -1484,10 +1487,7 @@ async fn get_agent_dir_honors_pir_agent_dir_alias() {
         "getAgentDir must resolve under PIR_AGENT_DIR, got {resolved}"
     );
 
-    match previous.as_deref() {
-        Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-        None => std::env::remove_var("PIR_AGENT_DIR"),
-    }
+    // `_env` restores PIR_AGENT_DIR (absence included) on drop.
     let _ = std::fs::remove_dir_all(&dir);
 }
 

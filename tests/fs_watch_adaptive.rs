@@ -32,6 +32,8 @@ fn test_config(cwd: PathBuf) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

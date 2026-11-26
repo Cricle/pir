@@ -17,7 +17,7 @@
 
 #[allow(unsafe_code)]
 #[allow(dead_code)]
-#[path = "../src/extensions/runtime/qjs_alloc.rs"]
+#[path = "../crates/pir-core/src/extensions/runtime/qjs_alloc.rs"]
 mod qjs_alloc;
 
 use std::ptr;

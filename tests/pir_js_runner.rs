@@ -336,9 +336,18 @@ Promise.reject(new Error("listened"));
 #[test]
 fn node_modules_available_from_cjs_entry() {
     let ws = Workspace::new("node-mods");
+    // The probe file name is unique per run: the script writes it and this
+    // test reads it back, so a shared literal name would let a concurrent (or
+    // previous) run satisfy the assertion with someone else's file.
+    let probe_name = crate::common::unique_temp_path("js-runner-write-probe")
+        .file_name()
+        .expect("probe file name")
+        .to_string_lossy()
+        .into_owned();
     ws.write(
         "mods.cjs",
-        r#"
+        &format!(
+            r#"
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -346,14 +355,15 @@ const os = require("os");
 const self = fs.readFileSync(__filename, "utf8");
 const marker = "mods.cjs-marker";
 fs.writeFileSync(
-  path.join(os.tmpdir(), "pir-js-runner-write-probe.txt"),
+  path.join(os.tmpdir(), "{probe_name}"),
   marker,
 );
 console.log("self-len:", self.length);
 console.log("join:", path.join("a", "b"));
 console.log("rand:", crypto.randomBytes(8).toString("hex"));
 console.log("tmpdir:", os.tmpdir() !== "");
-"#,
+"#
+        ),
     );
     let output = ws.run(&["mods.cjs"]);
     assert!(output.status.success(), "stderr: {}", stderr_of(&output));
@@ -376,7 +386,7 @@ console.log("tmpdir:", os.tmpdir() !== "");
     assert_eq!(rand.len(), 16, "8 random bytes as hex: {rand}");
     // The write probe also proves the fs roots allow script-dir-adjacent
     // temp writes (the write fences through the temp root).
-    let probe = std::env::temp_dir().join("pir-js-runner-write-probe.txt");
+    let probe = std::env::temp_dir().join(&probe_name);
     let written = std::fs::read_to_string(&probe).unwrap_or_default();
     let _ = std::fs::remove_file(&probe);
     assert_eq!(written.trim(), "mods.cjs-marker", "fs write probe");

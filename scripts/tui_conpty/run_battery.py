@@ -1409,7 +1409,6 @@ def execute(scen, args, run_dir, pir, use_mock=True):
                 vok, vdetail = False, f"malformed result: {vres!r}"
             checks.append({"check": "verify:" + str(vname), "args": [],
                            "ok": bool(vok), "detail": str(vdetail)})
-    rec["checks"] = checks
 
     # Acceptance rule (foreman, 2026-10-15): the driver's quit path has an
     # escalation (esc → `/quit` → RETRY → force-kill) that made every scenario
@@ -1425,6 +1424,8 @@ def execute(scen, args, run_dir, pir, use_mock=True):
                        "terminate the process (play-lane F1 regression)"),
         })
 
+    rec["checks"] = checks
+
     if infra:
         rec["status"] = "FAIL"
         rec["reason"] = infra
@@ -1432,6 +1433,21 @@ def execute(scen, args, run_dir, pir, use_mock=True):
         rec["status"] = "PASS"
     else:
         rec["status"] = "FAIL"
+
+    # Report the two acceptance dimensions separately. `verify:` is the
+    # existing opt-in artifact gate; everything else (screen/log checks,
+    # restore markers, single-quit) is lifecycle. The overall status stays the
+    # AND of both so existing exit-code/fail-fast semantics do not change.
+    def _status_for(subset):
+        if not subset:
+            return "N/A"
+        return "PASS" if all(c["ok"] for c in subset) else "FAIL"
+
+    lifecycle_checks = [c for c in checks if not c["check"].startswith("verify:")]
+    artifact_checks = [c for c in checks if c["check"].startswith("verify:")]
+    rec["lifecycle_status"] = "FAIL" if infra else _status_for(lifecycle_checks)
+    rec["artifact_status"] = "FAIL" if infra else _status_for(artifact_checks)
+
     first_bad = next((c for c in checks if not c["ok"]), None)
     if rec["status"] == "FAIL":
         if first_bad:
@@ -1471,6 +1487,9 @@ def write_reports(run_dir, meta, records):
         "passed": sum(1 for r in records if r["status"] == "PASS"),
         "failed": sum(1 for r in records if r["status"] == "FAIL"),
         "skipped": sum(1 for r in records if r["status"] == "SKIP"),
+        "lifecycle_passed": sum(1 for r in records if r.get("lifecycle_status") == "PASS"),
+        "artifact_passed": sum(1 for r in records if r.get("artifact_status") == "PASS"),
+        "artifact_not_checked": sum(1 for r in records if r.get("artifact_status") == "N/A"),
     }
     safe_meta = redact_urls(meta)
     safe_records = redact_urls(records)
@@ -1490,12 +1509,16 @@ def write_reports(run_dir, meta, records):
     lines.append(f"- scenarios: {summary['total']} — "
                  f"{summary['passed']} PASS, {summary['failed']} FAIL, "
                  f"{summary['skipped']} SKIP")
+    lines.append(f"- lifecycle: {summary['lifecycle_passed']} PASS · "
+                 f"artifact: {summary['artifact_passed']} PASS, "
+                 f"{summary['artifact_not_checked']} NOT_CHECKED")
     lines.append("")
-    lines.append("| # | status | scenario | time | first failure |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| # | status | lifecycle | artifact | scenario | time | first failure |")
+    lines.append("|---|---|---|---|---|---|---|")
     for i, r in enumerate(safe_records, 1):
         first = (r.get("first_failure") or r.get("reason") or "").replace("|", "\\|")
-        lines.append(f"| {i} | {r['status']} | {r['name']} | "
+        lines.append(f"| {i} | {r['status']} | {r.get('lifecycle_status', '-')} | "
+                     f"{r.get('artifact_status', '-')} | {r['name']} | "
                      f"{r['duration_s'] if r['duration_s'] is not None else '-'}s | {first} |")
     lines.append("")
     for r in safe_records:
@@ -1503,6 +1526,9 @@ def write_reports(run_dir, meta, records):
         lines.append("")
         lines.append(f"- scenario file: `{r['file']}`")
         lines.append(f"- artifacts: `{r['dir']}`")
+        if r["status"] != "SKIP":
+            lines.append(f"- acceptance: lifecycle={r.get('lifecycle_status', '-')} · "
+                         f"artifact={r.get('artifact_status', '-')}")
         if r["status"] == "SKIP":
             lines.append(f"- skipped: {r.get('reason', 'n/a')}")
             lines.append("")
@@ -1707,7 +1733,10 @@ def main(argv=None):
         records.append(rec)
         status = rec["status"]
         dur = rec["duration_s"] if rec["duration_s"] is not None else "-"
-        print(f" {status:<4}  ({dur}s)")
+        dims = ""
+        if status != "SKIP":
+            dims = f" [life={rec.get('lifecycle_status', '-')} art={rec.get('artifact_status', '-')}]"
+        print(f" {status:<4}{dims}  ({dur}s)")
         if status == "FAIL" and rec.get("first_failure"):
             print(f"        first failing check: {rec['first_failure']}")
         if args.fail_fast and status == "FAIL":

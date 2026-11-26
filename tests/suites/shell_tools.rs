@@ -34,12 +34,18 @@ fn registry() -> ToolRegistry {
     registry
 }
 
-fn context(root: &std::path::Path) -> ToolContext {
-    ToolContext::new(root)
+/// The tool context for a test: `root` is the working directory and
+/// `agent_dir` the directory the shell preferences resolve against
+/// (`bash`/`powershell` read `shell_prefs_in(&ctx.resolve_agent_dir())`), so a
+/// test's shell choice comes from a directory it owns — never from the
+/// process environment.
+fn context(root: &std::path::Path, agent_dir: &std::path::Path) -> ToolContext {
+    ToolContext::new(root).with_agent_dir(agent_dir)
 }
 
 fn context_with_updates(
     root: &std::path::Path,
+    agent_dir: &std::path::Path,
     updates: &Arc<Mutex<Vec<serde_json::Value>>>,
 ) -> ToolContext {
     let sink = Arc::clone(updates);
@@ -56,6 +62,7 @@ fn context_with_updates(
         held_mutation_keys: None,
         on_update: Some(emit),
         background: false,
+        agent_dir: Some(Arc::new(agent_dir.to_path_buf())),
     }
 }
 
@@ -79,31 +86,31 @@ fn bash_available() -> bool {
     pir::coding_agent::tools::resolve_shell_config(None).is_ok()
 }
 
-/// Hermetic agent-dir pin for tests that run the real shell tools.
+/// Hermetic agent dir for tests that run the real shell tools.
 ///
-/// `bash`/`powershell` resolve their shell through `current_shell_prefs()` ->
-/// `agent_dir()`, so an ambient `~/.pi/agent/settings.json` (`shellPath`,
-/// `shellCommandPrefix`, `shellPool: false`) would silently change what these
-/// tests execute. The guard points the process-global `PIR_AGENT_DIR` at a
-/// fresh, empty directory (no settings.json, no trust store) for the test's
-/// duration, so the preferences fall back to the built-in defaults, and
-/// restores the previous value (and removes the directory) on drop. It uses
-/// the binary-wide [`crate::common::AgentDirEnvGuard`] lock, so no other suite
-/// in this binary observes the temporary value.
-async fn hermetic_agent_dir(label: &str) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::scratch(label, None).await
+/// `bash`/`powershell` resolve their shell through
+/// `shell_prefs_in(&ctx.resolve_agent_dir())`, so an ambient
+/// `~/.pi/agent/settings.json` (`shellPath`, `shellCommandPrefix`,
+/// `shellPool: false`) would silently change what these tests execute. The
+/// directory is threaded into every [`context`]/[`context_with_updates`]
+/// explicitly: an empty dir (no settings.json, no trust store) makes the
+/// preferences fall back to the built-in defaults, and because it is a
+/// parameter rather than a process-global pin, no other suite in this binary
+/// can observe it — no lock needed.
+fn hermetic_agent_dir(label: &str) -> crate::common::TempAgentDir {
+    crate::common::scratch_agent_dir(label, None)
 }
 
 #[tokio::test]
 async fn bash_empty_output_gets_no_output_placeholder() {
-    let _agent_dir = hermetic_agent_dir("empty-output").await;
+    let agent_dir = hermetic_agent_dir("empty-output");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let result = run_tool(
         &registry,
@@ -120,14 +127,14 @@ async fn bash_empty_output_gets_no_output_placeholder() {
 
 #[tokio::test]
 async fn bash_exposes_common_coreutils() {
-    let _agent_dir = hermetic_agent_dir("coreutils").await;
+    let agent_dir = hermetic_agent_dir("coreutils");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let result = run_tool(
         &registry,
@@ -153,14 +160,14 @@ async fn bash_exposes_common_coreutils() {
 
 #[tokio::test]
 async fn bash_exit_code_error_keeps_placeholder_and_structured_content() {
-    let _agent_dir = hermetic_agent_dir("exit-code").await;
+    let agent_dir = hermetic_agent_dir("exit-code");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let result = run_tool(
         &registry,
@@ -182,14 +189,14 @@ async fn bash_exit_code_error_keeps_placeholder_and_structured_content() {
 
 #[tokio::test]
 async fn bash_success_carries_structured_content() {
-    let _agent_dir = hermetic_agent_dir("success").await;
+    let agent_dir = hermetic_agent_dir("success");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let result = run_tool(
         &registry,
@@ -212,14 +219,14 @@ async fn bash_success_carries_structured_content() {
 
 #[tokio::test]
 async fn bash_truncation_sets_details_and_footer() {
-    let _agent_dir = hermetic_agent_dir("truncation").await;
+    let agent_dir = hermetic_agent_dir("truncation");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     // 12000 lines (~70KB) trips both the 2000-line and 50KB limits.
     let result = run_tool(
@@ -246,7 +253,7 @@ async fn bash_truncation_sets_details_and_footer() {
 
 #[tokio::test]
 async fn bash_streams_throttled_updates() {
-    let _agent_dir = hermetic_agent_dir("streaming").await;
+    let agent_dir = hermetic_agent_dir("streaming");
     if !bash_available() {
         return;
     }
@@ -254,7 +261,7 @@ async fn bash_streams_throttled_updates() {
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let context = context_with_updates(&root, &updates);
+    let context = context_with_updates(&root, agent_dir.path(), &updates);
 
     let result = run_tool(
         &registry,
@@ -292,14 +299,14 @@ async fn bash_streams_throttled_updates() {
 
 #[tokio::test]
 async fn bash_timeout_kills_the_process_tree() {
-    let _agent_dir = hermetic_agent_dir("timeout").await;
+    let agent_dir = hermetic_agent_dir("timeout");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let started = Instant::now();
     let result = run_tool(
@@ -328,11 +335,11 @@ async fn bash_timeout_kills_the_process_tree() {
 
 #[tokio::test]
 async fn powershell_placeholder_and_structured_content() {
-    let _agent_dir = hermetic_agent_dir("powershell").await;
+    let agent_dir = hermetic_agent_dir("powershell");
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let empty = run_tool(
         &registry,
@@ -366,11 +373,11 @@ async fn powershell_placeholder_and_structured_content() {
 
 #[tokio::test]
 async fn powershell_accepts_fractional_timeout_and_kills() {
-    let _agent_dir = hermetic_agent_dir("powershell-timeout").await;
+    let agent_dir = hermetic_agent_dir("powershell-timeout");
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     let started = Instant::now();
     let result = run_tool(
@@ -405,7 +412,7 @@ async fn read_truncation_sets_details_and_byte_limit_footer() {
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = ToolContext::new(root.clone());
 
     // Line-limit case: 3000 short lines.
     let mut content = String::new();
@@ -462,7 +469,7 @@ async fn edit_details_carry_diff_patch_and_first_changed_line() {
         .await
         .expect("write fixture");
     let registry = registry();
-    let context = context(&root);
+    let context = ToolContext::new(root.clone());
 
     let result = run_tool(
         &registry,
@@ -490,7 +497,7 @@ async fn edit_pure_deletion_reports_new_file_line() {
         .await
         .expect("write fixture");
     let registry = registry();
-    let context = context(&root);
+    let context = ToolContext::new(root.clone());
 
     let result = run_tool(
         &registry,
@@ -523,7 +530,7 @@ async fn grep_truncation_sets_details() {
         .await
         .expect("write fixture");
     let registry = registry();
-    let context = context(&root);
+    let context = ToolContext::new(root.clone());
 
     let result = run_tool(
         &registry,
@@ -552,14 +559,14 @@ async fn grep_truncation_sets_details() {
 /// all tests live under `tests/`.)
 #[tokio::test]
 async fn bash_truncated_run_advertises_a_complete_local_spill_file() {
-    let _agent_dir = hermetic_agent_dir("spill").await;
+    let agent_dir = hermetic_agent_dir("spill");
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     tokio::fs::create_dir_all(&root).await.expect("create root");
     let registry = registry();
-    let context = context(&root);
+    let context = context(&root, agent_dir.path());
 
     // One long line past the rolling-buffer keep (`2 * DEFAULT_MAX_BYTES`
     // with a 50 KiB byte limit → the model-facing result keeps only the tail),

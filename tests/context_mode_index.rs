@@ -20,10 +20,13 @@ use serde_json::{json, Value};
 use pir::agent::tool_batch::ToolResult;
 use pir::agent::tool_execution::{AgentTool, ToolContext};
 use pir::plugins::builtin::{
-    ContextModePlugin, CTX_EXECUTE_TOOL_NAME, CTX_FETCH_AND_INDEX_TOOL_NAME, CTX_INDEX_TOOL_NAME,
-    CTX_PURGE_TOOL_NAME, CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
+    ContextModePlugin, CTX_BATCH_TOOL_NAME, CTX_DOCTOR_TOOL_NAME, CTX_EXECUTE_TOOL_NAME,
+    CTX_FETCH_AND_INDEX_TOOL_NAME, CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_RESUME_TOOL_NAME,
+    CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
 };
-use pir::plugins::plugin::{AgentPlugin, PluginRegistrations, RegistrationContext, ToolBackend};
+use pir::plugins::plugin::{
+    AgentPlugin, PluginEvent, PluginRegistrations, RegistrationContext, ToolBackend,
+};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -60,6 +63,8 @@ struct Harness {
     /// Direct handle for tests that seed legacy rows the tool APIs normalize.
     db_path: PathBuf,
     tools: BTreeMap<String, Arc<dyn AgentTool>>,
+    /// Keeps the plugin (and its shared state) for session-scoped tests.
+    plugin: ContextModePlugin,
     /// Keeps the temp directory alive until the tools (and their SQLite
     /// handle) have dropped.
     _dir: TestDir,
@@ -89,7 +94,17 @@ impl Harness {
             cwd,
             db_path,
             tools,
+            plugin,
         }
+    }
+
+    /// Push a session identity through the same `session_start` event the
+    /// host emits, so journal rows and session-scoped search have an owner.
+    async fn set_session(&self, id: &str) {
+        let mut payload = json!({ "sessionId": id, "cwd": self.cwd.to_string_lossy() });
+        self.plugin
+            .on_event(PluginEvent::new("session_start", &mut payload))
+            .await;
     }
 
     async fn run(&self, name: &str, args: Value) -> ToolResult {
@@ -122,6 +137,13 @@ fn results_of(value: &Value, query_index: usize) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("missing results array in {value}"))
         .clone()
+}
+
+fn sources_of(value: &Value, query_index: usize) -> Vec<String> {
+    results_of(value, query_index)
+        .iter()
+        .filter_map(|hit| hit["source"].as_str().map(str::to_owned))
+        .collect()
 }
 
 async fn source_hits(harness: &Harness, query: &str, source: &str) -> Vec<Value> {
@@ -550,6 +572,73 @@ async fn purge_requires_confirm_and_reports_rows() {
 }
 
 #[tokio::test]
+async fn purge_scopes_session_and_project() {
+    let harness = Harness::new("purge-session-project");
+    harness.set_session("session-purge").await;
+    harness
+        .index("# Doc\n\nsession_purge_body", "purge-doc", None)
+        .await;
+    let executed = harness
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "code": "console.log('session_purge_exec')" }),
+        )
+        .await;
+    assert!(!executed.is_error, "{}", executed.content);
+
+    // Session scope removes only the journal rows; the chunk store stays.
+    let events = harness.run(CTX_RESUME_TOOL_NAME, json!({})).await;
+    assert!(!events.is_error, "{}", events.content);
+    assert!(events.content.contains("ctx_index"), "{}", events.content);
+
+    let purged = harness
+        .run(
+            CTX_PURGE_TOOL_NAME,
+            json!({ "confirm": true, "session": "session-purge" }),
+        )
+        .await;
+    assert!(!purged.is_error, "{}", purged.content);
+    let value = parse_json(&purged);
+    assert!(value["purgedEvents"].as_u64().unwrap_or(0) >= 2, "{value}");
+    assert_eq!(stats(&harness).await["chunks"], 1, "chunks survive");
+    let resumed = harness.run(CTX_RESUME_TOOL_NAME, json!({})).await;
+    assert!(!resumed.is_error, "{}", resumed.content);
+    assert!(
+        resumed.content.contains("No journal rows"),
+        "{}",
+        resumed.content
+    );
+
+    // Project scope wipes chunks, sources and the journal.
+    let project = harness
+        .run(
+            CTX_PURGE_TOOL_NAME,
+            json!({ "confirm": true, "project": true }),
+        )
+        .await;
+    assert!(!project.is_error, "{}", project.content);
+    let value = parse_json(&project);
+    assert_eq!(value["purged"], 1, "{value}");
+    let snapshot = stats(&harness).await;
+    assert_eq!(snapshot["chunks"], 0);
+    assert_eq!(snapshot["sources"], 0);
+
+    // Multiple scopes are rejected before anything is deleted.
+    let conflict = harness
+        .run(
+            CTX_PURGE_TOOL_NAME,
+            json!({ "confirm": true, "project": true, "session": "session-purge" }),
+        )
+        .await;
+    assert!(conflict.is_error, "{}", conflict.content);
+    assert!(
+        conflict.content.contains("at most one scope"),
+        "{}",
+        conflict.content
+    );
+}
+
+#[tokio::test]
 async fn purge_blank_or_non_string_source_cannot_widen_to_global() {
     let harness = Harness::new("purge-scope-guard");
     harness.index("# Keep\n\nkeepbody", "keep", None).await;
@@ -706,7 +795,7 @@ async fn stats_reports_process_counters_and_db_state() {
     let executed = harness
         .run(
             CTX_EXECUTE_TOOL_NAME,
-            json!({ "code": "print('hello stats')" }),
+            json!({ "code": "console.log('hello stats')" }),
         )
         .await;
     assert!(!executed.is_error, "{}", executed.content);
@@ -732,6 +821,43 @@ async fn stats_reports_process_counters_and_db_state() {
         "{value}"
     );
     assert!(value["dbSizeBytes"].as_u64().unwrap() > 0, "{value}");
+}
+
+#[tokio::test]
+async fn stats_reports_session_and_project_journal_usage() {
+    let harness = Harness::new("stats-usage");
+    harness.set_session("stats-session").await;
+    let executed = harness
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "code": "console.log('usage exec')" }),
+        )
+        .await;
+    assert!(!executed.is_error, "{}", executed.content);
+    harness
+        .index("# Usage\n\nusage body", "usage-src", None)
+        .await;
+
+    let value = stats(&harness).await;
+    let session = &value["usage"]["session"];
+    assert!(session["calls"].as_u64().unwrap_or(0) >= 2, "{value}");
+    assert!(session["bytes"].as_u64().unwrap_or(0) > 0, "{value}");
+    let kinds: Vec<&str> = session["byKind"]
+        .as_array()
+        .expect("byKind")
+        .iter()
+        .filter_map(|entry| entry["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"exec"), "{value}");
+    assert!(kinds.contains(&"index"), "{value}");
+    assert_eq!(
+        value["usage"]["project"], value["usage"]["allTime"],
+        "one DB per project, so project and all-time totals agree"
+    );
+    assert_eq!(
+        value["usage"]["project"]["calls"], session["calls"],
+        "{value}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -948,4 +1074,648 @@ async fn fetch_rejects_non_http_schemes() {
         "got: {}",
         result.content
     );
+}
+
+// ---------------------------------------------------------------------------
+// Upstream v2 surface: scopes, timeline, journal, ctx_resume, ctx_batch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_scopes_separate_session_worktree_and_project() {
+    let harness = Harness::new("scopes");
+    harness.set_session("session-a").await;
+    harness
+        .index("# A\n\nscope_marker alpha", "doc-a", None)
+        .await;
+
+    // A second session indexed from a sibling worktree: its row must stay out
+    // of session-a's session scope and out of the cwd's worktree scope, yet
+    // remain visible to the project scope.
+    let other = harness.cwd.parent().expect("parent").join("other-worktree");
+    std::fs::create_dir_all(&other).expect("other cwd");
+    harness.set_session("session-b").await;
+    let other_index = harness
+        .tools
+        .get(CTX_INDEX_TOOL_NAME)
+        .expect("ctx_index")
+        .run(
+            &json!({ "content": "# B\n\nscope_marker beta", "source": "doc-b" }),
+            &ToolContext::new(other),
+        )
+        .await;
+    assert!(!other_index.is_error, "{}", other_index.content);
+    harness.set_session("session-a").await;
+
+    let session = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "scope_marker", "scope": "session", "limit": 10 }),
+        )
+        .await;
+    assert!(!session.is_error, "{}", session.content);
+    let session = parse_json(&session);
+    let session_sources = sources_of(&session, 0);
+    assert_eq!(
+        session_sources,
+        vec!["doc-a".to_owned()],
+        "session scope sees only session-a's rows: {session}"
+    );
+
+    let worktree = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "scope_marker", "scope": "worktree", "limit": 10 }),
+        )
+        .await;
+    assert!(!worktree.is_error, "{}", worktree.content);
+    assert_eq!(
+        sources_of(&parse_json(&worktree), 0),
+        vec!["doc-a".to_owned()],
+        "worktree scope excludes the sibling worktree"
+    );
+
+    let project = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "scope_marker", "scope": "project", "limit": 10 }),
+        )
+        .await;
+    assert!(!project.is_error, "{}", project.content);
+    let project_sources = sources_of(&parse_json(&project), 0);
+    assert!(
+        project_sources.contains(&"doc-a".to_owned()),
+        "{project_sources:?}"
+    );
+    assert!(
+        project_sources.contains(&"doc-b".to_owned()),
+        "{project_sources:?}"
+    );
+}
+
+#[tokio::test]
+async fn timeline_sort_pages_oldest_first_with_an_after_cursor() {
+    let harness = Harness::new("timeline");
+    harness.index("# One\n\nfirst_timeline", "one", None).await;
+    // Real-time ordering: keep the two stamps distinct (indexed_at is ms).
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    harness.index("# Two\n\nsecond_timeline", "two", None).await;
+
+    let listing = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "queries": [], "sort": "timeline", "limit": 10 }),
+        )
+        .await;
+    assert!(!listing.is_error, "{}", listing.content);
+    let value = parse_json(&listing);
+    let results = results_of(&value, 0);
+    assert_eq!(results.len(), 2, "{value}");
+    assert_eq!(results[0]["source"], "one", "oldest first: {value}");
+    assert_eq!(results[1]["source"], "two", "{value}");
+
+    // The reported `indexedAt` is the cursor the next page uses.
+    let first_stamp = results[0]["indexedAt"].as_i64().expect("indexedAt");
+    assert!(first_stamp > 0, "{value}");
+    let next = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "queries": [], "sort": "timeline", "after": first_stamp, "limit": 10 }),
+        )
+        .await;
+    assert!(!next.is_error, "{}", next.content);
+    let next_sources = sources_of(&parse_json(&next), 0);
+    assert_eq!(next_sources, vec!["two".to_owned()], "after pages past one");
+
+    // `offset` pages within the same window.
+    let offset = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "queries": [], "sort": "timeline", "offset": 1, "limit": 10 }),
+        )
+        .await;
+    assert!(!offset.is_error, "{}", offset.content);
+    assert_eq!(sources_of(&parse_json(&offset), 0), vec!["two".to_owned()]);
+}
+
+#[tokio::test]
+async fn ctx_resume_renders_the_journal_and_returns_one_row_by_seq() {
+    let harness = Harness::new("resume");
+    harness.set_session("journal-session").await;
+    harness
+        .index("# Doc\n\nresume_marker", "resume-doc", None)
+        .await;
+    let executed = harness
+        .run(
+            CTX_EXECUTE_TOOL_NAME,
+            json!({ "code": "console.log('resume_exec_marker')" }),
+        )
+        .await;
+    assert!(!executed.is_error, "{}", executed.content);
+
+    let block = harness.run(CTX_RESUME_TOOL_NAME, json!({})).await;
+    assert!(!block.is_error, "{}", block.content);
+    assert!(
+        block.content.contains("journal-session"),
+        "{}",
+        block.content
+    );
+    assert!(block.content.contains("resume-doc"), "{}", block.content);
+    assert!(block.content.contains("ctx_index"), "{}", block.content);
+    assert!(block.content.contains("ctx_execute"), "{}", block.content);
+    assert!(
+        block.content.len() <= 2_048,
+        "the block respects RESUME_CAP: {} B",
+        block.content.len()
+    );
+
+    // Each rendered line is `#<seq> kind/tool...`; the seq fetches the row
+    // whole (the pointer form).
+    let seq = block
+        .content
+        .lines()
+        .filter_map(|line| line.strip_prefix('#')?.split_whitespace().next())
+        .filter(|digits| digits.chars().all(|c| c.is_ascii_digit()))
+        .filter_map(|digits| digits.parse::<u64>().ok())
+        .next()
+        .expect("a rendered seq in the block");
+    let row = harness
+        .run(CTX_RESUME_TOOL_NAME, json!({ "seq": seq }))
+        .await;
+    assert!(!row.is_error, "{}", row.content);
+    assert!(!row.content.is_empty());
+
+    let missing = harness
+        .run(CTX_RESUME_TOOL_NAME, json!({ "seq": 9_999_999u64 }))
+        .await;
+    assert!(missing.is_error, "unknown seqs are errors");
+}
+
+#[tokio::test]
+async fn ctx_resume_rejects_an_unknown_session() {
+    let harness = Harness::new("resume-no-session");
+    let result = harness.run(CTX_RESUME_TOOL_NAME, json!({})).await;
+    assert!(result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("no session id"),
+        "{}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn ctx_batch_runs_shell_commands_and_returns_matching_sections() {
+    let harness = Harness::new("shell-batch");
+    let result = harness
+        .run(
+            CTX_BATCH_TOOL_NAME,
+            json!({
+                "commands": ["echo batch_marker_123", "echo second_marker_456"],
+                "queries": ["batch_marker_123"]
+            }),
+        )
+        .await;
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("batch_marker_123"),
+        "the matching section comes back: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("ctx_batch:"),
+        "the reply names the batch source: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("2 command(s)"),
+        "all commands ran: {}",
+        result.content
+    );
+
+    // The blocks are searchable afterwards under the batch source.
+    let search = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "second_marker_456", "scope": "project" }),
+        )
+        .await;
+    assert!(!search.is_error, "{}", search.content);
+    assert!(
+        !results_of(&parse_json(&search), 0).is_empty(),
+        "the second command's output was indexed too"
+    );
+}
+
+#[tokio::test]
+async fn ctx_batch_requires_commands_and_queries() {
+    let harness = Harness::new("shell-batch-bounds");
+    let no_commands = harness
+        .run(
+            CTX_BATCH_TOOL_NAME,
+            json!({ "commands": [], "queries": ["x"] }),
+        )
+        .await;
+    assert!(no_commands.is_error);
+    let no_queries = harness
+        .run(
+            CTX_BATCH_TOOL_NAME,
+            json!({ "commands": ["echo x"], "queries": [] }),
+        )
+        .await;
+    assert!(no_queries.is_error);
+    let too_many = harness
+        .run(
+            CTX_BATCH_TOOL_NAME,
+            json!({ "commands": vec!["echo x"; 17], "queries": ["x"] }),
+        )
+        .await;
+    assert!(too_many.is_error);
+}
+
+// ---------------------------------------------------------------------------
+// Per-session retention
+//
+// The store is fed by hooks, so without bounds a long-lived project grows
+// until the disk fills. Every limit is per session: one session can never
+// evict another session's rows, and eviction is always oldest-first.
+// ---------------------------------------------------------------------------
+
+const TINY_RETENTION: pir::plugins::builtin::context_mode::index::RetentionLimits =
+    pir::plugins::builtin::context_mode::index::RetentionLimits {
+        journal_max_rows: 3,
+        journal_max_bytes: 4 * 1024,
+        journal_ttl_secs: 7 * 24 * 60 * 60,
+        chunk_max_rows: 2,
+        chunk_max_bytes: 8 * 1024,
+        fetch_cache_max_rows: 2,
+        fetch_cache_max_bytes: 8 * 1024,
+    };
+
+/// A harness whose per-session caps are small enough to evict within a test.
+struct BoundedHarness {
+    inner: Harness,
+}
+
+impl BoundedHarness {
+    fn new(tag: &str) -> Self {
+        let dir = TestDir::new(tag);
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap_or_else(|error| panic!("cwd: {error}"));
+        let plugin = ContextModePlugin::with_retention_limits(
+            dir.path().join("context-mode.db"),
+            TINY_RETENTION,
+        );
+        let mut registrations = PluginRegistrations::default();
+        plugin
+            .register(&mut RegistrationContext::new(&mut registrations))
+            .unwrap_or_else(|error| panic!("register: {error}"));
+        let tools = registrations
+            .tools
+            .into_iter()
+            .filter_map(|(definition, backend)| match backend {
+                ToolBackend::Rust(tool) => Some((definition.name, tool)),
+                ToolBackend::Js { .. } => None,
+            })
+            .collect();
+        Self {
+            inner: Harness {
+                _dir: dir,
+                cwd,
+                db_path: plugin.resolved_db_path(),
+                tools,
+                plugin,
+            },
+        }
+    }
+}
+
+/// One journal row, written directly through the store so the test does not
+/// pay for a JS sandbox round trip per row.
+async fn append_rows(harness: &Harness, session: &str, rows: usize) {
+    use pir::plugins::builtin::context_mode::index::JournalInput;
+    let store = harness.plugin.index_store();
+    for index in 0..rows {
+        let body = format!("row {index} body padding padding padding padding padding");
+        let bytes = body.len();
+        store
+            .append_event(
+                JournalInput::new(session.to_owned(), "exec", "ctx_execute", body).with_outcome(
+                    true,
+                    Some(0),
+                    bytes,
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("append row: {error}"));
+    }
+}
+
+#[tokio::test]
+async fn journal_rows_are_capped_per_session_oldest_first() {
+    let harness = BoundedHarness::new("retention-rows").inner;
+    harness.set_session("sess-a").await;
+    append_rows(&harness, "sess-a", 10).await;
+
+    let store = harness.plugin.index_store();
+    let events = store
+        .session_events("sess-a".to_owned(), None)
+        .await
+        .expect("read back");
+    assert_eq!(
+        events.len(),
+        TINY_RETENTION.journal_max_rows,
+        "only the newest rows survive the per-session cap"
+    );
+    // The surviving rows are the newest ones: their bodies name rows 7..9.
+    let bodies: Vec<&str> = events.iter().map(|event| event.body.as_str()).collect();
+    assert!(
+        bodies.iter().any(|body| body.contains("row 9")),
+        "{bodies:?}"
+    );
+    assert!(
+        !bodies.iter().any(|body| body.contains("row 0 ")),
+        "the oldest row was evicted: {bodies:?}"
+    );
+
+    let retention = store
+        .retention("sess-a".to_owned())
+        .await
+        .expect("retention");
+    assert_eq!(retention.journal_rows, TINY_RETENTION.journal_max_rows);
+    assert!(!retention.over_limit, "the write path trimmed to the cap");
+}
+
+#[tokio::test]
+async fn one_session_never_evicts_another_sessions_rows() {
+    let harness = BoundedHarness::new("retention-isolation").inner;
+    harness.set_session("sess-a").await;
+    append_rows(&harness, "sess-a", 3).await;
+    append_rows(&harness, "sess-b", 10).await;
+
+    let store = harness.plugin.index_store();
+    let a = store
+        .session_events("sess-a".to_owned(), None)
+        .await
+        .unwrap();
+    let b = store
+        .session_events("sess-b".to_owned(), None)
+        .await
+        .unwrap();
+    assert_eq!(a.len(), 3, "session A keeps all of its rows: {a:?}");
+    assert_eq!(
+        b.len(),
+        TINY_RETENTION.journal_max_rows,
+        "session B is capped"
+    );
+}
+
+#[tokio::test]
+async fn journal_bytes_are_capped_per_session() {
+    let mut limits = TINY_RETENTION;
+    // Byte cap below three rows' worth, so the row cap would not trigger.
+    limits.journal_max_bytes = 120;
+    let max_bytes = limits.journal_max_bytes;
+    let dir = TestDir::new("retention-bytes");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plugin =
+        ContextModePlugin::with_retention_limits(dir.path().join("context-mode.db"), limits);
+    let store = plugin.index_store();
+    use pir::plugins::builtin::context_mode::index::JournalInput;
+    for index in 0..6 {
+        let body = format!("row {index} padding padding");
+        let bytes = body.len();
+        store
+            .append_event(
+                JournalInput::new("sess-bytes".to_owned(), "exec", "ctx_execute", body)
+                    .with_outcome(true, Some(0), bytes),
+            )
+            .await
+            .unwrap();
+    }
+    // The cap measures the stored `body`; the `bytes` column deliberately
+    // overstates it (the original output size) and must not drive eviction.
+    let events = store
+        .session_events("sess-bytes".to_owned(), None)
+        .await
+        .unwrap();
+    let stored = events
+        .iter()
+        .map(|event| event.body.len() as u64)
+        .sum::<u64>();
+    assert!(
+        stored <= max_bytes,
+        "stored journal bodies stay under the per-session cap: {stored} > {max_bytes}"
+    );
+    assert!(
+        events.len() < 6,
+        "the oldest rows were evicted to fit the byte cap: {events:?}"
+    );
+    drop(store);
+    drop(plugin);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn stale_journal_rows_expire_per_session() {
+    let mut limits = TINY_RETENTION;
+    limits.journal_ttl_secs = 1;
+    let dir = TestDir::new("retention-ttl");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plugin =
+        ContextModePlugin::with_retention_limits(dir.path().join("context-mode.db"), limits);
+    let store = plugin.index_store();
+    use pir::plugins::builtin::context_mode::index::JournalInput;
+    // Two rows from the store, then backdate the first past the TTL.
+    store
+        .append_event(JournalInput::new(
+            "sess-ttl".to_owned(),
+            "exec",
+            "ctx_execute",
+            "ancient".to_owned(),
+        ))
+        .await
+        .unwrap();
+    {
+        use rusqlite::Connection;
+        let connection = Connection::open(plugin.resolved_db_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE events SET created_at = 1 WHERE body = 'ancient'",
+                [],
+            )
+            .unwrap();
+    }
+    store
+        .append_event(JournalInput::new(
+            "sess-ttl".to_owned(),
+            "exec",
+            "ctx_execute",
+            "fresh".to_owned(),
+        ))
+        .await
+        .unwrap();
+    let events = store
+        .session_events("sess-ttl".to_owned(), None)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "the stale row expired: {events:?}");
+    assert_eq!(events[0].body, "fresh");
+    drop(store);
+    drop(plugin);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn chunks_are_capped_per_session_oldest_first() {
+    let harness = BoundedHarness::new("retention-chunks").inner;
+    harness.set_session("sess-chunks").await;
+    // Each call indexes one markdown section (~1 chunk) under its own source.
+    for index in 0..6 {
+        let result = harness
+            .run(
+                CTX_INDEX_TOOL_NAME,
+                json!({
+                    "content": format!("# Section {index}\n\nbody {index}"),
+                    "source": format!("doc-{index}"),
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+    }
+
+    let stats = stats(&harness).await;
+    assert_eq!(
+        stats["chunks"],
+        json!(TINY_RETENTION.chunk_max_rows),
+        "per-session chunk cap holds: {stats}"
+    );
+    // The newest sections survive; the oldest are gone.
+    let newest = source_hits(&harness, "body", "doc-5").await;
+    assert!(!newest.is_empty(), "the newest chunk survives");
+    let oldest = harness
+        .run(
+            CTX_SEARCH_TOOL_NAME,
+            json!({ "query": "body", "source": "doc-0", "scope": "project" }),
+        )
+        .await;
+    let oldest = parse_json(&oldest);
+    assert!(
+        results_of(&oldest, 0).is_empty(),
+        "the oldest chunk was evicted: {oldest}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_and_stats_report_retention_limits() {
+    let harness = BoundedHarness::new("retention-report").inner;
+    harness.set_session("sess-report").await;
+    append_rows(&harness, "sess-report", 5).await;
+
+    let doctor = harness.run(CTX_DOCTOR_TOOL_NAME, json!({})).await;
+    assert!(!doctor.is_error, "{}", doctor.content);
+    let value = parse_json(&doctor);
+    assert_eq!(
+        value["retention"]["limits"]["journalMaxRows"],
+        json!(TINY_RETENTION.journal_max_rows),
+        "{value}"
+    );
+    assert_eq!(
+        value["retention"]["session"]["journalRows"],
+        json!(TINY_RETENTION.journal_max_rows),
+        "{value}"
+    );
+
+    let stats = stats(&harness).await;
+    assert_eq!(
+        stats["retention"]["limits"]["chunkMaxRows"],
+        json!(TINY_RETENTION.chunk_max_rows),
+        "{stats}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_source_label_from_two_sessions_keeps_both() {
+    let harness = Harness::new("retention-source-isolation");
+    harness.set_session("sess-one").await;
+    harness
+        .index("# Shared\n\nshared_marker_one", "shared-doc", None)
+        .await;
+
+    // A second session re-indexes the same label. Replacement is scoped to
+    // (source, session), so the first session's rows must survive.
+    harness.set_session("sess-two").await;
+    harness
+        .index("# Shared\n\nshared_marker_two", "shared-doc", None)
+        .await;
+
+    let stats = stats(&harness).await;
+    assert_eq!(
+        stats["chunks"],
+        json!(2),
+        "both sessions keep their chunk under the shared label: {stats}"
+    );
+    for marker in ["shared_marker_one", "shared_marker_two"] {
+        let search = harness
+            .run(
+                CTX_SEARCH_TOOL_NAME,
+                json!({ "query": marker, "source": "shared-doc", "scope": "project" }),
+            )
+            .await;
+        assert!(!search.is_error, "{}", search.content);
+        assert!(
+            !results_of(&parse_json(&search), 0).is_empty(),
+            "`{marker}` stays searchable: {}",
+            search.content
+        );
+    }
+}
+
+/// The byte caps must measure encoded bytes, not SQLite `LENGTH()` characters:
+/// a CJK body is 3 bytes per character, so a character-counted cap would let
+/// roughly 3x the intended data through. One row here is ~100 bytes but only
+/// ~35 characters, so a character-based cap would keep all three.
+#[tokio::test]
+async fn journal_byte_cap_counts_utf8_bytes_not_characters() {
+    let mut limits = TINY_RETENTION;
+    // Room for two rows by BYTES, but all three by CHARACTER count.
+    limits.journal_max_bytes = 240;
+    let max_bytes = limits.journal_max_bytes;
+    let dir = TestDir::new("retention-bytes-utf8");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plugin =
+        ContextModePlugin::with_retention_limits(dir.path().join("context-mode.db"), limits);
+    let store = plugin.index_store();
+    use pir::plugins::builtin::context_mode::index::JournalInput;
+    // 30 CJK characters = 90 UTF-8 bytes each.
+    let body = "中".repeat(30);
+    for _ in 0..3 {
+        store
+            .append_event(JournalInput::new(
+                "sess-utf8".to_owned(),
+                "exec",
+                "ctx_execute",
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+    }
+    let events = store
+        .session_events("sess-utf8".to_owned(), None)
+        .await
+        .unwrap();
+    let bytes: u64 = events.iter().map(|event| event.body.len() as u64).sum();
+    assert!(
+        bytes <= max_bytes,
+        "the cap is measured in bytes: {bytes} > {max_bytes}"
+    );
+    assert!(
+        events.len() < 3,
+        "a character-counted cap would have kept all three rows: {} kept",
+        events.len()
+    );
+    drop(store);
+    drop(plugin);
+    drop(dir);
 }

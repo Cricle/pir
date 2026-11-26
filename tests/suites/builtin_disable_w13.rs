@@ -9,7 +9,7 @@
 //!    `Settings` field, no `SettingsManager` getter and no raw-key reader, and
 //!    the schema's `additionalProperties: true` made the array silently
 //!    accepted and dropped.
-//! 2. `pythonTool: false` was honored only by
+//! 2. A settings-only disable used to be honored only by
 //!    `AgentSession::build_plugin_host`; `pir print` built its host directly
 //!    and never applied the gate.
 //!
@@ -18,8 +18,8 @@
 //! - (a) `disabledBuiltinExtensions: ["context-mode"]` removes the builtin
 //!   from a default plan;
 //! - (b) `--no-mcp` and the settings key compose (neither widens the other);
-//! - (c) `pythonTool: false` removes `python` from BOTH a session host and a
-//!   print host (the two now share one helper);
+//! - (c) a settings-only disable removes the builtin from BOTH a session host
+//!   and a print host (the two now share one helper);
 //! - (d) an unknown name is harmless, and junk values are tolerated the way
 //!   every neighbour setting is;
 //! - the scope rule: a project may ADD a name but never re-enable a builtin
@@ -28,13 +28,13 @@
 //!   dropped) and the generator reproduces the committed artifact.
 //!
 //! NOTE: this file is registered by the foreman (`#[path = "suites/
-//! builtin_disable_w13.rs"]` in a `g_*` merged binary). It uses
-//! `crate::common::AgentDirEnvGuard` for the process-wide `PIR_AGENT_DIR`
-//! pin, so register it in a binary that includes `mod common;`
-//! (`tests/g_tools.rs` / `tests/g_agent.rs`).
+//! builtin_disable_w13.rs"]` in a `g_*` merged binary) and needs
+//! `mod common;` for the scratch agent-dir helper (`tests/g_tools.rs` /
+//! `tests/g_agent.rs`). The two host tests pass that directory explicitly, so
+//! they take no process-wide lock.
 
 use std::path::{Path, PathBuf};
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 use std::sync::Arc;
 
 use pir::config::settings::SettingsManager;
@@ -102,7 +102,7 @@ fn builtin_names(plan: &[PathBuf]) -> Vec<String> {
 /// The `builtin:<name>` paths of `plan` with `dropped` removed — the plugin
 /// paths a host built on the filtered plan must carry (a builtin's
 /// `PluginInfo::path` is exactly its plan path).
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 fn builtin_paths_without(plan: &[PathBuf], dropped: &str) -> Vec<String> {
     plan.iter()
         .filter(|path| pir::plugins::builtin_name(&path.to_string_lossy()) != Some(dropped))
@@ -113,7 +113,7 @@ fn builtin_paths_without(plan: &[PathBuf], dropped: &str) -> Vec<String> {
 
 /// A plan-only extension handle rooted at `cwd` with `plan` recorded — the
 /// shape both hosts build their `PluginHost` from (no QuickJS actor).
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 fn plan_only_handle(cwd: &Path, plan: &[PathBuf]) -> pir::extensions::ExtensionHandle {
     let handle =
         pir::extensions::ExtensionHandle::start_plan_only(pir::extensions::ExtensionConfig {
@@ -126,7 +126,7 @@ fn plan_only_handle(cwd: &Path, plan: &[PathBuf]) -> pir::extensions::ExtensionH
     handle
 }
 
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 fn fake_model() -> pir::ai::types::Model {
     serde_json::from_value(serde_json::json!({
         "id": "fake-model",
@@ -143,7 +143,7 @@ fn fake_model() -> pir::ai::types::Model {
     .expect("fake model JSON")
 }
 
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 fn session_config(
     cwd: &Path,
     extensions: &pir::extensions::ExtensionHandle,
@@ -163,6 +163,7 @@ fn session_config(
         event_stream: None,
         extensions: Some(extensions.clone()),
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -316,34 +317,36 @@ fn project_scope_can_add_but_never_lift_a_global_restriction() {
 }
 
 // ---------------------------------------------------------------------------
-// (c) `pythonTool: false` removes `python` from BOTH hosts.
+// (c) A settings-only disable removes the builtin from BOTH hosts.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "python")]
-fn default_plan_with_python() -> Vec<PathBuf> {
+#[cfg(feature = "context-mode")]
+fn default_plan_with_context_mode() -> Vec<PathBuf> {
     let plan = default_plan();
     assert!(
-        has_builtin(&plan, "python"),
-        "the fixture assumption is a default plan carrying `builtin:python`: {plan:?}"
+        has_builtin(&plan, "context-mode"),
+        "the fixture assumption is a default plan carrying `builtin:context-mode`: {plan:?}"
     );
     plan
 }
 
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 #[tokio::test(flavor = "current_thread")]
-async fn python_tool_false_removes_python_from_a_session_host() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+async fn settings_disable_removes_the_builtin_from_a_session_host() {
+    // An explicit agent dir carries the settings file the gate reads; nothing
+    // resolves through the process environment.
+    let agent_dir = crate::common::scratch_agent_dir(
         "builtin-disable-session",
-        Some(r#"{ "pythonTool": false }"#),
-    )
-    .await;
+        Some(r#"{ "disabledBuiltinExtensions": ["context-mode"] }"#),
+    );
 
     let cwd = TempDir::new("session-cwd");
-    let plan = default_plan_with_python();
+    let plan = default_plan_with_context_mode();
     let handle = plan_only_handle(cwd.path(), &plan);
-    let session = pir::agent_session::AgentSession::new_with_plugins(
+    let session = pir::agent_session::AgentSession::new_with_plugins_and_agent_dir(
         session_config(cwd.path(), &handle),
         Vec::new(),
+        agent_dir.path(),
     );
 
     let host = session
@@ -355,14 +358,14 @@ async fn python_tool_false_removes_python_from_a_session_host() {
         .map(|plugin| plugin.info().path.clone())
         .collect();
     assert!(
-        !paths.iter().any(|path| path == "builtin:python"),
-        "`pythonTool: false` must keep the python builtin out of the session host: {paths:?}"
+        !paths.iter().any(|path| path == "builtin:context-mode"),
+        "the settings disable must keep the builtin out of the session host: {paths:?}"
     );
     // The gate mutated the recorded plan, which is what every later consumer
     // of the handle reads.
-    assert!(!has_builtin(&handle.path_plan(), "python"));
+    assert!(!has_builtin(&handle.path_plan(), "context-mode"));
     // Every other builtin the plan carried is still instantiated.
-    let expected = builtin_paths_without(&plan, "python");
+    let expected = builtin_paths_without(&plan, "context-mode");
     for path in &expected {
         assert!(
             paths.contains(path),
@@ -371,20 +374,20 @@ async fn python_tool_false_removes_python_from_a_session_host() {
     }
 }
 
-#[cfg(feature = "python")]
+#[cfg(feature = "context-mode")]
 #[tokio::test(flavor = "current_thread")]
-async fn python_tool_false_removes_python_from_a_print_host() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+async fn settings_disable_removes_the_builtin_from_a_print_host() {
+    let agent_dir = crate::common::scratch_agent_dir(
         "builtin-disable-print",
-        Some(r#"{ "pythonTool": false }"#),
-    )
-    .await;
+        Some(r#"{ "disabledBuiltinExtensions": ["context-mode"] }"#),
+    );
 
     let cwd = TempDir::new("print-cwd");
-    let plan = default_plan_with_python();
+    let plan = default_plan_with_context_mode();
     let handle = plan_only_handle(cwd.path(), &plan);
-    let host = pir::coding_agent::print::print_plugin_host(Some(&handle))
-        .expect("the runtime builds the print host");
+    let host =
+        pir::coding_agent::print::print_plugin_host_in(Some(&handle), Some(agent_dir.path()))
+            .expect("the runtime builds the print host");
 
     let paths: Vec<String> = host
         .plugins()
@@ -392,11 +395,11 @@ async fn python_tool_false_removes_python_from_a_print_host() {
         .map(|plugin| plugin.info().path.clone())
         .collect();
     assert!(
-        !paths.iter().any(|path| path == "builtin:python"),
-        "`pir print` must honor `pythonTool: false` exactly like the TUI: {paths:?}"
+        !paths.iter().any(|path| path == "builtin:context-mode"),
+        "`pir print` must honor the settings disable exactly like the TUI: {paths:?}"
     );
-    assert!(!has_builtin(&handle.path_plan(), "python"));
-    let expected = builtin_paths_without(&plan, "python");
+    assert!(!has_builtin(&handle.path_plan(), "context-mode"));
+    let expected = builtin_paths_without(&plan, "context-mode");
     for path in &expected {
         assert!(
             paths.contains(path),
@@ -484,37 +487,6 @@ fn junk_values_are_tolerated_like_every_neighbour_field() {
         manager.disabled_builtin_extensions(),
         std::collections::BTreeSet::from(["mcp".to_owned()])
     );
-}
-
-#[test]
-fn python_tool_false_is_one_name_in_the_same_disabled_set() {
-    let global = TempDir::new("global-python");
-    write_settings(global.path(), r#"{ "pythonTool": false }"#);
-    let cwd = TempDir::new("cwd-python");
-    let manager = load_manager(global.path(), cwd.path(), false);
-
-    assert!(!manager.python_tool_enabled());
-    assert!(
-        manager.disabled_builtins().contains("python"),
-        "the key is expressed as the same `python` disabled name: {:?}",
-        manager.disabled_builtins()
-    );
-
-    // A project that sets `true` must not re-enable a globally disabled tool.
-    write_settings(&cwd.path().join(".pi"), r#"{ "pythonTool": true }"#);
-    let project_wins = load_manager(global.path(), cwd.path(), true);
-    assert!(
-        !project_wins.python_tool_enabled(),
-        "settings never widen a restriction: a project cannot re-enable the tool"
-    );
-
-    // Unset keeps it enabled. (Bind the temp dirs first: borrowing
-    // `TempDir::new(..).0` would drop the directory inside the call.)
-    let plain_global = TempDir::new("global-plain");
-    let plain_cwd = TempDir::new("cwd-plain");
-    let plain = load_manager(plain_global.path(), plain_cwd.path(), false);
-    assert!(plain.python_tool_enabled());
-    assert!(!plain.disabled_builtins().contains("python"));
 }
 
 // ---------------------------------------------------------------------------

@@ -81,7 +81,7 @@ fn available_names() -> Vec<String> {
     available.extend(names(&[
         "ctx_execute",
         "ctx_search",
-        "python",
+        "ctx_execute_file",
         "todo",
         "subagent",
         "tool_search",
@@ -208,7 +208,7 @@ fn run_registry() -> ToolRegistry {
     for name in [
         "ctx_execute",
         "ctx_search",
-        "python",
+        "ctx_execute_file",
         "todo",
         "subagent",
         "tool_search",
@@ -292,6 +292,7 @@ fn session_declared(
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     });
     let (session_registry, active) = session.active_tool_snapshot(None);
     let mut declared: Vec<String> = declared_tools(&session_registry, &active)
@@ -322,6 +323,7 @@ fn session_callable(
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     });
     let (session_registry, active) = session.active_tool_snapshot(None);
     let mut callable: Vec<String> = callable_tools(&session_registry, &active)
@@ -366,7 +368,12 @@ fn no_tools_with_an_explicit_allowlist_still_selects_the_named_tools() {
 #[test]
 fn no_tools_with_an_allowlist_pattern_keeps_the_mcp_tools_out() {
     let selection = resolve_selection(None, &names(&["ctx_*"]), &[], true, false);
-    assert_eq!(selection.enabled, names(&["ctx_execute", "ctx_search"]));
+    // `ctx_execute_file` belongs to the same context-mode family as
+    // `ctx_execute`/`ctx_search`, so the pattern selects all three.
+    assert_eq!(
+        selection.enabled,
+        names(&["ctx_execute", "ctx_execute_file", "ctx_search"])
+    );
     assert!(
         !selection
             .enabled
@@ -454,7 +461,7 @@ fn an_exclude_only_selection_carries_the_denylist_as_modifiers() {
     // it expands to against the tools present at resolve time, so the restore
     // removes exactly what the user asked for.
     let selection = resolve_selection(None, &[], &names(&["ctx_*"]), false, false);
-    let mut expected = names(&["-ctx_*", "-ctx_execute", "-ctx_search"]);
+    let mut expected = names(&["-ctx_*", "-ctx_execute", "-ctx_execute_file", "-ctx_search"]);
     expected.sort();
     let mut actual = selection.modifiers.clone();
     actual.sort();

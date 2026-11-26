@@ -163,6 +163,7 @@ fn session_config(cwd: &Path, handle: &ExtensionHandle) -> AgentSessionConfig {
         event_stream: None,
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -178,6 +179,8 @@ fn dialog_handle(cwd: &Path, has_ui: bool) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
 }
 

@@ -103,6 +103,8 @@ fn script_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -283,6 +285,16 @@ globalThis.__sdkErrorsResult = out;
 
 #[tokio::test(flavor = "current_thread")]
 async fn agent_session_prompt_rejects_on_failed_and_aborted_turns() {
+    // This test mutates `PIR_AGENT_DIR` / the provider key for the WHOLE
+    // process, because the SDK child-session bridge re-enters this binary as a
+    // subprocess and the child resolves its own agent dir from the inherited
+    // environment. That is a genuine process-level input with no in-process
+    // equivalent (the JS SDK surface takes no agent-dir argument), so the test
+    if crate::common::skip_without_nextest(
+        "sdk_agent_session_errors::agent_session_prompt_rejects_on_failed_and_aborted_turns",
+    ) {
+        return;
+    }
     let dir = TempDir::new("cas-errors");
     let agent_dir = TempDir::new("cas-errors-agent");
     let session_dir = dir.path().join("sessions");
@@ -317,6 +329,10 @@ async fn agent_session_prompt_rejects_on_failed_and_aborted_turns() {
     });
     std::fs::write(agent_dir.path().join("models.json"), models.to_string())
         .expect("write models.json");
+    // The child re-enters the REAL `pir` binary; the runtime's own default is
+    // `current_exe()`, which here is the test harness, so the bridge needs the
+    // packaged binary named explicitly. All three are inherited by the child
+    // and none has an in-process equivalent (see the test's guard above).
     std::env::set_var("PIR_EXECUTABLE", env!("CARGO_BIN_EXE_pir"));
     std::env::set_var("PIR_AGENT_DIR", agent_dir.path());
     std::env::set_var("TESTPROV_API_KEY", "test-key");

@@ -1,0 +1,26 @@
+[package]
+name = "pir-builtin-tool-repair"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Pure repair pipeline (grammar recovery, live-schema repair, alias normalization) for assistant tool calls in the pir coding agent"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[features]
+# Mirror the engine's `grep-find` compile-time gate: with it off, the
+# `grep`/`find` field-alias rows stay compiled out exactly as in the core
+# builtin when `pir-core/grep-find` is disabled.
+default = []
+grep-find = []
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+regex = "1.13.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

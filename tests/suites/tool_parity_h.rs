@@ -588,24 +588,42 @@ impl WriteOperations for FakeWrite {
 /// Upstream `write.ts:11-14`: the parameter descriptions are model-facing
 /// schema text, so they are pinned byte-for-byte (a wording drift is a wire
 /// change, not a comment change).
+///
+/// `append` is a pir extension for chunked large-file writes; upstream
+/// `write.ts` has only `path` and `content`. It is optional (`required` stays
+/// upstream's exact list), so the upstream call shape is unchanged.
 #[test]
 fn write_declares_the_upstream_parameter_schema() {
     let tool = WriteTool::new();
-    assert_eq!(
-        tool.parameters().expect("write schema"),
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write (relative or absolute)"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file"
-                }
+    let schema = tool.parameters().expect("write schema");
+    let expected = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file to write (relative or absolute)"
             },
-            "required": ["path", "content"]
+            "content": {
+                "type": "string",
+                "description": "Content to write to the file"
+            }
+        },
+        "required": ["path", "content"]
+    });
+    assert_eq!(schema["type"], expected["type"]);
+    assert_eq!(schema["properties"]["path"], expected["properties"]["path"]);
+    assert_eq!(
+        schema["properties"]["content"],
+        expected["properties"]["content"]
+    );
+    assert_eq!(schema["required"], expected["required"]);
+    let properties = schema["properties"].as_object().expect("properties");
+    assert_eq!(properties.len(), 3, "unexpected write parameters: {schema}");
+    assert_eq!(
+        properties["append"],
+        serde_json::json!({
+            "type": "boolean",
+            "description": "Append to the existing file instead of replacing it (creates the file when missing)"
         })
     );
 }
@@ -720,9 +738,22 @@ impl BashOperations for FakeBash {
 }
 
 fn bash_context(root: &Path, session: Option<(String, PathBuf)>) -> ToolContext {
+    bash_context_in(root, session, None)
+}
+
+/// [`bash_context`] with an EXPLICIT agent directory for the session env (the
+/// seam the production loop fills from the session's own agent dir). Passing it
+/// here keeps the test off the process environment: `ToolContext::resolve_agent_dir`
+/// prefers this value over `PIR_AGENT_DIR`.
+fn bash_context_in(
+    root: &Path,
+    session: Option<(String, PathBuf)>,
+    agent_dir: Option<&Path>,
+) -> ToolContext {
     let mut context = ToolContext::new(root);
     if let Some((session_id, session_file)) = session {
         context.session_env = Some(Arc::new(ToolSessionEnv {
+            performance: pir::config::settings::PerformanceSettings::default(),
             live_model: None,
             live_thinking: None,
             read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -735,7 +766,7 @@ fn bash_context(root: &Path, session: Option<(String, PathBuf)>) -> ToolContext 
             has_ui: false,
             project_trusted: true,
             user_agents_dir: None,
-            agent_dir: None,
+            agent_dir: agent_dir.map(Path::to_path_buf),
             credential: None,
             on_update: None,
             live_tools: None,
@@ -816,7 +847,6 @@ async fn bash_with_operations_streams_and_injects_pi_session_env() {
 
 #[tokio::test]
 async fn bash_local_child_sees_pi_session_environment() {
-    let _agent_dir = crate::common::AgentDirEnvGuard::scratch("pi-session-local", None).await;
     if std::process::Command::new("bash")
         .arg("-c")
         .arg("true")
@@ -831,9 +861,10 @@ async fn bash_local_child_sees_pi_session_environment() {
     let root = temp_workspace("pi-session-local");
     let session_file = root.join("session.jsonl");
     let tool = BashTool::new();
-    let context = bash_context(
+    let context = bash_context_in(
         &root,
         Some(("local-session".to_owned(), session_file.clone())),
+        Some(&root),
     );
     let result = tool
         .run(

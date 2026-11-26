@@ -1088,6 +1088,8 @@ async fn message_update_per_delta_cost_is_flat_for_every_reading_shape() {
             system_prompt: String::new(),
             is_idle: true,
             limits: Some(Default::default()),
+            allow_process_exit: false,
+            agent_dir: None,
         })
         .expect("runtime");
         let loaded = runtime

@@ -3,7 +3,7 @@
 # bin profiles must run.
 #
 # Rows (count is asserted below so this comment cannot drift):
-#   core   57 library rows: the boundary cases `docs/FEATURES.md` promises first
+#   core   59 library rows: the boundary cases `docs/FEATURES.md` promises first
 #          (bare minimal core, minimal + CLI, tui/extensions/...), then each
 #          non-provider feature alone — every selectable feature in Cargo.toml
 #          except `default`/`full` has its own row (including the seven
@@ -77,11 +77,11 @@
 #          pulls sibling suites that need `tui`/`extensions`.
 #          `smoke(cli,tool-read)` pins the partial build: `read` is available
 #          while every other leaf reports its own missing feature.
-#   TOTAL  85 cargo invocations.
+#   TOTAL 123 cargo invocations (87 root-package rows + 36 support-crate rows).
 #
 # It runs in the cargo target dir the caller selects (`CARGO_TARGET_DIR`,
 # default `target-alt`); lanes run it in their own `target-lane-*` dir so an
-# 81-row sweep never touches the foreman's `target/`. ALL rows run even after
+# sweep never touches the foreman's `target/`. ALL rows run even after
 # a failure — the point of a matrix is the complete list of broken
 # configurations — and any failed row makes the script exit 1 with the failing
 # rows named. Exit 2 = wrong working directory / missing manifest.
@@ -99,7 +99,6 @@ CONFIGS=(
   "minimal+cli|--features cli"
   "tui|--features tui"
   "extensions|--features extensions"
-  "python|--features python"
   "context-mode|--features context-mode"
   "mcp|--features mcp"
   "mcp-sd|--features mcp-sd"
@@ -108,10 +107,12 @@ CONFIGS=(
   "server|--features server"
   "client|--features client"
   "subagent|--features subagent"
+  "mode|--features mode"
   "tool-repair|--features tool-repair"
   "tool-search|--features tool-search"
   "todo|--features todo"
   "phone|--features phone"
+  "memory|--features memory"
   "tool-read|--features tool-read"
   "tool-bash|--features tool-bash"
   "tool-powershell|--features tool-powershell"
@@ -124,6 +125,7 @@ CONFIGS=(
   "grep-find|--features grep-find"
   "brush|--features brush"
   "image-tools|--features image-tools"
+  "image-resize|--features image-resize"
   "image-protocol|--features image-protocol"
   "print|--features print"
   "rpc|--features rpc"
@@ -148,7 +150,7 @@ CONFIGS=(
   "subagent+tool-search+todo|--features subagent,tool-search,todo"
   "sdk+provider-openai|--features sdk,provider-openai"
   "sdk+session+skills|--features sdk,session,skills"
-  "no-js|--features cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,python,context-mode,phone,provider-openai,provider-anthropic,provider-google,provider-bedrock,provider-mistral,tools,grep-find,image-tools,session,skills"
+  "no-js|--features cli,tui,env,env-daemon,server,client,subagent,tool-repair,tool-search,todo,context-mode,phone,memory,provider-openai,provider-anthropic,provider-google,provider-bedrock,provider-mistral,tools,grep-find,image-tools,session,skills"
   "tui-slim|--features cli,tui,tools,provider-openai,provider-anthropic,session,skills"
   "all-features|"
   "full|"
@@ -182,13 +184,13 @@ BIN_CONFIGS=(
   "bin(full)|"
 )
 SMOKE_CONFIGS=(
-  "smoke(cli)|--features cli"
-  "smoke(cli,tool-read)|--features cli,tool-read"
-  "smoke(cli,tools)|--features cli,tools"
-  "smoke(cli,mcp)|--features cli,mcp"
-  "smoke(cli,provider-openai)|--features cli,provider-openai"
-  "smoke(cli,tui,provider-openai)|--features cli,tui,provider-openai"
-  "smoke(full)|"
+  "smoke(cli)|--features cli|feature_off_surface"
+  "smoke(cli,tool-read)|--features cli,tool-read|feature_off_surface"
+  "smoke(cli,tools)|--features cli,tools|feature_off_surface"
+  "smoke(cli,mcp)|--features cli,mcp|feature_off_surface"
+  "smoke(cli,provider-openai)|--features cli,provider-openai|feature_off_surface"
+  "smoke(cli,tui,provider-openai)|--features cli,tui,provider-openai|feature_off_surface"
+  "smoke(full)| |feature_off_surface"
   "off(rpc,export-html)|--features rpc|rpc_export_off"
 )
 
@@ -196,7 +198,7 @@ SMOKE_CONFIGS=(
 # a row added without updating the header (or a stale header) fails the gate
 # before it spends any time compiling. The consumer count is asserted in the
 # consumer phase below (its glob is only known there).
-EXPECTED_LIB_ROWS=57
+EXPECTED_LIB_ROWS=59
 EXPECTED_BIN_ROWS=18
 EXPECTED_CONSUMER_ROWS=2
 EXPECTED_SMOKE_ROWS=8
@@ -217,7 +219,19 @@ run_row() {
   label="$1"; shift
   printf '%-28s ' "$label"
   RUN=$((RUN + 1))
-  if cargo "$@" --locked >"$LOG" 2>&1; then
+  cargo_args=()
+  test_args=()
+  after_separator=0
+  for arg in "$@"; do
+    if [ "$arg" = "--" ]; then
+      after_separator=1
+    elif [ "$after_separator" -eq 1 ]; then
+      test_args+=("$arg")
+    else
+      cargo_args+=("$arg")
+    fi
+  done
+  if cargo "${cargo_args[@]}" --locked "${test_args[@]}" >"$LOG" 2>&1; then
     echo "OK"
   else
     rc=$?
@@ -284,32 +298,68 @@ else
     FAILED_ROWS+=("consumer:count")
   fi
   for t in "${consumers[@]}"; do
-    run_row "consumer:$(basename "$t" .rs)" check --no-default-features --features sdk --test "$(basename "$t" .rs)"
+    run_row "consumer:$(basename "$t" .rs)" test --no-default-features --features sdk --test "$(basename "$t" .rs)" -- "$(basename "$t" .rs)"
   done
 fi
 
-# Runtime smoke: a profile that only compiles is not usable (north star R5).
-# `cargo test --test feature_off_surface` builds the `pir` binary for the same
-# feature set through CARGO_BIN_EXE_pir, then the test runs `--version`, the
-# documented off-error for a surface the profile lacks, and the local-mock
-# print turn when a wire adapter is compiled in. The slim `--tools grep`
-# diagnostic is a `#[cfg(not(feature = "grep-find"))]` test in the same target.
-# A row may carry an optional third `|test-target` field (default:
-# `feature_off_surface`); `off(rpc,export-html)` uses it to run the
-# `rpc`-without-`export-html` in-process pin, `tests/rpc_export_off.rs`.
+# Runtime smoke: a profile that only compiles is not usable. Each row builds
+# its small dedicated target; libtest receives the target's own tests directly.
+
 for row in "${SMOKE_CONFIGS[@]}"; do
   name="${row%%|*}"
   rest="${row#*|}"
   flags="${rest%%|*}"
-  target="feature_off_surface"
-  if [ "$rest" != "${rest#*|}" ]; then
-    target="${rest#*|}"
-  fi
+  target="${rest#*|}"
   args="--no-default-features"
   [ "$name" = "smoke(full)" ] && args=""
-  # shellcheck disable=SC2086
   run_row "$name" test $args $flags --test "$target"
+ done
+
+# Extracted support crates. They are separate workspace packages, so every row
+# above (which targets the root `pir-sdk` package) is blind to them. Each must
+# build on its own with no default features AND with its full feature set: a
+# published crate that only compiles as a dependency of the engine would break
+# a consumer's `cargo install`.
+#
+# `pir-core` and `pir-tui` are here too: they are published workspace members
+# (release.yml publishes both), so a feature that only compiles as a dependency
+# of `pir-sdk` would break the crate's own consumers the same way. They are
+# listed last because their no-default build takes the longest.
+SUPPORT_CRATES=(
+  pir-plugin-api
+  pir-protocol
+  pir-telemetry
+  pir-ai-types
+  pir-durable
+  pir-builtins
+  pir-builtin-subagent
+  pir-builtin-mode
+  pir-builtin-mcp
+  pir-builtin-codemode
+  pir-builtin-context-mode
+  pir-builtin-tool-search
+  pir-builtin-tool-repair
+  pir-builtin-todo
+  pir-builtin-memory
+  pir-builtin-phone
+  pir-core
+  pir-tui
+)
+EXPECTED_SUPPORT_ROWS=36
+SUPPORT_ROWS=0
+for crate in "${SUPPORT_CRATES[@]}"; do
+  run_row "crate:$crate" check -p "$crate" --no-default-features --lib
+  SUPPORT_ROWS=$((SUPPORT_ROWS + 1))
+  # The all-features twin covers the gated rows (`grep-find` aliases in
+  # tool-repair, the catalog's per-builtin features).
+  run_row "crate:$crate(full)" check -p "$crate" --all-features --lib
+  SUPPORT_ROWS=$((SUPPORT_ROWS + 1))
 done
+if [ "$SUPPORT_ROWS" -ne "$EXPECTED_SUPPORT_ROWS" ]; then
+  printf '%-28s ' "crate:count"
+  echo "MISMATCH ($SUPPORT_ROWS/$EXPECTED_SUPPORT_ROWS support-crate rows — update the header)"
+  FAILED_ROWS+=("crate:count")
+fi
 
 echo ""
 if [ "${#FAILED_ROWS[@]}" -eq 0 ]; then

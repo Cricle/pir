@@ -1,14 +1,13 @@
 //! A miniature coding assistant, end to end.
 //!
 //! The scripted model performs a small but real repair: it reads a broken
-//! Python module, edits it with the built-in `edit` tool, runs the real test
+//! shell module, edits it with the built-in `edit` tool, runs the real test
 //! suite with the built-in `bash` tool, and reports the result. The project
-//! lives in a fresh temporary directory; the test runner is real (set
-//! `PIR_PYTHON` if `python` is not on PATH).
+//! lives in a fresh temporary directory; the test runner is a plain POSIX
+//! shell script (no interpreter dependency).
 //!
 //! ```text
-//! PIR_PYTHON=/path/to/python.exe \
-//!   cargo run --example mini_coding --no-default-features --features "sdk,tools"
+//! cargo run --example mini_coding --no-default-features --features "sdk,tools"
 //! ```
 
 mod common;
@@ -21,40 +20,64 @@ use serde_json::json;
 use pir::ai::types::ThinkingLevel;
 use pir::sdk::{AgentBuilder, SdkError};
 
-const BROKEN: &str = r#"def add(a, b):
-    return a - b
-
-
-def mul(a, b):
-    return a * b
-"#;
-
-const FIXED: &str = r#"def add(a, b):
-    return a + b
-
-
-def mul(a, b):
-    return a * b
-"#;
-
-const TEST: &str = r#"from calc import add, mul
-
-assert add(2, 3) == 5, f"add(2, 3) = {add(2, 3)}"
-assert mul(2, 3) == 6
-print("all tests passed")
-"#;
-
-fn python_program() -> String {
-    std::env::var("PIR_PYTHON").unwrap_or_else(|_| "python".to_owned())
+const BROKEN: &str = r#"add() {
+    printf '%s\n' "$(($1 - $2))"
 }
 
+mul() {
+    printf '%s\n' "$(($1 * $2))"
+}
+"#;
+
+const FIXED: &str = r#"add() {
+    printf '%s\n' "$(($1 + $2))"
+}
+
+mul() {
+    printf '%s\n' "$(($1 * $2))"
+}
+"#;
+
+const TEST: &str = r#". ./calc.sh
+
+result="$(add 2 3)"
+[ "$result" = "5" ] || { printf 'add(2, 3) = %s\n' "$result"; exit 1; }
+[ "$(mul 2 3)" = "6" ] || { echo "mul(2, 3) failed"; exit 1; }
+echo "all tests passed"
+"#;
+
 fn run_tests(dir: &Path) -> (bool, String) {
-    let output = Command::new(python_program())
-        .arg("-B") // no __pycache__: same-mtime, same-size edits must rerun
-        .arg("test_calc.py")
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // Use the same shell resolution as the bash tool: on Windows a bare
+    // `bash` may name the WSL launcher instead of the Git Bash the tool uses.
+    let shell = pir::coding_agent::tools::resolve_shell_config(None)
+        .expect("resolve the shell used by the bash tool");
+    let mut command = Command::new(shell.program());
+    command
+        .args(shell.args())
         .current_dir(dir)
-        .output()
-        .expect("spawn the Python test runner (set PIR_PYTHON if python is missing)");
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if shell.stdin_transport() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.arg("bash test_calc.sh");
+    }
+    let mut child = command
+        .spawn()
+        .expect("spawn the shell test runner (the bash tool must have a shell)");
+    if shell.stdin_transport() {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(b"bash test_calc.sh\n")
+            .expect("send the test command");
+        drop(stdin);
+    }
+    let output = child
+        .wait_with_output()
+        .expect("wait for the shell test runner");
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     (output.status.success(), text.trim().to_owned())
@@ -91,8 +114,8 @@ async fn run() -> Result<(), SdkError> {
         std::env::temp_dir().join(format!("pir-sdk-mini-coding-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("calc.py"), BROKEN)?;
-    std::fs::write(dir.join("test_calc.py"), TEST)?;
+    std::fs::write(dir.join("calc.sh"), BROKEN)?;
+    std::fs::write(dir.join("test_calc.sh"), TEST)?;
 
     // 1. The project really fails before the assistant touches it.
     let (passes_before, output_before) = run_tests(&dir);
@@ -101,21 +124,18 @@ async fn run() -> Result<(), SdkError> {
 
     // 2. Script the model: read → edit → run tests → summarize.
     let (registry, model) = common::ScriptedProvider::registry(vec![
-        common::tool_calls_message(&[("read", json!({ "path": "calc.py" }))]),
+        common::tool_calls_message(&[("read", json!({ "path": "calc.sh" }))]),
         common::tool_calls_message(&[(
             "edit",
             json!({
-                "path": "calc.py",
+                "path": "calc.sh",
                 "edits": [{
-                    "oldText": "    return a - b",
-                    "newText": "    return a + b"
+                    "oldText": "\"$(($1 - $2))\"",
+                    "newText": "\"$(($1 + $2))\""
                 }]
             }),
         )]),
-        common::tool_calls_message(&[(
-            "bash",
-            json!({ "command": format!("\"{}\" -B test_calc.py", python_program()) }),
-        )]),
+        common::tool_calls_message(&[("bash", json!({ "command": "bash test_calc.sh" }))]),
         common::text_message("Fixed add() and confirmed the test suite passes."),
     ]);
 
@@ -149,7 +169,7 @@ async fn run() -> Result<(), SdkError> {
     println!("messages in run: {}", outcome.messages.len());
 
     // 4. The repair must be real: the file changed and the tests now pass.
-    let fixed = std::fs::read_to_string(dir.join("calc.py"))?;
+    let fixed = std::fs::read_to_string(dir.join("calc.sh"))?;
     println!("diff:");
     print_diff(BROKEN, &fixed);
     assert_eq!(fixed, FIXED, "the edit tool must have applied the fix");

@@ -358,6 +358,7 @@ fn env_at_depth(
     base.register(Arc::new(SubagentTool::default()));
     install_subagent_depth(&mut base, depth);
     Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -370,7 +371,11 @@ fn env_at_depth(
         has_ui: false,
         project_trusted: true,
         user_agents_dir: Some(user_agents_dir.to_path_buf()),
-        agent_dir: None,
+        // The in-process child session propagates this to ITS tool env, so the
+        // nested depth-N child discovers user agents here instead of resolving
+        // the process `PIR_AGENT_DIR`. `user_agents_dir` is `<agent_dir>/agents`,
+        // so the agent dir is its parent.
+        agent_dir: user_agents_dir.parent().map(Path::to_path_buf),
         credential: None,
         on_update: None,
         live_tools: None,
@@ -388,6 +393,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>, signal: Option<AbortSignal
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -398,35 +404,11 @@ async fn run_tool(
     SubagentTool::default().run(&args, ctx).await
 }
 
-/// Nested child sessions discover agents through the PROCESS agent dir: a
-/// loop-built [`ToolSessionEnv`] always carries `user_agents_dir: None`
-/// (`AgentSession::prompt` builds it that way), so `subagent` falls back to
-/// `PIR_AGENT_DIR/agents`. The chain/parallel tests scope that variable to
-/// their own fixture; every test in this file takes this lock so a scoped
-/// value is never visible to a concurrent reader (and the two scoping tests
-/// cannot overwrite each other's value).
-static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct AgentDirGuard {
-    previous: Option<std::ffi::OsString>,
-}
-
-impl AgentDirGuard {
-    fn set(path: &Path) -> Self {
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", path);
-        Self { previous }
-    }
-}
-
-impl Drop for AgentDirGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-    }
-}
+/// PROJECT agents are discovered under the call's cwd and USER-level agents
+/// under the session's own agent directory, which these tests pass as
+/// `ToolContext::with_agent_dir` — an argument, so no process-level
+/// `PIR_AGENT_DIR` pin (and no lock) is needed and concurrent siblings cannot
+/// see each other's fixture.
 
 // ---------------------------------------------------------------------------
 // (a) Test seam: entering at the limit refuses, depth 2 allows, state stays
@@ -435,7 +417,6 @@ impl Drop for AgentDirGuard {
 
 #[tokio::test]
 async fn entering_at_the_depth_limit_refuses_and_leaves_no_state_behind() {
-    let _env_lock = TEST_ENV_LOCK.lock().await;
     let temp = TempDir::new("seam");
     temp.write_agent("scout.md", "name: scout\ndescription: d\n", "b");
     let registry = fake_registry(Arc::new(|_, _| {
@@ -557,7 +538,6 @@ fn three_level_chain_refuses_the_next_level() {
 }
 
 async fn three_level_chain_body() {
-    let _env_lock = TEST_ENV_LOCK.lock().await;
     let temp = TempDir::new("chain");
     for agent in ["a", "b", "c"] {
         temp.write_agent(
@@ -566,8 +546,6 @@ async fn three_level_chain_body() {
             "b",
         );
     }
-    // Nested children resolve their agent dir from the process env.
-    let _agent_dir = AgentDirGuard::set(&temp.0);
 
     let observed_results: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let observed_for_responder = Arc::clone(&observed_results);
@@ -657,11 +635,8 @@ fn parallel_siblings_at_depth_one_keep_independent_depths() {
 }
 
 async fn parallel_siblings_body() {
-    let _env_lock = TEST_ENV_LOCK.lock().await;
     let temp = TempDir::new("parallel");
     temp.write_agent("worker.md", "name: worker\ndescription: d\n", "b");
-    // Nested children resolve their agent dir from the process env.
-    let _agent_dir = AgentDirGuard::set(&temp.0);
 
     let entered = Arc::new(AtomicUsize::new(0));
     let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
@@ -760,7 +735,6 @@ async fn parallel_siblings_body() {
 
 #[tokio::test]
 async fn aborted_child_leaves_no_depth_behind() {
-    let _env_lock = TEST_ENV_LOCK.lock().await;
     let temp = TempDir::new("abort");
     temp.write_agent("scout.md", "name: scout\ndescription: d\n", "b");
 

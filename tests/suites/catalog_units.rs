@@ -253,7 +253,8 @@ fn provider_ids(files: &serde_json::Map<String, serde_json::Value>) -> Vec<Strin
 
 #[test]
 fn providers_all_shim_metadata_matches_the_rust_catalog() {
-    let shim = include_str!("../../src/extensions/api/js/pi_ai_providers_all_shim.js.txt");
+    let shim =
+        include_str!("../../crates/pir-core/src/extensions/api/js/pi_ai_providers_all_shim.js.txt");
     let manifest = builtin_catalog_manifest().expect("embedded catalog manifest");
 
     let shim_manifest = providers_all_pinned_manifest(shim);
@@ -289,7 +290,7 @@ fn providers_all_shim_metadata_matches_the_rust_catalog() {
     );
 }
 
-/// The source-file test above cannot see a stale `assets/shims` binary: the
+/// The source-file test above cannot see a stale `crates/pir-core/assets/shims` binary: the
 /// extension host imports the deflate blob, not the `.js.txt`. Inflate the
 /// exact `include_bytes!` asset and compare the literals its runtime getters
 /// (`getBuiltinModelDataManifest()` / `getBuiltinModelDataVersion()` /

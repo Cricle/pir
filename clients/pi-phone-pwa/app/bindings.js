@@ -1,5 +1,5 @@
 import { addAttachments, clearAttachments, removeAttachment, renderAttachmentStrip, syncAttachmentsWithPrompt } from "./attachments.js";
-import { setServerBase } from "./config.js";
+import { normalizeServerBase, setServerBase } from "./config.js";
 import { toggleSidebar } from "./shell.js";
 import { renderCommandSuggestions } from "./autocomplete-controller.js";
 import { applyAutocompleteItem, submitPrompt } from "./commands.js";
@@ -193,7 +193,8 @@ export function initializeBindings({ handleEnvelope, handleAuthFailure }) {
   });
 
   el.tokenSaveButton.addEventListener("click", () => {
-    const nextServer = setServerBase(el.serverInput?.value.trim() || state.serverBase);
+    const rawServer = el.serverInput?.value.trim() || state.serverBase;
+    const nextServer = normalizeServerBase(rawServer);
     if (!nextServer) {
       showToast("Enter the phone server URL, for example https://phone.example.com.", "error");
       el.serverInput?.focus();
@@ -205,10 +206,16 @@ export function initializeBindings({ handleEnvelope, handleAuthFailure }) {
       el.tokenInput.focus();
       return;
     }
+    if (nextServer !== state.serverBase && nextToken === state.token) {
+      showToast("Enter a token issued by the selected server.", "error");
+      el.tokenInput.focus();
+      return;
+    }
 
+    setServerBase(nextServer);
     state.serverBase = nextServer;
     state.token = nextToken;
-    storeToken(state.token);
+    storeToken(state.token, state.serverBase);
     state.manuallyClosed = false;
     closeTokenModal();
     connectSocket({ handleEnvelope, handleAuthFailure });

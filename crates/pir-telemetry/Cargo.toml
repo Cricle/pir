@@ -1,0 +1,42 @@
+[package]
+name = "pir-telemetry"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Vendor-neutral span, metric, propagation and trace-store core for pir (upstream pi-telemetry surface)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = ["store"]
+# `TelemetryStore` + the portable `StoredSpan`/`StoredTrace`/`StoredMetric`
+# shapes and their query helpers. Needed by anything that persists or renders
+# collected traces (the in-memory recorder, `render_trace`).
+store = []
+# The in-memory recorder (`TestTelemetry` / `InMemoryTelemetry`) and the
+# metrics/span snapshots test code asserts on. Pulls `store`.
+testing = ["store"]
+
+# The crate's own suites assert on the in-memory recorder, so they need
+# `testing`. A dev-dependency-style self-feature is not expressible; enabling
+# it here keeps `cargo test -p pir-telemetry` self-contained while a normal
+# `cargo build` of a consumer that does not ask for `testing` stays lean.
+[dev-dependencies]
+pir-telemetry = { path = ".", features = ["testing"] }
+
+[[test]]
+name = "core"
+path = "tests/core.rs"
+
+[[test]]
+name = "store"
+path = "tests/store.rs"

@@ -66,7 +66,7 @@ Next steps, each a runnable example in this repo:
 | Sessions + plugins | [`sessions.rs`](../examples/sessions.rs), [`plugin.rs`](../examples/plugin.rs) | `cargo run --example sessions --no-default-features --features "sdk,session"`<br>`cargo run --example plugin --no-default-features --features "sdk"` |
 | Session lifecycle across processes | [`session_lifecycle.rs`](../examples/session_lifecycle.rs) | `cargo run --example session_lifecycle --no-default-features --features "sdk,session" -- start <root>` (then `continue` / `fork` / `inspect <jsonl>`) |
 | Manual compaction | [`session_compaction.rs`](../examples/session_compaction.rs) | `cargo run --example session_compaction --no-default-features --features "sdk,session"` |
-| A real repair with built-in tools | [`mini_coding.rs`](../examples/mini_coding.rs) | `PIR_PYTHON=<python> cargo run --example mini_coding --no-default-features --features "sdk,tools"` |
+| A real repair with built-in tools | [`mini_coding.rs`](../examples/mini_coding.rs) | `cargo run --example mini_coding --no-default-features --features "sdk,tools"` |
 
 `scripts/run_examples.sh` runs the whole offline set; `examples/README.md` lists every example, including the two
 network ones.
@@ -94,7 +94,7 @@ network ones.
 | `exclude_tools([...])` / `no_tools()` | Denylist on top of the default set (and any `tools` allowlist; unmatched ignored) / declare and execute no tools. |
 | `on_event(name, closure)` | One plugin per call: observe/transform a unified-dispatch event (`input`, `before_agent_start`, `tool_call`, `tool_result`, `session_start`, `model_select`, `thinking_level_select`, `turn_end`, `agent_before_settle`, `session_before_compact`/`fork`/`switch`, …). The closure receives `&mut serde_json::Value` and may return `()` or a `PluginEventOutcome`. Handlers run in registration order. |
 | `with_plugin(Arc<dyn AgentPlugin>)` | Attach a full Rust plugin (tools, commands, event handlers). |
-| `builtin(name)` / `builtins([...])` | Attach a compiled-in builtin (`"subagent"`, `"mode"`, `"tool-repair"`, `"tool-search"`, `"todo"`, `"memory"`, `"mcp"`, `"python"`, `"codemode"`). `builtin:`-prefixed and bare names are equivalent. `tool-search` is model-only and its `tool_search` tool is default-inactive: also add `.tools(["+tool_search"])` (exposure is then the model's call surface); deferred tools load on demand. |
+| `builtin(name)` / `builtins([...])` | Attach a compiled-in builtin (`"subagent"`, `"mode"`, `"tool-repair"`, `"tool-search"`, `"todo"`, `"memory"`, `"mcp"`, `"context-mode"`, `"codemode"`). `builtin:`-prefixed and bare names are equivalent. `tool-search` is model-only and its `tool_search` tool is default-inactive: also add `.tools(["+tool_search"])` (exposure is then the model's call surface); deferred tools load on demand. |
 | `extension_paths(paths)` / `only_builtin(bool)` | Load JS extensions from files or `builtin:<name>` pseudo-paths (requires `extensions`) / filter to `builtin:<name>` only: on-disk paths ignored with one diagnostic, no QuickJS actor (the CLI `--only-builtin` shape), no default-injection — attach builtins with `builtin()`/`builtins()`. |
 | `proxy(ProxyProvider, Model)` | Route requests through an application proxy server. Registers the provider in a private registry and pins the model exactly like `with_registry` (which it is mutually exclusive with, along with `endpoint`/`model*`). |
 | `session(SessionMode)` / `no_session()` | `DefaultDir` (default), `Dir(path)`, `Existing(path)`, or `None` (`SessionMode::None`, in-memory); durable modes write the upstream JSONL format (pi and pir share session files). |
@@ -489,15 +489,9 @@ async fn run_once(registry: &ProviderRegistry, model: Model, context: Arc<Contex
 ### Durable kernel
 
 `pir::durable` is the core durable conversation/task/document runtime (no cargo feature; not re-exported through
-`pir::sdk`). See the Rust quickstart in [`durable-spec.md`](durable-spec.md#rust-quickstart-developer-usage) for
-`JsonlStorage` + `Session`, forks, reopen and torn-line recovery.
-
-Two `define_task` functions exist and they are not interchangeable: the one in `pir::durable::harness::task`
-builds an executable definition (`define_task(name, version, initial).phase(..).build()`) whose `Task` a
-`TaskScheduler` runs, while `pir::durable::tasks` holds the metadata registry used for agent hooks
-(`TaskDefinition { kind, version, phases }`). A task phase can commit a durable sleep through
-`TaskRuntime::sleep_until`; `pir::durable::timers::Timers` wraps a host timer with the native fallback used by
-the scheduler.
+`pir::sdk`). See [`durable-spec.md`](durable-spec.md) for the Rust quickstart (`JsonlStorage` + `Session`, forks,
+reopen and torn-line recovery) and for the two non-interchangeable `define_task` functions, the task phase
+sleep/commit model, and the host-timer wrapper — that page is the normative reference and is not restated here.
 
 ## Extending the agent
 
@@ -528,10 +522,10 @@ fails `build()` — never a silent no-op:
 
 ```text
 Unknown built-in extension: builtin:<name>
-Built-in extension `builtin:python` is not compiled into this build (the `python` feature is off)
+Built-in extension `builtin:context-mode` is not compiled into this build (the `context-mode` feature is off)
 ```
 
-The agent directory's settings gates apply too: `pythonTool: false` or `disabledBuiltinExtensions` fails `build()`
+The agent directory's settings gates apply too: `disabledBuiltinExtensions` fails `build()`
 with a diagnostic naming the setting, so settings cannot be bypassed by attaching a builtin by name.
 `.builtin("builtin:subagent")` and `.builtin("subagent")` are equivalent.
 
@@ -552,23 +546,23 @@ binding; register it from `AgentPlugin::on_context` (the `register()` phase has 
 ctx.providers().expect("providers bound").register_provider_impl(Arc::new(my_provider));
 ```
 
-`ProviderBox` is `Arc<dyn Provider>` (`src/ai/provider.rs:316`); accessor `PluginContext::providers()`
-(`src/plugins/context.rs:229`), trait method `src/plugins/services/mod.rs:1815`, live impl
-`src/agent_session/plugin_services.rs:2985`. Lookup order is plugin-owned typed > session dynamic > shared dynamic
-> static (`src/ai/provider.rs:586-640`); same-id registrations stack across bindings, last-wins within one, and
+`ProviderBox` is `Arc<dyn Provider>` (`crates/pir-core/src/ai/provider.rs:316`); accessor `PluginContext::providers()`
+(`crates/pir-core/src/plugins/context.rs:229`), trait method `crates/pir-core/src/plugins/services/mod.rs:1815`, live impl
+`crates/pir-core/src/agent_session/plugin_services.rs:2985`. Lookup order is plugin-owned typed > session dynamic > shared dynamic
+> static (`crates/pir-core/src/ai/provider.rs:586-640`); same-id registrations stack across bindings, last-wins within one, and
 unregister/`Drop` removes only that binding's entries.
 
 The JSON path `register_provider(id, config)` supports only `models` / `baseUrl` / `api` / `headers` / `authHeader`
 (`apiKey` supplies the header value); `streamSimple` / `refreshModels` / `oauth` callbacks are rejected with a
-diagnostic and need a typed provider (`src/agent_session/providers.rs:2575-2652`;
-`src/plugins/services/mod.rs:1779-1800`). Native auth hooks stay process-wide and last-wins with no session
+diagnostic and need a typed provider (`crates/pir-core/src/agent_session/providers.rs:2575-2652`;
+`crates/pir-core/src/plugins/services/mod.rs:1779-1800`). Native auth hooks stay process-wide and last-wins with no session
 dimension (a live child's `register_auth_hooks` can shadow a parent's for the same provider id:
-`src/agent_session/plugin_services.rs:2999-3030`; `src/plugins/services/mod.rs:887-935`).
+`crates/pir-core/src/agent_session/plugin_services.rs:2999-3030`; `crates/pir-core/src/plugins/services/mod.rs:887-935`).
 
 `on_event` is the single-event shortcut: one closure plugin per call, stacked in registration order and receiving
 the same `serde_json::Value` payloads as a full plugin. Rust handlers observe `tool_execution_update` and the
 session-level events in the builder table; `tool_call` /`tool_result` dispatch through the same unified host
-(`dispatch_hosted_event`, `src/agent/tool_execution.rs:1878`, `:2156`), so each face observes them once.
+(`dispatch_hosted_event`, `crates/pir-core/src/agent/tool_execution.rs:1878`, `:2156`), so each face observes them once.
 
 ### Public value types
 
@@ -692,7 +686,7 @@ therefore inherits the HTTP stack even with no `provider-*` feature; recorded as
 The `pir` binary requires only `cli`, which does **not** imply `tools`.
 
 SDK-relevant features: `sdk` (facade), `session`, `skills`, `tools`, `provider-*`, `subagent`, `tool-repair`,
-`tool-search`, `todo`, `memory`, `mcp`, `python`, `extensions`, `grep-find`, `image-tools`. `with_registry` works without any
+`tool-search`, `todo`, `memory`, `mcp`, `context-mode`, `extensions`, `grep-find`, `image-tools`. `with_registry` works without any
 `provider-*`; `endpoint()` fails `build()` naming the missing feature; an environment-resolved catalog model's
 first request ends with the feature-naming error.
 
@@ -714,17 +708,17 @@ There is no standalone `sqlite` feature (the node:sqlite/better-sqlite3 host shi
 has the full matrix, the gating map and the measured per-feature optionality/minimality matrix (§4.1).
 
 Per-feature measured cost — release binary delta, packages added by `cargo tree`, and first-prompt / 100-round
-heap and WorkingSet — is tabulated in [`docs/FEATURES.md`](FEATURES.md) §4.1. Its measurement vehicle is the
-external consumer crate in the repo at
-[`.play/lanes/lane-sdk-dev/apps/quickstart-copy/README.md`](../.play/lanes/lane-sdk-dev/apps/quickstart-copy/README.md)
-(evaluation evidence, not part of the shipped package).
+heap and WorkingSet — is tabulated in [`docs/FEATURES.md`](FEATURES.md) §4.1. Its measurement vehicle is an
+external consumer crate kept as local evaluation evidence at
+`.play/lanes/lane-sdk-dev/apps/quickstart-copy/` (gitignored working material, not part of the shipped
+package; not linked because `.play/` is absent from a fresh clone).
 
 ## Packaging and size
 
-The crates.io package is `pir-sdk`; the library is imported as `pir` and the binary is `pir`. The package ships
-`src/**`, `assets/**`, `examples/**`, `benches/**`, `schemas/*.json`, `README.md`, `CHANGELOG.md`, `docs/sdk.md`
-and the license files; every other `docs/**` page is excluded (see `Cargo.toml`); `cargo package --list --no-verify`
-inspects the exact `.crate` file list.
+The crates.io package is `pir-sdk`; the library is imported as `pir` and the binary is `pir`. The root package ships
+its whitelisted `src/**`, `examples/**`, `benches/**`, `schemas/*.json`, prose and license files; engine assets are
+owned by the separately packaged `pir-core` crate (see `Cargo.toml` includes), and every other `docs/**` page is
+excluded. `cargo package --list --no-verify` inspects the exact `.crate` file list.
 
 Measured Windows x64 executables, one consumer (Rust std + tokio + serde_json included), fat LTO, one CGU, symbols
 stripped:
@@ -740,7 +734,9 @@ startup cost, and the loop is provider-I/O-bound. Numbers include the consumer's
 recorded measurement (the packaging round's `logs/lane-sdk-package/REPORT.md` is no longer in the tree); the
 surviving external-consumer pins are PIR-SDK-029 and
 `.play/evidence/lane-sdk-dev/round27-debug-budget/REPORT.md` (release quickstart 35,094,016 B; support-bot
-45,366,784 B). Copy-paste profile:
+45,366,784 B). **Not comparable with [`FEATURES.md`](FEATURES.md) §4.1**: that matrix reports a GNU
+consumer binary with fat tables (sdk-only ≈ 38 MB), while this table is Windows x64, fat LTO, one CGU,
+symbols stripped — same features, different artifact. Copy-paste profile:
 
 ```toml
 [profile.release]
@@ -752,6 +748,11 @@ strip = "symbols"
 
 Keep the feature set minimal (`full` is CLI parity, not embeds); when matching an existing profile, `lto`/`codegen-units`
 matter more than `opt-level` for the `pir` code itself.
+
+> **Note (build-time):** the table above is a recorded fat-LTO measurement. The workspace's own `[profile.release]`
+> now uses `lto = "thin"` + `codegen-units = 4` because fat LTO serialized the whole graph through one LLVM module and
+> dominated every release build. Embeds that care about the last few percent of size can keep `fat`/`1` in their own
+> `[profile.release]` — the two settings are independent per consumer.
 
 ## Verification
 

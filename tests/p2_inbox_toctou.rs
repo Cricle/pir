@@ -120,6 +120,7 @@ fn session_in(cwd: &Path) -> Arc<AgentSession> {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }))
 }
 
@@ -143,6 +144,7 @@ fn session_with_storage(cwd: &Path) -> Arc<AgentSession> {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }))
 }
 

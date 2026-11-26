@@ -38,6 +38,7 @@ fn widget(key: &str) -> FactoryWidget {
         width: 0,
         theme_generation: 0,
         dirty: true,
+        revision: 0,
     }
 }
 

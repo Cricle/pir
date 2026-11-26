@@ -276,6 +276,7 @@ fn session_config(
         event_stream: None,
         extensions,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -291,6 +292,8 @@ fn plan_only_handle(cwd: &Path) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
 }
 

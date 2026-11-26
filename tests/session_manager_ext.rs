@@ -99,6 +99,8 @@ fn script_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -423,8 +425,29 @@ globalThis.__casResult = out;
 
 #[tokio::test(flavor = "current_thread")]
 async fn create_agent_session_child_round_trip() {
+    // `PIR_AGENT_DIR` / `PIR_EXECUTABLE` below are process-global and the
+    // spawned child inherits them — that inheritance IS the property under
+    // test (the child re-enters this binary and resolves its own agent dir from
+    // the environment), so the pin stays and the test takes a private process.
+    if crate::common::skip_without_nextest(
+        "session_manager_ext::create_agent_session_child_round_trip",
+    ) {
+        return;
+    }
     let dir = TempDir::new("cas");
     let agent_dir = TempDir::new("cas-agent");
+    // The pin restores all three on drop, so a failing assertion cannot leave
+    // this harness pointing the next test at a removed agent dir.
+    let _env = crate::common::ProcessEnvPin::isolate(
+        &[
+            "PIR_AGENT_DIR",
+            "PIR_CODING_AGENT_DIR",
+            "PI_CODING_AGENT_DIR",
+            "PIR_EXECUTABLE",
+            "TESTPROV_API_KEY",
+        ],
+        &[],
+    );
     let session_dir = dir.path().join("sessions");
     std::fs::create_dir_all(&session_dir).expect("session dir");
 

@@ -17,12 +17,11 @@
 //!
 //! The installed npm tree is user-owned and read-only here: packages are
 //! discovered from `<agent-dir>/npm/node_modules` and pointed at in place.
-//! The runtime itself is redirected to a per-run temp agent dir
-//! (`PIR_AGENT_DIR`) and a temp `XDG_CONFIG_HOME` (the rpiv-* config root), so
-//! neither the engine nor the extensions read or write the operator's
-//! `~/.pi`/`~/.config` state. Those environment writes happen once, before any
-//! runtime starts; integration tests are a dedicated process, so no other test
-//! binary observes them.
+//! The runtime's own agent-dir reads are redirected to a per-run temp agent dir
+//! by [`ExtensionConfig::agent_dir`](pir::extensions::ExtensionConfig), not by
+//! the process environment, so neither the engine nor the extensions read or
+//! write the operator's `~/.pi` state and no other suite in this binary can
+//! observe the redirect.
 //!
 //! Every wait is bounded: actor start and load under an explicit
 //! `tokio::time` budget, event/tool dispatches under the injected
@@ -70,12 +69,11 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The shorter lifecycle budget `before_agent_start` runs under.
 const BEFORE_AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Temp roots shared by every test in this binary. `PIR_AGENT_DIR` is
-/// process-global, so the directory is created exactly once and every runtime
-/// in this harness points at it.
+/// Temp roots shared by every test in this binary: created once, and every
+/// runtime in this harness is handed the agent dir explicitly.
 struct TestEnv {
-    /// The real agent dir captured before `PIR_AGENT_DIR` was redirected; the
-    /// installed npm tree is read from here, in place and read-only.
+    /// The real agent dir the installed npm tree is read from, in place and
+    /// read-only.
     installed_npm_root: PathBuf,
     agent_dir: PathBuf,
     cwd: PathBuf,
@@ -96,26 +94,13 @@ fn test_env() -> &'static TestEnv {
         ));
         let agent_dir = root.join("agent");
         let cwd = root.join("cwd");
-        let config_home = root.join("config");
         std::fs::create_dir_all(&agent_dir).expect("create temp agent dir");
         std::fs::create_dir_all(&cwd).expect("create temp cwd");
-        std::fs::create_dir_all(&config_home).expect("create temp XDG config home");
-
-        // Redirect every agent-dir consumer (extension loader fallback,
-        // `getAgentDir()` shim, tool-repair's config lookup) before the first
-        // runtime starts. Integration tests run in their own process, so this
-        // cannot leak into another test binary.
-        std::env::set_var("PIR_AGENT_DIR", &agent_dir);
-        // The rpiv-* packages resolve their config through `~/.config`; the
-        // XDG override keeps reads off the operator's real config while
-        // preserving the packages' documented lookup rule.
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
 
         eprintln!(
-            "[ecosystem_runtime_exec] temp agent dir={} cwd={} xdg_config={}",
+            "[ecosystem_runtime_exec] temp agent dir={} cwd={}",
             agent_dir.display(),
-            cwd.display(),
-            config_home.display()
+            cwd.display()
         );
         TestEnv {
             installed_npm_root,
@@ -166,6 +151,11 @@ fn extension_config(model: Option<&str>, session_id: &str) -> ExtensionConfig {
         system_prompt: "You are a verification harness.".to_owned(),
         is_idle: true,
         limits: Some(limits),
+        allow_process_exit: false,
+        // The runtime's own agent-dir reads (the boot-time pi-package
+        // provisioning) follow this harness's scratch dir, so no test here has
+        // to pin the process-wide `PIR_AGENT_DIR`.
+        agent_dir: Some(test_env().agent_dir.clone()),
     }
 }
 

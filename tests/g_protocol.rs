@@ -1,8 +1,11 @@
 // Merged test binary: one link unit for a whole subsystem (test-suite link
 // time dominates `cargo test`; fewer binaries = faster compile). Each file
 // keeps its own module namespace, so helpers cannot collide.
-#[path = "suites/cbor.rs"]
-mod cbor;
+//
+// The pure wire-protocol unit suites (`cbor`, `framing`) moved to
+// `crates/pir-protocol/tests/` with the crate. `suites/protocol.rs` stays here:
+// it is an integration suite that drives `ai` + the server, not a protocol
+// unit test.
 #[path = "suites/config_migrations.rs"]
 mod config_migrations;
 #[path = "suites/config_schemas.rs"]
@@ -13,8 +16,6 @@ mod config_settings_units;
 mod config_units;
 #[path = "suites/forbidden_files.rs"]
 mod forbidden_files;
-#[path = "suites/framing.rs"]
-mod framing;
 #[path = "suites/lib_exports.rs"]
 mod lib_exports;
 #[path = "suites/orchestration_convergence.rs"]

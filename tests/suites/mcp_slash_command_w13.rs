@@ -34,11 +34,13 @@ use pir::plugins::{AgentPlugin, PluginHost};
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/// Pin `PIR_AGENT_DIR` at `dir` through the SHARED process-wide guard
-/// (`tests/common/mod.rs`), like the other `g_agent` suites: a module-local
-/// lock would not exclude their pins, and this suite used to leak its dir.
-async fn env_guard(dir: &TempDir) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::at(&dir.0, &[]).await
+/// Per-test isolation hook kept for the call sites below: the agent dir is the
+/// test's own scratch `TempDir`, handed to every construction explicitly
+/// (`build_plugin` → `PluginHost::build_with_agent_dir`, `McpPlugin::with_cwd`),
+/// so there is nothing process-global left to pin — no lock and no environment
+/// write. The function only names the directory each test already owns.
+fn agent_dir(dir: &TempDir) -> &std::path::Path {
+    &dir.0
 }
 
 struct TempDir(PathBuf);
@@ -88,7 +90,11 @@ fn write_mcp_json(dir: &TempDir, servers: serde_json::Value) {
 
 fn build_plugin(dir: &TempDir) -> (Arc<McpPlugin>, PluginHost) {
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);
+    let host = PluginHost::build_with_agent_dir(
+        None,
+        vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>],
+        Some(&dir.0),
+    );
     (plugin, host)
 }
 
@@ -116,7 +122,7 @@ const MCP_DESCRIPTION: &str =
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_command_is_registered_with_upstream_description() {
     let dir = TempDir::new("register");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
 
     let (_plugin, host) = build_plugin(&dir);
     let command = host
@@ -139,7 +145,7 @@ async fn mcp_command_is_registered_with_upstream_description() {
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_parses_upstream_actions_and_rejects_extras() {
     let dir = TempDir::new("parse");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
 
     write_mcp_json(
         &dir,
@@ -214,7 +220,7 @@ async fn mcp_parses_upstream_actions_and_rejects_extras() {
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_enable_disable_apply_to_the_session() {
     let dir = TempDir::new("toggle");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
 
     let (plugin, host) = build_plugin(&dir);
     // Extension-registered servers have no file, so the toggle is session-only
@@ -257,7 +263,7 @@ async fn mcp_enable_disable_apply_to_the_session() {
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_completions_follow_action_eligibility() {
     let dir = TempDir::new("complete");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
 
     write_mcp_json(
         &dir,
@@ -335,7 +341,7 @@ async fn mcp_completions_follow_action_eligibility() {
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_status_names_every_server_and_its_state() {
     let dir = TempDir::new("status");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
 
     write_mcp_json(
         &dir,
@@ -376,7 +382,7 @@ async fn mcp_status_names_every_server_and_its_state() {
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_status_reports_an_empty_configuration() {
     let dir = TempDir::new("empty");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
 
     let (_plugin, host) = build_plugin(&dir);
     let outcome = host
@@ -488,7 +494,7 @@ fn menu_labels(selects: &[(String, Vec<SelectOption>)], title_prefix: &str) -> V
 #[tokio::test(flavor = "current_thread")]
 async fn manager_disable_in_this_project_writes_the_project_override() {
     let dir = TempDir::new("project-disable");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
     write_mcp_json(
         &dir,
         serde_json::json!({ "docs": { "command": "pir-w13-does-not-exist" } }),
@@ -552,7 +558,7 @@ async fn manager_disable_in_this_project_writes_the_project_override() {
 #[tokio::test(flavor = "current_thread")]
 async fn manager_enable_in_this_project_writes_the_enabling_override() {
     let dir = TempDir::new("project-enable");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
     write_mcp_json(
         &dir,
         serde_json::json!({
@@ -600,7 +606,7 @@ async fn manager_enable_in_this_project_writes_the_enabling_override() {
 #[tokio::test(flavor = "current_thread")]
 async fn global_enable_on_a_project_override_keeps_the_explicit_value() {
     let dir = TempDir::new("override-keep-defaults");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
     write_mcp_json(
         &dir,
         serde_json::json!({ "docs": { "command": "pir-w13-does-not-exist" } }),
@@ -642,7 +648,7 @@ async fn global_enable_on_a_project_override_keeps_the_explicit_value() {
 #[tokio::test(flavor = "current_thread")]
 async fn manager_tools_view_lists_each_tools_effective_exposure() {
     let dir = TempDir::new("tools-view");
-    let _guard = env_guard(&dir).await;
+    let _agent_dir = agent_dir(&dir);
     let (command, args) = super::mcp_residuals_w13::mock_spawn();
     std::fs::write(
         dir.0.join("mcp.json"),

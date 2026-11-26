@@ -50,9 +50,38 @@ fn bash_available() -> bool {
 /// The rolling window the bash tool keeps (`2 * DEFAULT_MAX_BYTES`).
 const KEEP: usize = 2 * 50 * 1024;
 
+/// The spill-failure fixture needs the PROCESS temp directory, so it can only
+/// run where this test has the process to itself.
+///
+/// `std::env::temp_dir()` is process-global: pointing `TMP`/`TEMP`/`TMPDIR` at
+/// a regular file makes every CONCURRENT suite's `create_dir_all` fail. Under
+/// `cargo test --test zz_merged_5` (~800 tests in one process) that turned 311
+/// unrelated tests red, spanning `fs_watch_real`, `builtin_disable_w13`,
+/// `ai_proxy` and more. A thread-local override was tried as the narrow
+/// alternative and cannot work: the bash tool creates its spill file from a
+/// context that no longer carries the test thread's thread-local, so the
+/// fixture silently stopped forcing the failure while still passing its own
+/// preconditions.
+///
+/// The suite is therefore gated on the runner giving it a private process
+/// (`tests/common/mod.rs::skip_without_nextest_temp`). `cargo nextest` (the CI
+/// command, see `.config/nextest.toml`) runs one test per process, so the
+/// fixture is exercised there — that is its coverage home. A plain
+/// `cargo test` shares the process, so the test reports as skipped instead of
+/// poisoning its neighbours. Run it directly to exercise it locally:
+///
+/// ```text
+/// cargo test -p pir-sdk --test zz_merged_5 -- bash_eviction_utf8 --exact
+/// ```
+///
+/// with `PIR_ALLOW_SHARED_PROCESS_TEMP=1` when the rest of the binary is
+/// filtered out.
 #[tokio::test]
 async fn eviction_cut_lands_on_a_utf8_boundary() {
     if !bash_available() {
+        return;
+    }
+    if crate::common::skip_without_nextest_temp("bash_eviction_utf8") {
         return;
     }
     let root = temp_workspace();
@@ -86,6 +115,8 @@ async fn eviction_cut_lands_on_a_utf8_boundary() {
         .run(&serde_json::json!({ "command": command }), &context)
         .await;
 
+    // Restore immediately, before any assertion can panic out of the test and
+    // leave the process temp directory pointing at the blocker file.
     for (key, value) in saved {
         match value {
             Some(value) => std::env::set_var(key, value),

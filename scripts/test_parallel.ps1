@@ -23,8 +23,8 @@
 #   powershell -NoProfile -File scripts/test_parallel.ps1
 #       Warm-build once, then run all targets in N shards.
 #   powershell -NoProfile -File scripts/test_parallel.ps1 -Shards 4
-#   powershell -NoProfile -File scripts/test_parallel.ps1 -Test g_ai,g_tui
-#   powershell -NoProfile -File scripts/test_parallel.ps1 -Test g_agent -Test g_tools
+#   powershell -NoProfile -File scripts/test_parallel.ps1 -Test zz_merged_8
+#   powershell -NoProfile -File scripts/test_parallel.ps1 -Test zz_merged_6 -Test zz_merged_7
 #   powershell -NoProfile -File scripts/test_parallel.ps1 -UseNextest
 #   powershell -NoProfile -File scripts/test_parallel.ps1 -NoFailFast -TimeoutMinutes 45
 #   powershell -NoProfile -File scripts/test_parallel.ps1 -LogDir logs/my-run
@@ -41,9 +41,10 @@
 #   -TimeoutMinutes N  per-process bound (warm build and each shard); 0 = none
 #   -LogDir <path>     exact log output dir; default
 #                      logs/test-parallel/<yyyyMMdd-HHmmss>
-#   -UseNextest        force nextest (error if cargo-nextest is absent);
-#                      otherwise nextest is auto-detected and used if present
-#   -NoNextest         force plain `cargo test` even when nextest is installed
+#   -UseNextest        force nextest (error if cargo-nextest is absent)
+#   -NoNextest         force plain `cargo test` only for non-merged projects;
+#                      this repository rejects it because merged harnesses need
+#                      process-per-test isolation
 #   -Weighted          shard by a deterministic weight (1 + test-fn-count/25,
 #                      including #[path]-included tests/suites/*.rs) instead of
 #                      alphabetical round-robin
@@ -110,6 +111,18 @@ $Test = @($Test | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' } 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Merged harnesses have process-global test state and must run under nextest's
+# process-per-test isolation. A full build also gets little crate-level reuse:
+# each large harness is its own crate, so disable incremental only for that
+# build to avoid accumulating tens of gigabytes of stale state. Explicit
+# -Test subsets retain the caller's incremental setting for edit loops.
+$mergedMode = (Select-String -Path (Join-Path $root "Cargo.toml") -Pattern '^\s*autotests\s*=\s*false\s*$' -Quiet)
+$fullTestRun = ($Test.Count -eq 0)
+if ($fullTestRun -and -not $NoBuild -and -not $ListOnly) {
+    $env:CARGO_INCREMENTAL = "0"
+    Write-Host "[test_parallel] full test build: CARGO_INCREMENTAL=0 (subset runs keep incremental compilation)"
+}
+
 function Resolve-RepoPath {
     param([string]$Path)
     if ([IO.Path]::IsPathRooted($Path)) { return [IO.Path]::GetFullPath($Path) }
@@ -144,6 +157,7 @@ $env:CARGO_TERM_COLOR = "never"
 
 # --- nextest detection ------------------------------------------------------
 $nextestExe = Get-Command cargo-nextest -ErrorAction SilentlyContinue
+$skipNextestCheck = [bool]$ListOnly
 $nextestProfile = ""
 if (Test-Path (Join-Path $root ".config\nextest.toml")) {
     if (Select-String -Path (Join-Path $root ".config\nextest.toml") -Pattern '^\s*\[profile\.local\]\s*$' -Quiet) {
@@ -166,6 +180,12 @@ if ($UseNextest) {
     $nextestForced = $true
 } elseif (-not $NoNextest) {
     $useNextest = [bool]$nextestExe
+}
+if ($mergedMode -and -not $useNextest -and -not $skipNextestCheck) {
+    Write-Host "[test_parallel] merged test harnesses require cargo-nextest for process-per-test isolation."
+    Write-Host "[test_parallel] install it with: cargo install cargo-nextest --locked"
+    Write-Host "[test_parallel] do not use -NoNextest with this repository."
+    exit 1
 }
 
 # --- target discovery ------------------------------------------------------

@@ -1048,6 +1048,7 @@ async fn session_registry_reflects_and_aborts_background_calls() {
         event_stream: Some(scripted_background_stream()),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     // The run completes on the placeholder result; the real call keeps running
@@ -1221,6 +1222,7 @@ async fn subagent_background_call_runs_detached_and_reaches_the_next_parent_turn
             event_stream: Some(scripted_turn_stream(turns, Arc::clone(&requests), None)),
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         &dir,
     );
@@ -1473,6 +1475,7 @@ async fn background_completion_after_session_swap_is_not_persisted_into_new_stor
         )),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let ends: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let ends_for_handler = Arc::clone(&ends);
@@ -1822,6 +1825,8 @@ async fn ctx_execute_tool_background_option_detaches_the_nested_call() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start");
     let source = dir.join("nested-background.ts");
@@ -2425,6 +2430,8 @@ async fn nested_background_via_the_real_session_sink_persists_and_reports() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start");
     let source = dir.join("nested-background-session.ts");
@@ -2466,6 +2473,7 @@ async fn nested_background_via_the_real_session_sink_persists_and_reports() {
         )),
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     }));
     // Both injected follow-up frames drain in one poll (the completion must
     // reach the running turn, §2.4.2).
@@ -2860,26 +2868,27 @@ async fn nested_background_via_the_real_session_sink_persists_and_reports() {
 // settled-`seq` rule (`BackgroundRegistry::settle` returns `None`), so nothing
 // is delivered. Pinned by the last test.
 
-/// Hermetic agent-dir pin for the tests that run the real shell path (same
-/// shared [`crate::common::AgentDirEnvGuard`] as `tests/suites/shell_tools.rs`):
-/// `current_shell_prefs()` reads `agent_dir()`, so an ambient
-/// `~/.pi/agent/settings.json` (`shellPath`, `shellCommandPrefix`,
-/// `shellPool: false`) would silently change what these tests execute. The
-/// pinned empty directory makes the shell preferences fall back to the
-/// built-in defaults (pool enabled, no command prefix, platform bash), and
-/// the guard's lock excludes every other agent-dir suite in this binary.
-async fn hermetic_agent_dir(label: &str) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::scratch(label, None).await
+/// Hermetic agent dir for the tests that run the real shell path: the tool
+/// resolves `shell_prefs_in(&ctx.resolve_agent_dir())` from the directory its
+/// session was BUILT with, and these sessions are built with this one
+/// explicitly, so an ambient `~/.pi/agent/settings.json` (`shellPath`,
+/// `shellCommandPrefix`, `shellPool: false`) cannot change what they execute.
+/// The empty directory makes the shell preferences fall back to the built-in
+/// defaults (pool enabled, no command prefix, platform bash).
+///
+/// No env lock: the directory is a parameter, not a process-global pin.
+fn hermetic_agent_dir(label: &str) -> crate::common::TempAgentDir {
+    crate::common::scratch_agent_dir(label, None)
 }
 
-/// [`hermetic_agent_dir`] with `settings.json` written into the pinned
-/// directory first (e.g. `{"shellPool": false}` to force the bash tool's
-/// per-call arm instead of the persistent pool).
-async fn hermetic_agent_dir_pinned(
+/// [`hermetic_agent_dir`] with `settings.json` written into the directory
+/// first (e.g. `{"shellPool": false}` to force the bash tool's per-call arm
+/// instead of the persistent pool).
+fn hermetic_agent_dir_pinned(
     label: &str,
     settings_json: Option<&str>,
-) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::scratch(label, settings_json).await
+) -> crate::common::TempAgentDir {
+    crate::common::scratch_agent_dir(label, settings_json)
 }
 
 /// Whether a bash is resolvable on this host: without one the probe command
@@ -2924,6 +2933,9 @@ impl Drop for ProbeFixture {
 /// The session fixture shared by the resource tests: scripted provider (no
 /// network), `cwd` = the probe fixture directory, in-memory transcript
 /// (`session: None`, so nothing touches the real agent dir).
+///
+/// Build it with [`probe_session_at`]: the agent dir is a parameter (the
+/// session's shell/builtin reads resolve against it), never a process pin.
 fn probe_session_config(
     dir: &std::path::Path,
     tools: ToolRegistry,
@@ -2944,6 +2956,7 @@ fn probe_session_config(
         event_stream,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -2952,6 +2965,23 @@ fn core_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     pir::coding_agent::tools::register_core_tools(&mut registry);
     registry
+}
+
+/// [`probe_session_config`] bound to an explicit agent directory: every
+/// session in this suite is built this way, so its shell preferences, builtin
+/// gates and trust lookups resolve against a directory the test owns instead
+/// of the process-wide `PIR_AGENT_DIR`.
+fn probe_session_at(config: AgentSessionConfig, agent_dir: &std::path::Path) -> AgentSession {
+    AgentSession::new_with_agent_dir(config, agent_dir)
+}
+
+/// [`probe_session_at`] for a session that needs the `Arc` form (the tests
+/// that spawn a prompt and then address the session from the test body).
+fn probe_session_arc_at(
+    config: AgentSessionConfig,
+    agent_dir: &std::path::Path,
+) -> Arc<AgentSession> {
+    AgentSession::new_arc_with_agent_dir(config, agent_dir)
 }
 
 /// One scripted assistant message.
@@ -3291,24 +3321,23 @@ async fn wait_for_file_content(path: &std::path::Path, expected: &str, deadline:
 /// alongside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_background_kills_the_detached_bash_process() {
-    let _agent_dir = hermetic_agent_dir("abort-kill").await;
+    let agent_dir = hermetic_agent_dir("abort-kill");
     if !bash_available() {
         return;
     }
     // The hermetic defaults must route the call through the persistent shell
     // pool (the member teardown is the kill under test).
     assert!(
-        pir::config::settings::current_shell_prefs().pool,
+        pir::config::settings::shell_prefs_in(agent_dir.path()).pool,
         "the hermetic defaults must leave the persistent shell pool enabled"
     );
     let fixture = ProbeFixture::new("abort-kill");
     // A second, store-less session runs the OS-level checks out of the loop
     // (the fresh-spawn bash path), independently of the pool under test.
-    let checker = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        ToolRegistry::new(),
-        None,
-    ));
+    let checker = probe_session_at(
+        probe_session_config(&fixture.dir, ToolRegistry::new(), None),
+        agent_dir.path(),
+    );
 
     let turns = vec![
         scripted_message(
@@ -3321,15 +3350,18 @@ async fn abort_background_kills_the_detached_bash_process() {
         ),
         finished_message("dispatched"),
     ];
-    let session = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        core_registry(),
-        Some(scripted_turn_stream(
-            turns,
-            Arc::new(Mutex::new(Vec::new())),
-            None,
-        )),
-    ));
+    let session = probe_session_at(
+        probe_session_config(
+            &fixture.dir,
+            core_registry(),
+            Some(scripted_turn_stream(
+                turns,
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+            )),
+        ),
+        agent_dir.path(),
+    );
 
     let handler: EventHandler = Arc::new(|_event: AgentEvent| {});
     session
@@ -3399,16 +3431,15 @@ async fn abort_background_kills_the_detached_bash_process() {
 /// `tests/shell_command_timeout.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_detached_bash_call_is_exempt_from_the_settings_command_timeout() {
-    let _agent_dir = hermetic_agent_dir_pinned(
+    let agent_dir = hermetic_agent_dir_pinned(
         "background-timeout-exempt",
         Some(r#"{ "shellPool": false, "tools": { "commandTimeoutMs": 300 } }"#),
-    )
-    .await;
+    );
     if !bash_available() {
         return;
     }
     assert_eq!(
-        pir::config::settings::current_shell_prefs().effective_command_timeout_ms(),
+        pir::config::settings::shell_prefs_in(agent_dir.path()).effective_command_timeout_ms(),
         300,
         "the pinned settings must supply the small default under test"
     );
@@ -3424,15 +3455,18 @@ async fn a_detached_bash_call_is_exempt_from_the_settings_command_timeout() {
         ),
         finished_message("dispatched"),
     ];
-    let session = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        core_registry(),
-        Some(scripted_turn_stream(
-            turns,
-            Arc::new(Mutex::new(Vec::new())),
-            None,
-        )),
-    ));
+    let session = probe_session_at(
+        probe_session_config(
+            &fixture.dir,
+            core_registry(),
+            Some(scripted_turn_stream(
+                turns,
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+            )),
+        ),
+        agent_dir.path(),
+    );
     // The host-side listener, exactly like a real host subscribes.
     let ends: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let ends_for_handler = Arc::clone(&ends);
@@ -3491,16 +3525,15 @@ async fn a_detached_bash_call_is_exempt_from_the_settings_command_timeout() {
 /// registry remains to reap the command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_session_kills_the_detached_bash_process() {
-    let _agent_dir = hermetic_agent_dir("drop-kill").await;
+    let agent_dir = hermetic_agent_dir("drop-kill");
     if !bash_available() {
         return;
     }
     let fixture = ProbeFixture::new("drop-kill");
-    let checker = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        ToolRegistry::new(),
-        None,
-    ));
+    let checker = probe_session_at(
+        probe_session_config(&fixture.dir, ToolRegistry::new(), None),
+        agent_dir.path(),
+    );
 
     let turns = vec![
         scripted_message(
@@ -3513,15 +3546,18 @@ async fn dropping_the_session_kills_the_detached_bash_process() {
         ),
         finished_message("dispatched"),
     ];
-    let session = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        core_registry(),
-        Some(scripted_turn_stream(
-            turns,
-            Arc::new(Mutex::new(Vec::new())),
-            None,
-        )),
-    ));
+    let session = probe_session_at(
+        probe_session_config(
+            &fixture.dir,
+            core_registry(),
+            Some(scripted_turn_stream(
+                turns,
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+            )),
+        ),
+        agent_dir.path(),
+    );
 
     let handler: EventHandler = Arc::new(|_event: AgentEvent| {});
     session
@@ -3571,20 +3607,19 @@ async fn dropping_the_session_kills_the_detached_bash_process() {
 /// slot would block the foreground call forever, so the run is bounded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_foreground_bash_still_runs_after_an_aborted_background_bash() {
-    let _agent_dir = hermetic_agent_dir("pool-liveness").await;
+    let agent_dir = hermetic_agent_dir("pool-liveness");
     if !bash_available() {
         return;
     }
     assert!(
-        pir::config::settings::current_shell_prefs().pool,
+        pir::config::settings::shell_prefs_in(agent_dir.path()).pool,
         "the hermetic defaults must leave the persistent shell pool enabled"
     );
     let fixture = ProbeFixture::new("pool-liveness");
-    let checker = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        ToolRegistry::new(),
-        None,
-    ));
+    let checker = probe_session_at(
+        probe_session_config(&fixture.dir, ToolRegistry::new(), None),
+        agent_dir.path(),
+    );
 
     let gate = Arc::new(tokio::sync::Notify::new());
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3612,15 +3647,18 @@ async fn a_foreground_bash_still_runs_after_an_aborted_background_bash() {
         ),
         finished_message("done"),
     ];
-    let session = Arc::new(AgentSession::new(probe_session_config(
-        &fixture.dir,
-        core_registry(),
-        Some(scripted_turn_stream(
-            turns,
-            Arc::clone(&requests),
-            Some((1, Arc::clone(&gate))),
-        )),
-    )));
+    let session = probe_session_arc_at(
+        probe_session_config(
+            &fixture.dir,
+            core_registry(),
+            Some(scripted_turn_stream(
+                turns,
+                Arc::clone(&requests),
+                Some((1, Arc::clone(&gate))),
+            )),
+        ),
+        agent_dir.path(),
+    );
 
     let run = tokio::spawn({
         let session = Arc::clone(&session);
@@ -3786,24 +3824,18 @@ async fn wait_for_queued_detached_call(
 /// 2's untouched file is the abort's doing, not a broken setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
-    // The read-before-edit gate is orthogonal to this test: the fixture
-    // seeds `shared.txt` directly and never drives the `read` tool, so the
-    // production default (Enforce) would reject the detached `edit` at
-    // preparation, before it ever reaches the mutation queue under test.
-    // Pin the gate off for both phases (the mode is resolved once per
-    // `AgentSession::new`); the shared guard also keeps the process-wide
-    // env mutation serialized with the other agent-dir tests.
-    let _read_gate_off = crate::common::AgentDirEnvGuard::scratch_with(
-        "edit-queued-read-gate",
-        None,
-        &[("PIR_READ_BEFORE_EDIT", "off")],
-    )
-    .await;
+    // The read-before-edit gate is orthogonal to this test, so the fixture
+    // SATISFIES it instead of switching it off: the first turn drives the
+    // real `read` tool over the seeded file, which records a full, unchanged
+    // read in the session ledger. Every mode (including the production
+    // `edit-partial` default) then allows the queued `edit`, so no test has to
+    // pin `PIR_READ_BEFORE_EDIT` in the process environment.
     // --- Phase 1: control (no abort) — the queued detached edit applies. ---
     {
         let fixture = ProbeFixture::new("edit-queued-control");
         let file = fixture.path("shared.txt");
         std::fs::write(&file, SEED_CONTENT).expect("seed file");
+        let agent_dir = hermetic_agent_dir("edit-queued-control");
 
         let probe = Arc::new(HoldLockProbe {
             entered: Arc::new(AtomicUsize::new(0)),
@@ -3814,6 +3846,16 @@ async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
         tools.register(probe.clone());
 
         let turns = vec![
+            // Turn 1: satisfy the read-before-edit gate honestly.
+            scripted_message(
+                vec![tool_call_block(
+                    "call-read",
+                    "read",
+                    json!({ "path": "shared.txt" }),
+                )],
+                StopReason::ToolUse,
+            ),
+            // Turn 2: the mutation queue under test.
             scripted_message(
                 vec![
                     tool_call_block(
@@ -3835,15 +3877,18 @@ async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
             ),
             finished_message("done"),
         ];
-        let session = Arc::new(AgentSession::new(probe_session_config(
-            &fixture.dir,
-            tools,
-            Some(scripted_turn_stream(
-                turns,
-                Arc::new(Mutex::new(Vec::new())),
-                None,
-            )),
-        )));
+        let session = probe_session_arc_at(
+            probe_session_config(
+                &fixture.dir,
+                tools,
+                Some(scripted_turn_stream(
+                    turns,
+                    Arc::new(Mutex::new(Vec::new())),
+                    None,
+                )),
+            ),
+            agent_dir.path(),
+        );
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_for_handler = Arc::clone(&delivered);
         session.on_session_event(Arc::new(move |event: SessionEvent| {
@@ -3896,6 +3941,7 @@ async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
         let fixture = ProbeFixture::new("edit-queued-aborted");
         let file = fixture.path("shared.txt");
         std::fs::write(&file, SEED_CONTENT).expect("seed file");
+        let agent_dir = hermetic_agent_dir("edit-queued-aborted");
 
         let probe = Arc::new(HoldLockProbe {
             entered: Arc::new(AtomicUsize::new(0)),
@@ -3906,6 +3952,16 @@ async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
         tools.register(probe.clone());
 
         let turns = vec![
+            // Turn 1: the same honest `read`, so the gate is satisfied here too
+            // and phase 2 differs from the control ONLY by the abort.
+            scripted_message(
+                vec![tool_call_block(
+                    "call-read",
+                    "read",
+                    json!({ "path": "shared.txt" }),
+                )],
+                StopReason::ToolUse,
+            ),
             scripted_message(
                 vec![
                     tool_call_block(
@@ -3927,15 +3983,18 @@ async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
             ),
             finished_message("done"),
         ];
-        let session = Arc::new(AgentSession::new(probe_session_config(
-            &fixture.dir,
-            tools,
-            Some(scripted_turn_stream(
-                turns,
-                Arc::new(Mutex::new(Vec::new())),
-                None,
-            )),
-        )));
+        let session = probe_session_arc_at(
+            probe_session_config(
+                &fixture.dir,
+                tools,
+                Some(scripted_turn_stream(
+                    turns,
+                    Arc::new(Mutex::new(Vec::new())),
+                    None,
+                )),
+            ),
+            agent_dir.path(),
+        );
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_for_handler = Arc::clone(&delivered);
         session.on_session_event(Arc::new(move |event: SessionEvent| {
@@ -4012,23 +4071,22 @@ async fn aborting_a_queued_detached_edit_cancels_it_before_it_writes() {
 /// survives).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_background_kills_the_detached_bash_process_without_the_pool() {
-    let _agent_dir =
-        hermetic_agent_dir_pinned("abort-kill-nopool", Some(r#"{ "shellPool": false }"#)).await;
+    let agent_dir =
+        hermetic_agent_dir_pinned("abort-kill-nopool", Some(r#"{ "shellPool": false }"#));
     if !bash_available() {
         return;
     }
     // The pinned settings must route this run through the per-call arm: that
     // is the spawn site under test.
     assert!(
-        !pir::config::settings::current_shell_prefs().pool,
+        !pir::config::settings::shell_prefs_in(agent_dir.path()).pool,
         "the pinned settings must disable the persistent shell pool"
     );
     let fixture = ProbeFixture::new("abort-kill-nopool");
-    let checker = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        ToolRegistry::new(),
-        None,
-    ));
+    let checker = probe_session_at(
+        probe_session_config(&fixture.dir, ToolRegistry::new(), None),
+        agent_dir.path(),
+    );
 
     let turns = vec![
         scripted_message(
@@ -4041,15 +4099,18 @@ async fn abort_background_kills_the_detached_bash_process_without_the_pool() {
         ),
         finished_message("dispatched"),
     ];
-    let session = AgentSession::new(probe_session_config(
-        &fixture.dir,
-        core_registry(),
-        Some(scripted_turn_stream(
-            turns,
-            Arc::new(Mutex::new(Vec::new())),
-            None,
-        )),
-    ));
+    let session = probe_session_at(
+        probe_session_config(
+            &fixture.dir,
+            core_registry(),
+            Some(scripted_turn_stream(
+                turns,
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+            )),
+        ),
+        agent_dir.path(),
+    );
 
     let handler: EventHandler = Arc::new(|_event: AgentEvent| {});
     session
@@ -4092,16 +4153,15 @@ async fn abort_background_kills_the_detached_bash_process_without_the_pool() {
 /// descendant (the probe's `sleep 300 &`) does not survive the abort.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn abort_bash_kills_the_out_of_loop_command_tree() {
-    let _agent_dir = hermetic_agent_dir("abort-bash-tree").await;
+    let agent_dir = hermetic_agent_dir("abort-bash-tree");
     if !bash_available() {
         return;
     }
     let fixture = ProbeFixture::new("abort-bash-tree");
-    let session = Arc::new(AgentSession::new(probe_session_config(
-        &fixture.dir,
-        ToolRegistry::new(),
-        None,
-    )));
+    let session = probe_session_arc_at(
+        probe_session_config(&fixture.dir, ToolRegistry::new(), None),
+        agent_dir.path(),
+    );
 
     let run = tokio::spawn({
         let session = Arc::clone(&session);

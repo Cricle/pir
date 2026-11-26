@@ -45,6 +45,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        ..ExtensionConfig::default()
     }
 }
 

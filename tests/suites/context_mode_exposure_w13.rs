@@ -12,12 +12,12 @@
 //!
 //! Nine tools: exactly `register_core_tools`'s set minus `powershell`
 //! (registered, but `default_active: false`). Every `ctx_*` tool was absent —
-//! and so was every other plugin tool (`todo`, `python`, `tool_search`,
-//! `subagent`) — even though `builtin:context-mode` is `default_enabled` and
+//! and so was every other plugin tool (`todo`, `tool_search`, `subagent`) —
+//! even though `builtin:context-mode` is `default_enabled` and
 //! the build carries the `context-mode` feature.
 //!
 //! The break was never registration: `ContextModePlugin::register` registers
-//! all nine tools, and `PluginHost::build` runs it. The break was the MERGE.
+//! all twelve tools, and `PluginHost::build` runs it. The break was the MERGE.
 //! Print mode builds the unified plugin host (for the MCP reach wait hook and
 //! the builtin lifecycle) but its own tool registry only ever received
 //! `register_core_tools` + `merge_extension_tools` (the JS face). The Rust
@@ -30,10 +30,10 @@
 //!
 //! - the plugin-host seam: a DEFAULT plan (the real `order_extension_paths`
 //!   builtin insertion, not a hand-written path list) yields a host whose
-//!   registry resolves all nine `ctx_*` tools as `Direct` + `default_active`,
+//!   registry resolves all twelve `ctx_*` tools as `Direct` + `default_active`,
 //!   i.e. ACTIVE — not merely registered;
 //! - the merge seam: `merge_plugin_tools` (the function the print host now
-//!   calls) makes those nine tools active in the run registry, so
+//!   calls) makes those twelve tools active in the run registry, so
 //!   `declared_tool_definitions` — literally the request's `tools` list —
 //!   carries them;
 //! - the droppability contract is unchanged: `disabledBuiltinExtensions:
@@ -54,20 +54,24 @@ use pir::agent::tool_execution::{
 };
 use pir::extensions::{ExtensionConfig, SessionContextSnapshot};
 use pir::plugins::builtin::{
-    ContextModePlugin, CTX_BATCH_EXECUTE_TOOL_NAME, CTX_DOCTOR_TOOL_NAME,
-    CTX_EXECUTE_FILE_TOOL_NAME, CTX_EXECUTE_TOOL_NAME, CTX_FETCH_AND_INDEX_TOOL_NAME,
-    CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
+    ContextModePlugin, CTX_BATCH_EXECUTE_TOOL_NAME, CTX_BATCH_TOOL_NAME, CTX_DOCTOR_TOOL_NAME,
+    CTX_EXECUTE_FILE_TOOL_NAME, CTX_EXECUTE_TOOL_NAME, CTX_EXECUTE_TOOL_PROXY_NAME,
+    CTX_FETCH_AND_INDEX_TOOL_NAME, CTX_INDEX_TOOL_NAME, CTX_PURGE_TOOL_NAME, CTX_RESUME_TOOL_NAME,
+    CTX_SEARCH_TOOL_NAME, CTX_STATS_TOOL_NAME,
 };
 use pir::plugins::{AgentPlugin, PluginHost};
 
-/// The nine tool names `ContextModePlugin::register` installs, in the order
+/// The twelve tool names `ContextModePlugin::register` installs, in the order
 /// the plugin registers them.
-const CTX_TOOL_NAMES: [&str; 9] = [
+const CTX_TOOL_NAMES: [&str; 12] = [
+    CTX_EXECUTE_TOOL_PROXY_NAME,
     CTX_EXECUTE_TOOL_NAME,
     CTX_EXECUTE_FILE_TOOL_NAME,
     CTX_BATCH_EXECUTE_TOOL_NAME,
+    CTX_BATCH_TOOL_NAME,
     CTX_INDEX_TOOL_NAME,
     CTX_SEARCH_TOOL_NAME,
+    CTX_RESUME_TOOL_NAME,
     CTX_STATS_TOOL_NAME,
     CTX_PURGE_TOOL_NAME,
     CTX_DOCTOR_TOOL_NAME,
@@ -95,6 +99,26 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Restores `PIR_AGENT_DIR` when the ONE test that mutates it ends (panic
+/// included), so a process that runs the suite without nextest isolation never
+/// leaves a scratch directory behind.
+struct AgentDirRestore(Option<std::ffi::OsString>);
+
+impl AgentDirRestore {
+    fn capture() -> Self {
+        Self(std::env::var_os("PIR_AGENT_DIR"))
+    }
+}
+
+impl Drop for AgentDirRestore {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
+            None => std::env::remove_var("PIR_AGENT_DIR"),
+        }
     }
 }
 
@@ -163,7 +187,7 @@ fn resolved_tool_names(host: &PluginHost) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_plan_constructs_the_context_mode_builtin_and_registers_nine_tools() {
+fn default_plan_constructs_the_context_mode_builtin_and_registers_twelve_tools() {
     let fixture = default_host();
     let host = &fixture.host;
     let plugin_paths: Vec<String> = host
@@ -231,13 +255,13 @@ fn every_context_mode_tool_is_active_on_registration() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. The merge seam: the nine tools reach the run registry and the request's
+// 3. The merge seam: the twelve tools reach the run registry and the request's
 //    declaration list. This is the fix — before it, a print-mode run's
 //    registry held only core tools.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merged_run_registry_declares_all_nine_context_mode_tools() {
+fn merged_run_registry_declares_all_twelve_context_mode_tools() {
     let fixture = default_host();
     let registry = merged_registry(&fixture.host);
 
@@ -278,7 +302,7 @@ fn merged_run_registry_declares_all_nine_context_mode_tools() {
             "the merge must not drop core tool `{core}`: {declared_names:?}"
         );
     }
-    // The pre-fix shape the probe captured: nine tools. The merge must have
+    // The pre-fix shape the probe captured: twelve tools. The merge must have
     // moved past it.
     assert!(
         definitions.len() > 9,
@@ -402,11 +426,11 @@ fn default_plan_registration_stays_lazy() {
     assert_eq!(
         registrations.tools.len(),
         CTX_TOOL_NAMES.len(),
-        "the plugin must register exactly its nine tools"
+        "the plugin must register exactly its twelve tools"
     );
     assert!(
-        !plugin.has_python_worker(),
-        "registering must not start the Python worker"
+        !plugin.has_js_worker(),
+        "registering must not start the JS worker"
     );
     assert!(
         !plugin.index_is_open(),
@@ -541,16 +565,27 @@ fn default_database_path_is_rooted_at_the_agent_dir_base() {
 
 /// The real D10 scenario: the DEFAULT store reads the agent dir per
 /// resolution, so a mid-process `PIR_AGENT_DIR` change moves the database.
-/// Serialized through the binary-wide [`crate::common::AgentDirEnvGuard`] lock,
-/// the same guard the sibling suites in this binary pin with.
+///
+/// The MOVING VARIABLE is the property under test — the default store has no
+/// explicit-base constructor to carry a per-test directory — so this needs a
+/// process of its own and runs under a process-per-test runner (nextest in CI
+/// and the pre-push gate) or when the operator opts in.
 #[tokio::test(flavor = "current_thread")]
 async fn default_database_path_follows_a_changed_agent_dir() {
+    if crate::common::skip_without_nextest(
+        "context_mode_exposure_w13::default_database_path_follows_a_changed_agent_dir",
+    ) {
+        return;
+    }
     let dir = TempDir::new("db-agent-dir-follow");
     let agent_a = dir.0.join("agent-a");
     let agent_b = dir.0.join("agent-b");
     let cwd = dir.0.join("project");
     std::fs::create_dir_all(&cwd).expect("project cwd");
-    let _env = crate::common::AgentDirEnvGuard::at(&agent_a, &[]).await;
+    // Serialized by the nextest guard above; the previous value is restored on
+    // exit so the pin cannot leak into a following test in the same process.
+    let _restore = AgentDirRestore::capture();
+    std::env::set_var("PIR_AGENT_DIR", &agent_a);
 
     let plugin = ContextModePlugin::new();
     push_cwd(&plugin, &cwd);

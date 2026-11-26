@@ -13,9 +13,11 @@
 //! once.
 //!
 //! NOTE: registered by the foreman (`#[path = "suites/reload_native_w14.rs"]`
-//! in a `g_*` merged binary). It uses `crate::common::AgentDirEnvGuard`, so
-//! register it in a binary that includes `mod common;` (`tests/g_agent.rs`
-//! or `tests/g_tools.rs`).
+//! in a `g_*` merged binary). Every scenario owns a scratch agent dir and
+//! passes it explicitly (`AgentSession::…_and_agent_dir`,
+//! `PluginHost::build_with_agent_dir`, `ExtensionConfig::agent_dir`), so no
+//! test writes `PIR_AGENT_DIR` and the suite needs neither an env lock nor
+//! `mod common;`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -118,6 +120,7 @@ fn fake_model() -> Model {
 fn session_config(
     cwd: &Path,
     extensions: Option<pir::extensions::ExtensionHandle>,
+    agent_dir: &Path,
 ) -> AgentSessionConfig {
     AgentSessionConfig {
         performance: Default::default(),
@@ -134,6 +137,7 @@ fn session_config(
         event_stream: None,
         extensions,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -295,46 +299,76 @@ impl AgentPlugin for ReloadLifecycleRecorder {
 // D3 — the phone quota credential path follows the canonical resolver
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "phone")]
-#[tokio::test(flavor = "current_thread")]
-async fn phone_quota_auth_path_honours_pir_agent_dir() {
-    let temp = TempDir::new("phone");
-    let decoy = temp.0.join("decoy-pi-coding-agent-dir");
-    std::fs::create_dir_all(&decoy).expect("create decoy dir");
-    let decoy_text = decoy.to_string_lossy().into_owned();
-    // PIR_AGENT_DIR is pinned by the guard; PI_CODING_AGENT_DIR is the decoy the
-    // OLD private resolver would have used. The canonical resolver must pick
-    // the primary variable.
-    let _guard = crate::common::AgentDirEnvGuard::at(
-        &temp.0,
-        &[("PI_CODING_AGENT_DIR", decoy_text.as_str())],
-    )
-    .await;
+/// D3: the ONE canonical agent-dir resolver picks `PIR_AGENT_DIR` over
+/// `PI_CODING_AGENT_DIR`, and falls back to `~/.pi/agent` only when none of the
+/// three spellings is set.
+///
+/// The resolution is asserted through
+/// [`pir::ai::providers::resolve_agent_dir_at`], the pure function
+/// [`pir::ai::providers::agent_dir`] delegates to: the precedence is the
+/// property under test, and supplying the variable values as arguments proves
+/// it without writing any process-level state (a sibling suite pinning
+/// `PIR_AGENT_DIR` concurrently can therefore not move this assertion).
+#[test]
+fn agent_dir_precedence_prefers_pir_agent_dir() {
+    use std::ffi::OsString;
 
-    let resolved = pir::plugins::builtin::phone::quota_auth_path();
+    let primary = PathBuf::from("/scratch/primary");
+    let alias = PathBuf::from("/scratch/alias");
+    let compat = PathBuf::from("/scratch/compat");
 
     assert_eq!(
-        resolved,
-        temp.0.join("auth.json"),
-        "D3: the quota route must read the PIR_AGENT_DIR credential file"
+        pir::ai::providers::resolve_agent_dir_at(
+            [
+                Some(OsString::from(&primary)),
+                Some(OsString::from(&alias)),
+                Some(OsString::from(&compat)),
+            ],
+            Some(OsString::from("/scratch/home")),
+        ),
+        primary,
+        "D3: PIR_AGENT_DIR wins over PIR_CODING_AGENT_DIR and PI_CODING_AGENT_DIR"
     );
-    assert_ne!(
-        resolved,
-        decoy.join("auth.json"),
-        "D3: PIR_AGENT_DIR must win over PI_CODING_AGENT_DIR"
+    assert_eq!(
+        pir::ai::providers::resolve_agent_dir_at(
+            [
+                None,
+                Some(OsString::from(&alias)),
+                Some(OsString::from(&compat))
+            ],
+            Some(OsString::from("/scratch/home")),
+        ),
+        alias,
+        "D3: PIR_CODING_AGENT_DIR is the second spelling"
     );
-    // The operator's real `~/.pi/agent` is never consulted while the primary
-    // variable is set (the empty pinned dir cannot contain a credential).
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    {
-        assert_ne!(
-            resolved,
-            home.join(".pi").join("agent").join("auth.json"),
-            "D3: a pinned agent dir must never fall back to the real home dir"
-        );
-    }
+    assert_eq!(
+        pir::ai::providers::resolve_agent_dir_at(
+            [None, None, Some(OsString::from(&compat))],
+            Some(OsString::from("/scratch/home")),
+        ),
+        compat,
+        "D3: PI_CODING_AGENT_DIR is the pi-compatibility spelling"
+    );
+    assert_eq!(
+        pir::ai::providers::resolve_agent_dir_at(
+            [None, None, None],
+            Some(OsString::from("/scratch/home")),
+        ),
+        PathBuf::from("/scratch/home").join(".pi").join("agent"),
+        "D3: unset variables fall back to <home>/.pi/agent, never a relative path"
+    );
+    assert_eq!(
+        pir::ai::providers::resolve_agent_dir_at(
+            [
+                Some(OsString::new()),
+                Some(OsString::from(&alias)),
+                Some(OsString::from(&compat)),
+            ],
+            Some(OsString::from("/scratch/home")),
+        ),
+        alias,
+        "D3: an EMPTY primary spelling is skipped, not treated as a directory"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -349,28 +383,34 @@ async fn session_reload_runs_native_hooks_and_invalidates_the_codemode_cache() {
     let settings_path = temp.0.join("settings.json");
     std::fs::write(&settings_path, r#"{"codemode":{"sandboxMemoryMb":96}}"#)
         .expect("write pinned settings");
-    let _guard = crate::common::AgentDirEnvGuard::at(&temp.0, &[]).await;
-    let _override = UnsetEnvVar::new("PIR_CODEMODE_MEMORY_MB");
 
+    // No process state and no lock: the plugin, its settings scope and the
+    // extension-route cache are all keyed by THIS scratch agent dir.
+    let scope = pir::plugins::codemode::CodemodeScope::new(&temp.0, &temp.0);
     let recorder = ReloadRecorder::new("w14e-reload-recorder", false);
-    let session = AgentSession::new_with_plugins(
-        session_config(&temp.0, None),
+    let session = AgentSession::new_arc_with_plugins_and_host_in(
+        session_config(&temp.0, None, &temp.0),
         vec![
             Arc::clone(&recorder) as Arc<dyn AgentPlugin>,
-            pir::plugins::codemode::new_codemode_plugin(),
+            pir::plugins::codemode::new_codemode_plugin_with_scope(scope.clone()),
         ],
+        None,
+        Some(temp.0.clone()),
     );
 
-    // Seed the process-wide extension-route cache from the first settings
-    // snapshot (the state `/reload` must invalidate). `reload_cached_...` is
-    // the unconditional reset, so a value left by another test in this merged
-    // binary cannot mask the assertion below.
-    let primed = pir::plugins::codemode::reload_cached_codemode_config();
+    // Seed this agent dir's extension-route cache from the first settings
+    // snapshot (the state `/reload` must invalidate). The unconditional reset
+    // means a value left by another test cannot mask the assertion below.
+    let primed = pir::plugins::codemode::reload_cached_codemode_config_for(&scope);
     assert_eq!(primed.sandbox_memory_bytes, Some(96 * 1024 * 1024));
 
     std::fs::write(&settings_path, r#"{"codemode":{"sandboxMemoryMb":32}}"#)
         .expect("rewrite pinned settings");
-    let loads_before = pir::plugins::codemode::settings_load_count();
+    // The ATTRIBUTABLE counter for this scratch agent dir, taken BEFORE the
+    // reload: a sibling suite's session construction moves only the
+    // process-wide counter, never this one.
+    let loads = pir::plugins::codemode::watch_settings_loads(&temp.0);
+    let loads_before = loads.count();
 
     session
         .reload_plugins()
@@ -392,17 +432,14 @@ async fn session_reload_runs_native_hooks_and_invalidates_the_codemode_cache() {
         "D4: the reload rebuilt the registry (register() ran again), got {}",
         recorder.registrations()
     );
-    // The counter is process-wide and another suite in the same binary may
-    // construct a codemode plugin concurrently, so assert the reload's own
-    // read happened rather than an exact global delta.
-    assert!(
-        pir::plugins::codemode::settings_load_count() > loads_before,
-        "D4: codemode's on_reload re-read settings"
-    );
     assert_eq!(
-        pir::plugins::codemode::cached_codemode_config().sandbox_memory_bytes,
+        pir::plugins::codemode::cached_codemode_config_for(&scope).sandbox_memory_bytes,
         Some(32 * 1024 * 1024),
-        "D4: the reloaded settings replaced the cached codemode config"
+        "D4: the reloaded settings replaced this agent dir's cached codemode config"
+    );
+    assert!(
+        loads.count() > loads_before,
+        "D4: codemode's on_reload re-read settings (not served from the cache)"
     );
 }
 
@@ -416,7 +453,7 @@ async fn session_reload_survives_a_failing_plugin_on_reload() {
     let failing = ReloadRecorder::new("w14e-failing-plugin", true);
     let healthy = ReloadRecorder::new("w14e-healthy-plugin", false);
     let session = AgentSession::new_with_plugins(
-        session_config(&temp.0, None),
+        session_config(&temp.0, None, &temp.0),
         vec![
             Arc::clone(&failing) as Arc<dyn AgentPlugin>,
             Arc::clone(&healthy) as Arc<dyn AgentPlugin>,
@@ -513,7 +550,7 @@ async fn session_reload_emits_session_start_reload_exactly_once() {
     let temp = TempDir::new("reload-start-once");
     let (recorder, trace) = ReloadLifecycleRecorder::new("w14e-session-reload-lifecycle");
     let session = AgentSession::new_with_plugins(
-        session_config(&temp.0, None),
+        session_config(&temp.0, None, &temp.0),
         vec![recorder as Arc<dyn AgentPlugin>],
     );
 
@@ -547,7 +584,7 @@ async fn session_reload_emits_session_start_reload_exactly_once() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "extensions")]
-fn extension_config(cwd: &Path) -> pir::extensions::ExtensionConfig {
+fn extension_config(cwd: &Path, agent_dir: &Path) -> pir::extensions::ExtensionConfig {
     pir::extensions::ExtensionConfig {
         cwd: cwd.to_path_buf(),
         mode: "headless".to_owned(),
@@ -557,6 +594,8 @@ fn extension_config(cwd: &Path) -> pir::extensions::ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: Some(agent_dir.to_path_buf()),
     }
 }
 
@@ -575,7 +614,7 @@ async fn load_js_fixture(temp: &TempDir) -> pir::extensions::ExtensionHandle {
         "#,
     )
     .expect("write JS fixture");
-    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0))
+    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0, &temp.0))
         .expect("start extension runtime");
     let loaded = handle
         .load(std::slice::from_ref(&path))
@@ -698,10 +737,9 @@ fn write_trace_js_extension(temp: &TempDir, trace: &Path) -> PathBuf {
 #[tokio::test(flavor = "current_thread")]
 async fn session_reload_traces_native_hooks_around_the_js_reload() {
     let temp = TempDir::new("reload-order-trace");
-    let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-reload-trace", None).await;
     let trace_path = temp.0.join("reload-trace.log");
     let extension_path = write_trace_js_extension(&temp, &trace_path);
-    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0))
+    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0, &temp.0))
         .expect("start extension runtime");
     let loaded = handle
         .load(std::slice::from_ref(&extension_path))
@@ -714,7 +752,7 @@ async fn session_reload_traces_native_hooks_around_the_js_reload() {
         trace: trace_path.clone(),
     });
     let session = AgentSession::new_with_plugins(
-        session_config(&temp.0, Some(handle.clone())),
+        session_config(&temp.0, Some(handle.clone()), &temp.0),
         vec![recorder as Arc<dyn AgentPlugin>],
     );
     // Drop the load-time `js:factory` line: only the reload cycle is asserted.
@@ -746,7 +784,6 @@ async fn plugin_host_reload_still_reloads_the_js_runtime() {
     let temp = TempDir::new("reload-js");
     // Pin the agent dir: the host build resolves its settings from it (never
     // the real `~/.pi`).
-    let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-js-host", None).await;
     let handle = load_js_fixture(&temp).await;
     assert_eq!(
         js_start_reason(&handle).await,
@@ -754,9 +791,10 @@ async fn plugin_host_reload_still_reloads_the_js_runtime() {
         "no session_start was emitted before the reload"
     );
     let recorder = ReloadRecorder::new("w14e-js-host-recorder", false);
-    let host = pir::plugins::PluginHost::build(
+    let host = pir::plugins::PluginHost::build_with_agent_dir(
         Some(handle.clone()),
         vec![Arc::clone(&recorder) as Arc<dyn AgentPlugin>],
+        Some(&temp.0),
     );
 
     host.reload().await.expect("composite reload");
@@ -777,11 +815,10 @@ async fn plugin_host_reload_still_reloads_the_js_runtime() {
 #[tokio::test(flavor = "current_thread")]
 async fn session_native_reload_leaves_the_js_runtime_to_the_caller() {
     let temp = TempDir::new("reload-js-session");
-    let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-js-session", None).await;
     let handle = load_js_fixture(&temp).await;
     let recorder = ReloadRecorder::new("w14e-js-session-recorder", false);
     let session = AgentSession::new_with_plugins(
-        session_config(&temp.0, Some(handle.clone())),
+        session_config(&temp.0, Some(handle.clone()), &temp.0),
         vec![Arc::clone(&recorder) as Arc<dyn AgentPlugin>],
     );
 
@@ -911,7 +948,6 @@ fn reload_probe_storage(temp: &TempDir) -> (pir::session_manager::SessionManager
 #[tokio::test(flavor = "current_thread")]
 async fn session_reload_reloads_extensions_tools_and_resources() {
     let temp = TempDir::new("session-reload");
-    let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-session-reload", None).await;
     let skill = temp.0.join("alpha-skill.md");
     let prompt = temp.0.join("one-template.md");
     write_reload_skill(&skill, "alpha-skill", "alpha v1");
@@ -919,7 +955,7 @@ async fn session_reload_reloads_extensions_tools_and_resources() {
     let extension_path =
         write_reload_probe_extension(&temp, "reload-probe-v1", Some(&skill), Some(&prompt));
 
-    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0))
+    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0, &temp.0))
         .expect("start extension runtime");
     let loaded = handle
         .load(std::slice::from_ref(&extension_path))
@@ -928,7 +964,7 @@ async fn session_reload_reloads_extensions_tools_and_resources() {
     assert!(loaded.errors.is_empty(), "load errors: {:?}", loaded.errors);
 
     let (storage, entry_id) = reload_probe_storage(&temp);
-    let mut config = session_config(&temp.0, Some(handle.clone()));
+    let mut config = session_config(&temp.0, Some(handle.clone()), &temp.0);
     config.session = Some(storage);
     let session = AgentSession::new_with_plugins(config, Vec::new());
     let session_id = session.session_id().expect("persisted session id");
@@ -1055,12 +1091,11 @@ async fn session_reload_reloads_extensions_tools_and_resources() {
 #[tokio::test(flavor = "current_thread")]
 async fn extension_command_ctx_reload_reloads_the_session_resources() {
     let temp = TempDir::new("session-reload-command");
-    let _guard = crate::common::AgentDirEnvGuard::scratch("w14e-session-reload-cmd", None).await;
     let skill = temp.0.join("cmd-skill.md");
     write_reload_skill(&skill, "cmd-skill", "command v1");
     let extension_path = write_reload_probe_extension(&temp, "cmd-probe-v1", Some(&skill), None);
 
-    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0))
+    let handle = pir::extensions::ExtensionHandle::start(extension_config(&temp.0, &temp.0))
         .expect("start extension runtime");
     let loaded = handle
         .load(std::slice::from_ref(&extension_path))
@@ -1068,7 +1103,7 @@ async fn extension_command_ctx_reload_reloads_the_session_resources() {
         .expect("load reload probe");
     assert!(loaded.errors.is_empty(), "load errors: {:?}", loaded.errors);
     let (storage, _entry_id) = reload_probe_storage(&temp);
-    let mut config = session_config(&temp.0, Some(handle.clone()));
+    let mut config = session_config(&temp.0, Some(handle.clone()), &temp.0);
     config.session = Some(storage);
     let session = AgentSession::new_with_plugins(config, Vec::new());
     session.push_session_context_for_test().await;

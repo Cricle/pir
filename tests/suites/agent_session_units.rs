@@ -259,6 +259,7 @@ fn retry_session(agent_dir: &std::path::Path) -> pir::agent_session::AgentSessio
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         agent_dir,
     )

@@ -1,45 +1,59 @@
 # Unsafe-code inventory for tests/unsafe_gate.rs (U2 gate).
 #
-# Each line caps one file under src/ at the reviewed number of constructs.
-# Adding a new `unsafe {`, `unsafe fn` or `unsafe impl`/`trait` to a listed file
-# fails `no_new_unsafe_blocks_outside_the_reviewed_allowlist`; removing one
-# passes and asks for this file to be tightened.
+# Each line caps one file under the workspace source roots. The gate counts real
+# `unsafe {`, `unsafe fn` and `unsafe impl`/`unsafe trait` tokens only (comments
+# and string/char/raw literals are ignored), and compares component-wise:
 #
-# Format: <path relative to src/> <blocks> <unsafe fns> <unsafe impls/traits>
-# Regenerate with:
-#   cargo test --test unsafe_gate -- --ignored --nocapture print_current_unsafe_allowlist
-coding_agent/tools/bash.rs 5 0 0
-coding_agent/tools/confine.rs 27 0 0
-coding_agent/tools/shell_pool.rs 28 1 0
-coding_agent/tools/spill.rs 16 0 0
-coding_agent/tools/util.rs 1 0 0
-env_daemon/pty.rs 9 0 0
-env_daemon/sys/unix.rs 5 0 0
-env_daemon/sys/windows.rs 10 0 0
-env_daemon/watch.rs 2 0 0
-extensions/loader.rs 1 0 0
-extensions/runtime/exec.rs 1 0 0
-extensions/runtime/host_functions.rs 0 0 2
-extensions/runtime/host_functions/buffer_ops.rs 4 0 0
-extensions/runtime/host_functions/bytes_ops.rs 1 0 1
-extensions/runtime/host_functions/inspect_ops.rs 11 0 0
-extensions/runtime/host_functions/sqlite_ops.rs 2 0 0
-extensions/runtime/host_functions/system_ops.rs 1 0 0
-extensions/runtime/host_functions/v8_diagnostics.rs 1 0 0
-extensions/runtime/qjs_alloc.rs 16 3 1
-extensions/runtime/runtime.rs 1 0 0
-jobs.rs 14 0 0
-mcp/stdio.rs 1 0 0
-pir_node/modules/buffer.rs 5 0 0
-pir_node/modules/fs.rs 4 0 0
-plugins/builtin/phone/session.rs 1 0 0
-plugins/subagent/process.rs 1 0 0
-session_manager/mod.rs 4 0 0
-session_manager/retention.rs 7 0 0
-session_manager/tail_page.rs 1 0 0
-tui/alloc_trace.rs 0 4 1
-tui/spill_preview.rs 1 0 0
-tui/stdin_buffer.rs 3 0 0
-tui/terminal.rs 1 0 0
-tui/theme/osc11.rs 5 0 0
-# total: 34 file(s), 190 unsafe block(s), 8 unsafe fn, 5 unsafe impl/trait
+#   - a file with unsafe but no entry here fails (new unsafe surface);
+#   - a count above the ceiling fails and prints `src/<file>:<line>` for every
+#     current site in that file;
+#   - a count below the ceiling passes and asks for this file to be tightened.
+#
+# Every ceiling below is the exact current count, not headroom: there are no
+# unused slots for a future block to hide in. The trailing comment names the
+# reviewed platform/FFI boundary that justifies the file.
+#
+# Raising a ceiling is only for a reviewed platform/FFI boundary, together
+# with a `// SAFETY:` note at the site. Do not widen a module/file
+# `#[allow(unsafe_code)]` to cover a new block: this gate counts blocks.
+#
+# Regenerate the data lines with:
+#   cargo test --test zz_merged_2 unsafe_gate::print_current_unsafe_allowlist -- --ignored --nocapture
+# The helper prints bare counts; re-add each per-entry boundary comment during
+# review (they are part of the reviewed inventory, not decoration).
+crates/pir-core/src/coding_agent/tools/bash.rs 5 0 0  # Win32 Job Object FFI; Win32 GetFileAttributesW shell-path check; Unix killpg on the shell's process group
+crates/pir-core/src/coding_agent/tools/confine.rs 27 0 0  # Unix openat/mkdirat/fstatat/renameat/unlinkat; Win32 reparse-point-aware open
+crates/pir-core/src/coding_agent/tools/shell_pool.rs 28 1 0  # Win32 Job Object/console FFI, Unix geteuid; one unsafe fn (ACL check)
+crates/pir-core/src/coding_agent/tools/spill.rs 16 0 0  # Win32 security-descriptor/ACL + CreateFileW FFI
+crates/pir-core/src/coding_agent/tools/util.rs 1 0 0  # Win32 FormatMessageW for locale-independent OS error text (PIR-BIN-077); caller-owned fixed buffer
+crates/pir-core/src/env_daemon/pty.rs 9 0 0  # ConPTY and Unix pty/termios FFI
+crates/pir-core/src/env_daemon/sys/unix.rs 5 0 0  # libc process/session/filesystem FFI
+crates/pir-core/src/env_daemon/sys/windows.rs 10 0 0  # Win32 process/console/filesystem FFI
+crates/pir-core/src/env_daemon/watch.rs 2 0 0  # libc statfs/name-to-handle watcher FFI
+crates/pir-core/src/extensions/loader.rs 1 0 0  # rquickjs Module::load of a transpiled module source
+crates/pir-core/src/extensions/runtime/exec.rs 1 0 0  # libc::kill on a child this process spawned
+crates/pir-core/src/extensions/runtime/host_functions.rs 0 0 2  # rquickjs JsLifetime for static Rust-only userdata (SAFETY comment at the site)
+crates/pir-core/src/extensions/runtime/host_functions/buffer_ops.rs 4 0 0  # QuickJS raw typed-array accessors
+crates/pir-core/src/extensions/runtime/host_functions/bytes_ops.rs 1 0 1  # QuickJS raw typed-array bytes + JsLifetime for the hash registry userdata
+crates/pir-core/src/extensions/runtime/host_functions/inspect_ops.rs 11 0 0  # QuickJS reflective inspection (JS_FreeAtom/JS_GetClassID/raw value reads)
+crates/pir-core/src/extensions/runtime/host_functions/sqlite_ops.rs 2 0 0  # QuickJS typed-array bytes for SQLite blob bind/read
+crates/pir-core/src/extensions/runtime/host_functions/system_ops.rs 1 0 0  # QuickJS typed-array bytes for the process/os host ops
+crates/pir-core/src/extensions/runtime/host_functions/v8_diagnostics.rs 1 0 0  # JS_GetRuntime/JS_ComputeMemoryUsage out-buffer walk
+crates/pir-core/src/extensions/runtime/qjs_alloc.rs 16 3 1  # QuickJS custom allocator (std::alloc slab) + arena accounting; the one reviewed allocator island
+crates/pir-core/src/extensions/runtime/runtime.rs 1 0 0  # rquickjs Module::load of the prelude/runtime module source
+crates/pir-core/src/file_identity.rs 4 0 0  # Win32 FILE_ID_INFO identity probe via GetFileInformationByHandleEx + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle); moved out of session_manager/mod.rs so the spill exception shares the same implementation
+crates/pir-core/src/jobs.rs 16 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes + macOS proc_pidinfo(PROC_PIDTBSDINFO) start token (all with SAFETY notes)
+crates/pir-core/src/mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
+crates/pir-core/src/pir_node/modules/buffer.rs 5 0 0  # QuickJS typed-array bytes -> String::from_utf8_unchecked (validated first)
+crates/pir-core/src/pir_node/modules/fs.rs 4 0 0  # Win32 GetDiskFreeSpaceW out-pointers + reparse-point-aware path FFI
+crates/pir-core/src/plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
+crates/pir-core/src/plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
+crates/pir-core/src/session_manager/retention.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes (the start-token probe is now delegated to jobs.rs instead of duplicated)
+crates/pir-core/src/session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
+crates/pir-tui/src/alloc_trace.rs 0 4 1  # process-global GlobalAlloc delegation (R62 counters moved from lib to bin; PIR-BIN-022 zero-size fallback stays inside the impl)
+crates/pir-tui/src/spill_preview.rs 1 0 0  # memmap2 read-only map of a spill file (Arc<Mmap> preview, see PIR-TUI-023/R61 spill decision)
+crates/pir-tui/src/stdin_buffer.rs 3 0 0  # Win32 console input + Unix termios FFI
+crates/pir-tui/src/terminal.rs 1 0 0  # libc::raise(SIGTSTP) for terminal suspend
+crates/pir-tui/src/theme/osc11.rs 5 0 0  # libc fcntl/poll/read on the process' own stdin
+
+# total: 34 file(s), 189 unsafe block(s), 8 unsafe fn, 5 unsafe impl/trait

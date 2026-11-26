@@ -44,6 +44,9 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        // Keep the fixture minimal: `Default` covers the fields this suite
+        // does not care about (process.exit opt-in, memory cap, ...).
+        ..ExtensionConfig::default()
     }
 }
 

@@ -118,7 +118,7 @@ Per test:
 | Variable | Value | Why |
 |---|---|---|
 | `PIR_EXT_BYTECODE` | `0` by default | exercise the shims from source, not AOT blobs |
-| `PIR_EXT_SHIM_SRC` | `1` by default | live override for virtual-module shims from `src/extensions/api/js/*.txt` |
+| `PIR_EXT_SHIM_SRC` | `1` by default | live override for virtual-module shims from `crates/pir-core/src/extensions/api/js/*.txt` |
 | `PIR_AGENT_DIR` | `<agent-root>/agent-<run>-<id>` | fresh per-test agent state |
 | `NODE_TEST_KNOWN_GLOBALS` | `0` | pir leaks host globals; see deviations |
 | `TEST_SERIAL_ID`, `TEST_THREAD_ID` | unique per test | unique `tmpdir` name |
@@ -201,7 +201,7 @@ library: `python -I tests/test_node_suite_runner.py` from the pir checkout.
 8. **Timeouts.** 8 s versus Node's 120 s. The whole process tree is killed with
    `taskkill /F /T` on Windows. Timeouts are real hangs, not slow successes.
 9. **Source-shim mode is a live checkout.** `PIR_EXT_SHIM_SRC=1` reads
-   `src/extensions/api/js/*.txt` from the checkout recorded at compile time.
+   `crates/pir-core/src/extensions/api/js/*.txt` from the checkout recorded at compile time.
    If another process edits a shim during a run, results are not a single
    snapshot. `summary.json` records the explicit checkout root, a tree hash
    before/after, and `stable: false` if the samples differ or the final tree

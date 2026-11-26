@@ -281,6 +281,19 @@ fn fake_registry(contexts: Contexts) -> Arc<ProviderRegistry> {
 }
 
 fn session_factory(contexts: Contexts) -> SessionFactory {
+    session_factory_with_phone_child(contexts, None)
+}
+
+/// [`session_factory`] with the "phone child" flag stated explicitly.
+///
+/// `None` keeps the ambient behavior (`PI_PHONE_CHILD` read at construction),
+/// which is what the pool-spawned child does. A test passes `Some(true)` /
+/// `Some(false)` instead of mutating the process environment, so two tests
+/// building sessions concurrently cannot decide each other's flag.
+fn session_factory_with_phone_child(
+    contexts: Contexts,
+    phone_child: Option<bool>,
+) -> SessionFactory {
     Arc::new(move |session: Option<SessionManager>| {
         Ok(Arc::new(AgentSession::new(AgentSessionConfig {
             performance: Default::default(),
@@ -297,45 +310,9 @@ fn session_factory(contexts: Contexts) -> SessionFactory {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child,
         })))
     })
-}
-
-/// Process-wide env lock: sessions read `PI_PHONE_CHILD` at construction, so
-/// tests that toggle it must not overlap.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct PhoneChildEnv {
-    previous: Option<OsString>,
-    // Restores the previous value on drop, while the lock is still held
-    // (custom `Drop` runs before the fields are dropped).
-    _guard: MutexGuard<'static, ()>,
-}
-
-impl PhoneChildEnv {
-    fn set(value: Option<&str>) -> Self {
-        let guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os("PI_PHONE_CHILD");
-        match value {
-            Some(value) => std::env::set_var("PI_PHONE_CHILD", value),
-            None => std::env::remove_var("PI_PHONE_CHILD"),
-        }
-        Self {
-            previous,
-            _guard: guard,
-        }
-    }
-}
-
-impl Drop for PhoneChildEnv {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => std::env::set_var("PI_PHONE_CHILD", value),
-            None => std::env::remove_var("PI_PHONE_CHILD"),
-        }
-    }
 }
 
 struct TempDir(std::path::PathBuf);
@@ -475,11 +452,12 @@ fn session_entries(path: &str) -> Vec<Value> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_idle_prompt_persists_interleaved_custom_message() {
     let contexts: Contexts = Arc::new(Mutex::new(Vec::new()));
-    let env = PhoneChildEnv::set(Some("1"));
-    let (mut client, temp) = rpc_pair("child", session_factory(Arc::clone(&contexts))).await;
-    // The session read the flag at construction (inside `create`).
+    let (mut client, temp) = rpc_pair(
+        "child",
+        session_factory_with_phone_child(Arc::clone(&contexts), Some(true)),
+    )
+    .await;
     let path = create_session(&mut client).await;
-    drop(env);
 
     let images = json!([
         { "data": "AQID", "mimeType": "image/png" },
@@ -543,11 +521,12 @@ async fn child_idle_prompt_persists_interleaved_custom_message() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_prompt_is_not_transformed_without_the_env() {
     let contexts: Contexts = Arc::new(Mutex::new(Vec::new()));
-    let env = PhoneChildEnv::set(None);
-    let (mut client, temp) = rpc_pair("parent", session_factory(Arc::clone(&contexts))).await;
-    // The session read the flag at construction (inside `create`).
+    let (mut client, temp) = rpc_pair(
+        "parent",
+        session_factory_with_phone_child(Arc::clone(&contexts), Some(false)),
+    )
+    .await;
     let path = create_session(&mut client).await;
-    drop(env);
 
     let prompt = "⟦img1⟧ parent text";
     let images = json!([{ "data": "AQID", "mimeType": "image/png" }]);

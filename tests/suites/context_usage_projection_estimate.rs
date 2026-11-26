@@ -160,6 +160,7 @@ fn agent_for(cwd: &Path, session: SessionManager) -> AgentSession {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     })
 }
 

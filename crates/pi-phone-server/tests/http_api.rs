@@ -46,7 +46,10 @@ async fn http_surface_and_device_creation() -> anyhow::Result<()> {
     let (status, health) = request(addr, get("/api/health", None)).await;
     assert_eq!(status, 200);
     assert_eq!(health["protocolVersion"], 1);
-    assert_eq!(health["users"], 1);
+    assert!(health.get("users").is_none());
+
+    let (status, _) = request(addr, get("/api/metrics", None)).await;
+    assert_eq!(status, 404);
 
     let (status, me) = request(addr, get("/api/me", Some(&token))).await;
     assert_eq!(status, 200);

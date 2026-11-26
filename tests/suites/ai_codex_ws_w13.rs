@@ -1129,25 +1129,30 @@ fn capturing_session(
     session: Option<SessionManager>,
     seen: Arc<Mutex<Vec<StreamOptions>>>,
     cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
 ) -> AgentSession {
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(CapturingProvider { seen }));
-    AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(registry),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools: ToolRegistry::new(),
-        session,
-        compaction: None,
-        max_turns: 1,
-        system_prompt: None,
-        cwd: Some(cwd.to_path_buf()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: None,
-    })
+    AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session,
+            compaction: None,
+            max_turns: 1,
+            system_prompt: None,
+            cwd: Some(cwd.to_path_buf()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        agent_dir,
+    )
 }
 
 struct TempDir(std::path::PathBuf);
@@ -1183,7 +1188,12 @@ async fn agent_session_carries_a_stable_session_id() {
     let temp = TempDir::new("persisted");
     let session = SessionManager::create(".", &temp.0).expect("create session");
     let persisted_id = session.id().to_owned();
-    let agent = capturing_session(Some(session), Arc::clone(&seen), &settings.cwd());
+    let agent = capturing_session(
+        Some(session),
+        Arc::clone(&seen),
+        &settings.cwd(),
+        &settings.agent_dir(),
+    );
 
     agent.prompt("hi", no_op_handler()).await.expect("prompt");
     agent
@@ -1204,7 +1214,12 @@ async fn agent_session_carries_a_stable_session_id() {
     // A store-less session has no persisted id, so the facade mints one that is
     // stable across its turns and distinct from another session's.
     let ephemeral_seen = Arc::new(Mutex::new(Vec::new()));
-    let ephemeral = capturing_session(None, Arc::clone(&ephemeral_seen), &settings.cwd());
+    let ephemeral = capturing_session(
+        None,
+        Arc::clone(&ephemeral_seen),
+        &settings.cwd(),
+        &settings.agent_dir(),
+    );
     ephemeral
         .prompt("hi", no_op_handler())
         .await
@@ -1225,7 +1240,12 @@ async fn agent_session_carries_a_stable_session_id() {
     );
 
     let other_seen = Arc::new(Mutex::new(Vec::new()));
-    let other = capturing_session(None, Arc::clone(&other_seen), &settings.cwd());
+    let other = capturing_session(
+        None,
+        Arc::clone(&other_seen),
+        &settings.cwd(),
+        &settings.agent_dir(),
+    );
     other.prompt("hi", no_op_handler()).await.expect("prompt");
     let other_id = other_seen.lock().unwrap()[0].session_id.clone();
     assert_ne!(
@@ -1240,34 +1260,53 @@ async fn agent_session_carries_a_stable_session_id() {
 // reaches the Codex adapter through the session's request options.
 // ---------------------------------------------------------------------------
 
-/// A scratch project whose `<cwd>/.pi/settings.json` carries `settings`, marked
-/// trusted so the PROJECT scope applies. Project settings deep-merge over the
-/// global scope, so these values win even if a concurrent suite pins
-/// `PIR_AGENT_DIR` at its own scratch directory. The shared
-/// [`crate::common::AgentDirEnvGuard`] lock serializes the env mutation with
-/// the other agent-dir suites in this binary.
+/// A scratch project whose `<cwd>/.pi/settings.json` carries `settings`, and
+/// the AGENT DIR to build the session against (a sibling scratch dir, so no
+/// ambient `~/.pi` value participates). Project settings deep-merge over the
+/// global scope, so these values win.
+///
+/// Both directories are handed to the session explicitly
+/// (`AgentSession::new_with_agent_dir`) and the project is marked trusted for
+/// THIS cwd through the per-directory trust pin — not through
+/// `PIR_AGENT_DIR`/`PIR_TRUST_PROJECT`. Nothing here mutates process state, so
+/// the suite needs no env lock and two of its tests can run concurrently.
 struct ProjectSettings {
-    // Declared first: the env is restored before the scratch dir is removed.
-    _guard: crate::common::AgentDirEnvGuard,
+    // Declared first: the trust pin is cleared before the scratch dirs go.
+    _trust: TrustPin,
     temp: TempDir,
+    agent_dir: TempDir,
 }
 
 impl ProjectSettings {
     async fn new(label: &str, settings: &str) -> Self {
         let temp = TempDir::new(label);
+        let agent_dir = TempDir::new(&format!("{label}-agent"));
         let project_dir = temp.0.join(".pi");
         std::fs::create_dir_all(&project_dir).expect("create project settings dir");
         std::fs::write(project_dir.join("settings.json"), settings).expect("write settings");
-        let guard =
-            crate::common::AgentDirEnvGuard::at(&temp.0, &[("PIR_TRUST_PROJECT", "1")]).await;
+        pir::extensions::project_trust::pin_decision(&temp.0, true);
         Self {
-            _guard: guard,
+            _trust: TrustPin(temp.0.clone()),
             temp,
+            agent_dir,
         }
     }
 
     fn cwd(&self) -> std::path::PathBuf {
         self.temp.0.clone()
+    }
+
+    fn agent_dir(&self) -> std::path::PathBuf {
+        self.agent_dir.0.clone()
+    }
+}
+
+/// Clears this scenario's per-cwd trust pin on drop (panic-safe).
+struct TrustPin(std::path::PathBuf);
+
+impl Drop for TrustPin {
+    fn drop(&mut self) {
+        pir::extensions::project_trust::clear_recorded_decision(&self.0);
     }
 }
 
@@ -1291,22 +1330,26 @@ async fn settings_transport_reaches_the_session_codex_adapter() {
     // handed in here, so anything the adapter sees came through the session.
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(provider));
-    let agent = AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(registry),
-        model,
-        api_key: Some(fake_jwt("acct_123")),
-        thinking: ThinkingLevel::Off,
-        tools: ToolRegistry::new(),
-        session: None,
-        compaction: None,
-        max_turns: 1,
-        system_prompt: None,
-        cwd: Some(settings.cwd()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: None,
-    });
+    let agent = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(registry),
+            model,
+            api_key: Some(fake_jwt("acct_123")),
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: None,
+            compaction: None,
+            max_turns: 1,
+            system_prompt: None,
+            cwd: Some(settings.cwd()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        settings.agent_dir(),
+    );
     agent
         .prompt("settings please", no_op_handler())
         .await
@@ -1342,22 +1385,26 @@ async fn settings_websocket_timeout_reaches_the_session_codex_adapter() {
 
     let mut registry = ProviderRegistry::default();
     registry.set_provider(Arc::new(provider));
-    let agent = AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(registry),
-        model,
-        api_key: Some(fake_jwt("acct_123")),
-        thinking: ThinkingLevel::Off,
-        tools: ToolRegistry::new(),
-        session: None,
-        compaction: None,
-        max_turns: 1,
-        system_prompt: None,
-        cwd: Some(env.cwd()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: None,
-    });
+    let agent = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(registry),
+            model,
+            api_key: Some(fake_jwt("acct_123")),
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: None,
+            compaction: None,
+            max_turns: 1,
+            system_prompt: None,
+            cwd: Some(env.cwd()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        env.agent_dir(),
+    );
 
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(

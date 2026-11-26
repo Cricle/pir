@@ -333,6 +333,9 @@ fn export_header_sums_the_assistant_cost() {
 
 #[test]
 fn export_honors_the_requested_theme_colors() {
+    // The engine resolves theme colors through the front-end hook; the binary
+    // installs it at startup, and this test drives the exporter directly.
+    pir::tui::install_host_hooks();
     let dir = temp_dir("theme");
     let session = fixture_session(&dir);
     let light_page = pir::tui::theme::theme_export_colors(Some("light"))

@@ -121,6 +121,7 @@ fn session_with_storage(cwd: &Path, model: Model) -> Arc<AgentSession> {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }))
 }
 
@@ -379,6 +380,7 @@ fn threshold_model_resolves_routed_physical_window() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let raw = agent.model();

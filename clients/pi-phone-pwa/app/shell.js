@@ -1,4 +1,3 @@
-import { getServerBase } from "./config.js";
 import { prepareSessionSelection } from "./commands.js";
 import { refreshDevices } from "./devices.js";
 import { escapeHtml, formatDateTime } from "./formatters.js";
@@ -91,7 +90,7 @@ export function logout() {
   }
   state.socket = null;
   state.token = "";
-  storeToken("");
+  storeToken("", state.serverBase);
   toggleSidebar(false);
   openTokenModal();
 }
@@ -103,7 +102,7 @@ export function renderSidebar() {
     const username = user?.displayName || user?.username || "Not signed in";
     const server = (() => {
       try {
-        return new URL(getServerBase()).host;
+        return new URL(state.serverBase).host;
       } catch {
         return "";
       }

@@ -19,16 +19,18 @@
 //!
 //! * **(a)** config discovery, the log and the credential store come from the
 //!   same resolved directory;
-//! * **(b)** changing `PIR_AGENT_DIR` after construction does not silently
-//!   split configuration from the log/credentials — the divergence is
-//!   recorded;
+//! * **(b)** a config pass naming a DIFFERENT directory after construction
+//!   does not silently split configuration from the log/credentials — the
+//!   divergence is recorded;
 //! * **(c)** a second manager for another directory shares none of the first
 //!   one's files.
 //!
 //! Hermetic: temp directories only, no server process is ever spawned (the
 //! fixtures are stdio entries that are only parsed, never connected), and no
 //! real `~/.pi` is read or written (every manager is built with an explicit
-//! temp root; the one rootless manager pins the env at a scratch directory).
+//! temp root, including the rootless form, whose credential store is rooted
+//! with `without_log_at`). No test writes `PIR_AGENT_DIR`, so the suite needs
+//! no env lock.
 
 #![cfg(feature = "mcp")]
 
@@ -169,32 +171,21 @@ async fn changing_the_agent_dir_env_does_not_split_the_manager() {
     first.write_config("first");
     second.write_config("second");
 
-    // The plugin host's construction-time resolution, pinned hermetically.
-    let guard = crate::common::AgentDirEnvGuard::at(first.path(), &[]).await;
-    let resolved = pir::coding_agent::context::agent_dir();
-    assert_eq!(resolved.as_path(), first.path());
-    let manager = McpManager::new(&resolved, first.path());
+    // The construction-time resolution, stated explicitly (the plugin host
+    // resolves it once and passes it here).
+    let manager = McpManager::new(first.path(), first.path());
     assert_eq!(manager.agent_dir(), first.path());
 
-    // The change that used to split the state: a later live read of the env.
-    std::env::set_var("PIR_AGENT_DIR", second.path());
-    let live = pir::coding_agent::context::agent_dir();
-    assert_eq!(
-        live.as_path(),
-        second.path(),
-        "the env change must be visible to a live read"
-    );
-
-    // A post-change config pass, exactly like the plugin's `register` doing
-    // `load_config_files(&context::agent_dir(), ..)`.
-    let errors = manager.load_config_files(&live, false);
+    // A post-construction config pass naming a DIFFERENT directory, exactly
+    // like a plugin that re-resolved the agent dir before loading.
+    let errors = manager.load_config_files(second.path(), false);
     assert!(
         manager.registry().get("first").is_some(),
         "config discovery left the manager root"
     );
     assert!(
         manager.registry().get("second").is_none(),
-        "config discovery followed the live env (split-brain)"
+        "config discovery followed the requested dir (split-brain)"
     );
     assert!(
         errors.iter().any(|error| error.contains("rooted at")),
@@ -215,10 +206,8 @@ async fn changing_the_agent_dir_env_does_not_split_the_manager() {
     );
     assert!(
         !second.contains_file("mcp.log"),
-        "log moved with the live env"
+        "log moved with the requested dir"
     );
-
-    drop(guard);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,11 +299,9 @@ async fn the_config_pass_seam_loads_documents_from_the_manager_root() {
 async fn a_rootless_manager_follows_the_requested_dir() {
     let dir = Tree::new("rootless");
     dir.write_config("loose");
-    // `without_log` builds the default credential store from the env; pin it at
-    // a scratch dir so no real `~/.pi` is even named.
-    let _guard = crate::common::AgentDirEnvGuard::scratch("w16c-rootless", None).await;
-
-    let manager = McpManager::without_log(dir.path());
+    // `without_log` names the default credential store; the `_at` form keeps
+    // that path inside this scenario's scratch dir.
+    let manager = McpManager::without_log_at(dir.path(), dir.path());
     assert!(manager.agent_dir().as_os_str().is_empty());
     assert_eq!(
         manager.resolve_config_root(dir.path()).as_path(),

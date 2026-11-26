@@ -82,6 +82,8 @@ fn extension_config(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -227,12 +229,20 @@ impl TerminalInputHandler for BlockingNativeHandler {
     }
 }
 
-/// A native registry handler that answers the FIRST chunk after `delay` with
-/// `first_action` and every later chunk with `Pass`, recording the chunks it
-/// saw. The delay exceeds the router's inline budget, so the first chunk is
-/// deferred and its answer lands on the deferred path.
+/// A native registry handler that answers the FIRST chunk with `first_action`
+/// once the test RELEASES it, and every later chunk with `Pass`, recording the
+/// chunks it saw. The dispatcher therefore defers the first chunk and its
+/// answer lands on the deferred path.
+///
+/// The release is a channel, not a `sleep`: the test decides exactly when the
+/// answer becomes available, so "the backstop expired before the answer" is a
+/// deterministic ordering instead of a race between a 40 ms sleep and a 20 ms
+/// budget (which a loaded machine could flip).
 struct DelayedFirstHandler {
-    delay: Duration,
+    // `TerminalInputHandler` is `Send + Sync`, but a `Receiver` is neither
+    // `Sync` nor cloneable. The handler is only ever called from the
+    // dispatcher thread, so a `Mutex` is the correct wrapper.
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     first_action: TerminalInputAction,
     seen: Arc<Mutex<Vec<String>>>,
 }
@@ -249,14 +259,40 @@ impl TerminalInputHandler for DelayedFirstHandler {
         if !first {
             return TerminalInputAction::Pass;
         }
-        std::thread::sleep(self.delay);
+        // Park until the test releases this answer. A disconnected sender means
+        // the test finished; fail open rather than hang.
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
         self.first_action.clone()
     }
 }
 
-/// A native registry handler that panics on its first chunk and consumes every
-/// later one: the dispatcher must isolate the panic (that chunk fails open),
-/// survive, and keep dispatching later chunks.
+/// Release `release` on a helper thread once the handler has recorded its
+/// chunk (i.e. it is parked and the first chunk is provably in flight).
+///
+/// This replaces a fixed "the handler takes 40 ms" sleep: the ordering the
+/// tests need is "the answer arrives after the inline budget, before the
+/// handler timeout", and the record-before-wait publish makes that exact.
+fn release_when_parked(seen: Arc<Mutex<Vec<String>>>, release: std::sync::mpsc::Sender<()>) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            if Instant::now() >= deadline {
+                // Nothing parked: let the handler fail open.
+                return;
+            }
+            std::thread::yield_now();
+        }
+        let _ = release.send(());
+    });
+}
 struct PanicOnceHandler {
     calls: AtomicUsize,
     seen: Arc<Mutex<Vec<String>>>,
@@ -318,7 +354,9 @@ fn type_events_through_gate(router: &TerminalInputRouter, events: Vec<Event>) ->
                 }
                 None => {
                     deferred = Some((held, decision));
-                    std::thread::sleep(Duration::from_millis(1));
+                    // Yield the timeslice instead of sleeping: the deferred
+                    // answer arrives on the dispatcher's own OS thread.
+                    std::thread::yield_now();
                     continue;
                 }
             }
@@ -790,12 +828,18 @@ async fn a_deferred_chunk_holds_input_order_and_dispatches_each_event_once() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_deferred_replacement_is_applied_at_the_held_position() {
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let host = Arc::new(PluginHost::build(None, Vec::new()));
     let subscription = host.on_terminal_input(Arc::new(DelayedFirstHandler {
-        delay: Duration::from_millis(40),
+        release: std::sync::Mutex::new(released),
         first_action: TerminalInputAction::Replace("Xy".to_owned()),
         seen: Arc::clone(&seen),
     }));
+    // Release the answer once the handler is provably parked (it records the
+    // chunk before waiting), which is well after the 5 ms inline budget and
+    // well before the 2 s handler timeout — the deferral window is defined by
+    // those two bounds, not by a guessed sleep.
+    release_when_parked(Arc::clone(&seen), release);
     let router = TerminalInputRouter::with_budgets(
         Arc::clone(&host),
         Duration::from_millis(5),
@@ -836,12 +880,14 @@ async fn a_deferred_replacement_is_applied_at_the_held_position() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_deferred_replacement_is_not_coalesced_with_later_physical_keys() {
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let host = Arc::new(PluginHost::build(None, Vec::new()));
     let subscription = host.on_terminal_input(Arc::new(DelayedFirstHandler {
-        delay: Duration::from_millis(40),
+        release: std::sync::Mutex::new(released),
         first_action: TerminalInputAction::Replace("x\ry".to_owned()),
         seen: Arc::clone(&seen),
     }));
+    release_when_parked(Arc::clone(&seen), release);
     let router = TerminalInputRouter::with_budgets(
         Arc::clone(&host),
         Duration::from_millis(5),
@@ -916,7 +962,9 @@ async fn a_handler_past_the_defer_backstop_fails_open_without_stalling_the_next_
     release_tx.send(()).expect("release the handler");
     let settled_by = Instant::now() + Duration::from_secs(2);
     while router.is_busy() && Instant::now() < settled_by {
-        std::thread::sleep(Duration::from_millis(1));
+        // The dispatcher runs on its own OS thread: yield this thread so it
+        // can settle the request. No fixed delay.
+        std::thread::yield_now();
     }
     assert!(!router.is_busy(), "the wedged request settled");
     subscription.cancel();
@@ -928,9 +976,10 @@ async fn a_handler_past_the_defer_backstop_fails_open_without_stalling_the_next_
 #[tokio::test(flavor = "current_thread")]
 async fn a_late_replacement_after_the_backstop_is_dropped() {
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let host = Arc::new(PluginHost::build(None, Vec::new()));
     let subscription = host.on_terminal_input(Arc::new(DelayedFirstHandler {
-        delay: Duration::from_millis(40),
+        release: std::sync::Mutex::new(released),
         first_action: TerminalInputAction::Replace("ZZZ".to_owned()),
         seen: Arc::clone(&seen),
     }));
@@ -947,10 +996,21 @@ async fn a_late_replacement_after_the_backstop_is_dropped() {
         "the expired chunk fails open before the replacement answer arrives"
     );
 
+    // Now release the answer: it lands on the abandoned receiver, which must
+    // drop it and release the busy gate. Ordering is deterministic — the gate
+    // already failed open above, so this answer is provably LATE.
+    release
+        .send(())
+        .expect("the deferred handler is parked until this release");
+
     // Let the late answer land on the abandoned receiver and release the gate.
+    // No `sleep`: yield the CPU and re-read the in-flight count. The handler is
+    // already released above, so this converges without guessing a duration.
     let settled_by = Instant::now() + Duration::from_secs(2);
     while router.is_busy() && Instant::now() < settled_by {
-        std::thread::sleep(Duration::from_millis(1));
+        // The dispatcher runs on its OWN OS thread, so yielding this thread's
+        // timeslice (not the tokio task) is what lets it make progress.
+        std::thread::yield_now();
     }
     assert!(!router.is_busy(), "the abandoned request settled");
     assert_eq!(
@@ -994,7 +1054,9 @@ async fn a_panicking_handler_fails_open_and_the_dispatcher_survives() {
     );
     let settled_by = Instant::now() + Duration::from_secs(2);
     while router.is_busy() && Instant::now() < settled_by {
-        std::thread::sleep(Duration::from_millis(1));
+        // The dispatcher runs on its own OS thread: yield this thread so it
+        // can settle the request. No fixed delay.
+        std::thread::yield_now();
     }
     assert!(!router.is_busy(), "the panic did not leak the busy gate");
     assert_eq!(

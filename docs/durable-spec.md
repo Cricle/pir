@@ -1,25 +1,32 @@
 # Durable specification (pir)
 
-Normative reference for `src/durable/`: a **pir-side digest** of upstream `@earendil-works/pi-durable`
+Normative reference for `crates/pir-durable/src/`: a **pir-side digest** of upstream `@earendil-works/pi-durable`
 `docs/spec.md`. The reference tree is upstream commit `38ff99177` (package `1.4.0`); the digest began from
 `2ec55d808` (package `1.3.0`) and was re-checked against `38ff99177` for the ported modules. Upstream remains
-authoritative for anything not restated here; §12 lists deliberate Rust differences.
+authoritative for anything not restated here; §12 lists deliberate Rust differences. This page is **pinned to
+1.4.0 by design** — drift after that point (including the v1.5.2 audit) is tracked in
+[`upstream-drift-status.md`](upstream-drift-status.md), not restated here.
 
 ```text
 upstream package   pi/packages/durable
 upstream spec      pi/packages/durable/docs/spec.md
 upstream revision  38ff99177 (package 1.4.0; digest started at 2ec55d808, package 1.3.0)
-pir module         src/durable/
+pir module         crates/pir-durable/src/
 ```
 
-**Positioning.** pir mirrors upstream's sibling split (`src/durable/` ↔ `pi-durable`): this module is a **second
+**Positioning.** pir mirrors upstream's sibling split (`crates/pir-durable/src/` ↔ `pi-durable`): this module is a **second
 harness beside** `agent_loop`/`agent_session`, never the engine under them (see `../RESULTS.md`); do not stack the
 two turn drivers on one conversation.
 
 ## Rust quickstart (developer usage)
 
-`pir::durable` is core: it needs no cargo feature and is **not** re-exported by `pir::sdk`, so an embed imports it
-directly (`use pir::durable::…`). Upstream `@earendil-works/pi-durable` is likewise a library; there is no CLI
+`pir::durable` is the re-export of the **`pir-durable`** crate. It is on by
+default (the `durable` cargo feature is part of `full`), and `pir-core`
+re-exports it as `pub use pir_durable as durable;`, so `use pir::durable::…`
+works exactly as before. A slim embed can drop it with
+`--no-default-features` (without `durable`) and skip its 56k lines; the crate
+itself depends only on `pir-ai-types`/`pir-telemetry`, never on the engine.
+Upstream `@earendil-works/pi-durable` is likewise a library; there is no CLI
 command on either side. A runnable external-crate example is
 `.play/lanes/lane-sdk-dev/apps/durable-probe/` (JSONL open, root + entries, fork, reopen, torn-line recovery,
 document migration/checkpoint). The in-tree `examples/dev_durable_timers.rs` is the minimal host-timer example
@@ -152,7 +159,7 @@ timer it armed, a call after the end rejects, and a late fire is a no-op. The ti
 from `HarnessOptions.on_report`, which receives `(&str, &ReportInfo)` for harness failures. When
 `HarnessOptions.timers` is omitted, the scheduler wraps the native timer with a report closure that routes a
 timer-callback failure to `on_report` as `ReportInfo::HostError { callback: HostCallback::SetTimer, .. }`
-(`src/durable/harness/scheduler/mod.rs:1939-1961`; upstream's `hostTimers` wiring); when a `Timers` value is
+(`crates/pir-durable/src/harness/scheduler/mod.rs:1939-1961`; upstream's `hostTimers` wiring); when a `Timers` value is
 supplied, its own `report` closure is the only sink for that message. When a host arms the
 callback on its own thread, that thread must re-enter the Tokio runtime before invoking it (`Handle::enter()`):
 the scheduler wake path calls `tokio::spawn`, so a bare thread panics with "there is no reactor running". The
@@ -206,7 +213,7 @@ SubmissionRecord { id, conversation_id, request_id?, type: input|write,
 ```
 
 `TaskRecord` and `SubmissionRecord` additionally carry optional `trace`/`links` fields (propagation carriers;
-omitted when empty, see `src/durable/types.rs:533-552`).
+omitted when empty, see `crates/pir-durable/src/types.rs:533-552`).
 
 Conversation history parenting (`parent`) and task ownership (`owner`) are separate: `parent` controls inherited
 entries and documents; `owner` records task attribution and connects scopes for subtree abort and idle traversal.
@@ -295,7 +302,7 @@ excluding background subtrees. Two rules:
 
 Waiting: a phase may commit `{ status: waiting, checkpoint, on, policy }`; a cycle in the wait-for graph is
 rejected, and `failFast` marks every other live task in `on` (the one that already holds or ended with a
-non-`completed` outcome keeps its own outcome) via `src/durable/harness/scheduler/reconcile.rs:123-135`.
+non-`completed` outcome keeps its own outcome) via `crates/pir-durable/src/harness/scheduler/reconcile.rs:123-135`.
 
 ### 5.5 Sleeping, timers and wakeups
 
@@ -390,10 +397,10 @@ not the error).
   cannot truncate while a read-only map is alive; `Arc<Mmap>`+`Cow` shared-prefix snapshots remain proven only as
   prototypes (`session_manager`'s tail-page/`load_entries_from_file_mapped` readers are the
   agent-session-side mmap users, not `durable`).
-- **SQLite** is implemented (`src/durable/storage/sqlite/`) as a third backend behind the optional `rusqlite`
-  driver (compiled with the `extensions` or `context-mode` feature, `src/durable/storage/mod.rs:11-12`); WAL with
+- **SQLite** is implemented (`crates/pir-durable/src/storage/sqlite/`) as a third backend behind the optional `rusqlite`
+  driver (compiled with this crate's `sqlite` feature, `crates/pir-durable/src/storage/mod.rs:11-13`); WAL with
   `synchronous = NORMAL` unless `SqliteStorageOptions::fsync` upgrades it to `FULL`
-  (`src/durable/storage/sqlite/storage.rs:205-211`). Out of scope: namespaced `prefix`,
+  (`crates/pir-durable/src/storage/sqlite/storage.rs:205-211`). Out of scope: namespaced `prefix`,
   Cloudflare Durable Object adapter, `database`/`node` facades; full `packages/chord` stays deferred (delta subset
   only), chord-lite unscheduled.
 
@@ -417,8 +424,8 @@ Each deviation is explained in the code where it lives.
    `String.prototype.length`/`.slice`; a split surrogate becomes U+FFFD (the lossy decode of the same slice).
 6. **No `~/.pi` writes.** The caller supplies the storage root.
 7. **Zero new dependencies.** serde, serde_json, thiserror, tokio and tokio-util were already in the dependency
-   graph (the harness additionally uses the already-present `futures-util`; the SQLite backend rides the existing
-   optional `rusqlite` behind `extensions`/`context-mode`, `src/durable/storage/mod.rs:11-12`).
+   graph (the harness additionally uses the already-present `futures-util`; the SQLite backend rides the optional
+   `rusqlite` behind this crate's own `sqlite` feature, `crates/pir-durable/src/storage/mod.rs:11-13`).
 8. **`env/**`, `images/**`, `testing/**`, `tools/**`, `codemode/**` are out of this port.** pir has native
    equivalents for the latter five; the SQLite backend is ported separately under `storage/sqlite/`.
 9. **JSONL persists minted IDs (`ids.jsonl`).** Upstream JSONL keeps only an in-memory watermark, so a minted but
@@ -435,7 +442,7 @@ Each deviation is explained in the code where it lives.
     replaces the non-unique `(conversation_id, request_id)` index with a partial unique one after deleting older
     duplicates. Upstream ships schema version 2.
 13. **Built-in documents are staged agent-first.** `conversation_definitions()`
-    (`src/durable/harness/documents.rs`) lists `pi.agent, pi.live, pi.inbox, pi.provider, pi.usage`, so a new
+    (`crates/pir-durable/src/harness/documents.rs`) lists `pi.agent, pi.live, pi.inbox, pi.provider, pi.usage`, so a new
     conversation's one creation commit writes them in that order; upstream's `conversationCreated`
     (`harness/harness.ts`) stages `pi.live, pi.inbox, pi.usage, pi.provider` and then `pi.agent` via
     `createAgent`. The set, the ids the set mints, and every definition's semantics are identical — only the

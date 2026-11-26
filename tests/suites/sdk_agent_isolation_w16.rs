@@ -15,9 +15,13 @@
 //!   resolves the process environment exactly like the CLI, and the session
 //!   root is `<resolved agent dir>/sessions/...`.
 //!
-//! The environment-pinned cases take the binary-wide agent-dir lock
-//! (`tests/common/mod.rs::AgentDirEnvGuard`), shared with every other
-//! agent-dir suite in the merged `g_agent` binary.
+//! The two "default resolution" cases below pin the PROCESS environment on
+//! purpose — the property under test is that a builder without
+//! `.agent_dir(..)` still resolves it, and that an env change after a build
+//! does not re-point that agent — so they run only under a process-per-test
+//! runner (`tests/common/mod.rs::skip_without_nextest`) and pin with
+//! [`crate::common::ProcessEnvPin`], which needs no lock. Every other case
+//! passes its directory explicitly and touches no process state at all.
 
 use std::path::{Path, PathBuf};
 
@@ -273,10 +277,12 @@ async fn command_credential_cache_does_not_leak_between_agents() {
     }
     // Only A has the file the command reads.
     std::fs::write(dir_a.path().join("key.txt"), "command-key").expect("write key.txt");
+    // The remote-catalog refresh gate only; the agent dirs are explicit
+    // arguments, so neither build reads a process directory.
+    crate::common::ensure_offline_mode();
 
-    // Agent 1: the environment and the builder agree on A.
+    // Agent 1: the builder resolves A's `!command` against A.
     {
-        let _env = crate::common::AgentDirEnvGuard::at(dir_a.path(), &[("PI_OFFLINE", "1")]).await;
         let agent_a = AgentBuilder::new()
             .agent_dir(dir_a.path())
             .no_session()
@@ -293,7 +299,6 @@ async fn command_credential_cache_does_not_leak_between_agents() {
 
     // Agent 2: same command text, a directory that cannot produce it.
     {
-        let _env = crate::common::AgentDirEnvGuard::at(dir_b.path(), &[("PI_OFFLINE", "1")]).await;
         match AgentBuilder::new()
             .agent_dir(dir_b.path())
             .no_session()
@@ -320,8 +325,17 @@ async fn command_credential_cache_does_not_leak_between_agents() {
 /// default session root sits under it.
 #[tokio::test(flavor = "current_thread")]
 async fn default_builder_resolves_the_process_agent_dir() {
+    if crate::common::skip_without_nextest(
+        "sdk_agent_isolation_w16::default_builder_resolves_the_process_agent_dir",
+    ) {
+        return;
+    }
     let env_dir = TempDir::new("default-env");
-    let _env = crate::common::AgentDirEnvGuard::at(env_dir.path(), &[("PI_OFFLINE", "1")]).await;
+    // Pin the process resolution this test is about: `PIR_AGENT_DIR` alone, with
+    // the two lower-precedence aliases cleared, so a host that exports one of
+    // them cannot change which directory the builder resolves.
+    let _env = crate::common::ProcessEnvPin::agent_dir(env_dir.path());
+    crate::common::ensure_offline_mode();
 
     let agent = AgentBuilder::new()
         .with_registry(
@@ -354,6 +368,12 @@ async fn default_builder_resolves_the_process_agent_dir() {
 /// not re-point it. `attach_session` remains the explicit escape hatch.
 #[tokio::test(flavor = "current_thread")]
 async fn session_root_is_build_bound_to_the_agents_own_dir() {
+    if crate::common::skip_without_nextest(
+        "sdk_agent_isolation_w16::session_root_is_build_bound_to_the_agents_own_dir",
+    ) {
+        return;
+    }
+    crate::common::ensure_offline_mode();
     let agent_dir = TempDir::new("root-agent");
     let other_dir = TempDir::new("root-other");
 
@@ -374,7 +394,7 @@ async fn session_root_is_build_bound_to_the_agents_own_dir() {
     );
 
     // A later environment change must not re-point the built agent.
-    let _env = crate::common::AgentDirEnvGuard::at(other_dir.path(), &[("PI_OFFLINE", "1")]).await;
+    let _env = crate::common::ProcessEnvPin::agent_dir(other_dir.path());
     agent.new_session().await.expect("new session still works");
     assert_eq!(
         agent.session_dir(),

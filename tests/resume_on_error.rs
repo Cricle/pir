@@ -14,8 +14,10 @@ use pir::session_manager::SessionManager;
 use std::sync::{Mutex, OnceLock};
 
 fn assistant(stop: StopReason) -> Message {
-    let mut a = AssistantMessage::default();
-    a.stop_reason = stop;
+    let a = AssistantMessage {
+        stop_reason: stop,
+        ..Default::default()
+    };
     Message::Assistant(a)
 }
 

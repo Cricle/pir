@@ -22,7 +22,7 @@
 //!   registration or a changed plugin-provider definition invalidates it.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use pir::agent_session::{AgentSession, AgentSessionConfig};
 use pir::ai::auth::{
@@ -35,52 +35,16 @@ use pir::ai::types::*;
 use pir::ai::virtual_::{PhysicalModelRef, VirtualModelRegistration};
 use pir::extensions::{ExtensionConfig, ExtensionHandle, SessionContextSnapshot};
 use pir::plugins::{AgentPlugin, PluginInfo, RegistrationContext};
-use pir::session_manager::{
-    reset_session_list_file_reads, session_list_file_reads, SessionManager,
-};
-
-/// Serializes every test in this file: the credential-cache test pins the
-/// process-global `PIR_AGENT_DIR` while it runs, and the other tests' pushes
-/// read the same environment for their auth fingerprint.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Pins `PIR_AGENT_DIR` for one test and restores it (panic included) on
-/// drop, while holding [`ENV_LOCK`] for the test's whole lifetime.
-struct AgentDirOverride {
-    previous: Option<std::ffi::OsString>,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl AgentDirOverride {
-    fn new(agent_dir: &Path) -> Self {
-        let lock = env_lock();
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", agent_dir);
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for AgentDirOverride {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-    }
-}
+use pir::session_manager::SessionManager;
 
 /// Sets one credential-template environment variable and restores it on
-/// drop. Callers hold [`ENV_LOCK`] through an [`AgentDirOverride`], so this
-/// guard does not lock (avoiding a self-deadlock).
+/// drop.
+///
+/// The one test that uses this asserts a property ABOUT the process
+/// environment (`models.json` `$ENV` templates resolve against it), so the
+/// variable must be the real thing. The name is unique to that test, so no
+/// other suite reads or writes it and no lock is needed; it runs on the
+/// current-thread flavor and restores the previous value on drop.
 struct EnvVarOverride {
     name: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -495,6 +459,7 @@ fn oauth_session(
     runtime: ExtensionHandle,
     cwd: &Path,
     sessions: &Path,
+    agent_dir: &Path,
 ) -> AgentSession {
     std::fs::create_dir_all(sessions).expect("create session dir");
     let cwd_text = cwd.to_string_lossy().into_owned();
@@ -505,7 +470,7 @@ fn oauth_session(
     );
     config.session = None;
     config.extensions = Some(runtime);
-    AgentSession::new_with_plugins(config, Vec::new())
+    agent_at(config, Vec::new(), agent_dir)
 }
 
 /// Headless login interaction: only `notify` is required, and the fixture's
@@ -586,11 +551,40 @@ fn extension_config(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
 fn agent_config(cwd: &Path, session: SessionManager) -> AgentSessionConfig {
     agent_config_with_registry(cwd, session, Arc::new(ProviderRegistry::default()))
+}
+
+/// Build the session against an EXPLICIT agent dir.
+///
+/// Both halves of the push resolve credentials from the session's own agent
+/// directory (`authenticated_providers` and the catalog fingerprint), so the
+/// scratch dir each test owns fully determines what it reads: no test sets
+/// the process-global `PIR_AGENT_DIR`, and none needs an env lock. The
+/// per-directory listing probe ([`listing_reads`]) is the same idea for the
+/// session-directory scan.
+fn agent_at(
+    config: AgentSessionConfig,
+    inline_plugins: Vec<Arc<dyn AgentPlugin>>,
+    agent_dir: &Path,
+) -> AgentSession {
+    AgentSession::new_with_plugins_and_agent_dir(config, inline_plugins, agent_dir)
+}
+
+/// Files the listing scan opened under `dir` since [`reset_listing_reads`].
+/// The counter is keyed by directory, so a sibling test scanning its own
+/// sessions cannot move this one's number.
+fn listing_reads(dir: &Path) -> u64 {
+    pir::session_manager::session_list_file_reads_in(dir)
+}
+
+fn reset_listing_reads(dir: &Path) {
+    pir::session_manager::reset_session_list_file_reads_in(dir);
 }
 
 fn agent_config_with_registry(
@@ -613,6 +607,7 @@ fn agent_config_with_registry(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -666,10 +661,9 @@ async fn snapshot_catalog(handle: &ExtensionHandle) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn unchanged_push_reuses_the_previous_snapshot() {
-    let _serial = env_lock();
     let temp = TempDir::new("reuse");
+    let agent_dir = TempDir::new("reuse-agent");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
     manager
@@ -684,9 +678,9 @@ async fn unchanged_push_reuses_the_previous_snapshot() {
     let mut config = agent_config(temp.path(), manager);
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
-    reset_session_list_file_reads();
+    reset_listing_reads(temp.path());
     assert!(
         agent.push_session_context_for_test().await,
         "the first push has no previous snapshot and must build"
@@ -706,14 +700,14 @@ async fn unchanged_push_reuses_the_previous_snapshot() {
         "the snapshot carries the projected context entries: {first}"
     );
     assert_eq!(
-        session_list_file_reads(),
+        listing_reads(temp.path()),
         1,
         "the build lists the one session file exactly once"
     );
 
     // No session mutation between the two pushes: the runtime already holds
     // this exact snapshot, so the second push must be a no-op.
-    reset_session_list_file_reads();
+    reset_listing_reads(temp.path());
     assert!(
         !agent.push_session_context_for_test().await,
         "an unchanged push must not rebuild"
@@ -729,7 +723,7 @@ async fn unchanged_push_reuses_the_previous_snapshot() {
         "a cache hit must not fan the identical snapshot out again"
     );
     assert_eq!(
-        session_list_file_reads(),
+        listing_reads(temp.path()),
         0,
         "a skipped push must not re-read the session directory"
     );
@@ -767,10 +761,9 @@ async fn unchanged_push_reuses_the_previous_snapshot() {
 /// assistant turns reporting 100 and 200 must snapshot 200, never 300, and a
 /// later turn must move the value without the fingerprint hiding it.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn context_tokens_reports_last_usage_not_the_lifetime_total() {
-    let _serial = env_lock();
     let temp = TempDir::new("last-usage");
+    let agent_dir = TempDir::new("last-usage-agent");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
     manager
@@ -791,7 +784,7 @@ async fn context_tokens_reports_last_usage_not_the_lifetime_total() {
     let mut config = agent_config(temp.path(), manager);
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     assert!(
         agent.push_session_context_for_test().await,
@@ -861,10 +854,9 @@ async fn context_tokens_reports_last_usage_not_the_lifetime_total() {
 /// `context_usage()` back before the fingerprint check makes the second push
 /// count 2 instead of 1 and fails here.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn cache_hit_does_not_walk_context_usage() {
-    let _serial = env_lock();
     let temp = TempDir::new("usage-calls");
+    let agent_dir = TempDir::new("usage-calls-agent");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
     manager
@@ -879,7 +871,7 @@ async fn cache_hit_does_not_walk_context_usage() {
     let mut config = agent_config(temp.path(), manager);
     config.extensions = Some(handle);
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     agent.reset_session_context_usage_calls_for_test();
     assert!(
@@ -931,9 +923,18 @@ async fn cache_hit_does_not_walk_context_usage() {
 /// catalog carries the new authenticated provider list.
 #[tokio::test(flavor = "current_thread")]
 async fn model_catalog_push_is_cached_until_the_auth_environment_changes() {
+    // The catalog fingerprint covers every provider API-key variable
+    // (`credential_environment_fingerprint` -> `env_api_keys::all()`), so ANY
+    // suite sharing this process that sets one flips the stamp and forces a
+    // rebuild where this test asserts a cache hit. The property under test IS
+    // the process environment: it needs a private process.
+    if crate::common::skip_without_nextest(
+        "session_context_snapshot_cache::model_catalog_push_is_cached_until_the_auth_environment_changes",
+    ) {
+        return;
+    }
     let temp = TempDir::new("catalog-cache");
     let agent_dir = TempDir::new("catalog-cache-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
 
     let cwd = temp.path().to_string_lossy().into_owned();
@@ -948,7 +949,7 @@ async fn model_catalog_push_is_cached_until_the_auth_environment_changes() {
     let mut config = agent_config_with_registry(temp.path(), manager, Arc::clone(&registry));
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     assert!(
         agent.push_session_context_for_test().await,
@@ -1024,9 +1025,13 @@ async fn model_catalog_push_is_cached_until_the_auth_environment_changes() {
 /// push retries the load instead of reporting a cache hit.
 #[tokio::test(flavor = "current_thread")]
 async fn model_catalog_push_retries_after_a_transient_credential_load_failure() {
+    if crate::common::skip_without_nextest(
+        "session_context_snapshot_cache::model_catalog_push_retries_after_a_transient_credential_load_failure",
+    ) {
+        return;
+    }
     let temp = TempDir::new("catalog-load-retry");
     let agent_dir = TempDir::new("catalog-load-retry-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     std::fs::write(agent_dir.path().join("models.json"), "{ not valid json\n")
         .expect("write invalid models.json");
 
@@ -1042,7 +1047,7 @@ async fn model_catalog_push_retries_after_a_transient_credential_load_failure() 
     let mut config = agent_config_with_registry(temp.path(), manager, Arc::clone(&registry));
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     assert!(agent.push_session_context_for_test().await);
     assert_eq!(
@@ -1079,9 +1084,13 @@ async fn model_catalog_push_retries_after_a_transient_credential_load_failure() 
 /// here only because the fixture deliberately changed the file length.
 #[tokio::test(flavor = "current_thread")]
 async fn model_catalog_push_detects_same_size_same_mtime_rewrite() {
+    if crate::common::skip_without_nextest(
+        "session_context_snapshot_cache::model_catalog_push_detects_same_size_same_mtime_rewrite",
+    ) {
+        return;
+    }
     let temp = TempDir::new("catalog-same-stamp");
     let agent_dir = TempDir::new("catalog-same-stamp-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
     let path = agent_dir.path().join("models.json");
     let before = std::fs::metadata(&path)
@@ -1102,7 +1111,7 @@ async fn model_catalog_push_detects_same_size_same_mtime_rewrite() {
     let mut config = agent_config_with_registry(temp.path(), manager, Arc::clone(&registry));
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     assert!(agent.push_session_context_for_test().await);
     assert!(has_authenticated_provider(&handle, "alpha").await);
@@ -1158,10 +1167,16 @@ async fn model_catalog_push_detects_same_size_same_mtime_rewrite() {
 /// the stale list.
 #[tokio::test(flavor = "current_thread")]
 async fn model_catalog_push_detects_an_auth_env_value_change() {
+    // Sets a provider API-key variable; the catalog fingerprint reads the
+    // whole `env_api_keys::all()` set, so a shared process makes it race.
+    if crate::common::skip_without_nextest(
+        "session_context_snapshot_cache::model_catalog_push_detects_an_auth_env_value_change",
+    ) {
+        return;
+    }
     const KEY_VAR: &str = "PIR_SNAP2_TEST_API_KEY";
     let temp = TempDir::new("catalog-env-change");
     let agent_dir = TempDir::new("catalog-env-change-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let _key = EnvVarOverride::set(KEY_VAR, "key-one");
     write_models_json_template(agent_dir.path(), "alpha", "$PIR_SNAP2_TEST_API_KEY");
 
@@ -1177,7 +1192,7 @@ async fn model_catalog_push_detects_an_auth_env_value_change() {
     let mut config = agent_config_with_registry(temp.path(), manager, Arc::clone(&registry));
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     assert!(agent.push_session_context_for_test().await);
     assert!(
@@ -1208,9 +1223,13 @@ async fn model_catalog_push_detects_an_auth_env_value_change() {
 /// catalog cache without touching the session-derived snapshot.
 #[tokio::test(flavor = "current_thread")]
 async fn model_catalog_push_rebuilds_after_a_registry_registration() {
+    if crate::common::skip_without_nextest(
+        "session_context_snapshot_cache::model_catalog_push_rebuilds_after_a_registry_registration",
+    ) {
+        return;
+    }
     let temp = TempDir::new("catalog-registry");
     let agent_dir = TempDir::new("catalog-registry-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
 
     let cwd = temp.path().to_string_lossy().into_owned();
@@ -1225,7 +1244,7 @@ async fn model_catalog_push_rebuilds_after_a_registry_registration() {
     let mut config = agent_config_with_registry(temp.path(), manager, Arc::clone(&registry));
     config.extensions = Some(handle.clone());
     let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-    let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+    let agent = agent_at(config, vec![recorder], agent_dir.path());
 
     assert!(agent.push_session_context_for_test().await);
     assert_eq!(agent.model_catalog_push_stats(), (1, 5, 1));
@@ -1284,9 +1303,13 @@ async fn model_catalog_push_rebuilds_after_a_registry_registration() {
 /// on the SNAP1 implementation, not merely on a missing test seam.
 #[tokio::test(flavor = "current_thread")]
 async fn model_catalog_push_is_cached_across_plugin_provider_resyncs() {
+    if crate::common::skip_without_nextest(
+        "session_context_snapshot_cache::model_catalog_push_is_cached_across_plugin_provider_resyncs",
+    ) {
+        return;
+    }
     let temp = TempDir::new("catalog-plugin-provider");
     let agent_dir = TempDir::new("catalog-plugin-provider-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     write_models_json(agent_dir.path(), "alpha", "key-alpha");
 
     let cwd = temp.path().to_string_lossy().into_owned();
@@ -1300,7 +1323,7 @@ async fn model_catalog_push_is_cached_across_plugin_provider_resyncs() {
     let mut config = agent_config_with_registry(temp.path(), manager, Arc::clone(&registry));
     config.extensions = Some(handle.clone());
     let provider_plugin: Arc<dyn AgentPlugin> = Arc::new(GammaProviderPlugin::new());
-    let agent = AgentSession::new_with_plugins(config, vec![provider_plugin]);
+    let agent = agent_at(config, vec![provider_plugin], agent_dir.path());
 
     // The prompt loop's pre-run sync registers `gamma` before the push.
     agent.sync_plugin_providers_for_test().await;
@@ -1369,11 +1392,9 @@ async fn model_catalog_push_is_cached_across_plugin_provider_resyncs() {
 /// child's requests carried no plugin key. The old implementation fails the
 /// child assertion because its sync returns before installing any key.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn child_session_sharing_registry_installs_its_own_extension_api_keys() {
     let temp = TempDir::new("catalog-child-provider");
     let agent_dir = TempDir::new("catalog-child-provider-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
 
@@ -1383,8 +1404,11 @@ async fn child_session_sharing_registry_installs_its_own_extension_api_keys() {
         Arc::clone(&registry),
     );
     parent_config.session = None;
-    let parent =
-        AgentSession::new_with_plugins(parent_config, vec![Arc::new(GammaProviderPlugin::new())]);
+    let parent = agent_at(
+        parent_config,
+        vec![Arc::new(GammaProviderPlugin::new())],
+        agent_dir.path(),
+    );
     parent.sync_plugin_providers_for_test().await;
     assert!(
         parent.extension_api_key_installed_for_test("gamma"),
@@ -1402,8 +1426,11 @@ async fn child_session_sharing_registry_installs_its_own_extension_api_keys() {
         Arc::clone(&registry),
     );
     child_config.session = None;
-    let child =
-        AgentSession::new_with_plugins(child_config, vec![Arc::new(GammaProviderPlugin::new())]);
+    let child = agent_at(
+        child_config,
+        vec![Arc::new(GammaProviderPlugin::new())],
+        agent_dir.path(),
+    );
     child.sync_plugin_providers_for_test().await;
 
     assert!(
@@ -1433,11 +1460,9 @@ async fn child_session_sharing_registry_installs_its_own_extension_api_keys() {
 /// its next `flow.login()` executes child2's JS callback; the runtime token
 /// also stays alive because `JsOAuthFlow` holds a strong `ExtensionHandle`.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
     let temp = TempDir::new("catalog-child-oauth");
     let agent_dir = TempDir::new("catalog-child-oauth-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1446,6 +1471,7 @@ async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
         parent_runtime.clone(),
         temp.path(),
         &temp.path().join("parent-sessions"),
+        agent_dir.path(),
     );
     parent
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1467,6 +1493,7 @@ async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
         child1_runtime.clone(),
         temp.path(),
         &temp.path().join("child1-sessions"),
+        agent_dir.path(),
     );
     child1
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1488,6 +1515,7 @@ async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
         child2_runtime.clone(),
         temp.path(),
         &temp.path().join("child2-sessions"),
+        agent_dir.path(),
     );
     child2
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1572,11 +1600,9 @@ async fn shared_registry_child_oauth_overlays_and_keys_are_session_bound() {
 /// dropping it runs the exact synchronous cleanup `Drop for
 /// ProviderSyncCleanupGuard` runs at child teardown.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn child_session_cleanup_restores_the_parent_shared_oauth_provider() {
     let temp = TempDir::new("catalog-child-cleanup");
     let agent_dir = TempDir::new("catalog-child-cleanup-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1585,6 +1611,7 @@ async fn child_session_cleanup_restores_the_parent_shared_oauth_provider() {
         parent_runtime.clone(),
         temp.path(),
         &temp.path().join("parent-sessions"),
+        agent_dir.path(),
     );
     parent
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1611,6 +1638,7 @@ async fn child_session_cleanup_restores_the_parent_shared_oauth_provider() {
         child_runtime.handle().clone(),
         temp.path(),
         &temp.path().join("child-sessions"),
+        agent_dir.path(),
     );
     child
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1681,11 +1709,9 @@ async fn child_session_cleanup_restores_the_parent_shared_oauth_provider() {
 /// SNAP6 P1-1: with no previous owner for the id, child teardown still has
 /// to delete the child-installed entry (restoring `None` == removal).
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn child_session_cleanup_removes_provider_without_previous_owner() {
     let temp = TempDir::new("catalog-child-cleanup-no-previous");
     let agent_dir = TempDir::new("catalog-child-cleanup-no-previous-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let child_runtime = start_oauth_runtime(&temp, "child").await;
@@ -1694,6 +1720,7 @@ async fn child_session_cleanup_removes_provider_without_previous_owner() {
         child_runtime.clone(),
         temp.path(),
         &temp.path().join("child-sessions"),
+        agent_dir.path(),
     );
     child
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1735,11 +1762,9 @@ async fn child_session_cleanup_removes_provider_without_previous_owner() {
 /// A strong `child_installed` handle is kept alive so the check exercises the
 /// `Arc::ptr_eq` mismatch, not just a dead `Weak`.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn child_session_cleanup_does_not_remove_parent_replacement() {
     let temp = TempDir::new("catalog-child-cleanup-overwrite");
     let agent_dir = TempDir::new("catalog-child-cleanup-overwrite-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1748,6 +1773,7 @@ async fn child_session_cleanup_does_not_remove_parent_replacement() {
         parent_runtime.clone(),
         temp.path(),
         &temp.path().join("parent-sessions"),
+        agent_dir.path(),
     );
     parent
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1760,6 +1786,7 @@ async fn child_session_cleanup_does_not_remove_parent_replacement() {
         child_runtime.clone(),
         temp.path(),
         &temp.path().join("child-sessions"),
+        agent_dir.path(),
     );
     child
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1806,11 +1833,9 @@ async fn child_session_cleanup_does_not_remove_parent_replacement() {
 /// A ends first and removes its stamp; B's teardown must walk past A's dead
 /// entry and remove the id when the parent never owned it.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn sibling_cleanup_skips_finished_sibling_and_removes_without_parent() {
     let temp = TempDir::new("catalog-sibling-cleanup-no-parent");
     let agent_dir = TempDir::new("catalog-sibling-cleanup-no-parent-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let sibling_a_runtime = start_oauth_runtime(&temp, "sibling-a").await;
@@ -1819,6 +1844,7 @@ async fn sibling_cleanup_skips_finished_sibling_and_removes_without_parent() {
         sibling_a_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-a-sessions"),
+        agent_dir.path(),
     );
     sibling_a
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1831,6 +1857,7 @@ async fn sibling_cleanup_skips_finished_sibling_and_removes_without_parent() {
         sibling_b_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-b-sessions"),
+        agent_dir.path(),
     );
     sibling_b
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1867,11 +1894,9 @@ async fn sibling_cleanup_skips_finished_sibling_and_removes_without_parent() {
 /// B's restore chain still contains A, but A's stamp is gone, so B must skip
 /// it and restore the parent provider.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
     let temp = TempDir::new("catalog-sibling-cleanup-parent");
     let agent_dir = TempDir::new("catalog-sibling-cleanup-parent-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1880,6 +1905,7 @@ async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
         parent_runtime.clone(),
         temp.path(),
         &temp.path().join("parent-sessions"),
+        agent_dir.path(),
     );
     parent
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1893,6 +1919,7 @@ async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
         sibling_a_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-a-sessions"),
+        agent_dir.path(),
     );
     sibling_a
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1905,6 +1932,7 @@ async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
         sibling_b_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-b-sessions"),
+        agent_dir.path(),
     );
     sibling_b
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1944,11 +1972,9 @@ async fn sibling_cleanup_restores_parent_after_earlier_sibling_finished() {
 /// SNAP7 P2-3 LIFO order: B ends first while A still runs, so B restores A's
 /// exact allocation; A then restores the parent.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
     let temp = TempDir::new("catalog-sibling-cleanup-lifo");
     let agent_dir = TempDir::new("catalog-sibling-cleanup-lifo-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let registry = test_registry();
 
     let parent_runtime = start_oauth_runtime(&temp, "parent").await;
@@ -1957,6 +1983,7 @@ async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
         parent_runtime.clone(),
         temp.path(),
         &temp.path().join("parent-sessions"),
+        agent_dir.path(),
     );
     parent
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1969,6 +1996,7 @@ async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
         sibling_a_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-a-sessions"),
+        agent_dir.path(),
     );
     sibling_a
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -1981,6 +2009,7 @@ async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
         sibling_b_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-b-sessions"),
+        agent_dir.path(),
     );
     sibling_b
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -2024,11 +2053,9 @@ async fn sibling_cleanup_lifo_restores_live_sibling_then_parent() {
 /// dynamic entry survives in the shared registry and the parent keeps
 /// resolving the child's dead wrapper.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn child_session_cleanup_after_definition_removal_still_removes_owned_provider() {
     let temp = TempDir::new("catalog-child-cleanup-defs-removed");
     let agent_dir = TempDir::new("catalog-child-cleanup-defs-removed-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
 
@@ -2039,7 +2066,7 @@ async fn child_session_cleanup_after_definition_removal_still_removes_owned_prov
         Arc::clone(&registry),
     );
     config.session = None;
-    let child = AgentSession::new_with_plugins(config, vec![Arc::new(plugin)]);
+    let child = agent_at(config, vec![Arc::new(plugin)], agent_dir.path());
 
     child.sync_plugin_providers_for_test().await;
     let installed = registered_provider(&registry, "toggle");
@@ -2074,11 +2101,9 @@ async fn child_session_cleanup_after_definition_removal_still_removes_owned_prov
 /// always-authenticated api-key auth keeps serving requests). Clearing the
 /// session stamp on every live pass makes the final plain sync rebuild.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn stream_simple_rollback_to_plain_reinstalls_the_plain_provider() {
     let temp = TempDir::new("catalog-stream-rollback");
     let agent_dir = TempDir::new("catalog-stream-rollback-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
     let handle = ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
@@ -2090,7 +2115,7 @@ async fn stream_simple_rollback_to_plain_reinstalls_the_plain_provider() {
     );
     config.extensions = Some(handle);
     let plugin = Arc::new(MutableStreamProviderPlugin::new());
-    let agent = AgentSession::new_with_plugins(config, vec![plugin.clone()]);
+    let agent = agent_at(config, vec![plugin.clone()], agent_dir.path());
 
     // Initial plain definition: a normal dynamic provider, and a stamp is
     // written.
@@ -2144,11 +2169,9 @@ async fn stream_simple_rollback_to_plain_reinstalls_the_plain_provider() {
 /// child must resolve its own, and a parallel sibling must resolve its own.
 /// The child's overlay disappears at teardown; the parent keeps working.
 #[tokio::test(flavor = "current_thread")]
-#[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
 async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows() {
     let temp = TempDir::new("catalog-provider-overlay-oauth");
     let agent_dir = TempDir::new("catalog-provider-overlay-oauth-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let auth_path = temp.path().join("auth.json");
     let mut base =
         ProviderRegistry::default().with_auth_storage(Arc::new(FileAuthStorage::new(auth_path)));
@@ -2162,6 +2185,7 @@ async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows(
         parent_runtime.clone(),
         temp.path(),
         &temp.path().join("parent-sessions"),
+        agent_dir.path(),
     );
     parent
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -2242,6 +2266,7 @@ async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows(
         child_runtime.handle().clone(),
         temp.path(),
         &temp.path().join("child-sessions"),
+        agent_dir.path(),
     );
     child
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -2412,6 +2437,7 @@ async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows(
         sibling_runtime.clone(),
         temp.path(),
         &temp.path().join("sibling-sessions"),
+        agent_dir.path(),
     );
     sibling
         .refresh_plugin_registry_and_sync_providers_for_test()
@@ -2506,7 +2532,6 @@ async fn session_provider_overlay_isolates_parent_child_and_sibling_oauth_flows(
 async fn single_session_plain_provider_keeps_registry_visibility() {
     let temp = TempDir::new("catalog-provider-overlay-plain");
     let agent_dir = TempDir::new("catalog-provider-overlay-plain-agent");
-    let _env = AgentDirOverride::new(agent_dir.path());
     let cwd = temp.path().to_string_lossy().into_owned();
     let registry = test_registry();
     let config = agent_config_with_registry(
@@ -2514,7 +2539,11 @@ async fn single_session_plain_provider_keeps_registry_visibility() {
         SessionManager::create(&cwd, temp.path()).expect("session"),
         Arc::clone(&registry),
     );
-    let agent = AgentSession::new_with_plugins(config, vec![Arc::new(GammaProviderPlugin::new())]);
+    let agent = agent_at(
+        config,
+        vec![Arc::new(GammaProviderPlugin::new())],
+        agent_dir.path(),
+    );
     agent.sync_plugin_providers_for_test().await;
 
     let key = agent.provider_session_key_for_test();
@@ -2546,6 +2575,7 @@ async fn single_session_plain_provider_keeps_registry_visibility() {
 #[tokio::test(flavor = "current_thread")]
 async fn snapshot_push_with_prebuilt_projection_reuses_it() {
     let temp = TempDir::new("prebuilt-projection");
+    let agent_dir = TempDir::new("prebuilt-projection-agent");
     let cwd = temp.path().to_string_lossy().into_owned();
     let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
     manager
@@ -2558,7 +2588,7 @@ async fn snapshot_push_with_prebuilt_projection_reuses_it() {
     let handle = ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
     let mut config = agent_config(temp.path(), manager);
     config.extensions = Some(handle.clone());
-    let agent = AgentSession::new_with_plugins(config, Vec::new());
+    let agent = agent_at(config, Vec::new(), agent_dir.path());
 
     let session = agent.session_manager().expect("persisted session");
     let projection = session
@@ -2639,11 +2669,10 @@ mod fragment_cache_tests {
     /// fragment set (zero full builds after the first), and the pushed
     /// projection stays consistent with the live projection.
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn append_pushes_extend_the_cached_fragments_and_stay_byte_equal() {
-        let _serial = env_lock();
         reset_fragment_cache_stats_for_test();
         let temp = TempDir::new("frag-extend");
+        let agent_dir = TempDir::new("frag-extend-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -2657,7 +2686,7 @@ mod fragment_cache_tests {
             ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
         let mut config = agent_config(temp.path(), manager);
         config.extensions = Some(handle.clone());
-        let agent = AgentSession::new_with_plugins(config, Vec::new());
+        let agent = agent_at(config, Vec::new(), agent_dir.path());
 
         let first = push_and_capture(&handle, &agent).await;
         let (builds_first, _extends_first, _cloned_first) = fragment_cache_stats_for_test();
@@ -2743,11 +2772,10 @@ mod fragment_cache_tests {
     /// label append — the label rewrites an existing node's rendered fields;
     /// covered by the tree cache unit test.)
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn label_append_extends_fragments_and_publishes_the_label() {
-        let _serial = env_lock();
         reset_fragment_cache_stats_for_test();
         let temp = TempDir::new("frag-label");
+        let agent_dir = TempDir::new("frag-label-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -2761,7 +2789,7 @@ mod fragment_cache_tests {
             ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
         let mut config = agent_config(temp.path(), manager);
         config.extensions = Some(handle.clone());
-        let agent = AgentSession::new_with_plugins(config, Vec::new());
+        let agent = agent_at(config, Vec::new(), agent_dir.path());
 
         let _first = push_and_capture(&handle, &agent).await;
         let (builds_first, _extends, _cloned) = fragment_cache_stats_for_test();
@@ -2823,11 +2851,10 @@ mod fragment_cache_tests {
     /// the fragment set — extending would splice the wrong views at the wrong
     /// positions.
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn branch_falls_back_to_a_full_fragment_build() {
-        let _serial = env_lock();
         reset_fragment_cache_stats_for_test();
         let temp = TempDir::new("frag-branch");
+        let agent_dir = TempDir::new("frag-branch-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -2841,7 +2868,7 @@ mod fragment_cache_tests {
             ExtensionHandle::start(extension_config(temp.path())).expect("extension handle");
         let mut config = agent_config(temp.path(), manager);
         config.extensions = Some(handle.clone());
-        let agent = AgentSession::new_with_plugins(config, Vec::new());
+        let agent = agent_at(config, Vec::new(), agent_dir.path());
 
         let _first = push_and_capture(&handle, &agent).await;
         let (builds_first, _extends, _cloned) = fragment_cache_stats_for_test();
@@ -2945,7 +2972,7 @@ mod branch_text_cache_tests {
             .last()
             .expect("a recorded snapshot")
             .branch_json
-            .clone()
+            .to_string()
     }
 
     /// One push that must rebuild, then: the recorded `branch_json` equals the
@@ -2980,11 +3007,10 @@ mod branch_text_cache_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn branch_text_extends_on_appends_and_falls_back_on_structure_changes() {
-        let _serial = env_lock();
         reset_branch_text_cache_stats_for_test();
         let temp = TempDir::new("branch-text");
+        let agent_dir = TempDir::new("branch-text-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -3000,7 +3026,7 @@ mod branch_text_cache_tests {
         let mut config = agent_config(temp.path(), manager);
         config.extensions = Some(handle.clone());
         let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-        let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+        let agent = agent_at(config, vec![recorder], agent_dir.path());
 
         // (a) First push: full render.
         let first = push_and_check(&agent, &pushes, &handle, "first push").await;
@@ -3170,10 +3196,9 @@ mod branch_text_cache_tests {
     /// storage generation, so a same-path reload (bumped by build_index)
     /// refuses the splice and full-renders. This pin stays green.
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn branch_text_same_path_reload_serves_stale_bytes() {
-        let _serial = env_lock();
         let temp = TempDir::new("branch-reload");
+        let agent_dir = TempDir::new("branch-reload-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -3193,7 +3218,7 @@ mod branch_text_cache_tests {
         let mut config = agent_config(temp.path(), manager);
         config.extensions = Some(handle.clone());
         let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-        let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+        let agent = agent_at(config, vec![recorder], agent_dir.path());
 
         // (a) First push caches the branch text for [user, assistant].
         assert!(
@@ -3285,10 +3310,9 @@ mod branch_text_cache_tests {
     /// reply is unparsable. Expected to FAIL until the caller/extender also
     /// refuses to splice from an EMPTY rendered aggregate.
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn zero_message_cached_projection_splice_emits_invalid_json() {
-        let _serial = env_lock();
         let temp = TempDir::new("empty-aggregate");
+        let agent_dir = TempDir::new("empty-aggregate-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -3301,7 +3325,7 @@ mod branch_text_cache_tests {
         let mut config = agent_config(temp.path(), manager);
         config.extensions = Some(handle.clone());
         let recorder: Arc<dyn AgentPlugin> = Arc::new(recorder);
-        let agent = AgentSession::new_with_plugins(config, vec![recorder]);
+        let agent = agent_at(config, vec![recorder], agent_dir.path());
         let session = agent.session_manager().expect("persisted session");
 
         let last_projection = |pushes: &Arc<Mutex<Vec<SessionContextSnapshot>>>| {
@@ -3381,10 +3405,9 @@ mod native_snapshot_shape_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[allow(clippy::await_holding_lock)] // the env lock must span the runtime awaits
     async fn native_only_push_skips_the_js_only_views_but_keeps_entries() {
-        let _serial = env_lock();
         let temp = TempDir::new("native-js-gate");
+        let agent_dir = TempDir::new("native-js-gate-agent");
         let cwd = temp.path().to_string_lossy().into_owned();
         let mut manager = SessionManager::create(&cwd, temp.path()).expect("session");
         manager
@@ -3396,7 +3419,7 @@ mod native_snapshot_shape_tests {
 
         let (recorder, pushes) = SnapshotRecorder::new();
         let config = agent_config(temp.path(), manager);
-        let agent = AgentSession::new_with_plugins(config, vec![Arc::new(recorder)]);
+        let agent = agent_at(config, vec![Arc::new(recorder)], agent_dir.path());
         native_push(&pushes, &agent).await;
 
         let snapshot = pushes

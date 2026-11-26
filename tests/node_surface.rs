@@ -17,6 +17,8 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -262,8 +264,9 @@ export default (pi: any) => {
 
 #[tokio::test(flavor = "current_thread")]
 async fn node_surface_name_lock() {
-    let dir = std::env::temp_dir().join("pir-node-surface-lock");
-    let _ = std::fs::remove_dir_all(&dir);
+    // Unique per run: these tests remove-then-create the directory, so a shared
+    // literal name would let a parallel or previous run delete a live fixture.
+    let dir = crate::common::unique_temp_path("node-surface-lock");
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let rt = ExtensionRuntime::new(test_config_at(&dir))
         .await
@@ -370,8 +373,7 @@ export default (pi: any) => {
 
 #[tokio::test(flavor = "current_thread")]
 async fn vm_sandbox_semantics() {
-    let dir = std::env::temp_dir().join("pir-vm-behavior");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::common::unique_temp_path("vm-behavior");
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let rt = ExtensionRuntime::new(test_config_at(&dir))
         .await
@@ -679,8 +681,7 @@ export default (pi: any) => {
 
 #[tokio::test(flavor = "current_thread")]
 async fn path_os_parity() {
-    let dir = std::env::temp_dir().join("pir-path-os-parity");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::common::unique_temp_path("path-os-parity");
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let rt = ExtensionRuntime::new(test_config_at(&dir))
         .await
@@ -1186,8 +1187,7 @@ export default (pi: any) => {
 
 #[tokio::test(flavor = "current_thread")]
 async fn fs_parity() {
-    let dir = std::env::temp_dir().join("pir-fs-parity");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::common::unique_temp_path("fs-parity");
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let rt = ExtensionRuntime::new(test_config_at(&dir))
         .await

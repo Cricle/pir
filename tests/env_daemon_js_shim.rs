@@ -24,7 +24,7 @@ use pir::extensions::{ExtensionConfig, ExtensionRuntime};
 use serde_json::{json, Value};
 
 /// The shim under test, included as source so the fixture copy is byte-identical.
-const SHIM: &str = include_str!("../src/extensions/api/js/pi_env_shim.js.txt");
+const SHIM: &str = include_str!("../crates/pir-core/src/extensions/api/js/pi_env_shim.js.txt");
 
 /// The fixture extension: registers one tool that drives the env client and
 /// reports everything it saw as JSON.
@@ -151,6 +151,8 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: "You are a test.".to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

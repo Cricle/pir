@@ -194,6 +194,7 @@ fn session_config(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -1648,6 +1649,8 @@ fn extension_config(cwd: &std::path::Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -1900,7 +1903,8 @@ async fn mcp_servers_change_emits_once_per_registry_change() {
     let temp = TempDir::new("mcp-per-change");
     // Keep the global mcp.json away from the fixture: two extension
     // registrations at host build must be the only changes.
-    let _agent_dir = crate::common::AgentDirEnvGuard::scratch("hooks-w20-mcp", None).await;
+    // Every construction below takes its own agent dir (the fixture temp dir),
+    // so no process pin and no lock.
     let extension_path = temp.0.join("mcp_two_servers.ts");
     std::fs::write(
         &extension_path,
@@ -1931,12 +1935,13 @@ async fn mcp_servers_change_emits_once_per_registry_change() {
     assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
 
     let (recorder, events) = Recorder::for_events(&["mcp_servers_change"]);
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(handle.clone()),
         vec![
             Arc::new(McpPlugin::with_cwd(&temp.0, &temp.0)) as Arc<dyn AgentPlugin>,
             recorder as Arc<dyn AgentPlugin>,
         ],
+        Some(&temp.0),
     );
 
     // The two registrations queued at host build each flush as their own

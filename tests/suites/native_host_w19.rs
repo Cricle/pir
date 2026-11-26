@@ -344,6 +344,7 @@ fn session_config(
         event_stream: None,
         extensions,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -378,6 +379,8 @@ fn ui_handle(temp: &TempDir, has_ui: bool) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
 }
 

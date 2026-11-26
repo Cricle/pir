@@ -221,6 +221,7 @@ fn tool_context(cwd: &Path, registry: Arc<ProviderRegistry>) -> ToolContext {
         signal: None,
         nested: None,
         session_env: Some(Arc::new(ToolSessionEnv {
+            performance: pir::config::settings::PerformanceSettings::default(),
             live_model: None,
             live_thinking: None,
             read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -243,6 +244,7 @@ fn tool_context(cwd: &Path, registry: Arc<ProviderRegistry>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 

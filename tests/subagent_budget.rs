@@ -23,9 +23,11 @@ use pir::ai::auth::ApiKeyAuth;
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::*;
+use pir::config::settings::{PerformanceProfile, PerformanceSettings};
 use pir::plugins::subagent::{
     active_child_runtime_slots, SubagentBudget, SubagentTool, DEFAULT_SUBAGENT_MAX_TURNS,
-    DEFAULT_SUBAGENT_WALL_CLOCK_MS, SUBAGENT_MAX_TURNS_ENV, SUBAGENT_WALL_CLOCK_ENV,
+    DEFAULT_SUBAGENT_WALL_CLOCK_MS, SUBAGENT_MAX_TOTAL_TOKENS_ENV, SUBAGENT_MAX_TURNS_ENV,
+    SUBAGENT_WALL_CLOCK_ENV,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,7 +247,22 @@ fn session_env(
     user_agents_dir: PathBuf,
     tools: ToolRegistry,
 ) -> Arc<ToolSessionEnv> {
+    session_env_with_performance(
+        registry,
+        user_agents_dir,
+        tools,
+        PerformanceSettings::default(),
+    )
+}
+
+fn session_env_with_performance(
+    registry: Arc<ProviderRegistry>,
+    user_agents_dir: PathBuf,
+    tools: ToolRegistry,
+    performance: PerformanceSettings,
+) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        performance,
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -276,6 +293,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -288,6 +306,7 @@ fn budget_defaults_and_env_overrides() {
     let defaults = SubagentBudget::from_lookup(|_| None);
     assert_eq!(defaults.max_turns, DEFAULT_SUBAGENT_MAX_TURNS);
     assert_eq!(defaults.max_turns, 1_000);
+    assert_eq!(defaults.max_total_tokens, 0);
     assert_eq!(
         defaults.wall_clock,
         Some(Duration::from_millis(DEFAULT_SUBAGENT_WALL_CLOCK_MS))
@@ -295,10 +314,12 @@ fn budget_defaults_and_env_overrides() {
 
     let overridden = SubagentBudget::from_lookup(|name| match name {
         SUBAGENT_MAX_TURNS_ENV => Some("7".to_owned()),
+        SUBAGENT_MAX_TOTAL_TOKENS_ENV => Some("1234".to_owned()),
         SUBAGENT_WALL_CLOCK_ENV => Some("1500".to_owned()),
         _ => None,
     });
     assert_eq!(overridden.max_turns, 7);
+    assert_eq!(overridden.max_total_tokens, 1_234);
     assert_eq!(overridden.wall_clock, Some(Duration::from_millis(1_500)));
 
     // `0` restores the pre-C1-03 unlimited semantics for both knobs.
@@ -307,14 +328,46 @@ fn budget_defaults_and_env_overrides() {
         _ => None,
     });
     assert_eq!(unlimited.max_turns, usize::MAX);
+    assert_eq!(unlimited.max_total_tokens, 0);
     assert_eq!(unlimited.wall_clock, None);
 
     // Junk/negative values keep the safe defaults.
     let junk = SubagentBudget::from_lookup(|name| match name {
-        SUBAGENT_MAX_TURNS_ENV | SUBAGENT_WALL_CLOCK_ENV => Some("not-a-number".to_owned()),
+        SUBAGENT_MAX_TURNS_ENV | SUBAGENT_WALL_CLOCK_ENV | SUBAGENT_MAX_TOTAL_TOKENS_ENV => {
+            Some("not-a-number".to_owned())
+        }
         _ => None,
     });
     assert_eq!(junk, defaults);
+}
+
+#[test]
+fn performance_settings_drive_subagent_budgets_and_env_still_wins() {
+    let efficient = PerformanceSettings {
+        profile: Some(PerformanceProfile::Efficient),
+        ..Default::default()
+    };
+    let resolved = SubagentBudget::resolve(&efficient, |_| None);
+    assert_eq!(resolved.max_turns, 100);
+    assert_eq!(resolved.max_total_tokens, 100_000);
+
+    let settings_only = PerformanceSettings {
+        subagent_max_turns: Some(12),
+        subagent_max_total_tokens: Some(3_000),
+        ..Default::default()
+    };
+    let resolved = SubagentBudget::resolve(&settings_only, |_| None);
+    assert_eq!(resolved.max_turns, 12);
+    assert_eq!(resolved.max_total_tokens, 3_000);
+
+    // Explicit environment values keep precedence over settings.
+    let resolved = SubagentBudget::resolve(&settings_only, |name| match name {
+        SUBAGENT_MAX_TURNS_ENV => Some("4".to_owned()),
+        SUBAGENT_MAX_TOTAL_TOKENS_ENV => Some("500".to_owned()),
+        _ => None,
+    });
+    assert_eq!(resolved.max_turns, 4);
+    assert_eq!(resolved.max_total_tokens, 500);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +401,7 @@ async fn turn_cap_stops_a_runaway_child() {
 
     let tool = SubagentTool::default().with_budget(SubagentBudget {
         max_turns: 3,
+        max_total_tokens: 0,
         wall_clock: None,
         abort_grace: Duration::from_millis(100),
     });
@@ -376,7 +430,112 @@ async fn turn_cap_stops_a_runaway_child() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Wall-clock budget
+// 3. Token budget
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn token_budget_stops_a_child_after_its_first_response() {
+    let temp = TempDir::new("token-cap");
+    temp.write_agent(
+        "writer.md",
+        "name: writer\ndescription: answers\n",
+        "answer",
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_provider = Arc::clone(&calls);
+    let registry = fake_registry(
+        Arc::new(move |_| {
+            calls_for_provider.fetch_add(1, Ordering::SeqCst);
+            // The fake assistant spends 10 input + 5 output tokens per turn.
+            assistant(vec![text("done")], StopReason::Stop)
+        }),
+        false,
+    );
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    let env = session_env(registry, temp.0.join("agents"), tools);
+    let ctx = tool_context(&temp.0, env);
+
+    let tool = SubagentTool::default().with_budget(SubagentBudget {
+        max_turns: 100,
+        max_total_tokens: 10,
+        wall_clock: None,
+        abort_grace: Duration::from_millis(100),
+    });
+    let result = tool
+        .run(
+            &serde_json::json!({ "agent": "writer", "task": "answer" }),
+            &ctx,
+        )
+        .await;
+
+    assert!(
+        result.is_error,
+        "expected an error, got: {}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("Subagent token budget exceeded (10 tokens)"),
+        "token-budget error missing: {}",
+        result.content
+    );
+    // The loop spends one response, sees 10 + 5 >= 10, and stops before a
+    // second provider request.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn session_performance_settings_bound_the_child_without_an_explicit_budget() {
+    let temp = TempDir::new("settings-token-cap");
+    temp.write_agent(
+        "writer.md",
+        "name: writer\ndescription: answers\n",
+        "answer",
+    );
+    let registry = fake_registry(
+        Arc::new(|_| assistant(vec![text("done")], StopReason::Stop)),
+        false,
+    );
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+    // No `.with_budget(..)`: the tool must read the session's effective
+    // performance settings, which is the path a settings.json file takes.
+    let env = session_env_with_performance(
+        registry,
+        temp.0.join("agents"),
+        tools,
+        PerformanceSettings {
+            subagent_max_total_tokens: Some(10),
+            ..Default::default()
+        },
+    );
+    let ctx = tool_context(&temp.0, env);
+
+    let result = SubagentTool::default()
+        .run(
+            &serde_json::json!({ "agent": "writer", "task": "answer" }),
+            &ctx,
+        )
+        .await;
+
+    assert!(
+        result.is_error,
+        "expected an error, got: {}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("Subagent token budget exceeded (10 tokens)"),
+        "settings-driven token-budget error missing: {}",
+        result.content
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Wall-clock budget
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -394,6 +553,7 @@ async fn wall_clock_budget_stops_a_hung_child() {
 
     let tool = SubagentTool::default().with_budget(SubagentBudget {
         max_turns: 1_000,
+        max_total_tokens: 0,
         wall_clock: Some(Duration::from_millis(50)),
         abort_grace: Duration::from_millis(50),
     });
@@ -425,7 +585,7 @@ async fn wall_clock_budget_stops_a_hung_child() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Outer cancellation aborts parallel children and releases runtime slots
+// 5. Outer cancellation aborts parallel children and releases runtime slots
 // ---------------------------------------------------------------------------
 
 static RUNTIME_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -446,6 +606,8 @@ fn plan_only_parent() -> pir::extensions::ExtensionHandle {
             system_prompt: String::new(),
             is_idle: true,
             limits: Some(Default::default()),
+            allow_process_exit: false,
+            agent_dir: None,
         });
     handle.set_path_plan(vec![PathBuf::from("builtin:subagent")]);
     handle
@@ -490,6 +652,7 @@ async fn outer_cancel_aborts_parallel_children_and_releases_runtime_slots() {
 
     let tool = SubagentTool::with_extensions(Some(parent)).with_budget(SubagentBudget {
         max_turns: usize::MAX,
+        max_total_tokens: 0,
         wall_clock: None,
         abort_grace: Duration::from_millis(100),
     });

@@ -59,6 +59,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        ..ExtensionConfig::default()
     }
 }
 
@@ -322,6 +323,7 @@ async fn extension_tool_registered_in_session_start_is_callable() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("go", no_events()).await.expect("prompt");
@@ -392,6 +394,7 @@ async fn ctx_shutdown_requests_a_host_exit_without_aborting_the_run() {
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("go", no_events()).await.expect("prompt");
@@ -502,6 +505,7 @@ async fn tool_call_handler_blocks_bash_before_execution() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("go", no_events()).await.expect("prompt");
@@ -571,6 +575,7 @@ async fn input_handler_transform_replaces_prompt_text() {
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     });
 
     agent.prompt("hello", no_events()).await.expect("prompt");
@@ -669,6 +674,7 @@ async fn tool_call_handler_rewrites_tool_input() {
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     });
 
     agent.prompt("go", no_events()).await.expect("prompt");
@@ -806,7 +812,7 @@ mod shim_deflate {
         ),
         (
             "fs_shim.js.txt",
-            "7ed3ab742e8be11497d06f952b3757850573f770ba7d36944f5bbe9f420552ab",
+            "1ab592fa56956c308b484a08d6227629679559e0e421b68c218a91dd48a9e26a",
         ),
         (
             "http2_shim.js.txt",
@@ -972,7 +978,7 @@ mod shim_deflate {
             // AOT-MODULE: the prelude now executes as an ES module, so the
             // timer registry/sequence it shares with `process_global_stub`
             // are published on `globalThis`.
-            "d9e92d365a2ce76eb1641db54ff1d89134534b658ab94b8eaf0742e387ef223b",
+            "df149d78a1be7efa472f783e68c38de7a2d19d5d624e0672b60f4c2fc0bc1930",
         ),
         (
             "process_global_stub.js.txt",
@@ -1167,7 +1173,7 @@ mod shim_deflate {
                 "{name}: decompressed bytes drifted from the pre-deflate source"
             );
 
-            let disk = std::fs::read(format!("src/extensions/api/js/{name}"))
+            let disk = std::fs::read(format!("crates/pir-core/src/extensions/api/js/{name}"))
                 .unwrap_or_else(|error| panic!("{name}: cannot read source: {error}"));
             // The blobs are generated from canonical LF bytes (see
             // scripts/gen_shims_deflate.py); a Windows checkout with
@@ -1204,8 +1210,9 @@ mod shim_deflate {
         use pir::extensions::api::bytecode;
         use std::collections::BTreeMap;
 
-        let manifest_text = std::fs::read_to_string("assets/bytecode/virtual-manifest.txt")
-            .expect("read virtual manifest");
+        let manifest_text =
+            std::fs::read_to_string("crates/pir-core/assets/bytecode/virtual-manifest.txt")
+                .expect("read virtual manifest");
         let manifest: BTreeMap<&str, &str> = manifest_text
             .lines()
             .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
@@ -1271,7 +1278,8 @@ mod shim_deflate {
             payload.len() * 2 < pir::extensions::api::HOST_PRELUDE.source().len(),
             "prelude bytecode should be materially smaller than its source"
         );
-        let manifest = std::fs::read_to_string("assets/bytecode/manifest.txt").expect("manifest");
+        let manifest = std::fs::read_to_string("crates/pir-core/assets/bytecode/manifest.txt")
+            .expect("manifest");
         let expected = manifest
             .lines()
             .filter(|line| !line.starts_with('#'))
@@ -1364,7 +1372,9 @@ mod shim_deflate {
         assert_eq!(embedded.len(), 90, "embedded shim count");
 
         let mut sources: BTreeSet<String> = BTreeSet::new();
-        for entry in std::fs::read_dir("src/extensions/api/js").expect("read shim source dir") {
+        for entry in std::fs::read_dir("crates/pir-core/src/extensions/api/js")
+            .expect("read shim source dir")
+        {
             let path = entry.expect("shim source dir entry").path();
             let name = path
                 .file_name()
@@ -1400,7 +1410,8 @@ mod shim_deflate {
         }
 
         let mut blob_sources: BTreeSet<String> = BTreeSet::new();
-        for entry in std::fs::read_dir("assets/shims").expect("read shim blob dir") {
+        for entry in std::fs::read_dir("crates/pir-core/assets/shims").expect("read shim blob dir")
+        {
             let path = entry.expect("shim blob dir entry").path();
             let name = path
                 .file_name()
@@ -1479,9 +1490,16 @@ mod shim_deflate {
             .unwrap_or_else(|_| vec!["prelude.js.txt".to_owned()]);
         for name in &names {
             let name = name.as_str();
-            let source_path = format!("src/extensions/api/js/{name}");
+            let source_path = format!("crates/pir-core/src/extensions/api/js/{name}");
             let source = std::fs::read(&source_path)
                 .unwrap_or_else(|error| panic!("{source_path}: {error}"));
+            // Canonical bytes are LF regardless of the checkout's
+            // core.autocrlf/eol setting, exactly like
+            // `scripts/gen_shims_deflate.py`. Without this a Windows checkout
+            // would write CRLF blobs that fail the byte-exact gate on Linux CI.
+            let source = String::from_utf8_lossy(&source)
+                .replace("\r\n", "\n")
+                .into_bytes();
             let mut encoder =
                 flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
             encoder
@@ -1490,7 +1508,7 @@ mod shim_deflate {
             let blob = encoder
                 .finish()
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let out = format!("assets/shims/{name}.deflate");
+            let out = format!("crates/pir-core/assets/shims/{name}.deflate");
             std::fs::write(&out, &blob).unwrap_or_else(|error| panic!("{out}: {error}"));
             eprintln!("[regen] {out}: {} -> {} bytes", source.len(), blob.len());
         }

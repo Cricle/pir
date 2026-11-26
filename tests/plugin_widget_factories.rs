@@ -169,6 +169,7 @@ fn build_session(
             event_stream: None,
             extensions,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin as Arc<dyn AgentPlugin>],
     )
@@ -186,6 +187,8 @@ fn plan_only_handle(cwd: &Path) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
 }
 
@@ -720,6 +723,8 @@ fn start_handle(dir: &Path) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start")
 }

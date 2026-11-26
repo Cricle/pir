@@ -316,6 +316,7 @@ fn session_config(cwd: &Path) -> AgentSessionConfig {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -442,6 +443,7 @@ async fn running_abort_refuses_the_native_service_tool_call() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin.clone() as Arc<dyn AgentPlugin>],
     );

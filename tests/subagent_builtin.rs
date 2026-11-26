@@ -405,6 +405,7 @@ fn env_with(
     project_trusted: bool,
 ) -> Arc<ToolSessionEnv> {
     Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -435,6 +436,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>, signal: Option<AbortSignal
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -569,6 +571,52 @@ fn builtin_agents_are_offered_only_when_no_agent_files_exist() {
 }
 
 #[test]
+fn builtin_reviewer_states_the_json_verdict_contract() {
+    let empty = TempDir::new("reviewer-contract");
+    let user_dir = empty.0.join("user-agents");
+    let builtins = discover_agents(&empty.0, AgentScope::User, &user_dir);
+    let reviewer = builtins
+        .agents
+        .iter()
+        .find(|agent| agent.name == "reviewer")
+        .expect("the shipped agents include the reviewer");
+
+    // The foreman gate machine-reads the first line, so the shipped prompt
+    // must spell out the exact JSON contract instead of leaving the reviewer
+    // to invent its own format.
+    assert!(
+        reviewer.system_prompt.contains(
+            r#"{"verdict":"PASS"|"FAIL","visual":"verified"|"not_checked","evidence":"one sentence"}"#
+        ),
+        "reviewer.md must document the JSON verdict line: {}",
+        reviewer.system_prompt
+    );
+    assert!(
+        reviewer
+            .system_prompt
+            .contains("`visual` is `verified` only"),
+        "reviewer.md must define when visual=verified is allowed"
+    );
+    let prompt = &reviewer.system_prompt;
+    for requirement in [
+        "first execution cycle",
+        "first scheduled callback after loading the page",
+        "menu or idle frame before user input",
+        "worker claims do not substitute for execution",
+        "return FAIL and explain why",
+        "runtime command, its result, and the behavior you",
+        "task's authorized build, test, and smoke commands",
+        "not itself authorization",
+        "Do NOT modify",
+    ] {
+        assert!(
+            prompt.contains(requirement),
+            "reviewer.md must state {requirement:?}"
+        );
+    }
+}
+
+#[test]
 fn project_agents_dir_walks_up_to_nearest() {
     let temp = TempDir::new("walkup");
     temp.write_project_agent("a.md", "name: a\ndescription: d\n", "b");
@@ -652,6 +700,83 @@ fn aggregate_parallel_text_formats_status_blocks() {
 }
 
 #[test]
+fn retained_result_transcript_is_bounded_and_keeps_final_output() {
+    let long_text = "y".repeat(20_000);
+    let huge_content = "x".repeat(40_000);
+    let mut result = SingleResult::placeholder("worker", "task");
+    result.pending = false;
+    result.stop_reason = Some("stop".into());
+    let mut messages = vec![Message::System(UserMessage {
+        role: UserRole::System,
+        content: vec![text(&long_text)],
+        tools_added: None,
+        tools_removed: None,
+        sections: None,
+        timestamp: 0,
+    })];
+    for step in 0..6 {
+        messages.push(Message::Assistant(assistant(
+            vec![
+                text(&long_text),
+                tool_call_block(
+                    &format!("call-{step}"),
+                    "write",
+                    serde_json::json!({"path": "out.txt", "content": huge_content}),
+                ),
+            ],
+            StopReason::ToolUse,
+        )));
+    }
+    messages.push(Message::Assistant(assistant(
+        vec![text("FINAL ANSWER")],
+        StopReason::Stop,
+    )));
+    let original_len = messages.len();
+    result.messages = messages;
+
+    let json = result.to_json();
+    let retained = json["messages"].as_array().expect("messages array");
+    // The system prompt is not transcript; the oldest turns are dropped
+    // first and the final answer is never dropped.
+    assert_eq!(json["messagesTruncated"], true);
+    assert!(json["messagesOmitted"].as_u64().expect("omitted count") >= 1);
+    assert!(retained.len() < original_len);
+    assert_eq!(retained.last().unwrap()["role"], "assistant");
+    assert_eq!(
+        retained.last().unwrap()["content"][0]["text"],
+        "FINAL ANSWER"
+    );
+    for message in retained {
+        for block in message["content"].as_array().expect("content array") {
+            if let Some(text) = block["text"].as_str() {
+                assert!(
+                    text.chars().count() <= 8 * 1024 + 64,
+                    "text block still {} chars",
+                    text.chars().count()
+                );
+            }
+            if let Some(arguments) = block.get("arguments") {
+                assert!(
+                    arguments.to_string().len() <= 9 * 1024,
+                    "tool-call arguments still {} bytes",
+                    arguments.to_string().len()
+                );
+            }
+        }
+    }
+    let serialized = serde_json::to_string(retained).unwrap();
+    assert!(
+        serialized.len() <= 50 * 1024 + 2,
+        "retained transcript is {} bytes",
+        serialized.len()
+    );
+    // The typed transcript is untouched: chain `{previous}` and the
+    // model-facing output still see every message.
+    assert_eq!(result.messages.len(), original_len);
+    assert_eq!(result_output(&result), "FINAL ANSWER");
+}
+
+#[test]
 fn failure_detection_and_output_precedence() {
     use pir::plugins::subagent::SingleResult;
     let mut result = SingleResult::placeholder("a", "t");
@@ -679,6 +804,14 @@ fn failure_detection_and_output_precedence() {
     // "(no output)" last.
     result.messages = Vec::new();
     assert_eq!(result_output(&result), "(no output)");
+
+    // `length` is a truncated run, not a success: the model-facing text must
+    // explain the truncation even when the provider supplied no error text.
+    result.error_message = None;
+    result.stop_reason = Some("length".into());
+    assert!(is_failed(&result));
+    result.error_message = Some("truncated at max output tokens".into());
+    assert_eq!(result_output(&result), "truncated at max output tokens");
 }
 
 #[test]
@@ -893,10 +1026,18 @@ async fn bare_workspace_child_still_gets_the_default_preamble() {
     // to the agent body alone.
     let temp = TempDir::new("bare-sysprompt");
     // The skill scan also reads `~/.agents/skills` (home-anchored, NOT gated
-    // by the agent dir), so point `HOME` at an empty dir for this test —
+    // by the agent dir), so this test points `HOME` at an empty dir —
     // otherwise a developer machine's global skills make the workspace
-    // non-bare and the body-only arm below is never exercised. Restored on
-    // drop so the other tests keep their ambient environment.
+    // non-bare and the body-only arm below is never exercised.
+    //
+    // `HOME` is a PROCESS-level input, so under plain `cargo test` (one
+    // process, parallel threads) it would leak into every sibling suite. It
+    // therefore runs only when a process-per-test runner drives the binary
+    // (nextest: CI and the pre-push gate) or the operator opts in, exactly
+    // like `bash_eviction_utf8`'s temp-directory fixture.
+    if crate::common::skip_without_nextest_home("subagent_builtin::bare_workspace_child_prompt") {
+        return;
+    }
     struct HomeGuard(Option<std::ffi::OsString>);
     impl Drop for HomeGuard {
         fn drop(&mut self) {
@@ -927,6 +1068,7 @@ async fn bare_workspace_child_still_gets_the_default_preamble() {
     // `agent_dir` points at the same (otherwise empty) temp dir so the
     // prompt's global skill/context discovery finds nothing either.
     let env = Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1034,6 +1176,7 @@ async fn agent_with_own_model_uses_the_default_thinking_level() {
     registry.set_provider(Arc::clone(&provider) as Arc<dyn Provider>);
     // Dispatch (parent) thinking level: high.
     let env = Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1109,6 +1252,7 @@ async fn child_resolves_models_json_from_the_parent_agent_dir() {
         calls: AtomicUsize::new(0),
     }));
     let env = Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1169,6 +1313,7 @@ async fn child_inherits_only_matching_provider_credentials() {
     assert!(format!("{credential:?}").contains("[redacted]"));
     assert!(!format!("{credential:?}").contains("endpoint-scoped-key"));
     let env = Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1255,6 +1400,7 @@ async fn chain_live_updates_show_completed_plus_one_running_entry() {
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&updates);
     let env = Arc::new(ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1345,6 +1491,7 @@ async fn tool_allowlist_limits_child_registry() {
         assistant(vec![text(&content)], StopReason::Stop)
     }));
     let mut env = ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1432,6 +1579,7 @@ async fn parallel_mode_aggregates_and_emits_live_updates() {
     let updates: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let updates_for_env = updates.clone();
     let mut env = ToolSessionEnv {
+        performance: pir::config::settings::PerformanceSettings::default(),
         live_model: None,
         live_thinking: None,
         read_ledger: std::sync::Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -1665,8 +1813,12 @@ async fn trusted_project_skips_the_gate() {
     assert_eq!(result.content, "PROJECT_RAN");
 }
 
+/// `confirmProjectAgents` is model-controlled input, not a trust assertion:
+/// it can never open the gate. Untrusted project agents fail closed whatever
+/// the field says (the pre-hardening behavior let the model skip a human
+/// approval, which is exactly the trust bypass the gate exists to prevent).
 #[tokio::test]
-async fn confirm_project_agents_false_skips_the_gate() {
+async fn confirm_project_agents_false_cannot_open_the_gate() {
     let temp = TempDir::new("confirm-false");
     temp.write_project_agent("ok.md", "name: ok\ndescription: d\n", "b");
     let registry = fake_registry(Arc::new(|_, context| {
@@ -1676,7 +1828,7 @@ async fn confirm_project_agents_false_skips_the_gate() {
             assistant(vec![text("unused")], StopReason::Stop)
         }
     }));
-    let env = env_with(registry, Some(temp.0.join("agents")), true, false);
+    let env = env_with(registry, Some(temp.0.join("agents")), false, false);
     let ctx = tool_context(&temp.0, env, None);
     let result = run_tool(
         serde_json::json!({
@@ -1688,12 +1840,26 @@ async fn confirm_project_agents_false_skips_the_gate() {
         &ctx,
     )
     .await;
-    assert!(!result.is_error, "content: {}", result.content);
-    assert_eq!(result.content, "RAN");
+    // Fail closed: the run is refused with the trust prompt, never "RAN".
+    assert!(
+        result
+            .content
+            .contains("Project-local agents require approval"),
+        "content: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("RAN"),
+        "content: {}",
+        result.content
+    );
 }
 
+/// Headless hosts have no approval surface, so an untrusted project agent is
+/// refused rather than run. This is the same fail-closed rule as above: the
+/// gate is not "ask if you can", it is "no trust, no project agents".
 #[tokio::test]
-async fn headless_runs_skip_the_gate_like_upstream_print_mode() {
+async fn headless_runs_refuse_untrusted_project_agents() {
     let temp = TempDir::new("headless");
     temp.write_project_agent("ok.md", "name: ok\ndescription: d\n", "b");
     let registry = fake_registry(Arc::new(|_, context| {
@@ -1710,8 +1876,18 @@ async fn headless_runs_skip_the_gate_like_upstream_print_mode() {
         &ctx,
     )
     .await;
-    assert!(!result.is_error, "content: {}", result.content);
-    assert_eq!(result.content, "RAN");
+    assert!(
+        result
+            .content
+            .contains("Project-local agents require approval"),
+        "content: {}",
+        result.content
+    );
+    assert!(
+        !result.content.contains("RAN"),
+        "content: {}",
+        result.content
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1820,28 +1996,30 @@ fn subagent_runs_through_the_agent_loop_with_session_env() {
 
                 let mut tools = ToolRegistry::new();
                 tools.register(Arc::new(SubagentTool::default()));
-                // The loop-built session env resolves the user-agent directory from the
-                // process agent dir; point it at the fixture for this test. (The other
-                // tests in this binary inject the directory through the env struct and
-                // never read the process env, so this is race-free here.)
-                let previous_agent_dir = std::env::var("PIR_AGENT_DIR").ok();
-                std::env::set_var("PIR_AGENT_DIR", &temp.0);
-                let agent = Arc::new(AgentSession::new(AgentSessionConfig {
-                    performance: Default::default(),
-                    provider_registry: Arc::clone(&registry),
-                    model: fake_model(),
-                    api_key: None,
-                    thinking: ThinkingLevel::Off,
-                    tools,
-                    session: None,
-                    compaction: None,
-                    max_turns: 4,
-                    system_prompt: None,
-                    cwd: Some(temp.0.clone()),
-                    event_stream: None,
-                    extensions: None,
-                    tool_selection: None,
-                }));
+                // Explicit agent dir: the loop-built session env resolves the
+                // user-agent directory from THIS directory, so the fixture is
+                // an argument and the process environment stays untouched (no
+                // lock, and no sibling suite in the merged harness can see it).
+                let agent = Arc::new(AgentSession::new_with_agent_dir(
+                    AgentSessionConfig {
+                        performance: Default::default(),
+                        provider_registry: Arc::clone(&registry),
+                        model: fake_model(),
+                        api_key: None,
+                        thinking: ThinkingLevel::Off,
+                        tools,
+                        session: None,
+                        compaction: None,
+                        max_turns: 4,
+                        system_prompt: None,
+                        cwd: Some(temp.0.clone()),
+                        event_stream: None,
+                        extensions: None,
+                        tool_selection: None,
+                        phone_child: None,
+                    },
+                    &temp.0,
+                ));
 
                 let tool_results: Arc<Mutex<Vec<serde_json::Value>>> =
                     Arc::new(Mutex::new(Vec::new()));
@@ -1875,10 +2053,6 @@ fn subagent_runs_through_the_agent_loop_with_session_env() {
                     });
 
                 let terminal = agent.prompt("kick off", handler).await.expect("prompt");
-                match previous_agent_dir {
-                    Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-                    None => std::env::remove_var("PIR_AGENT_DIR"),
-                }
                 assert_eq!(
                     get_final_output(&[Message::Assistant(terminal)]).as_deref(),
                     Some("parent done")
@@ -1954,6 +2128,7 @@ fn session_env_propagates_the_explicit_credential_to_child_runs() {
                         event_stream: None,
                         extensions: None,
                         tool_selection: None,
+                        phone_child: None,
                     },
                     &temp.0,
                 ));
@@ -2093,6 +2268,8 @@ async fn child_executes_extension_tools_through_the_parent_handle() {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start");
     let load = handle.load(&[ext_path]).await.expect("load extension");
@@ -2335,6 +2512,7 @@ mod tool_search_isolation {
                     modifiers: Vec::new(),
                     uses_default_tools: false,
                 }),
+                phone_child: None,
             },
             vec![Arc::new(ToolSearchPlugin::new()) as Arc<dyn pir::plugins::plugin::AgentPlugin>],
         );
@@ -2359,6 +2537,8 @@ mod tool_search_isolation {
             system_prompt: String::new(),
             is_idle: true,
             limits: Some(Default::default()),
+            allow_process_exit: false,
+            agent_dir: None,
         })
         .expect("extension runtime");
         let load = handle
@@ -2368,6 +2548,7 @@ mod tool_search_isolation {
         assert!(load.errors.is_empty(), "{:?}", load.errors);
         handle.set_path_plan(vec![PathBuf::from("builtin:tool-search"), ext_path]);
         let env = Arc::new(ToolSessionEnv {
+            performance: pir::config::settings::PerformanceSettings::default(),
             live_model: None,
             live_thinking: None,
             read_ledger: Arc::new(pir::agent::read_ledger::ReadLedger::default()),
@@ -2717,6 +2898,7 @@ mod tool_search_isolation {
                     modifiers: Vec::new(),
                     uses_default_tools: false,
                 }),
+                phone_child: None,
             },
             vec![Arc::new(ToolSearchPlugin::new()) as Arc<dyn pir::plugins::plugin::AgentPlugin>],
         );
@@ -2738,6 +2920,8 @@ mod tool_search_isolation {
             system_prompt: String::new(),
             is_idle: true,
             limits: Some(Default::default()),
+            allow_process_exit: false,
+            agent_dir: None,
         })
         .expect("extension runtime");
         let load = handle
@@ -2747,6 +2931,7 @@ mod tool_search_isolation {
         assert!(load.errors.is_empty(), "{:?}", load.errors);
         handle.set_path_plan(vec![PathBuf::from("builtin:tool-search"), ext_path]);
         let env = Arc::new(ToolSessionEnv {
+            performance: pir::config::settings::PerformanceSettings::default(),
             live_model: None,
             live_thinking: None,
             read_ledger: Arc::new(pir::agent::read_ledger::ReadLedger::default()),

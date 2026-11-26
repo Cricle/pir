@@ -43,7 +43,7 @@ use pir::tui::theme::{theme_watch_timeout, ThemeWatcherPlan};
 /// emits the error notice AND the run-end signal; without the run-end signal
 /// the spinner armed by `submit_prompt` spins forever behind the notice — the
 /// play p01 screens show it still animating (`⠏` at one snapshot, `⠹` at the
-/// next) after `Error: No pi model configured…`.
+/// next) after `Error: No model selected…`.
 #[test]
 fn f2_worker_level_failure_ends_the_run_state() {
     assert_eq!(

@@ -1,0 +1,51 @@
+[package]
+name = "pir-builtins"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Aggregate catalog of the pir builtin plugin implementations (registration order, default-enable flags)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+pir-builtin-subagent = { path = "../pir-builtin-subagent", version = "0.3.2", optional = true }
+pir-builtin-mode = { path = "../pir-builtin-mode", version = "0.3.2", optional = true }
+pir-builtin-mcp = { path = "../pir-builtin-mcp", version = "0.3.2", optional = true }
+pir-builtin-codemode = { path = "../pir-builtin-codemode", version = "0.3.2", optional = true }
+pir-builtin-context-mode = { path = "../pir-builtin-context-mode", version = "0.3.2", optional = true }
+pir-builtin-tool-search = { path = "../pir-builtin-tool-search", version = "0.3.2", optional = true }
+pir-builtin-tool-repair = { path = "../pir-builtin-tool-repair", version = "0.3.2", optional = true }
+pir-builtin-todo = { path = "../pir-builtin-todo", version = "0.3.2", optional = true }
+pir-builtin-memory = { path = "../pir-builtin-memory", version = "0.3.2", optional = true }
+pir-builtin-phone = { path = "../pir-builtin-phone", version = "0.3.2", optional = true }
+
+[features]
+default = ["full"]
+subagent = ["dep:pir-builtin-subagent"]
+mode = ["dep:pir-builtin-mode"]
+mcp = ["dep:pir-builtin-mcp"]
+codemode = ["dep:pir-builtin-codemode"]
+context-mode = ["dep:pir-builtin-context-mode"]
+tool-search = ["dep:pir-builtin-tool-search"]
+tool-repair = ["dep:pir-builtin-tool-repair"]
+todo = ["dep:pir-builtin-todo"]
+memory = ["dep:pir-builtin-memory"]
+phone = ["dep:pir-builtin-phone"]
+full = [
+    "subagent",
+    "mode",
+    "mcp",
+    "codemode",
+    "context-mode",
+    "tool-search",
+    "tool-repair",
+    "todo",
+    "memory",
+    "phone",
+]

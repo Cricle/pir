@@ -82,6 +82,8 @@ Set-Location $root
 if (-not $env:CARGO_TARGET_DIR) {
     $env:CARGO_TARGET_DIR = (Join-Path $root "target-alt")
 }
+# -RetryFailed expands its target subset below; the full-build flag is computed
+# after that expansion so a failure-only rerun retains incremental iteration.
 # Deep in-process nesting (the subagent builtin runs a child agent loop on the
 # same stack chain) exceeds the 2 MiB default test-thread stack in debug
 # builds; libtest honors RUST_MIN_STACK for its thread spawns. 8 MiB gives
@@ -148,7 +150,11 @@ if ($RetryFailed) {
     $Tests = @($Tests + $prevFailed) | Sort-Object -Unique
 }
 
-# Resolve a cargo target name ("g_ai", "node_shims", "pir") to the newest
+$fullTestRun = ($Tests.Count -eq 0)
+if ($fullTestRun -and -not $NoBuild -and -not $List) {
+    $env:CARGO_INCREMENTAL = "0"
+    Write-Host "[test_fast] full test build: CARGO_INCREMENTAL=0 (subset runs keep incremental compilation)"
+}
 # matching test executable already present in the target dir. Used by
 # -NoBuild, where cargo is not asked to enumerate the artifacts.
 function Resolve-TestExe {

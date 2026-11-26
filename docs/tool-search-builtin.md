@@ -4,10 +4,13 @@
 It registers the model-facing `tool_search` tool: a BM25 search over **not-yet-active**
 `codemode` / `deferred` tools that loads matches into the session's active set.
 
-- Implementation: `src/plugins/builtin/tool_search.rs`; feature `tool-search`; entry
-  `src/plugins/builtin.rs` (`name: "tool-search"`, `replaceable: true`, default-enabled).
+- Pure logic: `crates/pir-builtin-tool-search/src/search.rs` (tokenizer, BM25 ranker,
+  schema-text walker — published, engine-free). Runtime half: `crates/pir-core/src/plugins/builtin/tool_search.rs`
+  (the tool, the active-set override, the reach rules); feature `tool-search`; entry
+  `crates/pir-core/src/plugins/builtin.rs` (`name: "tool-search"`, `replaceable: true`, default-enabled).
 - Upstream contract: `toolSearchSchema` (`tool.ts:159-164`); behavior truth is the upstream
-  extension source. Tests: module unit tests; `tests/suites/plugins_w11.rs` (`tool_search_next_request`).
+  extension source. Tests: `crates/pir-builtin-tool-search/tests/search.rs` (ranking, ordering,
+  script handling) plus `tests/suites/plugins_w11.rs` (`tool_search_next_request`).
 
 ## 1. Tool contract
 

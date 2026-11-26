@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use pir::ai::provider::ProviderRegistry;
 use pir::ai::providers::catalog::openrouter::{
-    configured_base_url, model_wire_value, openrouter_cost, per_million,
+    configured_base_url_in, model_wire_value, openrouter_cost, per_million,
     personalize_openrouter_catalog, OPENROUTER_BASE_URL,
 };
 use pir::ai::providers::{
@@ -56,16 +56,6 @@ fn chat_model(id: &str) -> Model {
         model_type: None,
         compat: None,
     }
-}
-
-/// Serializes the tests that mutate process-global env (`PIR_AGENT_DIR`,
-/// `PI_CATALOG_BASE_URL`, provider keys).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn unique_dir(tag: &str) -> PathBuf {
@@ -377,22 +367,15 @@ async fn a_personalized_catalog_survives_offline() {
 /// the user-model request (upstream `RefreshModelsContext.baseUrl`).
 #[test]
 fn a_configured_base_url_wins() {
-    let _env = env_lock();
     let root = unique_dir("base-url");
-    // Holds the env lock: other tests in this binary also override the
-    // agent dir and provider keys.
-    let previous = std::env::var_os("PIR_AGENT_DIR");
-    std::env::set_var("PIR_AGENT_DIR", &root);
     std::fs::write(
         root.join("models.json"),
         r#"{ "providers": { "openrouter": { "baseUrl": "https://us.openrouter.ai/api/v1" } } }"#,
     )
     .expect("models.json");
-    let resolved = configured_base_url();
-    match previous {
-        Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-        None => std::env::remove_var("PIR_AGENT_DIR"),
-    }
+    // The agent directory is an argument: `models.json` is read from `root`,
+    // so this test touches no process state and needs no lock.
+    let resolved = configured_base_url_in(&root);
     assert_eq!(resolved, "https://us.openrouter.ai/api/v1");
 }
 
@@ -442,34 +425,6 @@ async fn live_openrouter_endpoint_shapes() {
     );
 }
 
-/// Saves the process-global vars a strict-refresh test mutates and restores
-/// them on drop, so an assertion failure cannot leak into the next test.
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    fn capture(vars: &[&'static str]) -> Self {
-        Self {
-            saved: vars
-                .iter()
-                .map(|name| (*name, std::env::var_os(name)))
-                .collect(),
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
-
 /// `pir update --models` must apply the same OpenRouter key-based
 /// personalization as the session-runtime install path: the strict refresh
 /// builds every overlay through the shared provider personalizer, so the
@@ -477,12 +432,20 @@ impl Drop for EnvGuard {
 /// personalized list is persisted.
 #[test]
 fn strict_update_applies_the_openrouter_personalizer() {
-    let _env = env_lock();
-    let _guard = EnvGuard::capture(&["PIR_AGENT_DIR", "PI_CATALOG_BASE_URL", "OPENROUTER_API_KEY"]);
-
     let root = unique_dir("strict-personalized");
     let agent_dir = root.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    // The credential and the catalog endpoint are ARGUMENTS: the key goes into
+    // this agent dir's `auth.json` and the base URL is passed to the refresh,
+    // so the test mutates no process state and needs no lock.
+    pir::ai::auth::FileAuthStorage::in_agent_dir(&agent_dir)
+        .store(
+            "openrouter",
+            pir::ai::auth::StoredCredential::ApiKey(pir::ai::types::ApiKeyCredential::new(Some(
+                "sk-or-test".to_string(),
+            ))),
+        )
+        .expect("store openrouter key");
 
     // The OpenRouter API base (a `models.json` regional-endpoint override)
     // answers `GET /models/user` with the key's single allowed model.
@@ -535,11 +498,10 @@ fn strict_update_applies_the_openrouter_personalizer() {
         .to_string(),
     );
 
-    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
-    std::env::set_var("PI_CATALOG_BASE_URL", &catalog_base);
-    std::env::set_var("OPENROUTER_API_KEY", "sk-or-test");
-
-    let result = pir::coding_agent::package_manager::update_model_catalogs(&agent_dir);
+    let result = pir::coding_agent::package_manager::update_model_catalogs_in(
+        &agent_dir,
+        Some(&catalog_base),
+    );
     assert!(
         result.is_ok(),
         "the strict refresh with a mock catalog must succeed: {result:?}"
@@ -605,14 +567,6 @@ fn strict_update_applies_the_openrouter_personalizer() {
 /// user-model request is made.
 #[test]
 fn strict_update_leaves_non_personalized_providers_unchanged() {
-    let _env = env_lock();
-    let _guard = EnvGuard::capture(&[
-        "PIR_AGENT_DIR",
-        "PI_CATALOG_BASE_URL",
-        "OPENROUTER_API_KEY",
-        "ANTHROPIC_API_KEY",
-    ]);
-
     let root = unique_dir("strict-plain");
     let agent_dir = root.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -645,12 +599,22 @@ fn strict_update_leaves_non_personalized_providers_unchanged() {
         .to_string(),
     );
 
-    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
-    std::env::set_var("PI_CATALOG_BASE_URL", &catalog_base);
-    std::env::remove_var("OPENROUTER_API_KEY");
-    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+    // Credentials live in this agent dir's `auth.json` (anthropic only — no
+    // openrouter key, so no personalizer runs) and the catalog endpoint is an
+    // argument: nothing here touches the process environment.
+    pir::ai::auth::FileAuthStorage::in_agent_dir(&agent_dir)
+        .store(
+            "anthropic",
+            pir::ai::auth::StoredCredential::ApiKey(pir::ai::types::ApiKeyCredential::new(Some(
+                "test-key".to_string(),
+            ))),
+        )
+        .expect("store anthropic key");
 
-    let result = pir::coding_agent::package_manager::update_model_catalogs(&agent_dir);
+    let result = pir::coding_agent::package_manager::update_model_catalogs_in(
+        &agent_dir,
+        Some(&catalog_base),
+    );
     assert!(
         result.is_ok(),
         "the strict refresh with a mock catalog must succeed: {result:?}"

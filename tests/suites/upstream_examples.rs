@@ -127,6 +127,8 @@ async fn new_runtime(up: &Upstream) -> ExtensionRuntime {
         system_prompt: SYSTEM_PROMPT.to_string(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     };
     ExtensionRuntime::new(config)
         .await

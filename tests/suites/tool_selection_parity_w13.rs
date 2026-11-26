@@ -31,7 +31,7 @@
 //!    (`ctx_execute`, `todo`, ...) instead of silently un-declaring them, and
 //!    drops exactly the name it lists;
 //! 5. flag semantics are unchanged: `--no-extensions`, `--no-mcp`,
-//!    `pythonTool: false`, `--no-tools`, unknown names, the literal `?` /
+//!    `--no-tools`, unknown names, the literal `?` /
 //!    case-sensitive patterns and the `--tools` shape errors all behave
 //!    exactly as before.
 
@@ -60,8 +60,6 @@ const CODEMODE_BRIDGES: [&str; 2] = [
 const CTX_EXECUTE: &str = pir::plugins::builtin::CTX_EXECUTE_TOOL_NAME;
 #[cfg(feature = "context-mode")]
 const CTX_SEARCH: &str = pir::plugins::builtin::CTX_SEARCH_TOOL_NAME;
-#[cfg(feature = "python")]
-const PYTHON: &str = pir::plugins::builtin::PYTHON_TOOL_NAME;
 #[cfg(feature = "todo")]
 const TODO: &str = pir::plugins::builtin::TODO_TOOL_NAME;
 #[cfg(feature = "subagent")]
@@ -105,7 +103,7 @@ fn interactive_available(cli_paths: &[PathBuf], no_extensions: bool) -> Vec<Avai
 }
 
 /// [`interactive_available`] with the composed `disabledBuiltinExtensions` /
-/// `pythonTool: false` / `--no-mcp` set (`disabled_from_flags(no_mcp)` unioned
+/// `--no-mcp` set (`disabled_from_flags(no_mcp)` unioned
 /// through `SettingsManager::disabled_builtins_with_flags` in the real host).
 fn interactive_available_with(
     cli_paths: &[PathBuf],
@@ -180,7 +178,8 @@ impl Drop for TempDir {
 
 #[tokio::test(flavor = "current_thread")]
 async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("tool-selection-w13", None).await;
+    // The host is built with an explicit agent dir below, so this suite needs
+    // no process pin and no lock.
     let dir = TempDir::new("host");
     let plan = pir::plugins::order_extension_paths(&[], &[], false);
     if plan.is_empty() {
@@ -194,7 +193,11 @@ async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
         ..Default::default()
     });
     handle.set_path_plan(plan);
-    let host = Arc::new(PluginHost::build(Some(handle.clone()), Vec::new()));
+    let host = Arc::new(PluginHost::build_with_agent_dir(
+        Some(handle.clone()),
+        Vec::new(),
+        Some(&dir.0),
+    ));
 
     // The registry `merge_plugin_tools` reads: every builtin-registered tool,
     // hidden exposure included (the print host's `available_tools` includes
@@ -340,8 +343,6 @@ fn default_plan_offers_every_enabled_builtin_tool() {
     let mut expected: Vec<&str> = Vec::new();
     #[cfg(feature = "context-mode")]
     expected.extend([CTX_EXECUTE, CTX_SEARCH]);
-    #[cfg(feature = "python")]
-    expected.push(PYTHON);
     #[cfg(feature = "todo")]
     expected.push(TODO);
     #[cfg(feature = "subagent")]
@@ -756,18 +757,18 @@ fn no_extensions_drops_the_default_builtin_names() {
 
     // An explicit `-e builtin:<name>` still loads, with or without
     // `--no-extensions`.
-    #[cfg(feature = "python")]
+    #[cfg(feature = "context-mode")]
     {
-        let explicit = vec![PathBuf::from("builtin:python")];
+        let explicit = vec![PathBuf::from("builtin:context-mode")];
         let available = interactive_available(&explicit, true);
         assert!(
-            available.iter().any(|tool| tool.name == PYTHON),
+            available.iter().any(|tool| tool.name == CTX_EXECUTE),
             "an explicit builtin path stays selectable: {available:?}"
         );
         assert_eq!(
-            resolve(&names(&[PYTHON]), &[], false, false, &available),
-            names(&[PYTHON]),
-            "`--no-extensions -e builtin:python --tools python` selects it"
+            resolve(&names(&[CTX_EXECUTE]), &[], false, false, &available),
+            names(&[CTX_EXECUTE]),
+            "`--no-extensions -e builtin:context-mode --tools ctx_execute` selects it"
         );
     }
 }
@@ -797,20 +798,6 @@ fn no_mcp_drops_the_aggregate_mcp_resource_tools() {
             .all(|name| !without_mcp.iter().any(|entry| entry == name)),
         "`--no-mcp` (`disabledBuiltinExtensions: [\"mcp\"]`) keeps them off the \
          plan: {without_mcp:?}"
-    );
-}
-
-#[cfg(feature = "python")]
-#[test]
-fn python_tool_false_drops_python() {
-    let enabled = builtin_plan_tool_names(&[], false, &Default::default());
-    assert!(enabled.iter().any(|name| name == PYTHON));
-    let disabled: std::collections::BTreeSet<String> = std::iter::once(PYTHON.to_owned()).collect();
-    let without_python = builtin_plan_tool_names(&[], false, &disabled);
-    assert!(
-        without_python.iter().all(|name| name != PYTHON),
-        "`pythonTool: false` (folded into the disabled set) drops python from \
-         the selectable names: {without_python:?}"
     );
 }
 

@@ -137,6 +137,28 @@ fn search_match_key_is_stable_across_identical_frames() {
 }
 
 #[test]
+fn substring_search_handles_corpus_edges_and_multibyte_tails() {
+    // The folded corpus is scanned with a literal byte-substring finder
+    // (`memchr::memmem`): a needle may cross the row separator, end exactly
+    // at the corpus tail, or start inside a non-ASCII run.
+    let lines = vec!["alpha omega".to_string(), "tail".to_string()];
+    let across_rows = find_search_matches(&lines, "omega tail");
+    assert_eq!(across_rows.len(), 1);
+    assert_eq!(across_rows[0].segments.len(), 2);
+    assert_eq!(across_rows[0].segments[1].row, 1);
+    assert_eq!(across_rows[0].segments[1].end_col, 4);
+    // Case-insensitive at the tail, and a needle longer than the corpus is
+    // simply absent (the finder reports no candidate).
+    assert_eq!(find_search_matches(&lines, "OMEGA TAIL").len(), 1);
+    assert!(find_search_matches(&lines, "omega tail beyond").is_empty());
+
+    let unicode = vec!["日本語".to_string()];
+    let tail = find_search_matches(&unicode, "語");
+    assert_eq!(tail.len(), 1, "a non-ASCII tail must still match");
+    assert_eq!(tail[0].segments[0].row, 0);
+}
+
+#[test]
 fn refresh_search_keeps_the_selected_match_by_key() {
     let frame = vec!["one match here".to_string(), "one match there".to_string()];
     let mut state = AltScreenState::default();

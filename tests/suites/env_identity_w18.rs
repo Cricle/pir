@@ -25,9 +25,12 @@
 //!
 //! The key tests are pure (the key function is driven through its
 //! `configuration_key_for_test` seam, never the process environment). The D12
-//! test holds [`crate::common::AgentDirEnvGuard`], the process-wide lock for
-//! `PIR_AGENT_DIR` mutations, and drives the real panic hook on a scratch
-//! thread so the per-thread dedupe flag starts clear.
+//! test pins `PIR_AGENT_DIR` on purpose — the hook resolves it at call time,
+//! which is exactly the property under test — so it runs only under a
+//! process-per-test runner (`crate::common::skip_without_nextest`) and pins
+//! with [`crate::common::ProcessEnvPin`], which needs no lock. It drives the
+//! real panic hook on a scratch thread so the per-thread dedupe flag starts
+//! clear.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -227,10 +230,21 @@ impl Drop for PanicHookRestore {
 /// The defect, end to end: the hook is installed while the agent dir is A, the
 /// environment then moves to B, a panic fires, and the *notice* — reading the
 /// live dir, as startup and exit do — must find that crash under B.
+///
+/// The MOVING VARIABLE is the property under test, so this cannot be rewritten
+/// around an explicit argument: the hook resolves `PIR_AGENT_DIR` itself, and
+/// the defect was precisely that it pinned the install-time value. It therefore
+/// needs a process of its own and runs only under a process-per-test runner
+/// (nextest in CI and the pre-push gate) or when the operator opts in.
 #[tokio::test]
 async fn a_panic_after_an_agent_dir_change_is_found_by_the_live_notice() {
-    let guard = crate::common::AgentDirEnvGuard::scratch("w18b-d12-a", None).await;
-    let dir_a = guard.dir().expect("scratch agent dir").to_path_buf();
+    if crate::common::skip_without_nextest(
+        "env_identity_w18::a_panic_after_an_agent_dir_change_is_found_by_the_live_notice",
+    ) {
+        return;
+    }
+    let dir_a = ScratchDir::new("w18b-d12-a");
+    let _pin = crate::common::ProcessEnvPin::agent_dir(dir_a.path());
     let dir_b = ScratchDir::new("w18b-d12-b");
 
     // Take the global hook over for the duration: silence the panic output the
@@ -271,7 +285,7 @@ async fn a_panic_after_an_agent_dir_change_is_found_by_the_live_notice() {
 
     // ...and not under A (the install-time dir).
     assert!(
-        read_crash_log(&crash_log_path(&dir_a)).is_empty(),
+        read_crash_log(&crash_log_path(dir_a.path())).is_empty(),
         "a hook that pinned its install-time dir would have written here"
     );
 

@@ -92,6 +92,7 @@ fn tool_context(cwd: &Path, ledger: Arc<ReadLedger>) -> ToolContext {
         signal: None,
         nested: None,
         session_env: Some(Arc::new(ToolSessionEnv {
+            performance: pir::config::settings::PerformanceSettings::default(),
             live_model: None,
             live_thinking: None,
             provider_registry: Arc::new(ProviderRegistry::default()),
@@ -114,6 +115,7 @@ fn tool_context(cwd: &Path, ledger: Arc<ReadLedger>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -149,6 +151,15 @@ async fn write(ctx: &ToolContext, path: &str, content: &str) -> ToolResult {
     WriteTool::new()
         .run(
             &serde_json::json!({ "path": path, "content": content }),
+            ctx,
+        )
+        .await
+}
+
+async fn append(ctx: &ToolContext, path: &str, content: &str) -> ToolResult {
+    WriteTool::new()
+        .run(
+            &serde_json::json!({ "path": path, "content": content, "append": true }),
             ctx,
         )
         .await
@@ -313,6 +324,99 @@ async fn edit_warn_mode_allows_partial_read_but_still_blocks_write() {
         "write must remain strict in edit-warn mode: {}",
         write_result.content
     );
+}
+
+#[tokio::test]
+async fn edit_partial_allows_a_partial_read_with_a_warning() {
+    let dir = TempDir::new("edit-partial");
+    dir.write("note.txt", "alpha\nbeta\ngamma\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::EditPartial)),
+    );
+
+    let read_result = read(&ctx, "note.txt", Some(2), Some(1)).await;
+    assert!(
+        !read_result.is_error,
+        "read failed: {}",
+        read_result.content
+    );
+
+    let edit_result = edit(&ctx, "note.txt", "gamma", "GAMMA").await;
+    assert!(
+        !edit_result.is_error,
+        "partial read should allow edit with a warning: {}",
+        edit_result.content
+    );
+    assert!(edit_result.content.contains("Warning:"));
+    assert_eq!(dir.read("note.txt"), "alpha\nbeta\nGAMMA\n");
+}
+
+#[tokio::test]
+async fn edit_partial_keeps_write_and_stale_targets_strict() {
+    let dir = TempDir::new("edit-partial-strict");
+    dir.write("note.txt", "alpha\nbeta\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::EditPartial)),
+    );
+
+    let partial = read(&ctx, "note.txt", Some(1), Some(1)).await;
+    assert!(!partial.is_error, "read failed: {}", partial.content);
+    let write_result = write(&ctx, "note.txt", "replacement\n").await;
+    assert_refused_mentioning(&write_result, "only part of the file has been read");
+
+    let full = read(&ctx, "note.txt", None, None).await;
+    assert!(!full.is_error, "read failed: {}", full.content);
+    dir.write("note.txt", "alpha\nbeta\ngamma\n");
+    let edit_result = edit(&ctx, "note.txt", "gamma", "GAMMA").await;
+    assert_refused_mentioning(&edit_result, "changed since it was last read");
+    assert_eq!(dir.read("note.txt"), "alpha\nbeta\ngamma\n");
+}
+
+#[tokio::test]
+async fn edit_partial_still_refuses_a_never_read_file() {
+    let dir = TempDir::new("edit-partial-never-read");
+    dir.write("note.txt", "alpha\nbeta\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::EditPartial)),
+    );
+
+    let result = edit(&ctx, "note.txt", "beta", "BETA").await;
+    assert_refused_mentioning(&result, "has not been read in this session");
+    assert_eq!(dir.read("note.txt"), "alpha\nbeta\n");
+}
+
+#[tokio::test]
+async fn append_creates_or_extends_a_file() {
+    let dir = TempDir::new("append");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::EditPartial)),
+    );
+
+    let first = append(&ctx, "built.txt", "one\n").await;
+    assert!(!first.is_error, "append failed: {}", first.content);
+    assert_eq!(dir.read("built.txt"), "one\n");
+
+    let second = append(&ctx, "built.txt", "two\n").await;
+    assert!(!second.is_error, "append failed: {}", second.content);
+    assert_eq!(dir.read("built.txt"), "one\ntwo\n");
+}
+
+#[tokio::test]
+async fn append_to_an_unread_existing_file_is_refused() {
+    let dir = TempDir::new("append-unread");
+    dir.write("note.txt", "alpha\n");
+    let ctx = tool_context(
+        dir.path(),
+        Arc::new(ReadLedger::new(ReadBeforeEditMode::EditPartial)),
+    );
+
+    let result = append(&ctx, "note.txt", "beta\n").await;
+    assert_refused_mentioning(&result, "has not been read in this session");
+    assert_eq!(dir.read("note.txt"), "alpha\n");
 }
 
 #[tokio::test]

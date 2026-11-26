@@ -14,7 +14,7 @@ OPS = [
     ("wait", 1.5),
     ("snap", "r05_on"),
     ("log", "real model submits a plan"),
-    ("send", b"Use submit_plan to submit a one-step plan: create a file r05_plan.txt in the current directory containing exactly PLAN_REAL_OK. Do not use any other tool.\r"),
+    ("send", b"Use submit_plan to submit a one-step plan: create a file r05_plan.txt in the current directory containing exactly PLAN_REAL_OK. Set verification to the array [\"test -f r05_plan.txt\"] (an array of command strings). Do not use any other tool.\r"),
     ("wait", 60.0),
     ("wait_quiet", 10),
     ("snap", "r05_pending"),

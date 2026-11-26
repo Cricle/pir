@@ -963,6 +963,7 @@ fn recording_factory(observed: Arc<AtomicUsize>) -> SessionFactory {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }

@@ -4,8 +4,11 @@
 It registers the model-facing `memory` tool, the `/memory` slash command, and the `input` auto-recall hook. No
 external `cm` process is spawned for memory operations.
 
-- Implementation: `src/plugins/builtin/memory/` (`mod.rs`, `service.rs`, `tool.rs`, `prompt.rs`); feature `memory`;
-  entry `src/plugins/builtin.rs` (`name: "memory"`, `replaceable: true`, default-enabled).
+- Pure envelope: `crates/pir-builtin-memory/src/prompt.rs` (the XML-escaped recall block and the
+  stable system-prompt brief — published, engine-free). Runtime half:
+  `crates/pir-core/src/plugins/builtin/memory/` (`mod.rs`, `service.rs`, `tool.rs`); feature
+  `memory`; entry `crates/pir-core/src/plugins/builtin.rs` (`name: "memory"`, `replaceable: true`,
+  default-enabled).
 - Backend: `cm_memory::Cm` (library), opened lazily per store path; all calls run through
   `tokio::task::spawn_blocking`.
 
@@ -162,7 +165,7 @@ published `cm-memory 0.3.1` registry crate is what these tests link against.
 ## 8. Measured A/B
 
 The post-0.3.1 real-agent A/B (auto policy, one provider/model) is recorded in
-[memory-builtin-ab-2026-11-10.md](memory-builtin-ab-2026-11-10.md). Q&A
+[memory-builtin-ab-2026-11-10.md](archive/memory-builtin-ab-2026-11-10.md). Q&A
 aggregate median total tokens improved by **-42.1%** (N 9/9); the coding
 tasks are neutral to positive within run-to-run variance. After the short-edit
 routing change, plain C1–C3 prompts receive **no automatic memory context**
@@ -173,5 +176,5 @@ two-session plan→implement comparison reduced median total tokens by **45.8%**
 (129,708 → 70,327) and tool calls by 12.9%, both arms 3/3 verified. The
 practical rule is to use memory for non-trivial, cross-session, or
 large-repository work; auto mode no longer pays context on plain one-shot
-edits. Earlier provider/policy phases are archived under
-`.ab-test/archive-before-review-fixes/` and are not mixed into these tables.
+edits. Earlier provider/policy phases were archived before the review fixes
+(local working data, not tracked) and are not mixed into these tables.

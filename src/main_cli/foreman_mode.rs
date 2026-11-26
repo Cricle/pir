@@ -124,10 +124,34 @@ async fn run_start(
         if !status.success() {
             anyhow::bail!("foreman run exited with {status}");
         }
+        // A run that exhausted the reviewer gate settles normally at the model
+        // layer; the phase is the only signal that the result is unverified.
+        // CI must not read that as success.
+        if let Some(message) = pir::foreman::unverified_exit_error(&session_path) {
+            anyhow::bail!("{message}");
+        }
+        // A paused run is not a finished one: say why it stopped and how to
+        // continue instead of leaving the zero exit unexplained.
+        if let Some(foreman) = pir::foreman::read_status(&session_path) {
+            if !foreman.pending.is_empty() {
+                eprintln!(
+                    "foreman run paused for approval ({} pending). Approve with \
+                     `pir foreman approve <id>` (or --all), then continue with \
+                     `pir foreman resume \"{}\"`.",
+                    foreman.pending.len(),
+                    session_path.display()
+                );
+            }
+        }
         return Ok(());
     }
     let meta = jobs
-        .spawn_argv(&current_exe()?, &args, &cwd_path, &[])
+        .spawn_argv(
+            &current_exe()?,
+            &args,
+            &cwd_path,
+            &[("PIR_FOREMAN_STRICT_EXIT".to_owned(), "1".to_owned())],
+        )
         .map_err(anyhow::Error::msg)?;
     let result = json!({
         "job": meta.id,
@@ -144,6 +168,9 @@ async fn run_start(
             result["session"].as_str().unwrap_or("?")
         );
         println!("log: {}", result["log"].as_str().unwrap_or("?"));
+        println!(
+            "check progress: pir foreman status   (approve a pending request: pir foreman approve <id>)"
+        );
     }
     Ok(())
 }
@@ -193,6 +220,11 @@ fn run_status(
                 println!(
                     "  {}  [{}]  {}",
                     approval.id, approval.kind, approval.summary
+                );
+            }
+            if !status.pending.is_empty() {
+                println!(
+                    "approve: pir foreman approve <id> (or --all)   deny: pir foreman deny <id>"
                 );
             }
         }
@@ -281,14 +313,28 @@ async fn run_decision(
             );
         }
     }
+    // Take the writer lock before touching the journal: a live TUI owns it,
+    // and deciding first would mutate the record and then fail, leaving the
+    // TUI's next snapshot to overwrite the external decision.
+    let mut manager = SessionManager::open(&session_path)?;
+    manager.ensure_exclusive_writer()?;
     let decisions = pir::foreman::decide_approval(
         &session_path,
         if all { None } else { id.as_deref() },
         approved,
     )
     .map_err(anyhow::Error::msg)?;
-    let mut manager = SessionManager::open(&session_path)?;
-    manager.ensure_exclusive_writer()?;
+    if decisions.is_empty() {
+        // `decide_approval` expires stale requests first, so this covers an
+        // unknown id, an already-decided one, and one older than 24h. Never
+        // resume the run with nothing actually decided.
+        anyhow::bail!(match id.as_deref() {
+            Some(id) => format!(
+                "approval {id} is not pending (unknown id, already decided, or expired after 24h); run `pir foreman status` to see pending approvals"
+            ),
+            None => "no pending approvals to decide".to_owned(),
+        });
+    }
     for record in &decisions {
         let text = if record.kind == "plan" && approved {
             let mut text = format!(
@@ -351,7 +397,12 @@ async fn run_decision(
     let prompt_file = write_prompt(agent_dir, &session_path, prompt)?;
     let args = child_args(&session_path, &prompt_file);
     let meta = jobs
-        .spawn_argv(&current_exe()?, &args, Path::new(&cwd), &[])
+        .spawn_argv(
+            &current_exe()?,
+            &args,
+            Path::new(&cwd),
+            &[("PIR_FOREMAN_STRICT_EXIT".to_owned(), "1".to_owned())],
+        )
         .map_err(anyhow::Error::msg)?;
     println!(
         "{} {} approval(s); resumed as job {}",
@@ -359,6 +410,7 @@ async fn run_decision(
         decisions.len(),
         meta.id
     );
+    println!("follow it with: pir foreman logs {} --follow", meta.id);
     Ok(())
 }
 

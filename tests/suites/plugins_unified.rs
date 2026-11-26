@@ -64,6 +64,8 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -912,6 +914,7 @@ async fn session_host_consumes_notifications_and_set_active_tools() {
             event_stream: None,
             extensions: Some(runtime.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(RustProbePlugin::new("rust-probe"))],
     );
@@ -1071,6 +1074,7 @@ async fn js_tool_receives_the_real_tool_call_id() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1158,6 +1162,7 @@ async fn core_and_rust_plugin_tool_defs_reach_the_js_view() {
             event_stream: None,
             extensions: Some(runtime.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(RustProbePlugin::new("rust-probe"))],
     );
@@ -1338,10 +1343,11 @@ fn builtin_paths_partition_filter_and_order() {
     // conflicts). `builtin:subagent` in the list above is the real builtin;
     // the factory order is subagent, mode, mcp, codemode, python,
     // context-mode, tool-search, tool-repair, todo — mode is the foreman
-    // companion, python and context-mode are pir-only, `todo` is the npm
-    // `@juicesharp/rpiv-todo` port appended last, and `phone` stays
-    // default-disabled (not inserted), see `src/plugins/builtin.rs` and
-    // `docs/todo-builtin.md`.
+    // companion, python keeps its Settings/tool-selection name over the
+    // embedded QuickJS engine, context-mode is the Code Mode port, `todo` is
+    // the npm `@juicesharp/rpiv-todo` port appended last, and `phone` stays
+    // default-disabled (not inserted), see `crates/pir-core/src/plugins/
+    // builtin.rs` and `docs/todo-builtin.md`.
 
     let ordered = order_extension_paths(
         &[PathBuf::from("cli.ts")],

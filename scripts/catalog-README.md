@@ -1,6 +1,6 @@
 # Built-in provider catalog: refreshing the snapshot
 
-`src/ai/providers/catalog/*.json` is pir's frozen copy of upstream pi-ai's
+`crates/pir-core/src/ai/providers/catalog/*.json` is pir's frozen copy of upstream pi-ai's
 built-in model catalog. Upstream does **not** commit those files: they are
 generated at build time by `packages/ai/scripts/generate-models.ts` from
 models.dev, the OpenRouter API and gateway pricing, and are gitignored at
@@ -55,7 +55,7 @@ The output is byte-stable for a given upstream data directory:
 - compact JSON (no insignificant whitespace) with LF line endings and exactly
   one trailing newline.
 
-Do not hand-edit `src/ai/providers/catalog/*.json`. Change the generator or the
+Do not hand-edit `crates/pir-core/src/ai/providers/catalog/*.json`. Change the generator or the
 overrides file, then re-run it.
 
 ## `scripts/catalog-overrides.json`

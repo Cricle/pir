@@ -23,6 +23,17 @@ use crate::ws;
 static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../clients/pi-phone-pwa");
 
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> anyhow::Result<()> {
+    serve_with_shutdown(listener, state, std::future::pending()).await
+}
+
+pub async fn serve_with_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let sweep_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -33,7 +44,9 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> anyhow
             registry.expire_pending(Duration::from_secs(90));
         }
     });
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
@@ -83,42 +96,41 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Response {
-    let users = state.store.count_users().unwrap_or(0);
-    let devices = state.store.count_devices().unwrap_or(0);
-    let sessions = state.store.count_sessions().unwrap_or(0);
-    let memory = metrics::memory_snapshot();
-    let registry = state.registry.read().await;
-    Json(json!({
+    let response = Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "protocolVersion": crate::protocol::PROTOCOL_VERSION,
-        "uptimeSeconds": state.started_at.elapsed().as_secs(),
-        "users": users,
-        "devices": devices,
-        "sessions": sessions,
-        "onlineDevices": registry.online_devices(),
-        "onlineSessions": registry.online_sessions(),
-        "clients": registry.client_count(),
-        "cacheBytes": registry.cache_bytes(),
-        "cachedSessions": registry.cached_sessions(),
-        "subscribers": registry.subscriber_count(),
-        "pendingCommands": registry.pending_commands(),
-        "memory": memory,
-        // Compatibility fields for the existing PWA shell.
+        // Compatibility fields for the existing PWA shell. Detailed relay
+        // counters stay behind the authenticated metrics endpoint.
         "hasToken": true,
         "isRunning": true,
         "serverRunning": true,
         "singleClientMode": false,
         "serverUrl": state.config.public_url.clone(),
     }))
-    .into_response()
+    .into_response();
+    no_store(response)
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> Json<Value> {
+async fn metrics_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(expected) = state.config.metrics_token.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(received) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !auth::constant_time_eq(expected, received) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let memory = metrics::memory_snapshot();
     let counters = state.metrics.snapshot();
     let registry = state.registry.read().await;
-    Json(json!({
+    let response = Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSeconds": state.started_at.elapsed().as_secs(),
         "memory": memory,
@@ -133,6 +145,16 @@ async fn metrics_handler(State(state): State<AppState>) -> Json<Value> {
             "cachedSessions": registry.cached_sessions(),
         }
     }))
+    .into_response();
+    no_store(response)
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn version() -> Json<Value> {
@@ -292,6 +314,7 @@ async fn delete_device(
                 registry.unregister_device(&id, None);
                 registry.remove_pending_for_device(&id);
             }
+            let _ = state.store.mark_device_sessions_offline(&id);
             state
                 .store
                 .audit(Some(&auth.user_id), "device.revoke", Some(&id));
@@ -412,6 +435,7 @@ async fn delete_session(
                     .is_some_and(|session| session.user_id == auth.user_id)
                 {
                     registry.remove_session_id(&id);
+                    registry.remove_pending_for_session(&id);
                 }
             }
             state
@@ -606,8 +630,27 @@ async fn create_ws_ticket(State(state): State<AppState>, headers: HeaderMap) -> 
         Ok(auth) => auth,
         Err(response) => return response,
     };
-    let ticket = state.tickets.issue(&auth.user_id);
-    Json(json!({ "ticket": ticket, "expiresInSeconds": 30 })).into_response()
+    let ticket = match state.tickets.issue(&auth.user_id, &auth.token_id) {
+        Some(ticket) => ticket,
+        None => {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "ticket-limit",
+                "too many active WebSocket tickets",
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("30"),
+            );
+            return response;
+        }
+    };
+    let mut response = Json(json!({ "ticket": ticket, "expiresInSeconds": 30 })).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn static_handler(uri: Uri) -> Response {

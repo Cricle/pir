@@ -87,12 +87,16 @@ fn bridge_name(host: &PluginHost, server: &str) -> String {
         .unwrap_or_else(|| panic!("no registered bridge for {server}"))
 }
 
+/// Build the session under test around the caller's scratch TREE: the tree is
+/// both the project cwd and the agent dir, so every session-scoped read
+/// (settings, credentials, sessions root, builtin gates) stays inside it and
+/// the caller needs no process-environment pin.
 fn build_session(
     cwd: &Path,
     plugins: Vec<Arc<dyn AgentPlugin>>,
     tool_selection: Option<ToolSelection>,
 ) -> Arc<AgentSession> {
-    AgentSession::new_arc_with_plugins(
+    AgentSession::new_arc_with_plugins_and_host_in(
         AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
@@ -108,8 +112,11 @@ fn build_session(
             event_stream: None,
             extensions: None,
             tool_selection,
+            phone_child: None,
         },
         plugins,
+        None,
+        Some(cwd.to_path_buf()),
     )
 }
 
@@ -130,7 +137,6 @@ fn declared(session: &AgentSession, host: &PluginHost) -> Vec<String> {
 fn disabling_a_server_prunes_its_materialized_bridges() {
     let tree = Tree::new("prune-disable");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         register_mock(plugin.manager(), "docs", MOCK_HEALTHY, 60, 0, &[]);
         register_mock(plugin.manager(), "other", MOCK_HEALTHY, 60, 0, &[]);
@@ -214,7 +220,6 @@ fn disabling_a_server_prunes_its_materialized_bridges() {
 fn changing_exposure_to_codemode_prunes_the_direct_bridge() {
     let tree = Tree::new("prune-exposure");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         register_mock(plugin.manager(), "docs", MOCK_HEALTHY, 60, 0, &[]);
         register_mock(plugin.manager(), "other", MOCK_HEALTHY, 60, 0, &[]);
@@ -273,7 +278,6 @@ fn changing_exposure_to_codemode_prunes_the_direct_bridge() {
 fn an_explicitly_selected_bridge_is_never_pruned() {
     let tree = Tree::new("prune-explicit");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         register_mock(plugin.manager(), "docs", MOCK_HEALTHY, 60, 0, &[]);
         plugin
@@ -320,7 +324,6 @@ fn an_explicitly_selected_bridge_is_never_pruned() {
 fn a_settings_selected_bridge_survives_an_unrelated_prune() {
     let tree = Tree::new("prune-settings");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         register_mock(plugin.manager(), "docs", MOCK_HEALTHY, 60, 0, &[]);
         register_mock(plugin.manager(), "other", MOCK_HEALTHY, 60, 0, &[]);
@@ -397,7 +400,6 @@ fn late_exclude_selection(pattern: &str) -> ToolSelection {
 fn a_glob_exclusion_covers_a_bridge_discovered_after_startup() {
     let tree = Tree::new("prune-glob");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         let selection = late_exclude_selection("mcp__docs__*");
         assert!(
             selection
@@ -449,7 +451,6 @@ fn a_glob_exclusion_covers_a_bridge_discovered_after_startup() {
 fn an_exact_exclusion_still_excludes_a_late_bridge() {
     let tree = Tree::new("prune-exact");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         let selection = late_exclude_selection("mcp__docs__work");
         assert!(
             selection

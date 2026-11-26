@@ -1,4 +1,4 @@
-import { getServerBase } from "./config.js";
+import { apiUrl } from "./transport.js";
 import { state } from "./state.js";
 
 function authHeaders() {
@@ -15,7 +15,7 @@ async function readError(response) {
 }
 
 export async function refreshDevices() {
-  const response = await fetch(`${getServerBase()}/api/devices`, {
+  const response = await fetch(apiUrl("/api/devices"), {
     cache: "no-store",
     headers: authHeaders(),
   });
@@ -26,7 +26,7 @@ export async function refreshDevices() {
 }
 
 export async function createDeviceToken(name) {
-  const response = await fetch(`${getServerBase()}/api/devices`, {
+  const response = await fetch(apiUrl("/api/devices"), {
     method: "POST",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -42,7 +42,7 @@ export async function createDeviceToken(name) {
 }
 
 export async function revokeDevice(deviceId) {
-  const response = await fetch(`${getServerBase()}/api/devices/${encodeURIComponent(deviceId)}`, {
+  const response = await fetch(apiUrl(`/api/devices/${encodeURIComponent(deviceId)}`), {
     method: "DELETE",
     headers: authHeaders(),
   });

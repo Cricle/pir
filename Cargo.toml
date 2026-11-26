@@ -4,6 +4,12 @@
 # crate publishes as `pir-sdk`. The crate is still imported as `pir`
 # ([lib] name below) and the executable is still `pir` ([[bin]] name), so
 # `use pir::...` and `cargo install pir-sdk` (binary: `pir`) are both correct.
+#
+# Layout: this package is the *facade* — it re-exports `pir-core` (the engine)
+# under the historical `pir::...` paths and, with the `tui` feature, re-exports
+# `pir-tui` as `pir::tui`. Embedders keep depending on this single crate; the
+# engine has no terminal dependencies and a new front end is a new crate that
+# depends on `pir-core` (see `docs/architecture.md`).
 name = "pir-sdk"
 # Single source of truth for the crate/binary version is `[workspace.package]`
 # at the bottom of this file; every workspace member inherits it via
@@ -14,7 +20,7 @@ edition = "2021"
 rust-version = "1.97"
 # Integration-test auto-discovery is disabled on purpose: every tests/*.rs
 # file used to be its own test target, and each one statically linked the
-# whole pir-sdk. scripts/gen_merged_tests.ps1 folds them into 8 generated
+# whole engine. scripts/gen_merged_tests.ps1 folds them into 8 generated
 # tests/zz_merged_N.rs harnesses (explicit [[test]] entries at the end of
 # this file). Run it after adding/removing a tests/*.rs file.
 autotests = false
@@ -38,11 +44,11 @@ categories = ["command-line-utilities", "development-tools"]
 # has no commits (measured 2026-10-27: the default VCS-based list enumerated
 # 32,446 files, including target-lane-*/ build output).
 #
-#   src/**       the crate; the provider catalog JSON under src/ai/catalog is
-#                pulled in with include_str!.
-#   assets/**    REQUIRED at compile time: node_shims.rs `include_bytes!`s
-#                assets/shims/*.js.txt.deflate. Dropping this directory breaks
-#                the build of the published crate.
+#   src/**       the facade + the `pir` binary; the engine is `pir-core` and
+#                the terminal UI is `pir-tui` (both are published separately
+#                and referenced by versioned path dependencies). The embedded
+#                JS shims and agent presets live in `crates/pir-core/assets/`
+#                and ship with that crate.
 #   examples/**  the documented SDK examples (they are part of the crate's
 #                public documentation and are built by `cargo package`).
 #   benches/**   the criterion bench (dev-dependency; type-checked by CI).
@@ -53,14 +59,8 @@ categories = ["command-line-utilities", "development-tools"]
 #   (`license = "MIT OR Apache-2.0"` above).
 #
 # Deliberately excluded: tests/ (12.9 MB, 269 targets — not needed to build the
-# published crate; including it would more than double package size and make
-# `cargo publish` verification compile the whole suite), docs/ (site
-# markdown; only docs/sdk.md is shipped for the README link), scripts/,
-# schemas notes, and every target*/logs/ directory.
-#
-# Every pattern is `/`-anchored: cargo's include patterns are gitignore-style,
-# so a bare `README.md` would also match scripts/**/README.md and every other
-# README in the tree (verified with `cargo package --list`).
+# published crate), docs/ (site markdown; only docs/sdk.md is shipped for the
+# README link), scripts/, and every target*/logs/ directory.
 include = [
     "/Cargo.toml",
     "/README.md",
@@ -68,7 +68,6 @@ include = [
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
     "/src/**",
-    "/assets/**",
     "/examples/**",
     "/benches/**",
     "/schemas/*.json",
@@ -105,6 +104,14 @@ name = "pir-minimal"
 path = "src/bin/pir-minimal.rs"
 required-features = []
 
+# The AOT bytecode generator: compiles every embedded JS shim to QuickJS
+# bytecode (`scripts/gen_shims_bytecode.*` drives it). Not shipped — it exists
+# so the checked-in `assets/bytecode` blobs can be regenerated and verified.
+[[bin]]
+name = "pir-gen-bytecode"
+path = "src/bin/pir_gen_bytecode.rs"
+required-features = ["extensions"]
+
 [lib]
 name = "pir"
 path = "src/lib.rs"
@@ -136,19 +143,20 @@ name = "control"
 path = "examples/control.rs"
 required-features = ["sdk"]
 
-# The two durable examples use only the core `pir::durable` surface (durable is
-# not a cargo feature), so they build in every shape, including bare
-# `--no-default-features`. Declared explicitly so the aggregate `--examples`
-# sweep cannot silently drop them once `autoexamples` changes.
+# The two durable examples use the `pir::durable` surface, which since the
+# 2026-11-25 extraction is the default-on `durable` feature (the separate
+# `pir-durable` crate). They declare it so the aggregate `--examples` sweep
+# builds them under the default feature set and skips them (rather than
+# failing) under a slim `--no-default-features` build.
 [[example]]
 name = "dev_durable_reports"
 path = "examples/dev_durable_reports.rs"
-required-features = []
+required-features = ["durable"]
 
 [[example]]
 name = "dev_durable_timers"
 path = "examples/dev_durable_timers.rs"
-required-features = []
+required-features = ["durable"]
 
 [[example]]
 name = "extension"
@@ -169,8 +177,8 @@ path = "examples/mini_coding.rs"
 required-features = ["sdk", "tools"]
 
 # PROTOCOL v6 mmap/COW prototype: the only dependency is `memmap2`, which the
-# `session` feature owns (`Cargo.toml` `session = ["dep:memmap2"]`). Nothing
-# from `pir` is used, so `sdk` is not needed.
+# `session` feature owns (`pir-core/Cargo.toml` `session = ["dep:memmap2"]`).
+# Nothing from `pir` is used, so `sdk` is not needed.
 [[example]]
 name = "mmap_cow_probe"
 path = "examples/mmap_cow_probe.rs"
@@ -246,204 +254,47 @@ path = "examples/tools.rs"
 required-features = ["sdk"]
 
 [dependencies]
+# The facade proper: the engine plus (optionally) the terminal front end.
+# Every feature below forwards to these crates; the facade adds no
+# dependencies of its own beyond what the `pir` binary needs to bootstrap.
+pir-core = { path = "crates/pir-core", version = "0.3.2", default-features = false }
+pir-tui = { path = "crates/pir-tui", version = "0.3.2", optional = true }
 anyhow = "1"
-thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "fs", "process", "signal"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-serde_yaml = "0.9"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "native-tls"] }
-# Codex ChatGPT transport: upstream pools a WebSocket and sends
-# `previous_response_id` continuations instead of resending full history.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "native-tls"], optional = true }
-futures-util = "0.3"
-tracing = "0.1"
-regex = "1.13.1"
-# Read-only memory maps for the session-file open path: a huge session is
-# tail-paged (scan backwards from the end) and the bytes the parser walks come
-# from the page cache instead of a heap buffer, so opening a 100 MB session
-# never copies the file. 0.9.11 is already in the lock as a transitive dep (the
-# notify/ignore stack), so this introduces no new external crate to compile.
-# Optional: the only consumer is `session_manager::tail_page`, which itself
-# rides the `session` feature. `--no-default-features` therefore drops it from
-# the graph; the `session` feature re-adds it.
-memmap2 = { version = "0.9", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The AOT bytecode generator (`pir-gen-bytecode`) compiles the embedded shims
+# with rquickjs directly; nothing else in this facade crate touches the engine.
+# The feature set matches `pir-core`'s edge so Cargo resolves one shape.
+rquickjs = { version = "0.14.0", features = [
+    "futures",
+    "loader",
+    "parallel",
+    "disable-assertions",
+], optional = true }
 # Optional process-wide allocator for allocator A/B runs (feature
 # `mimalloc-alloc`, OFF by default). `default-features = false` selects plain
-# mimalloc (the crate's default feature set is empty anyway); the `pir` bin
-# registers `mimalloc::MiMalloc` as its `#[global_allocator]`. A build without
-# the feature has exactly the previous allocator setup.
+# mimalloc; the `pir` bin registers `mimalloc::MiMalloc` as its
+# `#[global_allocator]`. A build without the feature keeps the previous setup.
 mimalloc = { version = "0.1", optional = true, default-features = false }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
-# 0.23 shares the tree's single base64 (reqwest/rmcp/swc/hyper-util already
-# pull 0.23.1); the Engine API (engine::general_purpose::{STANDARD,URL_SAFE*})
-# is unchanged between 0.22 and 0.23, so this dedupes one compiled crate.
-base64 = "0.23"
-sha2 = "0.10"
-# Node/npm host ops (src/pir_node, previously the `pir-node` workspace crate).
-# Optional: only the `extensions` feature pulls the JS engine and these codecs.
-aes = { version = "0.8", optional = true }
-sha1 = { version = "0.10", optional = true }
-sha3 = { version = "0.10", optional = true }
-md-5 = { version = "0.10", optional = true }
-pbkdf2 = { version = "0.12", features = ["hmac"], optional = true }
-scrypt = { version = "0.11", optional = true }
-url = { version = "2.5", optional = true }
-# AWS SigV4 request signing for the Bedrock ConverseStream adapter.
-hmac = { version = "0.12", optional = true }
-# Entropy for randomBytes/randomUUID and other core IDs.
-getrandom = "0.3"
-# gzip/deflate codec behind the node:zlib shim (src/extensions/runtime/
-# host_functions/child_fns.rs) and the shim-deflate inflation in
-# `extensions::api::embedded`. The `zlib-rs` backend is pure Rust like
-# miniz_oxide but roughly 2x faster (it is a port of zlib's C, including the
-# longest-match deflate path), which is what a `zlib.deflateSync` benchmark
-# compares against Node's C zlib.
-flate2 = { version = "1.1", default-features = false, features = [
-    "zlib-rs",
-    "runtime_detection",
-], optional = true }
-# Brotli + Zstandard codecs behind the same node:zlib host op table: Node's
-# convenience-method surface (brotliCompress / zstdCompress + the *Sync and
-# stream-constructor forms) is what test-zlib-convenience-methods exercises,
-# and flate2 alone leaves it one throw away from green. `brotli` is pure Rust
-# (compressor + decompressor); `zstd` rides zstd-sys' bundled C source, built
-# by the `cc` crate with the MSVC toolset the tree already links against.
-brotli = { version = "9", optional = true }
-zstd = { version = "0.13", optional = true }
-# The cm-memory engine behind the `memory` builtin. `default-features = false`
-# keeps the `cm` CLI out of pir's graph; only the library facade is linked.
-# Consume the published crate so `cargo package`/CI resolve the same code as
-# local builds (cm-memory 0.3.1, released 2026-11-10).
-cm-memory = { version = "0.3.1", default-features = false, optional = true }
-# RS256 (RSA PKCS#1 v1.5 + SHA-256) signing for the Google Vertex
-# service-account OAuth2 JWT (pure Rust; no OpenSSL/native deps).
-rsa = { version = "0.9", features = ["sha2"], optional = true }
-ciborium = "0.2.2"
-# TUI-only dependencies (feature `tui`): the terminal event loop and renderers.
-crossterm = { version = "0.29.0", optional = true }
-unicode-width = "0.2.2"
-# Grapheme-cluster segmentation for the TUI width/cursor layer (UAX #29
-# extended clusters: ZWJ emoji, flags, skin tones, keycaps, combining marks)
-# and word segmentation for tool search in any script. Rust's `Intl.Segmenter`
-# equivalent, already in the lock as a transitive dep (MIT/Apache-2.0) — this
-# promotes it to a direct dependency edge only.
-unicode-segmentation = "1.13"
-# Mermaid code-block rendering (src/tui/mermaid.rs): the ecosystem Unicode
-# box-drawing renderer that replaced the hand-written grok-mermaid port.
-# Clean tree: MIT, MSRV 1.92, three deps (ascii-dag, chrono, unicode-width).
-mermaid-text = { version = "0.57", optional = true }
-similar = "2"
-# SIMD newline search for session-file scanning/listing. Already in the lock as
-# a transitive dependency; promoting it to a direct edge adds no new crate.
-memchr = "2"
-unicode-normalization = "0.1"
-# Extension runtime (feature `extensions`): QuickJS + the swc transpile stack.
-# `disable-assertions` compiles quickjs.c with NDEBUG: the engine's internal
-# assertions are debug aids, and leaving them on costs a few percent on every
-# JS-heavy path (release builds of qjs ship without them too).
-rquickjs = { version = "0.14.0", features = ["futures", "loader", "parallel", "disable-assertions"], optional = true }
-swc_ecma_parser = { version = "46.0.0", optional = true }
-swc_ecma_codegen = { version = "32.0.3", optional = true }
-swc_ecma_ast = { version = "29.0.2", optional = true }
-swc_ecma_transforms_base = { version = "50.0.0", optional = true }
-swc_ecma_transforms_typescript = { version = "56.0.0", optional = true }
-swc_common = { version = "26.0.0", optional = true }
-arboard = { version = "3", default-features = false, features = ["image-data"], optional = true }
-# Inline image support for the read tool and the halfblocks preview
-# (decode/resize/encode; promoted from an image-protocol-only optional dep).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"], optional = true }
-# ripgrep's search engine (the same crates the `rg` binary is built from):
-# the grep tool searches in-process instead of spawning an external `rg`.
-grep-searcher = { version = "0.1", optional = true }
-grep-regex = { version = "0.1", optional = true }
-# ripgrep's directory walker with gitignore-glob overrides (the `ignore`
-# crate 鈥?ripgrep/fd's own engine 鈥?run in-process by the find and grep
-# tools; glob matching rides its OverrideBuilder, no standalone globset dep).
-ignore = { version = "0.4", optional = true }
-# `pir env-daemon` (src/env_daemon/, the built-in pi-env protocol-v1 daemon):
-# WHATWG UTF-8 stream decoding for command output, matching Node's
-# `new TextDecoder().decode(...)` (upstream packages/env/daemon/src/decode.rs).
-# Already in the dependency graph (reqwest/encoding_rs_io ride 0.8.42), so this
-# is a direct-dependency edge, not a new lock line.
-encoding_rs = "0.8"
-# `pir env-daemon` watch operation: the same native watcher (inotify/FSEvents/
-# ReadDirectoryChangesW) the upstream daemon uses, with the client-visible
-# polling fallback handled in src/env_daemon/watch.rs. Upstream pins 8.2.0.
-notify = { version = "8.2", optional = true }
-# Await-able cancellation (CancellationToken) behind the AbortSignal type 鈥?
-# replaces the first-slice 50 ms polling loops (bash abort, cache-warmer watcher).
-tokio-util = "0.7"
-# Enum <-> str plumbing and Display/From derives (quality wave: replaces
-# hand-written as_str/from_str/Display three-piece impls).
-strum = { version = "0.27", features = ["derive"] }
-derive_more = { version = "2", features = ["display", "from"] }
-# Glob matching for model/tool patterns. Already in the lock through `ignore`
-# (ripgrep's walker), so this is a direct-dependency edge, not a new crate.
-# Replaces the hand-rolled `glob_matches` matcher (backtracking, no `**`
-# semantics, no escape handling).
-globset = "0.4"
-# Version comparison for the update-check/`--version` paths (upstream uses
-# `semver` semantics). Already in the lock as a transitive edge.
-semver = "1"
-# Text wrapping/indent helpers for the TUI. Pinned to the 0.15 line already in
-# 0.15 avoids the icu_segmenter data tables that 0.16's unicode-linebreak
-# feature would pull (~1 MB of binary and a long compile).
-textwrap = { version = "0.15", default-features = false, features = ["unicode-width", "unicode-linebreak"] }
-# Official Model Context Protocol SDK (modelcontextprotocol/rust-sdk). The MCP
-# client layer is built on it: rmcp owns the JSON-RPC 2.0 framing, the
-# initialize handshake + protocol version negotiation, request correlation,
-# and both wire transports (child-process stdio and streamable HTTP with SSE).
-rmcp = { version = "3.5", default-features = false, optional = true, features = [
-    "client",
-    "transport-streamable-http-client-reqwest",
-    "reqwest-native-tls",
-    # Server side: the built-in `sd` (search & replace) MCP server runs as a
-    # stdio server hosted by the `pir` executable itself.
-    "server",
-    "transport-io",
-] }
-# node:crypto real backends (src/extensions/runtime/host_functions/node_fns.rs):
-# Rust-native SQLite remains a root feature for context-mode and durable storage.
-rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-# Embedded bash-compatible shell (`brush`) behind the `brush` feature: when no
-# external Git Bash / /bin/bash is installed, the bash tool can still run
-# commands in-process via `pir __brush` rather than failing (an installed bash
-# is preferred because it carries coreutils/PATH; on Windows a pool spawn costs
-# ~300 ms per call, which the embedded fallback avoids). brush-core is the
-# interpreter, brush-builtins the standard command set; both are pure Rust,
-# MIT-licensed (the tree gains rpds' MPL-2.0 — see deny.toml). The `pir __brush`
-# hidden subcommand hosts the persistent member the shell pool drives, so the
-# pool's per-call script protocol is unchanged.
-brush-core = { version = "0.5.0", optional = true }
-brush-builtins = { version = "0.2.0", optional = true }
 
 [features]
-# Today's behavior = `full` (every feature, `image-protocol` included); the
-# bin requires only `cli` (see `[[bin]]`). A minimal library build
-# (`--no-default-features`) keeps only the core:
-# ai/agent/agent_session/session_manager/config/compaction/skills/
-# system_prompt/protocol/telemetry/logging/diagnostics/plugins(trait + light
-# builtins)/coding_agent(json + the bash shell resolution the session and
-# provider config-value executor share). The built-in tools are the seven
-# per-tool leaves (`tool-read`, `tool-bash`, `tool-powershell`, `tool-edit`,
-# `tool-write`, `tool-ls`, `tool-background`); the aggregate `tools` feature
-# is exactly their union, and the independent `grep-find` leaf registers
-# `grep`/`find` outside it. With every leaf AND `grep-find` off,
-# `register_core_tools` is a no-op and `CORE_TOOL_NAMES` is empty.
-# `compaction` and `telemetry` are core today —
-# they are NOT cargo features yet (zero cfg sites), so no build can turn them
-# off. `sdk` is optional and is NOT in the bare core: `pir::sdk` exists only
-# when the `sdk` feature is enabled (no stub). Design: docs/FEATURES.md.
+# Today's behavior = `full` (every feature). The bin requires only `cli`
+# (see `[[bin]]`). `--no-default-features` keeps the engine's minimal agent
+# (`pir-core`), so a library-only build is still runnable via `pir::minimal`.
+#
+# Front-end split: `tui` enables `pir-tui` (the terminal front end). The
+# engine never depends on it; another UI is another crate + another feature.
 default = ["full"]
 full = [
     "tui",
+    "durable",
     "extensions",
-    "python",
     "context-mode",
     "mcp",
+    "python",
     "env",
     "env-daemon",
     "server",
@@ -472,101 +323,43 @@ full = [
     # Empty profile marker; `full` is still the union of every feature.
     "minimal",
 ]
-# Default-on optional surfaces (user decision 2026-10-22: "except the agent
-# loop, everything is an optional feature that is on by default"). `session`
-# and `skills` keep their public data types and degrade to documented stubs, so
-# a consumer that turns them off loses functionality but never a signature.
-# `sdk` is different: it is a wholly optional facade — with it off `pir::sdk`
-# is not compiled at all (there is no stub), so an embedder that uses the SDK
-# enables the feature. `--no-default-features` leaves the agent loop +
-# providers + tools + config compilable.
-#   session     — upstream-format JSONL persistence, the tail-page reader and
-#                 session discovery. Off: the agent runs with no transcript
-#                 persistence (in-memory only). `memmap2` is optional and only
-#                 this feature pulls it in.
-session = ["dep:memmap2"]
-#   skills      — skill discovery/loading (`src/skills.rs`). Off: skill loading
-#                 reports the documented "disabled" diagnostic; the prompt
-#                 renderer still compiles.
-skills = []
-#   sdk         — the curated embedding facade (`pir::sdk`). Off: the module
-#                 is not compiled (no stub); embedders enable `sdk`.
-sdk = []
-# The zero-optional profile marker. It deliberately enables NOTHING: the
-# runnable minimal agent (`pir::minimal`, the `pir-minimal` bin) and its one
-# OpenAI-compatible provider are core, so `--no-default-features` alone is
-# already runnable. `minimal` exists as the named profile for scripts and
-# consumers (`cargo check --no-default-features --features minimal`); it is a
-# member of `full` (so `full` stays the union of every feature) and enabling
-# it never changes the compiled surface.
-minimal = []
-# AI wire adapters: each feature gates one provider family's adapter and its
-# registry/construction arm. The exception is the plain OpenAI-compatible
-# `/chat/completions` adapter (`ai::api::openai`), which is core because the
-# minimal profile needs exactly one real provider and `reqwest` is an
-# unconditional dependency; `provider-openai` gates the Responses/Codex/
-# pi-messages adapters, catalog auto-construction of OpenAI-family models and
-# the Codex WebSocket transport. `provider-google` carries the Vertex
-# service-account JWT (`rsa`), `provider-bedrock` the SigV4 signing (`hmac`);
-# `extensions` needs both too (node:crypto), so they are shared, not owned.
-provider-openai = ["dep:tokio-tungstenite"]
-provider-anthropic = []
-provider-google = ["dep:rsa"]
-provider-bedrock = ["dep:hmac"]
-provider-mistral = []
-# The image attach path (read's inline images) and the AI layer's image-content
-# helpers; there is no separate image tool. The TUI also uses the crate
-# (settings menu, preview),
-# but that is independent: `tui` does NOT enable read's attachment path, so
-# `tui` without `image-tools` keeps the documented "type/size only" behavior.
-image-tools = ["dep:image"]
-# The clap-based CLI argument surface (`src/coding_agent/cli.rs`); the binary
-# requires it, an SDK embed does not. `cli` implies the executable's front ends
-# (`print`, `rpc`) and the session HTML exporter (`export-html`), so every
-# `pir` binary keeps today's behavior; it deliberately does NOT imply `tools`
-# (see below).
-cli = ["dep:clap", "print", "rpc", "export-html"]
-# `pir print` / the print-mode host (`src/coding_agent/print.rs`). Implied by
-# `cli`; a library-only embed can enable it alone.
-print = []
-# `pir rpc` / the JSON-line host (`src/coding_agent/rpc.rs`). Implied by `cli`;
-# a library-only embed can enable it alone. The `export_html` command is always
-# on the wire surface: `rpc` without `export-html` answers the documented
-# missing-feature error instead of silently dropping the command.
-rpc = []
-# Session → self-contained HTML (`src/coding_agent/export_html.rs`, `--export`
-# and the TUI `/export`). Implied by `cli` and `tui`. NOT implied by `rpc`, so
-# an `rpc`-only embed gets the runtime off-error (pinned by
-# `tests/rpc_export_off.rs`) rather than losing the command silently.
-export-html = []
-# Per-tool gates. Each is a dependency-free leaf: a build can compile exactly
-# one core tool (plus the shell/session plumbing that stays core) and
-# `register_core_tools`/`CORE_TOOL_NAMES` reflect only the enabled leaves.
-#   tool-read       — `read` (and the shared confinement/path helpers)
-#   tool-bash       — the `bash` tool (`BashTool`); the bash module itself
-#                     (`ShellConfig`, the shell pool, `ShellCapture`) stays
-#                     core for the session/provider exec paths
-#   tool-powershell — `powershell`
-#   tool-edit       — `edit` (the TUI edit preview also compiles it)
-#   tool-write      — `write`
-#   tool-ls         — `ls`
-#   tool-background — `background_status` + `background_abort`
-tool-read = []
-tool-bash = []
-tool-powershell = []
-tool-edit = []
-tool-write = []
-tool-ls = []
-tool-background = []
-# The aggregate built-in tools feature: a meta-feature over the seven leaves
-# above (read/bash/powershell/edit/write/ls and the model-facing background
-# controls), registered by `coding_agent::tools::register_core_tools`.
-# Deliberately NOT implied by `cli`: `--features cli` is a real toolless binary
-# (the session/RPC `execute_bash` path, prompt rendering and the shell-pool
-# helpers stay core), and an explicit `--tools <core-name>` in that build emits
-# the compiled-out diagnostic naming that tool's leaf feature. `tools` is in
-# `full`, so the shipped binary is unchanged.
+
+# ---------------------------------------------------------------------------
+# Engine features (forwarded to pir-core)
+# ---------------------------------------------------------------------------
+# The durable runtime (a separate crate re-exported at `pir::durable`).
+durable = ["pir-core/durable"]
+session = ["pir-core/session", "pir-tui?/session"]
+skills = ["pir-core/skills"]
+sdk = ["pir-core/sdk"]
+minimal = ["pir-core/minimal"]
+provider-openai = ["pir-core/provider-openai"]
+provider-anthropic = ["pir-core/provider-anthropic"]
+provider-google = ["pir-core/provider-google"]
+provider-bedrock = ["pir-core/provider-bedrock"]
+provider-mistral = ["pir-core/provider-mistral"]
+image-tools = ["pir-core/image-tools", "image-resize"]
+# The `image` codec for the model-facing resize pipeline. Implied by
+# `image-tools`; exposed separately for an embed that wants only the resize
+# helpers (the TUI also enables the engine-side feature directly).
+image-resize = ["pir-core/image-resize"]
+cli = ["pir-core/cli", "dep:clap"]
+print = ["pir-core/print"]
+rpc = ["pir-core/rpc"]
+export-html = ["pir-core/export-html"]
+tool-read = ["pir-core/tool-read"]
+tool-bash = ["pir-core/tool-bash"]
+tool-powershell = ["pir-core/tool-powershell"]
+tool-edit = ["pir-core/tool-edit"]
+tool-write = ["pir-core/tool-write"]
+tool-ls = ["pir-core/tool-ls"]
+tool-background = ["pir-core/tool-background"]
+# The aggregate must ALSO enable the leaf features on this crate: integration
+# tests compile against `pir-sdk` and gate on `cfg(feature = "tool-read")` etc.,
+# so an aggregate that only forwarded `pir-core/tools` left those cfgs false and
+# compiled compiled-out-build tests into a full build.
 tools = [
+    "pir-core/tools",
     "tool-read",
     "tool-bash",
     "tool-powershell",
@@ -575,155 +368,48 @@ tools = [
     "tool-ls",
     "tool-background",
 ]
-# `grep`/`find` tools and the ripgrep engine crates they run in-process
-# (`env_daemon`'s directory listing shares `ignore` and carries `env` itself).
-# An independent leaf: it does not pull the seven `tool-*` leaves (or the
-# aggregate `tools` meta-feature) into the build, so a search-only embed can
-# compile `grep`/`find` without read/bash/edit/write/ls/background.
-grep-find = ["dep:grep-searcher", "dep:grep-regex", "dep:ignore"]
-
-# Terminal UI: crossterm loop, editor, renderers, clipboard (arboard), grapheme
-# segmentation, mermaid blocks, theme file watching (`notify`).
-tui = [
-    "dep:crossterm",
-    "dep:image",
-    "dep:crossterm_winapi",
-    "dep:arboard",
-    "dep:notify",
-    "dep:mermaid-text",
-    # The TUI `/export` command renders a session through
-    # `coding_agent::export_html`; the feature (and its module) follows.
-    "export-html",
-]
-# Embedded QuickJS extension runtime (rquickjs + the swc transpile stack).
-extensions = [
-    "dep:aes",
-    "dep:sha1",
-    "dep:sha3",
-    "dep:md-5",
-    "dep:pbkdf2",
-    "dep:scrypt",
-    "dep:url",
-    "dep:rquickjs",
-    "dep:flate2",
-    "dep:brotli",
-    "dep:zstd",
-    "dep:rusqlite",
-    "dep:hmac",
-    "dep:rsa",
-    "dep:notify",
-    "dep:swc_ecma_parser",
-    "dep:swc_ecma_codegen",
-    "dep:swc_ecma_ast",
-    "dep:swc_ecma_transforms_base",
-    "dep:swc_ecma_transforms_typescript",
-    "dep:swc_common",
-]
-# Optional process-wide allocator for the `pir` bin (A/B measurement only).
-#
-# OFF by default and deliberately NOT a member of `full`: a normal (default)
-# build keeps the system allocator, and `--no-default-features` is unaffected.
-# Enabling it swaps the bin's instrumented `TracingAllocator`
-# (PIR-TUI-019/020) for `mimalloc::MiMalloc`, so `PIR_ALLOC_TRACE` is inactive
-# in that build — a binary can install exactly one `#[global_allocator]`. The
-# library never registers an allocator, so tests/SDK embedders are unchanged.
-# The feature is package-wide, so the `pir` bin (`required-features = ["cli"]`)
-# sees it whenever `cli` is on.
-#   cargo run --features mimalloc-alloc -- <args>
+grep-find = ["pir-core/grep-find"]
+extensions = ["pir-core/extensions", "pir-tui?/extensions", "dep:rquickjs"]
+brush = ["pir-core/brush"]
+context-mode = ["pir-core/context-mode"]
+# The `python` tool name is kept for Settings/tool-selection compatibility; the
+# tool now runs JavaScript on the embedded QuickJS runtime.
+python = ["pir-core/python"]
+# Allocator A/B switch for the `pir` binary only (`src/main.rs`). OFF by
+# default: enabling it swaps the process-wide allocator, which is what the
+# perf harness compares against the default.
 mimalloc-alloc = ["dep:mimalloc"]
-# The `python` builtin tool (embedded RustPython 3).
-# The `python` feature name is kept for Settings/tool-selection compatibility;
-# the tool now runs JavaScript on the embedded QuickJS runtime (js_vm.rs).
-python = []
-# Embedded bash-compatible shell for the bash tool (`pir __brush` + the shell
-# pool's brush member). Without it the tool spawns the external shell exactly
-# as before; `shellPath` in settings still wins over brush.
-brush = ["dep:brush-core", "dep:brush-builtins"]
-# The `context-mode` builtin: Python scripts as a context-saving execution
-# surface (only stdout enters the transcript) plus an FTS5/BM25 knowledge
-# base. Reuses the embedded RustPython interpreter and rusqlite; the sqlite
-# feature keeps the node:sqlite shims behind `extensions`, this feature pulls
-# the same bundled SQLite for the index.
-context-mode = ["python", "dep:rusqlite"]
-# MCP client + the `mcp` builtin (rmcp 3.5). The builtin's tool-exposure and
-# output-schema model is expressed through the codemode engine (its reach
-# rules and `mcp_result_schema` live in `plugins::codemode`), so the feature
-# carries `extensions`.
-mcp = ["dep:rmcp", "extensions"]
-# The built-in `sd` MCP server (`pir mcp-sd`, stdio): exposes a sed-style
-# search & replace tool to any MCP client, including pir itself.
-mcp-sd = ["mcp", "dep:ignore"]
-# (No `sqlite` feature: the node:sqlite / better-sqlite3 shims are host
-# functions *of* the extension engine and ride `extensions`, which pulls
-# rusqlite. Splitting SQLite back out needs JS-side stubs; see docs/FEATURES.md §4.)
-# The daemon's watch/list backend: the platform watcher (`notify`) and the
-# `ignore` walker behind `listFiles`. After the `env-daemon` split its only
-# compiled consumer is the daemon, and `env-daemon` implies it; `env` alone is
-# a dependency-only row (no daemon, no ops). The daemon's wire data plane
-# (`env_daemon::frame`/`decode`) stays core for the remote-env client.
-env = ["dep:notify", "dep:ignore"]
-# The daemon half of the env wire (`pir env-daemon serve`): the server, its
-# exec/pty/file/list/watch ops and the platform `sys` layer. The data plane
-# (`frame`/`decode`) and `env_daemon::DAEMON_SUBCOMMAND` stay core so the
-# remote-env client and the `pir env-daemon` missing-feature arm compile in a
-# build without the daemon. Implies `env` (watch/list backend).
-env-daemon = ["env"]
-# In-tree TCP/Unix server + client presets (no heavy dependencies).
-server = []
-# The remote protocol client (`pir::client`, `pir client`): the consumer half
-# of the `server` wire, with no dependencies beyond the core protocol types.
-# Off: `pir::client` does not exist (no stub) and `pir client` reports the
-# missing feature instead of failing to compile.
-client = []
-# The `subagent` builtin (upstream's subagent example extension, ported
-# natively): in-process child agent sessions with their own extension runtime.
-# Absent in a build without the feature, so `builtin:subagent` reports the
-# unknown-builtin error there.
-subagent = []
-# The `tool-repair` builtin (pi-tool-repair 0.3.6 ported natively): the
-# assistant `message_end` repair pipeline plus the `before_provider_request`
-# schema sanitizer. This gates the builtin's registration (its factory entry
-# and plugin type); the pure repair core stays compiled because the core
-# session's repair seam (`agent_session/tool_repair.rs`) names it.
-tool-repair = []
-# The `tool-search` builtin (upstream extensions/tool-search): BM25 search
-# over the not-yet-active tools, loading the matches into the active set.
-# Absent in a build without the feature, so `builtin:tool-search` reports the
-# unknown-builtin error there.
-tool-search = []
-# The `todo` builtin (the npm `@juicesharp/rpiv-todo` package ported natively):
-# the model-facing `todo` task list plus the `/todos` command, rebuilt from the
-# session transcript so it survives `/reload`, resume and compaction. Absent in
-# a build without the feature, so `builtin:todo` reports the unknown-builtin
-# error there.
-todo = []
-# The `memory` builtin: the cm-memory single-file project memory engine
-# (`tools/cm-rs`, published as `cm-memory`) embedded as native Rust. Registers
-# the `memory` tool, the `/memory` command, and the input auto-recall hook.
-# Absent in a build without the feature, so `builtin:memory` reports the
-# unknown-builtin error there.
-memory = ["dep:cm-memory"]
-# pi-phone ported natively: the phone-first remote UI (HTTP+WS server, session
-# mirror, parallel RPC sessions, Tailscale). Compiled into `full` but DEFAULT
-# OFF on the extension plan (`BuiltinExtensionDef::default_enabled: false`):
-# it binds a local port and holds a server task. sha1 is the WS handshake;
-# flate2 (already linked for node:zlib, pure-Rust miniz backend) serves the
-# embedded UI gzip-encoded.
-phone = ["dep:tokio-tungstenite"]
-# The halfblocks image preview renderer in the TUI (`src/tui/image_preview.rs`).
-# The `image` crate comes with `tui` or `image-tools`; this feature gates the
-# renderer on top of that. It is part of `full` (default-on, so the preview
-# works out of the box) but independently disableable in a slim TUI build:
-# with it off, `terminal.showImages: true` renders the `[Image: ...]` text
-# fallback instead of halfblocks.
-image-protocol = ["tui"]
+mcp = ["pir-core/mcp"]
+mcp-sd = ["pir-core/mcp-sd"]
+env = ["pir-core/env"]
+env-daemon = ["pir-core/env-daemon"]
+server = ["pir-core/server"]
+client = ["pir-core/client"]
+subagent = ["pir-core/subagent"]
+# Alias of `subagent` (see `pir-core/Cargo.toml`): the foreman/plan modes need
+# the subagent tool, and the explicit name keeps one feature per builtin.
+mode = ["subagent"]
+tool-repair = ["pir-core/tool-repair"]
+tool-search = ["pir-core/tool-search"]
+todo = ["pir-core/todo"]
+memory = ["pir-core/memory"]
+phone = ["pir-core/phone"]
+# Test-only: `pir-telemetry`'s in-memory recorder (`TestTelemetry`). The
+# integration suites under `tests/` reach it through `pir::telemetry`; the
+# workspace dev-dependencies enable it, production builds never do.
+telemetry-testing = ["pir-core/telemetry-testing"]
+
+# a pir-sdk dependency or published facade feature; build it directly with
+# `cargo build -p pir-native-shell --features desktop`.
+
+# Terminal UI: crossterm loop, editor, renderers, clipboard, theme watching.
+# `export-html` follows because the TUI's `/export` command renders a session.
+tui = ["dep:pir-tui", "export-html", "pir-core/image-resize", "pir-core/ui-support", "image-resize"]
+# The halfblocks/image-protocol renderer inside the TUI.
+image-protocol = ["tui", "pir-tui/image-protocol"]
 
 # Quality gates: CI runs `cargo clippy --all-targets --all-features -- -D
-# warnings`, so every `warn` entry here is a build gate. The pedantic picks
-# below were chosen conservatively (verified silent on the current tree):
-# `disallowed-methods`/`disallowed-types` ship with an empty config list and
-# are pure extension points; `wildcard_dependencies`/`negative_feature_names`
-# only read Cargo.toml (no "*" version reqs, no negated feature names).
+# warnings`, so every `warn` entry here is a build gate.
 [lints.rust]
 unsafe_code = "deny"
 
@@ -733,72 +419,112 @@ disallowed_methods = "warn"
 disallowed_types = "warn"
 wildcard_dependencies = "warn"
 negative_feature_names = "warn"
-# clippy 1.99.1 false positive: it reports `thread_local!` initializers as
-# non-const even when they are already written as `const { ... }` (reproduced
-# with a minimal `clippy-driver` file). Remove when the toolchain is updated.
 missing_const_for_thread_local = "allow"
 
-# Process-group kill for stdio MCP servers (upstream killProcessTree on Unix).
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-# The musl release has no system OpenSSL; native-tls -> openssl-sys must build
-# its own against musl-gcc. This is target-scoped so glibc builds keep using
-# the platform library.
-[target.'cfg(target_env = "musl")'.dependencies]
-openssl-sys = { version = "0.9", features = ["vendored"] }
-
-# Shell-tool process-tree kill (upstream killProcessTree on Windows): the
-# child runs in a Job Object so abort/timeout reach every descendant;
-# `taskkill /T /F` stays the fallback. Zero-transitive-dependency crate (only
-# windows-targets, already in the tree).
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    # CreateJobObjectW is gated behind Win32_Security (SECURITY_ATTRIBUTES).
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    # Win32_System_Threading was audited out: the only Job Object calls used
-    # (CreateJobObjectW/AssignProcessToJobObject/TerminateJobObject) reference
-    # types from Win32_Foundation (HANDLE) and Win32_Security only.
-    # Re-added for `pir env-daemon` (src/env_daemon/sys/windows.rs):
-    # CREATE_NO_WINDOW for hidden child processes and taskkill.
-    "Win32_System_Threading",
-    # `pir env-daemon` file ops: CreateFileW/GetFileInformationByHandle/
-    # MoveFileExW and the BY_HANDLE_FILE_INFORMATION identity probe.
-    "Win32_Storage_FileSystem",
-    # CancelSynchronousIo, so a pipe reader blocked in ReadFile wakes up and
-    # closes its pipe when a command settles (upstream sys/windows.rs).
-    "Win32_System_IO",
-    # Native Shift+Enter detection (GetAsyncKeyState) in src/tui/stdin_buffer.rs.
-    "Win32_UI_Input_KeyboardAndMouse",
-    # FormatMessageW for locale-independent OS error text in
-    # src/coding_agent/tools/util.rs (english_os_message).
-    "Win32_System_Diagnostics_Debug",
-] }
-# The upstream `enableWindowsVTInput` port (src/tui/stdin_buffer.rs) reaches
-# GetConsoleMode/SetConsoleMode through the safe wrappers crossterm already
-# depends on (the workspace denies `unsafe_code`, so the raw Win32 calls are
-# not available to us). Same 0.9 line the lock already carries.
-crossterm_winapi = { version = "0.9", optional = true }
-
 [dev-dependencies]
+# Tests and examples were written against the pre-split single crate and use
+# the engine's third-party crates directly. They are dev-only: a consumer of
+# `pir-sdk` does not pull them in.
+#
+# `testing` is enabled here (not in any published feature): the integration
+# suites construct `pir::telemetry::TestTelemetry`, and a dev-dependency
+# feature-union makes that available to `cargo test` without putting the
+# in-memory recorder in a release build.
+pir-telemetry = { path = "crates/pir-telemetry", features = ["testing"] }
 criterion = "0.5"
 pir-phone-server = { path = "crates/pi-phone-server" }
-# Heap profiling harness (`tests/startup_heap_profile.rs`, ignored by default):
-# dhat tracks every allocation site without changing the product binary.
 dhat = "0.3"
-# Provider-adapter test modernization: insta golden snapshots + proptest for
-# SSE chunk-boundary robustness (quality wave Q9).
 insta = { version = "1", features = ["json"] }
 proptest = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "native-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "native-tls"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1.13.1"
+memmap2 = "0.9"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.23"
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+sha1 = "0.10"
+getrandom = "0.3"
+pbkdf2 = "0.12"
+flate2 = "1.1"
+brotli = "8"
+zstd = "0.13"
+cm-memory = { version = "0.3.1", default-features = false }
+rsa = { version = "0.9", features = ["sha2"] }
+ciborium = "0.2.2"
+unicode-width = "0.2.2"
+unicode-segmentation = "1.13"
+similar = "2"
+memchr = "2"
+unicode-normalization = "0.1"
+swc_ecma_parser = "46.0.0"
+swc_ecma_codegen = "32.0.3"
+swc_ecma_ast = "29.0.2"
+swc_ecma_transforms_base = "50.0.0"
+swc_ecma_transforms_typescript = "56.0.0"
+swc_common = "26.0.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+grep-searcher = "0.1"
+grep-regex = "0.1"
+ignore = "0.4"
+encoding_rs = "0.8"
+notify = "8.2"
+tokio-util = "0.7"
+strum = { version = "0.27", features = ["derive"] }
+derive_more = { version = "2", features = ["display", "from"] }
+globset = "0.4"
+semver = "1"
+textwrap = { version = "0.15", default-features = false, features = ["unicode-width", "unicode-linebreak"] }
+rmcp = { version = "3.5", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest-native-tls",
+    "server",
+    "transport-io",
+] }
+aes = "0.8"
+scrypt = "0.11"
+rusqlite = { version = "0.31", features = ["bundled"] }
+brush-core = "0.5.0"
+brush-builtins = "0.2.0"
+crossterm = "0.29.0"
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+mermaid-text = "0.57"
+
+[target.'cfg(unix)'.dev-dependencies]
+# Integration tests (`env_client_pty.rs`) probe processes with libc directly.
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+crossterm_winapi = "0.9"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Diagnostics",
+    "Win32_System_Diagnostics_Debug",
+] }
 
 [package.metadata.cargo-machete]
 # The package is `md-5`; the code imports its crate as `md5` (node:crypto
 # hash/hmac backend), which cargo-machete cannot see as a package use.
 # `openssl-sys` is target-only: the musl release enables its `vendored` feature
 # for native-tls, with no Rust-side import.
-ignored = ["openssl-sys"]
+ignored = ["md-5", "openssl-sys"]
 
 # Criterion owns `main` (its own runner + report); without `harness = false`
 # cargo compiles the bench under libtest and runs 0 benchmarks.
@@ -818,48 +544,58 @@ name = "trigram_bench"
 path = "bench/trigram_bench/main.rs"
 required-features = ["context-mode"]
 
-# Size posture, measured (Q55): the default release profile is fat LTO + one
-# codegen unit + `strip = true`. Same-source A/B against the control shape:
-# 82,649,600 B vs 95,676,416 B — a 13.62% smaller executable (evidence:
-# logs/w18-help/q55/; recorded in docs/STATUS.md and docs/w19-north-star.md).
-# The trade is build time: fat LTO + one CGU serializes the final link, which
-# is why the opt-in `release-balanced` (opt-level 2; another −3.46% at a small
-# JS/Python wall cost) and `release-size` profiles below exist for iteration
-# and size-first builds. `strip` drops symbols from the shipped binary at zero
-# compile-time cost.
 [profile.release]
 opt-level = 3
-# Size without behaviour change: fat LTO + one codegen unit let LLVM
-# cross-crate inline and fold identical code, which is where most of the
-# remaining ~81 MiB went. Deliberately NOT used: `panic = "abort"` (both
+# THIN LTO, not fat. `strip = true` removes symbols only. Deliberately NOT
+# used: `panic = "abort"` (both
 # `extensions/runtime/host_functions/worker_fns.rs` and `tui/autocomplete.rs`
 # contain a panicking boundary, and `coding_agent/crash_log.rs` installs a
-# `panic::set_hook`, so unwinding is load-bearing). `strip = true` removes
-# symbols only. The opt-in `release-size` profile below applies `opt-level =
-# "s"` only to cold code and keeps the interpreters at 3; `release-balanced`
-# uses opt-level 2 uniformly. The default keeps opt-level 3 for throughput.
-lto = "fat"
-codegen-units = 1
+# `panic::set_hook`, so unwinding is load-bearing).
+#
+# Why thin: fat LTO + one codegen unit serializes the whole crate graph through
+# a single LLVM module, which dominated every release build (8m51s recorded in
+# `scripts/GATE-README.md` gate 11) and made a one-line engine edit pay the
+# entire link. `thin` still cross-crate inlines (it is a superset of plain
+# per-CGU inlining) and parallelizes the link; the size difference between thin
+# and fat LTO on this tree is low single-digit percent. `codegen-units = 4`
+# rather than 1 for the same reason: one CGU forces serial codegen and disables
+# thin LTO's pipeline. `release-size` / `release-balanced` inherit this, so they
+# get thin too.
+lto = "thin"
+codegen-units = 4
 strip = true
 
 # Size-first profile: identical features and behaviour, LLVM optimizes for
-# size. Build with `cargo build --profile release-size --bin pir`; the measured
-# delta and its throughput trade are recorded in logs/w18-help/q55/.
+# size. Build with `cargo build --profile release-size --bin pir`.
 #
-# The hot execution crates stay at opt-level 3: a pure `"s"` build is ~29%
-# smaller but costs ~85% on JavaScript loops and ~22% on Python loops, almost
-# all of it in the QuickJS C runtime and the RustPython VM/stdlib. Keeping
-# those (plus our own crate, the async runtime and the grep stack) at 3
-# preserves the interactive paths while the cold bulk (swc, brush, image,
-# HTTP/TLS, MCP) still gets the size win.
+# Measured on x86_64-pc-windows-gnu, `--bin pir`, this tree:
+#   release      73,700,864 B
+#   release-size 66,945,024 B   (-9.17%, -6.76 MB)
+# `.text` shrinks by 6.4 MB (61.4 MB -> 54.8 MB) and `.rdata` by 0.25 MB; the
+# rest of the win is the same in both profiles, so the shipped size tracks the
+# code sections directly.
+#
+# COST: the "s" crates lose instruction-level parallelism, and the QuickJS C
+# runtime is the worst hit (that is why rquickjs* sits in the opt-level 3
+# list below). Do not use this profile for the JavaScript-heavy interactive
+# paths without re-measuring; `release-balanced` is the conservative choice.
+#
+# `strip` is repeated here on purpose. `inherits = "release"` did NOT carry it
+# into the produced binary on this toolchain (cargo 1.99.1): a release-size
+# build emitted 88,791,040 B with 167,844 COFF symbols still in the table, and
+# an external `strip --strip-all` brought the very same artifact to
+# 66,945,024 B. Spelling it out costs nothing and keeps the profile honest.
 [profile.release-size]
 inherits = "release"
 opt-level = "s"
+strip = true
 
 [profile.release-size.package.pir-sdk]
 opt-level = 3
-
-
+[profile.release-size.package.pir-core]
+opt-level = 3
+[profile.release-size.package.pir-tui]
+opt-level = 3
 
 [profile.release-size.package.rquickjs]
 opt-level = 3
@@ -892,160 +628,89 @@ opt-level = 3
 [profile.release-size.package.tokio]
 opt-level = 3
 
-# Middle ground: every crate at opt-level 2. Measured at 79,790,080 B
-# (−3.46% vs release) with JavaScript +4.1% wall and Python +1.2% wall, so it
-# is the safer choice when the embedded JS/Python loops matter more than the
-# last two megabytes. Evidence: logs/w18-help/q55/SIZE-TUNE-REPORT.md.
+# The three hot paths the original whitelist missed. `opt-level = "s"` on
+# these is where the "slower" part of the size win came from, not the cold
+# bulk: every provider request goes through the HTTP/TLS stack, every TUI
+# frame through crossterm, and every transcript/settings/tool payload
+# through serde. At "s" they trade measurable throughput for a few MB that
+# the genuinely cold crates (swc, brush, image codecs, MCP) give up for
+# free, because none of those run on a per-token or per-frame path.
+[profile.release-size.package.serde]
+opt-level = 3
+[profile.release-size.package.serde_derive]
+opt-level = 3
+[profile.release-size.package.reqwest]
+opt-level = 3
+[profile.release-size.package.hyper]
+opt-level = 3
+[profile.release-size.package.hyper-util]
+opt-level = 3
+[profile.release-size.package.rustls]
+opt-level = 3
+[profile.release-size.package.crossterm]
+opt-level = 3
+
+[profile.release-size.package.futures-util]
+opt-level = 3
+[profile.release-size.package.parking_lot]
+opt-level = 3
+
+# Middle ground: every crate at opt-level 2. Not re-measured on this tree; the
+# only recorded number (79,790,080 B, -3.46% vs release at the time, JavaScript
+# +4.1% wall) predates the thin-LTO + codegen-units=4 change above and the
+# `release` baseline it compared against is now 73,700,864 B, so treat the
+# percentage as indicative rather than current. Pick this profile when the
+# embedded JavaScript loops matter more than the last few megabytes and you
+# want a much shorter build than `release-size` (opt-level 2 keeps LLVM's
+# vectorizer and inliner fully on, so it is also the mildest throughput hit).
 [profile.release-balanced]
 inherits = "release"
 opt-level = 2
 
-# Benchmark/iteration profile: release optimization without the serializing
-# fat-LTO link, so JS/perf measurements land in minutes instead of tens of
-# minutes. Not for shipment (the shipped profile is `release`).
-[profile.release-fast]
-inherits = "release"
-lto = false
-codegen-units = 16
-
-# No debuginfo in dev: the crate links ~99 test binaries, and line tables
+# No debuginfo in dev: the crate links ~14 test binaries, and line tables
 # pushed each to ~80 MB — a lib edit (including any `.js.txt` include_str!)
 # meant re-linking ~8 GB, dominating the edit-test loop. Panic locations and
 # assert messages are unaffected (they are compiled-in constants); only
 # RUST_BACKTRACE symbolization loses file:line. Raise to 1/2 when chasing a
 # crash that needs symbolized backtraces.
+#
+# `strip = "debuginfo"` on top of `debug = 0`: `debug = 0` removes DWARF but
+# NOT the COFF symbol table, which is what actually dominates these binaries
+# (measured on `zz_merged_7`: 249 MB -> 139 MB, 44% smaller; the code sections
+# end at 145 MB of the original file). That table is pure linker I/O on every
+# relink, so stripping it is the single biggest edit-test-loop win here. Tests
+# are unaffected — no suite asserts on symbolized backtraces (crash_log's
+# `stack` is a caller-supplied string), verified by re-running the stripped
+# harness (892 passed). "debuginfo" and not "symbols" so a future `debug = 1`
+# still works as documented above.
 [profile.dev]
 opt-level = 0
 debug = 0
-
-# The embedded engine must be optimized in dev/test builds too. Without this,
-# the default dev profile hands quickjs.c to the C compiler at -O0, so every
-# JS-heavy test and `pir js` debug run is several times slower than the shipped
-# release binary and benchmarks do not represent production. Only the three
-# engine packages are optimized; the rest of the crate stays at opt-level 0, so
-# the edit-test loop and backtraces are unaffected (the C build happens once).
-[profile.dev.package.rquickjs-sys]
-opt-level = 3
-
-[profile.dev.package.rquickjs-core]
-opt-level = 3
-
-[profile.dev.package.rquickjs]
-opt-level = 3
-
-# `cargo test` uses the test profile; keep the same engine optimization there
-# (profile inheritance does not reliably carry per-package overrides).
-[profile.test.package.rquickjs-sys]
-opt-level = 3
-
-[profile.test.package.rquickjs-core]
-opt-level = 3
-
-[profile.test.package.rquickjs]
-opt-level = 3
-
-# The Node host bridge itself: dev/test builds otherwise run every host op
-# (base64 codecs, hashing, zlib, JSON payload conversion) at -O0, which makes
-# `fs.readFileSync`/`writeFileSync`/`crypto` several times slower than the
-# release binary. These are the crates on the JS↔Rust boundary; the rest of the
-# workspace stays unoptimized so the edit-test loop is unchanged.
-[profile.dev.package.pir-sdk]
-opt-level = 3
-
-[profile.test.package.pir-sdk]
-opt-level = 3
-
-[profile.dev.package.serde_json]
-opt-level = 3
-
-[profile.test.package.serde_json]
-opt-level = 3
-
-[profile.dev.package.base64]
-opt-level = 3
-
-[profile.test.package.base64]
-opt-level = 3
-
-[profile.dev.package.sha1]
-opt-level = 3
-
-[profile.test.package.sha1]
-opt-level = 3
-
-[profile.dev.package.sha2]
-opt-level = 3
-
-[profile.test.package.sha2]
-opt-level = 3
-
-[profile.dev.package.sha3]
-opt-level = 3
-
-[profile.test.package.sha3]
-opt-level = 3
-
-# `sha3` delegates the permutation to this crate; without the override the
-# SHA-3 family runs at -O0 even when `sha3` itself is optimized.
-[profile.dev.package.keccak]
-opt-level = 3
-
-[profile.test.package.keccak]
-opt-level = 3
-
-[profile.dev.package.md-5]
-opt-level = 3
-
-[profile.test.package.md-5]
-opt-level = 3
-
-[profile.dev.package.hmac]
-opt-level = 3
-
-[profile.test.package.hmac]
-opt-level = 3
-
-[profile.dev.package.pbkdf2]
-opt-level = 3
-
-[profile.test.package.pbkdf2]
-opt-level = 3
-
-[profile.dev.package.aes]
-opt-level = 3
-
-[profile.test.package.aes]
-opt-level = 3
-
-[profile.dev.package.rsa]
-opt-level = 3
-
-[profile.test.package.rsa]
-opt-level = 3
-
-[profile.dev.package.flate2]
-opt-level = 3
-
-[profile.test.package.flate2]
-opt-level = 3
-
-[profile.dev.package.miniz_oxide]
-opt-level = 3
-
-[profile.test.package.miniz_oxide]
-opt-level = 3
-
-# `flate2`'s active backend: the `zlib-rs` crate carries the real deflate
-# work, so leaving it at the dev profile's O0 made `zlib.deflateSync(4KB)`
-# ~145–176µs instead of ~19–35µs in every test and `pir js` run.
-[profile.dev.package.zlib-rs]
-opt-level = 3
-
-[profile.test.package.zlib-rs]
-opt-level = 3
+strip = "debuginfo"
 
 [workspace]
-members = ["crates/pi-phone-server"]
+members = [
+    "crates/pir-core",
+    "crates/pir-tui",
+    "crates/pi-phone-server",
+    "crates/pir-native-shell",
+    "crates/pir-plugin-api",
+    "crates/pir-telemetry",
+    "crates/pir-ai-types",
+    "crates/pir-durable",
+    "crates/pir-protocol",
+    "crates/pir-builtins",
+    "crates/pir-builtin-tool-repair",
+    "crates/pir-builtin-todo",
+    "crates/pir-builtin-tool-search",
+    "crates/pir-builtin-mode",
+    "crates/pir-builtin-memory",
+    "crates/pir-builtin-context-mode",
+    "crates/pir-builtin-codemode",
+    "crates/pir-builtin-mcp",
+    "crates/pir-builtin-phone",
+    "crates/pir-builtin-subagent",
+]
 resolver = "2"
 
 # Single source of truth for the workspace version. Every member inherits it
@@ -1055,6 +720,11 @@ resolver = "2"
 # release workflow parses this section (prereleases like `0.3.2-rc.1` are valid).
 [workspace.package]
 version = "0.3.2"
+# Shared metadata for the published support crates (plugin API + builtins).
+# `pir-core`/`pir-tui`/`pir-sdk` keep their own explicit values.
+license = "MIT OR Apache-2.0"
+authors = ["Earendil Works <team@earendil.works>"]
+repository = "https://github.com/Cricle/pir"
 
 # BEGIN GENERATED MERGED TEST TARGETS
 # Regenerated by scripts/gen_merged_tests.ps1; every root tests/*.rs file is
@@ -1093,68 +763,47 @@ name = "zz_merged_8"
 path = "tests/zz_merged_8.rs"
 
 [[test]]
-name = "python_session_lifecycle"
-path = "tests/python_session_lifecycle.rs"
-
-[[test]]
 name = "worker_threads_real"
 path = "tests/worker_threads_real.rs"
 
+# Durable integration suites that need the engine's real `SessionManager` /
+# extension runtime; the pure suites live in `crates/pir-durable/tests/`.
 [[test]]
-name = "durable_memcopy_bench"
-path = "tests/durable_memcopy_bench.rs"
-
-[[test]]
-name = "g_durable"
-path = "tests/g_durable.rs"
+name = "g_durable_integration"
+path = "tests/g_durable_integration.rs"
 
 [[test]]
 name = "print_native_session"
 path = "tests/print_native_session.rs"
 
-# END GENERATED MERGED TEST TARGETS
-
-# Standalone (not merged) on purpose: it is opt-in measurement scaffolding for
-# the allocator/GC spike (`PIR_GC_MEASURE=1` prints numbers, asserts nothing),
-# and the parsing/profile tests are pure. Keeping it out of the merged harness
-# means the harness stays byte-identical for the gate.
 [[test]]
-name = "alloc_gc_tuning"
-path = "tests/alloc_gc_tuning.rs"
-required-features = ["extensions"]
-
-# Fixed-workload measurement; kept standalone to avoid linking the merged
-# integration suites with the optimized benchmark profile.
-[[test]]
-name = "native_workload_parity"
-path = "tests/native_workload_parity.rs"
-required-features = ["cli", "extensions"]
-
-# Multi-plugin hosting measurement (N synthesized extension packages in one
-# runtime). Standalone like the other opt-in measurement harnesses; the
-# driver is `_scratch/plugin-scale/run.ps1`.
-[[test]]
-name = "plugin_scale"
-path = "tests/plugin_scale.rs"
-required-features = ["extensions"]
+name = "resume_on_error"
+path = "tests/resume_on_error.rs"
 
 [[test]]
-name = "v8_diagnostics"
-path = "tests/v8_diagnostics.rs"
-required-features = ["cli", "extensions"]
+name = "feature_off_surface"
+path = "tests/feature_off_surface.rs"
+required-features = ["cli"]
 
 [[test]]
-name = "node_core"
-path = "tests/node_core.rs"
-required-features = ["extensions"]
+name = "sdk_consumer_surface"
+path = "tests/sdk_consumer_surface.rs"
+required-features = ["sdk"]
 
-# One-shot AOT bytecode generator for the embedded JS shims. Run with
-# `cargo run --bin pir-gen-bytecode --features extensions` after editing any
-# `src/extensions/api/js/*.js.txt` source. Not part of the product binary.
-[[bin]]
-name = "pir-gen-bytecode"
-path = "src/bin/pir_gen_bytecode.rs"
-required-features = ["extensions"]
+[[test]]
+name = "sdk_consumer_embed"
+path = "tests/sdk_consumer_embed.rs"
+required-features = ["sdk"]
 
+[[test]]
+name = "rpc_export_off"
+path = "tests/rpc_export_off.rs"
+required-features = ["rpc"]
+
+
+# Test builds disable debug assertions: the integration harnesses assert their
+# own invariants, and the overflow checks in every (large) test binary were a
+# measurable part of the gate's runtime. Kept from the node-AOT branch so both
+# trees agree on the test profile.
 [profile.test]
 debug-assertions = false

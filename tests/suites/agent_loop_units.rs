@@ -13,7 +13,7 @@ use std::sync::Arc;
 use pir::agent::agent_loop::{
     record_completed_turn, CompletedTurn, FinishTurnContext, PrepareNextTurnHook,
 };
-use pir::ai::types::{AssistantMessage, ContentBlock, TextContent};
+use pir::ai::types::{AssistantMessage, ContentBlock, TextContent, ToolResultMessage};
 
 fn test_hook() -> PrepareNextTurnHook {
     Arc::new(|_context: Arc<FinishTurnContext>| Box::pin(async { None }))
@@ -23,18 +23,19 @@ fn test_hook() -> PrepareNextTurnHook {
 fn needs_completed_false_still_records_an_empty_marker() {
     let hook = test_hook();
     let mut completed: Option<CompletedTurn> = None;
-    let message = AssistantMessage {
+    let message = Arc::new(AssistantMessage {
         content: vec![ContentBlock::Text(TextContent {
             text: "payload".to_owned(),
             text_signature: None,
         })],
         ..AssistantMessage::default()
-    };
-    record_completed_turn(Some(&hook), false, &mut completed, 3, &message, &[]);
+    });
+    let empty: Arc<[ToolResultMessage]> = Arc::from([]);
+    record_completed_turn(Some(&hook), false, &mut completed, 3, &message, &empty);
     let completed = completed.expect("the completion marker must exist");
     assert_eq!(completed.turn_index, 3);
     assert_eq!(
-        completed.message,
+        *completed.message,
         AssistantMessage::default(),
         "needs_completed=false must not clone the assistant payload"
     );
@@ -45,14 +46,15 @@ fn needs_completed_false_still_records_an_empty_marker() {
 fn needs_completed_true_copies_the_snapshot() {
     let hook = test_hook();
     let mut completed: Option<CompletedTurn> = None;
-    let message = AssistantMessage {
+    let message = Arc::new(AssistantMessage {
         content: vec![ContentBlock::Text(TextContent {
             text: "payload".to_owned(),
             text_signature: None,
         })],
         ..AssistantMessage::default()
-    };
-    record_completed_turn(Some(&hook), true, &mut completed, 7, &message, &[]);
+    });
+    let empty: Arc<[ToolResultMessage]> = Arc::from([]);
+    record_completed_turn(Some(&hook), true, &mut completed, 7, &message, &empty);
     let completed = completed.expect("the completion marker must exist");
     assert_eq!(completed.turn_index, 7);
     assert_eq!(
@@ -64,13 +66,14 @@ fn needs_completed_true_copies_the_snapshot() {
 #[test]
 fn no_hook_records_nothing() {
     let mut completed: Option<CompletedTurn> = None;
+    let empty: Arc<[ToolResultMessage]> = Arc::from([]);
     record_completed_turn(
         None,
         true,
         &mut completed,
         1,
-        &AssistantMessage::default(),
-        &[],
+        &Arc::new(AssistantMessage::default()),
+        &empty,
     );
     assert!(completed.is_none());
 }

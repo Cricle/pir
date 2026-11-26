@@ -13,7 +13,7 @@ OPS = [
     ("wait", 1.5),
     ("snap", "r03_plan_on"),
     ("log", "ask the real model to plan and submit"),
-    ("send", b"Use submit_plan to submit a short 2-step plan for creating a file named real_plan.txt. Do not do anything else.\r"),
+    ("send", b"Use submit_plan to submit a short 2-step plan for creating a file named real_plan.txt. Set verification to the array [\"test -f real_plan.txt\"] (an array of command strings). Do not do anything else.\r"),
     ("wait", 30.0),
     ("wait_quiet", 8),
     ("snap", "r03_pending"),

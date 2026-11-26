@@ -50,13 +50,22 @@ const MAGIC: &[u8; 8] = b"PIRQCJS\0";
 const FORMAT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 52;
 
-fn repo_root() -> PathBuf {
+/// Where the codegen assets live. The bytecode registry itself is
+/// `crates/pir-core/src/extensions/api/bytecode.rs`, and it embeds the blobs
+/// with `include_bytes!("../../../assets/bytecode/…")` — i.e. relative to
+/// `crates/pir-core`. Writing to the repository root instead would leave the
+/// crate embedding the previous blobs, so the generator and the
+/// `include_bytes!` paths must name the same directory.
+fn bytecode_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("crates")
+        .join("pir-core")
+        .join("assets")
+        .join("bytecode")
 }
 
 fn main() {
-    let root = repo_root();
-    let out_dir = root.join("assets").join("bytecode");
+    let out_dir = bytecode_dir();
     let virtual_dir = out_dir.join("v");
     // Regeneration owns this directory: drop stale blobs from previous runs
     // (the dev-only script shims used to be compiled too; none is embedded).

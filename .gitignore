@@ -1,8 +1,11 @@
 # Rust
 /target/
-/target-lane-*/
+/target-*/
 **/*.rs.bk
 Cargo.lock.bak
+# Zero-byte `<name>.rs\u200d.tmp` leftovers from an editor/tool save that
+# targets a file by a zero-width-joined name; they are never real sources.
+**/*.rs*.tmp
 
 # Local build/test artifacts (never stage; the eval harness owns target/)
 /target-alt/
@@ -52,6 +55,8 @@ pnpm-lock.yaml
 *.js
 # Standalone pi-phone PWA client source (served/embedded by the central server).
 !clients/pi-phone-pwa/**
+# Native-shell embedded runtime asset is Rust source input, not a Node artifact.
+!crates/pir-native-shell/assets/app.js
 
 # OS
 .DS_Store

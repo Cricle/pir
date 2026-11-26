@@ -343,6 +343,7 @@ fn session_config(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 

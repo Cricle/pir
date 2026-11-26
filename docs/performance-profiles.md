@@ -5,22 +5,18 @@ keeps the historical tool loadout, unlimited tool-result text, compaction
 thresholds, and turn limits unchanged.
 
 > **The balanced default tool loadout is a documented SUPERSET of upstream pi.**
-> With no `--tools` / `settings.defaultTools`, a full build declares **22
-> tools**: nine registration-active core tools (`background_abort`,
-> `background_status`, `bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`)
-> plus the 13 default-active builtin-extension tools (`ctx_batch_execute`,
-> `ctx_doctor`, `ctx_execute`, `ctx_execute_file`, `ctx_fetch_and_index`,
-> `ctx_index`, `ctx_purge`, `ctx_search`, `ctx_stats`, `python`, `todo`,
-> `memory`, `subagent`), where upstream pi's implicit set is four (`read`,
-> `bash`, `edit`, `write`). The extra core five are pir capabilities
-> (in-process grep/find, `ls`, the scheduler-owned background controls) and the
-> builtins are the default-on extension layer; the measured declaration is
-> ~+30.7 KB of `tools[]` JSON (~+7.7k tokens) on the first request, ~26 KB of
-> it the builtins. `efficient` (below) and `--tools read,bash,edit,write` both
+> With no `--tools` / `settings.defaultTools`, a full build declares **24
+> tools** (nine registration-active core tools plus 15 default-active builtin
+> tools), where upstream pi's implicit set is four (`read`, `bash`, `edit`,
+> `write`). The extra five core tools are pir capabilities (in-process
+> grep/find, `ls`, the scheduler-owned background controls) and the builtins
+> are the default-on extension layer; the declaration costs ~+33 KB of
+> `tools[]` JSON (~+8.3k tokens) on the first request.
+> [`FEATURES.md`](FEATURES.md) §3.1 is the canonical list, rationale and
+> measurement. `efficient` (below) and `--tools read,bash,edit,write` both
 > select the upstream four; `--no-extensions` leaves the core nine; no tool
 > becomes unreachable either way (the registry is never filtered by the
-> selection). See [`docs/FEATURES.md`](FEATURES.md) § 3.1 and the 2026-11-14
-> decision brief `.play/live-assist/x10-tool-loadout.md`.
+> selection).
 
 ```json
 {
@@ -35,10 +31,13 @@ measurements. It selects these defaults (each field can be overridden):
 
 | Setting | Efficient default |
 |---|---:|
-| `toolResultMaxBytes` | 32 KiB |
+| `toolResultMaxBytes` | 24 KiB |
+| `read`/`bash` output cap | 1,000 lines / 24 KiB — applied by `--perf-profile efficient` or `PIR_PERF_PROFILE=efficient`; a settings-file `performance.profile` does not reach these caps (`PIR_TOOL_OUTPUT_MAX_*` overrides) |
 | `softTurnBudget` | 24 turns |
 | `hardTurnBudget` | 48 turns |
 | `maxTotalTokens` | 250,000 |
+| `subagentMaxTurns` | 100 |
+| `subagentMaxTotalTokens` | 100,000 |
 | `contextFilesMaxBytes` | 64 KiB |
 | bash command timeout | 30s default |
 | broad-search guard | **on by default in every profile**; reject `find /`, recursive grep/rg over `/tmp`/home, and `cd /tmp` + project search/test |
@@ -50,8 +49,10 @@ broad-search) and omits only the advisory final self-check
 matching tool/agent gate and upstream `buildRules` has no equivalent. `balanced`
 keeps all four. The omission is implemented as prompt rule options, not as a
 fixture-specific or tool-specific exception; the read gate itself stays active
-(`efficient` uses `EditWarn`: a partial/stale edit warns, a never-read file is
-still refused).
+(both profiles use `EditPartial`: a partial read may edit with a warning, while
+a never-read or stale file is still refused and `write` still requires a full,
+unchanged read). Set `PIR_READ_BEFORE_EDIT=edit-warn` to also allow a stale
+edit with a warning, or `enforce` for the old strict behavior.
 
 The guard is controlled by `tools.broadSearchGuard` (default `true`). Set it
 to `false` only when a workflow intentionally needs whole-filesystem searches:
@@ -73,6 +74,14 @@ remaining requests of the current run. It is never added to the session
 transcript, message events, or resumed history. The hard turn budget and
 cumulative token budget terminate an incomplete run with an identifiable
 `StopReason::Error`, so a truncated run is never reported as a success.
+
+`subagentMaxTurns` / `subagentMaxTotalTokens` bound every child run the
+`subagent` tool starts (single, chain, parallel, inline and process executors).
+They do not replace the per-run budgets: a child stops at whichever limit is
+lower, and a subagent budget stop is reported as `Subagent token budget
+exceeded` / a turn-cap error instead of a successful result. `PIR_SUBAGENT_MAX_TURNS`
+and `PIR_SUBAGENT_MAX_TOTAL_TOKENS` override the settings values; `0` removes
+the corresponding cap.
 
 Use the CLI flag or the process-local switch when a settings file is not
 desired:

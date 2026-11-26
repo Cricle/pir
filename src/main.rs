@@ -75,6 +75,12 @@ fn main() -> Result<()> {
     // A deleted working directory must not crash startup with an opaque OS
     // error (upstream main.ts:591-603).
     pir::coding_agent::cli::check_startup_cwd(std::env::current_dir())?;
+    // The engine owns no renderer: install the terminal front end's hooks so
+    // theme-aware `--export`, contributed theme files and the migration
+    // keypress pause keep working in `pir` (the TUI itself installs them again
+    // defensively when it starts).
+    #[cfg(feature = "tui")]
+    pir::tui::install_host_hooks();
     let worker = std::thread::Builder::new()
         .name("pir-main".to_owned())
         .stack_size(pir::env_daemon::stack_budget_bytes(cfg!(debug_assertions)))

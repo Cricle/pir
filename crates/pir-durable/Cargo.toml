@@ -1,0 +1,74 @@
+[package]
+name = "pir-durable"
+version.workspace = true
+edition = "2021"
+rust-version = "1.97"
+description = "Durable conversation, task and document runtime for pir (native port of @earendil-works/pi-durable)"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+include = ["/Cargo.toml", "/src/**", "/tests/**"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+# The storage scan/watermark code keeps `thread_local!` with a runtime
+# initializer (the value is not const-constructible); the engine carried the
+# same allow before this crate was extracted.
+[lints.clippy]
+missing_const_for_thread_local = "allow"
+
+[dependencies]
+futures-util = "0.3"
+# The engine's value types (messages, models, usage, stream options, the
+# assistant event stream), the span/metric core, the text truncation helpers,
+# the on-disk session record types + summary constants the pi-format bridge
+# reads, and the in-flight tool-argument mirror. All of these live here (not in
+# `pir-core`) so this crate has no dependency on the engine.
+pir-ai-types = { path = "../pir-ai-types", version = "0.3.2" }
+pir-telemetry = { path = "../pir-telemetry", version = "0.3.2" }
+rusqlite = { version = "0.31", features = ["bundled", "hooks"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "io-util", "fs"] }
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = ["sqlite"]
+# The SQLite storage backend. Was gated on the host engine's
+# `extensions`/`context-mode` features before this crate existed; now it is
+# this crate's own switch.
+sqlite = ["dep:rusqlite"]
+
+# The suites are pulled into one link unit (like the workspace's merged
+# harnesses) because each `tests/*.rs` would otherwise be its own binary that
+# statically links the whole crate. The four `[[test]]` entries below pin the
+# targets explicitly; `tests/suites/*.rs` are modules of `tests/durable.rs`
+# (included via `#[path]`), never targets of their own.
+[[test]]
+name = "durable"
+path = "tests/durable.rs"
+
+[[test]]
+name = "durable_storage"
+path = "tests/durable_storage.rs"
+
+[[test]]
+name = "durable_trace_propagation"
+path = "tests/durable_trace_propagation.rs"
+
+# Own `#[global_allocator]` (counting allocator), so it must stay a separate
+# binary; also an opt-in `#[ignore]` benchmark.
+[[test]]
+name = "durable_memcopy_bench"
+path = "tests/durable_memcopy_bench.rs"
+harness = true
+
+[dev-dependencies]
+memchr = "2"
+memmap2 = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "fs"] }
+

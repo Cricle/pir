@@ -143,12 +143,12 @@ step "cargo fmt --all -- --check"
 cargo fmt --all -- --check || fail "formatting (run: cargo fmt --all)"
 
 # --- 3. compile -------------------------------------------------------------
-step "cargo check --all-targets --locked"
-cargo check --all-targets --locked || fail "cargo check"
+step "cargo check --workspace --exclude pir-native-shell --all-targets --locked"
+cargo check --workspace --exclude pir-native-shell --all-targets --locked || fail "cargo check"
 
 # --- 4. lints ---------------------------------------------------------------
-step "cargo clippy --all-targets --all-features --locked -- -D warnings"
-cargo clippy --all-targets --all-features --locked -- -D warnings || fail "clippy"
+step "cargo clippy --workspace --exclude pir-native-shell --all-targets --all-features --locked -- -D warnings"
+cargo clippy --workspace --exclude pir-native-shell --all-targets --all-features --locked -- -D warnings || fail "clippy"
 
 # --- 5. tests ---------------------------------------------------------------
 if [ "$FAST" -eq 0 ]; then
@@ -178,15 +178,21 @@ if [ "$FAST" -eq 0 ]; then
       -TargetDir "$CARGO_TARGET_DIR" -NoFailFast -UseNextest ||
       fail "test_parallel.ps1"
   else
-    step "cargo nextest run (profile ci)"
+    step "cargo nextest run --workspace (profile ci)"
     # Profile `ci` is the CI gate: fail-fast=false, 4 threads, 120s/360s
     # slow timeout (.config/nextest.toml). A green local run therefore means
-    # the same tests CI will run, not a laxer subset.
-    cargo nextest run --locked --profile ci || fail "nextest"
+    # the same tests CI will run, not a laxer subset. `--workspace` is
+    # load-bearing: without a package selection nextest inherits cargo's
+    # default members, which for this non-virtual workspace is `pir-sdk` alone
+    # — the support crates' own test suites would never run. Merged harnesses have
+    # little crate-level incremental reuse, so keep this full build bounded;
+    # the setting is scoped to this command and does not affect later checks.
+    CARGO_INCREMENTAL=0 cargo nextest run --workspace --exclude pir-native-shell \
+      --locked --profile ci || fail "nextest"
   fi
 
-  step "cargo test --doc --locked"
-  cargo test --doc --locked || fail "doctests"
+  step "cargo test --workspace --exclude pir-native-shell --doc --locked"
+  CARGO_INCREMENTAL=0 cargo test --workspace --exclude pir-native-shell --doc --locked || fail "doctests"
 else
   echo ""
   echo "(--fast: skipping nextest + doctests)"
@@ -194,7 +200,7 @@ fi
 
 # --- 6. full feature matrix (opt-in) ---------------------------------------
 if [ "$MATRIX" -eq 1 ]; then
-  step "scripts/feature_matrix.sh (81 cargo invocations)"
+  step "scripts/feature_matrix.sh (111 cargo invocations)"
   bash scripts/feature_matrix.sh || fail "feature matrix"
 else
   echo ""

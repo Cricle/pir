@@ -4,6 +4,11 @@ pir's interactive TUI is a crossterm port of upstream's pi-tui components (there
 frame is a hand-rolled diff painter over crossterm): multiline editor with kill-ring/undo, streaming transcript
 (markdown + diff + tool renderers), dialogs, selectors, autocomplete, and alt-screen mode.
 
+> **Source location (2026-11-21):** the TUI is the `pir-tui` crate
+> (`crates/pir-tui/src/`); references below use the historical `src/tui/...`
+> spelling. The facade re-exports it as `pir::tui` behind the `tui` feature.
+> See [`architecture.md`](architecture.md).
+
 ## Layout
 
 - **Editor**: multiline input, `!` prefix enters bash mode, kill-ring (ctrl+u/ctrl+k/ctrl+y, alt+y rotation), undo,
@@ -145,20 +150,29 @@ mode. The command is registered by the `mode` builtin (gated by the `subagent` f
 - **`/mode foreman`** — the main agent becomes a read-only foreman/router. It plans, delegates every workspace
   mutation or command to the existing `subagent` tool, inspects results with read-only tools, and must get an
   independent `reviewer` verdict before reporting completion. The host hides every non-allowlisted tool
-  declaration from the model-facing tool list (so `bash`, `edit`, `write`, `python`, `codemode`, `ctx_execute`,
+  declaration from the model-facing tool list (so `bash`, `edit`, `write`, `codemode`, `ctx_execute`,
   `memory`, and MCP tools are not offered), and the `tool_call` seam still blocks them as an execution fence if a
   hidden name is guessed. Worker children keep their normal tool surface; the mode does not change `subagent`
   itself. The status line shows `MODE: FOREMAN`.
 - **`/mode plan`** — read-only investigation and planning mode. Mutating tools are hidden and blocked; only
   `scout`, `planner`, and `reviewer` subagents may run. The model investigates, then calls the model-visible
-  `submit_plan` tool with a concrete plan (ordered steps, files to change, risks, verification). That tool is
-  blocked at the gate and creates a plan approval: `/approvals` shows the plan decision dialog. Approving
-  switches the session to normal mode and sends the approved plan back as a follow-up so it is executed with
-  the full tool surface; denying keeps plan mode and asks for a revision. The plan text and decision are
-  journalled and survive resume. The status line shows `MODE: PLAN` until approval or an explicit mode switch.
+  `submit_plan` tool with a concrete plan (ordered steps, files to change, risks) plus a required
+  `verification` array of exact shell commands; free-form prose is rejected. For a deliverable that can run
+  (a program, script, or page), at least one command should execute the delivered artifact's startup and first
+  execution cycle; a parser, grep, or source inspection alone is not sufficient. That tool is blocked at the gate
+  and creates a plan approval: `/approvals` shows the plan decision dialog. Approving switches the session to
+  normal mode and sends the approved plan back as a follow-up so it is executed with the full tool surface.
+  The verification commands become an execution contract: the run may settle normally only after a successful
+  tool call for one of the declared commands (zero exit status, no error). Otherwise the host injects an
+  `EXECUTION CONTRACT` nudge, up to 3 times, then settles as `PHASE: UNVERIFIED`. The first success retires the
+  contract (one-shot), while the pass id and call remain journalled for audit. Denying keeps plan mode and asks
+  for a revision. The plan text and decision are journalled and survive resume. The status line shows
+  `MODE: PLAN` until approval or an explicit mode switch.
 - **Reviewer gate** — after any non-reviewer `subagent` call, the `agent_before_settle` boundary checks the latest
   reviewer result. The preferred reviewer reply is a JSON object on its first line,
-  `{"verdict":"PASS"|"FAIL","evidence":"..."}`; a plain `PASS`/`FAIL` first line is accepted for compatibility.
+  `{"verdict":"PASS"|"FAIL","evidence":"..."}`; the built-in reviewer also reports
+  `"visual":"verified"|"not_checked"`, which is advisory only — the gate reads `verdict`.
+  A plain `PASS`/`FAIL` first line is accepted for compatibility.
   `FAIL`, an errored child, or no reviewer result injects a visible `FOREMAN GATE` message and continues the run.
   A new worker invalidates an earlier PASS. The gate nudges at most 3 times per worker generation; when the
   budget is exhausted the run may settle but the footer becomes `PHASE: UNVERIFIED` and a warning is posted.
@@ -196,6 +210,9 @@ sidecar and writes the normal session transcript/journal. `status`, `logs [--fol
 `resume`, and `clean` operate on that session. Background manual approvals are asynchronous: the first run may
 settle at the blocked delegation, and `approve`/`deny` appends the decision and starts a new run. There is no
 long-lived multi-client daemon or live TUI attach; use `logs --follow` while it runs and `resume` after it exits.
+Both launch modes report an exhausted reviewer gate as failure: `--foreground` checks the journal before returning,
+and the detached child carries `PIR_FOREMAN_STRICT_EXIT=1` so the print host exits nonzero when the phase is
+`UNVERIFIED` (the job's exit status therefore fails too). A verified run still exits zero.
 
 ## Modes
 

@@ -8,23 +8,23 @@ runtime. Load with `-e <path>` (file or directory), or discover from `<agentDir>
 
 The hot boundary between a JS extension and the Rust host is JSON-**shaped** but no longer JSON-**encoded**:
 `globalThis.__pir_native` exposes functions that take and return live QuickJS values, converted to/from
-`serde_json::Value` trees in-process (`src/extensions/runtime/native_bridge.rs`). The context snapshot, event
+`serde_json::Value` trees in-process (`crates/pir-core/crates/pir-core/src/extensions/runtime/native_bridge.rs`). The context snapshot, event
 dispatch, tool execution, and the models/usage/tool/command snapshots cross as objects — no `JSON.stringify` /
 `JSON.parse` at the seam. The legacy `__pir_host` string functions remain as a fallback: every prelude call site
 guards with `typeof __pir_native?.x === "function"`, so a boot path without the native tier degrades to the
 string bridge unchanged. Extension source files are not modified by any of this.
 
-## Node builtins in Rust (`crates/pir-node`)
+## Node builtins in Rust (`crates/pir-core/src/pir_node`)
 
 The Node/npm surface an extension sees (`node:fs`, `node:crypto`, `child_process`, `zlib`, `http`/`net`,
 `worker_threads`, `node:sqlite`, `bcrypt`, `dns`, `path`, `os`, `process`, …) is implemented in Rust in the
-standalone `crates/pir-node` workspace crate. It has no dependency on rquickjs: its public entry point is
+`pir-core` engine crate, under the `pir_node` module. It has no dependency on rquickjs: its public entry point is
 `NodeRuntime::invoke(module, op, &serde_json::Value) -> Result<serde_json::Value, NodeError>`, and every module
-keeps the exact Node error shape (`{ok:false, code, message, syscall, path}` / libuv `errno`). The crate owns the
+keeps the exact Node error shape (`{ok:false, code, message, syscall, path}` / libuv `errno`). The module owns the
 whole implementation — there is no second op table in the host. `NodeRuntime::invoke` dispatches exactly these
-host-op modules (`crates/pir-node/src/lib.rs`): `os`, `process`, `path`, `crypto`, `zlib`, `sqlite`, `bcrypt`,
+host-op modules (`crates/pir-core/src/pir_node/mod.rs`): `os`, `process`, `path`, `crypto`, `zlib`, `sqlite`, `bcrypt`,
 `child`, `fs_watch`/`fsWatch`, `fs`, `dns`, `npm`, `http`, `worker`. The typed C-ABI fast paths (`__pirBufferCodec`,
-`__pirPath`, the `__pirFs*`/`__pirCrypto*` kernels) are additional entry points into the same crate, not a second
+`__pirPath`, the `__pirFs*`/`__pirCrypto*` kernels) are additional entry points into the same module, not a second
 implementation.
 
 The JS side reaches it through one C-ABI funnel: `globalThis.__pirNode.invoke(module, op, payload)` receives live
@@ -79,12 +79,12 @@ The embedded JS shims are compiled to QuickJS module bytecode offline, so a runt
 ~4 MB of shim source at boot:
 
 - Generator: `cargo +stable-x86_64-pc-windows-gnu run --features extensions --bin pir-gen-bytecode` writes
-  `assets/bytecode/`.
-  - `assets/bytecode/prelude.js.txt.qc` — the script-boot shim evaluated per runtime (`eval_shim_precompiled`).
-  - `assets/bytecode/node_globals.js.txt.qc` and `node_modules_bootstrap.js.txt.qc` — the two Node-compat boot
+  `crates/pir-core/assets/bytecode/`.
+  - `crates/pir-core/assets/bytecode/prelude.js.txt.qc` — the script-boot shim evaluated per runtime (`eval_shim_precompiled`).
+  - `crates/pir-core/assets/bytecode/node_globals.js.txt.qc` and `node_modules_bootstrap.js.txt.qc` — the two Node-compat boot
     bundles. Their text is assembled from many file-backed shims, so they are compiled under the synthetic
     names, not as one `Shim`.
-  - `assets/bytecode/v/*.qc` — every virtual module the loader can resolve (`@node/*`, typebox, pi packages),
+  - `crates/pir-core/assets/bytecode/v/*.qc` — every virtual module the loader can resolve (`@node/*`, typebox, pi packages),
     compiled under its **canonical** module name. QuickJS keys its module cache by that resolved name, so the
     name inside the bytecode must match it; otherwise every import would create a fresh module instance
     (the `crypto.subtle` identity check catches this).
@@ -93,14 +93,14 @@ The embedded JS shims are compiled to QuickJS module bytecode offline, so a runt
   format version and payload length (and rejects an empty/mismatched payload); the digest is pinned by the
   manifests and checked by the wiring tests. A stale or upgraded-engine blob falls back to the
   deflated-source path instead of loading.
-- Manifests: `assets/bytecode/manifest.txt` and `virtual-manifest.txt` pin the payload digests, checked by
+- Manifests: `crates/pir-core/assets/bytecode/manifest.txt` and `virtual-manifest.txt` pin the payload digests, checked by
   `tests/suites/extensions_wiring.rs` along with a `Module::load` smoke test for every blob.
 - Bytecode is bound to the build's QuickJS version and byte order. Regenerate after editing a shim, changing the
   `Shim` registry, or upgrading rquickjs.
 - `PIR_EXT_BYTECODE=0` (`false`/`off`) makes every shim load from source instead of the embedded blobs. The
   guard header records the payload, not the source, so without this switch a shim edit that has not been
   re-AOT'd silently keeps running the old code — use it in the edit/test loop, and regenerate before shipping.
-- `PIR_EXT_SHIM_SRC=1` reads a virtual shim's source from `src/extensions/api/js/<name>` at the checkout
+- `PIR_EXT_SHIM_SRC=1` reads a virtual shim's source from `crates/pir-core/crates/pir-core/src/extensions/api/js/<name>` at the checkout
   recorded by `CARGO_MANIFEST_DIR` (`api::node_shims::dev_shim_source`), instead of the embedded deflate blob.
   It is a development override only: an installed binary, a moved checkout, or a missing file silently keeps
   the embedded source. Only virtual modules go through this path; the prelude and the assembled
@@ -116,7 +116,7 @@ and loads it with `Module::load` on later runs, so the work happens once per sou
 `pir` start, worker runtime or extension reload:
 
 - Key: `sha256("pir-ext-bytecode-3" NUL canonical module name NUL raw source bytes)` — the schema string is
-  `CACHE_SCHEMA` (`src/extensions/bytecode_cache.rs`), and the hash is taken **before** SWC, so a hit skips both
+  `CACHE_SCHEMA` (`crates/pir-core/src/extensions/bytecode_cache.rs`), and the hash is taken **before** SWC, so a hit skips both
   the transpile and the compile. An edited file always misses.
 - Location: `<agent_dir>/cache/ext-bytecode/<key>.qc` (`PIR_AGENT_DIR` isolates test/alternate installs). Writes
   are temp-file + rename, so concurrent `pir` processes never read a partial blob; the directory is pruned once
@@ -134,8 +134,8 @@ and loads it with `Module::load` on later runs, so the work happens once per sou
 
 ## Module resolution and sandbox roots
 
-On-disk modules are authority-checked before they are read (`src/extensions/loader.rs`,
-`src/extensions/runtime/runtime.rs`):
+On-disk modules are authority-checked before they are read (`crates/pir-core/src/extensions/loader.rs`,
+`crates/pir-core/crates/pir-core/src/extensions/runtime/runtime.rs`):
 
 - **Canonical containment.** Every resolved file is `std::fs::canonicalize`d and must `starts_with` a
   registered canonical root (`is_within_allowed_roots`, `allowed_module_file`). Symlinks and `..` are
@@ -168,7 +168,7 @@ throughput.
 The two single-face rules are likewise always on because two copies would double-apply: `builtin:tool-repair`
 suppresses the JS `pi-tool-repair`, and `builtin:phone` suppresses `@malinamnam/pi-phone`. `PIR_PREFER_NATIVE=0`
 (also `false`/`off`) restores upstream first-wins behavior for the six full-port pairs, for a user who
-deliberately wants the JS package to win. See `src/plugins/loader.rs`'s `NATIVE_PRECEDENCE`.
+deliberately wants the JS package to win. See `crates/pir-core/src/plugins/loader.rs`'s `NATIVE_PRECEDENCE`.
 
 ## Default-disabled packages
 
@@ -287,14 +287,15 @@ export default function (pi) {
 `registerVirtualModel` ([custom-provider.md](custom-provider.md)), `registerShortcut`, `registerFlag`,
 `registerMCPServer`, `events.on/emit`. Tool parameter schemas are validated at load; `pi.on(event, handler)` is
 fail-closed against the known-event registry (an unknown name is a load-time `TypeError`; accepted set:
-`src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
+`crates/pir-core/src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
 `pir --help-extensions` (the upstream `Extension CLI Flags:` help section); `--help` itself never executes
 extension code.
 
 `pi.events` is a **JS-runtime-only** bus: `emit` synchronously invokes the prelude's `busSubs` subscribers
 (`prelude.js.txt:3075`). The native `EventService` (`PluginContext::events()`) is a separate Rust bus with no
 cross-face bridge — JS emissions do not reach native subscribers and vice versa
-(`src/agent_session/plugin_services.rs:178-182`, `:4161-4219`; `src/plugins/services/mod.rs:2112-2126`).
+(`crates/pir-core/src/agent_session/plugin_services.rs:178-182`, `:4161-4219`;
+`crates/pir-core/src/plugins/services/mod.rs:2112-2126`).
 
 ## The `ctx` surface
 
@@ -315,7 +316,7 @@ cross-face bridge — JS emissions do not reach native subscribers and vice vers
 ## V8 diagnostics (`node:v8`)
 
 The engine is QuickJS, so `node:v8` is a load-compatible diagnostic surface, not V8
-(`src/extensions/api/js/v8_shim.js.txt`, `src/extensions/runtime/host_functions/v8_diagnostics.rs`):
+(`crates/pir-core/crates/pir-core/src/extensions/api/js/v8_shim.js.txt`, `crates/pir-core/crates/pir-core/src/extensions/runtime/host_functions/v8_diagnostics.rs`):
 
 - `getHeapStatistics()` samples the live QuickJS heap. `malloc_size` maps to both `total_heap_size` and
   `malloced_memory`, `memory_used_size` to `used_heap_size`, and `malloc_limit` to `heap_size_limit`;
@@ -376,7 +377,7 @@ The QuickJS allocator is the system allocator by default. `PIR_QJS_ALLOC=pool` (
 selected, `PIR_QJS_ALLOC_STATS=1` enables process-global counters and prints one
 `PIR_QJS_ALLOC stats allocs=… alloc_bytes=… frees=… large=… in_use_bytes=…` line when that runtime is torn
 down; without the pool the variable does nothing. Each runtime, including every worker runtime, owns an
-independent pool (`src/extensions/runtime/qjs_alloc.rs`).
+independent pool (`crates/pir-core/crates/pir-core/src/extensions/runtime/qjs_alloc.rs`).
 
 ### When the heap cap trips
 
@@ -406,7 +407,8 @@ Every host↔JS queue is bounded and the bound is visible. **If the source can p
 backpressure: the OS pipe/socket/transport stops being read); only where Node coalesces or truncates (watcher
 notifications, blocking `spawnSync`) does the queue drop, and every drop is counted through `ext_diag!` (`[ext]
 …` / `[env-daemon] …` / `[env-client] …` / `[session] …`, repeat-collapsed by the logging router). The
-provider event stream (`src/ai/event_stream.rs`, capacity 32 + producer backpressure) uses the same pattern.
+provider event stream (`crates/pir-ai-types/src/event_stream.rs`, capacity 32 + producer
+backpressure) uses the same pattern.
 
 | Queue (source) | Bound | When full | Observation |
 |---|---|---|---|

@@ -11,10 +11,10 @@
 //!   within a test window — the first revalidation is one full interval out,
 //!   mirroring upstream's `stored.checkedAt < interval -> skip`).
 //!
-//! Standalone binary: tests/ and tests/suites/ are another agent's conflict
-//! zone, so nothing is registered into any `g_*.rs` suite. One `#[test]` fn
-//! keeps the process-global env-var mutations (`PI_OFFLINE`,
-//! `PI_CATALOG_BASE_URL`, `PIR_AGENT_DIR`) race-free.
+//! Merged into `zz_merged_1` (see `tests/zz_merged_1.rs`). Every input the
+//! install path depends on — the agent dir, the catalog base URL, the offline
+//! gate — is passed to `install_remote_catalog_overlays_with` as an argument,
+//! so this file touches no process state and needs no lock.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pir::ai::provider::ProviderRegistry;
 use pir::ai::providers::{
-    install_remote_catalog_overlays, RemoteCatalogOverlay, RemoteCatalogOverlayConfig,
+    install_remote_catalog_overlays_with, RemoteCatalogOverlay, RemoteCatalogOverlayConfig,
 };
 
 /// The mock catalog body: one chat model for the overlay to merge over the
@@ -170,49 +170,23 @@ fn temp_agent_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Save/restore helper for the process-global env vars this test mutates.
-struct EnvGuard {
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    fn take(vars: &'static [&'static str]) -> Self {
-        let saved = vars
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect();
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in &self.saved {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
-
 #[test]
 fn catalog_overlay_install_end_to_end() {
-    let env = EnvGuard::take(&["PI_OFFLINE", "PI_CATALOG_BASE_URL", "PIR_AGENT_DIR"]);
+    // No process pin and no lock: every input the install needs — the agent
+    // dir, the catalog base URL, the offline gate — is an argument to
+    // `install_remote_catalog_overlays_with`, so this test cannot affect a
+    // sibling suite's network or cache.
     let agent_dir = temp_agent_dir("e2e");
-    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
-    std::env::remove_var("PI_OFFLINE");
-    std::env::remove_var("PI_CATALOG_BASE_URL");
     let mock = MockCatalogServer::start();
     let expected_path = "/api/models/providers/anthropic?types=chat,image,classifier";
 
-    // --- offline gate: PI_OFFLINE=1 must spawn nothing and touch no network.
-    std::env::set_var("PI_OFFLINE", "1");
+    // --- offline gate: offline must spawn nothing and touch no network.
     let registry = Arc::new(ProviderRegistry::default());
-    let offline_count = install_remote_catalog_overlays(&registry);
+    let offline_count =
+        install_remote_catalog_overlays_with(&registry, Some(mock.base.clone()), &agent_dir, true);
     assert_eq!(
         offline_count, 0,
-        "PI_OFFLINE=1 must gate the overlay install entirely"
+        "the offline gate must skip the overlay install entirely"
     );
     std::thread::sleep(Duration::from_millis(150));
     assert_eq!(
@@ -220,7 +194,6 @@ fn catalog_overlay_install_end_to_end() {
         0,
         "offline install must not hit the catalog endpoint"
     );
-    std::env::remove_var("PI_OFFLINE");
 
     let runtime = tokio::runtime::Runtime::new().expect("test tokio runtime");
     runtime.block_on(async {
@@ -288,9 +261,13 @@ fn catalog_overlay_install_end_to_end() {
         // for its own lifetime and would permanently pollute the request
         // counter the quiet-window assertion below reads.
         let install_mock = MockCatalogServer::start();
-        std::env::set_var("PI_CATALOG_BASE_URL", &install_mock.base);
         let registry = Arc::new(ProviderRegistry::default());
-        let installed = install_remote_catalog_overlays(&registry);
+        let installed = install_remote_catalog_overlays_with(
+            &registry,
+            Some(install_mock.base.clone()),
+            &agent_dir,
+            false,
+        );
         let catalog_providers = pir::ai::providers::catalog::CATALOG_FILES.len();
         assert_eq!(
             installed, catalog_providers,
@@ -312,5 +289,4 @@ fn catalog_overlay_install_end_to_end() {
     });
 
     runtime.shutdown_timeout(Duration::from_secs(1));
-    drop(env);
 }

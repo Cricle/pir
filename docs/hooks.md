@@ -3,7 +3,7 @@
 Coverage matrix for pi's extension hook surface (upstream `types.d.ts`: `ExtensionEvent`,
 `ExtensionAPI.on`, `ExtensionUIContext`), audited against pir's dispatch sites; emit-site
 `file:line` references are indicative and drift. `tests/hook_coverage.rs` compares the marker blocks
-with `src/plugins/coverage.rs` and statically checks every wired name's emit site.
+with `crates/pir-core/src/plugins/coverage.rs` and statically checks every wired name's emit site.
 
 Two faces receive hooks: **JS** (`pi.on` via `ExtensionHandle::emit` / `dispatch_hosted_event`) and
 **native** (Rust/inline plugins via `AgentPlugin::on_event`, through `PluginHost::emit` — ordered,
@@ -125,7 +125,7 @@ faces observe `compaction_start → session_before_compact → session_compact �
 Native-only presentation events (no upstream `on` counterpart; headless projection of `ctx.ui.*`
 notifications): `status`, `extension_ui_request` (`agent_session/notifications.rs:357`, `:365`).
 
-`pi.on` is fail-closed against the central registry (`src/plugins/coverage.rs::is_known_event`; the
+`pi.on` is fail-closed against the central registry (`crates/pir-core/src/plugins/coverage.rs::is_known_event`; the
 prelude calls `isKnownEvent`). The accepted set is exactly `WIRED_NATIVE_EVENTS` +
 `NATIVE_ONLY_EVENTS` (`status`, `extension_ui_request`) + `SYNTHETIC_EVENTS` (`entry_appended`,
 `thinking_level_changed`, `history_trimmed` (PIR-BIN-075: the store-less ephemeral-history trim
@@ -135,7 +135,7 @@ a load-time `TypeError` (`pi.on: unknown event name ...`); custom bus events use
 
 ## Marker blocks (machine-checked)
 
-`tests/hook_coverage.rs` requires both blocks to match `src/plugins/coverage.rs` exactly (set
+`tests/hook_coverage.rs` requires both blocks to match `crates/pir-core/src/plugins/coverage.rs` exactly (set
 equality, one event per line). `WIRED_NATIVE_EVENTS` has 49 entries; `UNSUPPORTED_NATIVE_EVENTS` is
 empty.
 
@@ -213,7 +213,7 @@ cells.
 | `setTheme` / `theme` / `getAllThemes` | theme registry | `UiService::set_theme` / `theme` / `themes` | full |
 | `getToolsExpanded` / `setToolsExpanded` | shared runtime cell | `UiService::tools_expanded` / `set_tools_expanded` | full (same `RuntimeState::tools_expanded` cell the TUI's Ctrl+O writes) |
 | `onTerminalInput` | prelude handler list, dispatched through the `terminal_input` bridge | `UiService::on_terminal_input` + `AgentPlugin::on_event("terminal_input")` | full: each chunk dispatches once before built-in handling; `{consume}` stops, `{data}` replaces; see deviation 6 |
-| `custom` (overlay component) | prelude `custom`: builds the component and routes `uiDialog("custom")` through the shared overlay funnel (`prelude.js.txt:695`) | `UiService::custom` (`plugin_services.rs:2333`, `start_custom_overlay` `:2011`) | wired in TUI: same dialog slot/queue/deadline; components render and take input/focus, `done(value)` settles on the shared funnel. Non-UI hosts: JS `undefined`, native `capability("ui","custom")` |
+| `custom` (overlay component) | prelude `custom`: builds the component and routes `uiDialog("custom")` through the shared overlay funnel (`prelude.js.txt:695`) | `UiService::custom` (`plugin_services.rs:2333`, `start_custom_overlay` `:2011`) | wired in TUI: same dialog slot/queue/deadline; components render and take input/focus, `done(value)` settles on the shared funnel; `options.blocked` reports OSC 7501 for inline and overlay forms, retained while `setHidden()`. Non-UI hosts: JS `undefined`, native `capability("ui","custom")` |
 | `setEditorComponent` | recorded for `getEditorComponent` bookkeeping, never rendered | not bound | **unsupported by design**: pir's editor is a native Rust component with no byte-level editor factory seam (documented in the prelude) |
 | dialogs (`ui_prompt_start/end`) | prelude `withUIPrompt` | native `native_ui_prompt` guard | full for each native dialog (start on first poll, end exactly once on ok/cancel/timeout/error/drop) |
 

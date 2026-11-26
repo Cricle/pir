@@ -199,7 +199,7 @@ fn tool_definition_matches_the_contract() {
     assert_eq!(parameters["required"], json!(["action"]));
     assert_eq!(
         parameters["properties"]["action"]["enum"],
-        json!(["create", "update", "list", "get", "delete", "clear"])
+        json!(["create", "update", "list", "get", "delete", "clear", "batch"])
     );
     assert_eq!(
         parameters["properties"]["status"]["enum"],
@@ -218,6 +218,7 @@ fn tool_definition_matches_the_contract() {
         "metadata",
         "id",
         "includeDeleted",
+        "updates",
     ] {
         assert!(
             parameters["properties"].get(key).is_some(),
@@ -1090,6 +1091,160 @@ fn create_requires_a_non_blank_subject() {
     }
     assert!(state.tasks.is_empty());
     assert_eq!(state.next_id, 1);
+}
+
+#[test]
+fn create_accepts_an_initial_status_but_never_a_tombstone() {
+    let mut state = TodoState::empty();
+    let op = apply_mutation(
+        &mut state,
+        TaskAction::Create,
+        &params(json!({
+            "subject": "working",
+            "status": "in_progress",
+            "activeForm": "writing the parser"
+        })),
+    );
+    assert!(matches!(op, TodoOp::Create { task_id: 1 }), "{op:?}");
+    assert_eq!(state.tasks[0].status, TaskStatus::InProgress);
+    assert_eq!(
+        format_content(&op, &state),
+        "Created #1: working (in_progress)"
+    );
+
+    let op = apply_mutation(
+        &mut state,
+        TaskAction::Create,
+        &params(json!({ "subject": "done", "status": "completed" })),
+    );
+    assert_eq!(state.tasks[1].status, TaskStatus::Completed);
+    assert_eq!(format_content(&op, &state), "Created #2: done (completed)");
+
+    let op = apply_mutation(
+        &mut state,
+        TaskAction::Create,
+        &params(json!({ "subject": "gone", "status": "deleted" })),
+    );
+    assert_eq!(error_message(&op), "cannot create a deleted task");
+    assert_eq!(state.tasks.len(), 2);
+    assert_eq!(state.next_id, 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_applies_multiple_changes_atomically() {
+    let plugin = plugin();
+    let host = host_with(Arc::clone(&plugin));
+    run_tool(&host, json!({ "action": "create", "subject": "a" })).await;
+    run_tool(&host, json!({ "action": "create", "subject": "b" })).await;
+
+    let result = run_tool(
+        &host,
+        json!({
+            "action": "batch",
+            "updates": [
+                { "action": "update", "id": 1, "status": "completed" },
+                { "action": "update", "id": 2, "status": "in_progress", "activeForm": "working" },
+                { "action": "create", "subject": "c", "status": "completed" }
+            ]
+        }),
+    )
+    .await;
+
+    assert!(!result.is_error, "{result:?}");
+    assert!(
+        result
+            .content
+            .contains("1. Updated #1 (pending → completed)"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result
+            .content
+            .contains("2. Updated #2 (pending → in_progress)"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result.content.contains("3. Created #3: c (completed)"),
+        "{}",
+        result.content
+    );
+    let details = result.details.expect("batch details");
+    assert_eq!(details["action"], "batch");
+    assert_eq!(details["nextId"], 4);
+    assert_eq!(details["tasks"][0]["status"], "completed");
+    assert_eq!(details["tasks"][1]["status"], "in_progress");
+    assert_eq!(details["tasks"][2]["status"], "completed");
+    assert_eq!(plugin.state().tasks.len(), 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_failure_leaves_the_previous_state_unchanged() {
+    let plugin = plugin();
+    let host = host_with(Arc::clone(&plugin));
+    run_tool(&host, json!({ "action": "create", "subject": "a" })).await;
+    run_tool(&host, json!({ "action": "create", "subject": "b" })).await;
+
+    let result = run_tool(
+        &host,
+        json!({
+            "action": "batch",
+            "updates": [
+                { "action": "update", "id": 1, "status": "completed" },
+                { "action": "update", "id": 99, "status": "completed" }
+            ]
+        }),
+    )
+    .await;
+
+    assert!(
+        result
+            .content
+            .contains("batch item 2 (update): #99 not found"),
+        "{}",
+        result.content
+    );
+    let state = plugin.state();
+    assert_eq!(state.tasks.len(), 2, "no partial batch commit");
+    assert_eq!(state.tasks[0].status, TaskStatus::Pending);
+    assert_eq!(state.tasks[1].status, TaskStatus::Pending);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_rejects_empty_read_only_and_nested_items() {
+    let host = host_with(plugin());
+    for (args, expected) in [
+        (
+            json!({ "action": "batch", "updates": [] }),
+            "batch requires a non-empty updates array",
+        ),
+        (
+            json!({ "action": "batch", "updates": [{ "action": "list" }] }),
+            "batch item 1: list is read-only; call it directly",
+        ),
+        (
+            json!({ "action": "batch", "updates": [{ "action": "batch", "updates": [] }] }),
+            "batch item 1: nested batch is not allowed",
+        ),
+    ] {
+        let result = run_tool(&host, args).await;
+        assert!(
+            result.content.contains(expected),
+            "expected {expected:?}, got {}",
+            result.content
+        );
+    }
+
+    let too_many: Vec<Value> = (0..101).map(|_| json!({ "action": "clear" })).collect();
+    let result = run_tool(&host, json!({ "action": "batch", "updates": too_many })).await;
+    assert!(
+        result
+            .content
+            .contains("batch supports at most 100 updates"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]

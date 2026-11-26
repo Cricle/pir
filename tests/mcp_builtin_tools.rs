@@ -30,18 +30,10 @@ use pir::plugins::{AgentPlugin, PluginHost};
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-
-/// `PIR_AGENT_DIR` is process-wide; the MCP plugin reads it in `register()`.
-/// Every env-mutating test in this binary serializes on this lock.
-async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    use tokio::sync::OnceCell;
-    static ENV_LOCK: OnceCell<tokio::sync::Mutex<()>> = OnceCell::const_new();
-    ENV_LOCK
-        .get_or_init(|| async { tokio::sync::Mutex::new(()) })
-        .await
-        .lock()
-        .await
-}
+//
+// Each scenario owns a scratch agent dir and passes it explicitly
+// (`McpPlugin::with_cwd`, `PluginHost::build_with_agent_dir`), so no test pins
+// the process-global `PIR_AGENT_DIR` and none serializes on an env lock.
 
 struct TempDir(PathBuf);
 
@@ -337,20 +329,22 @@ fn build_plugin(
     cwd: &std::path::Path,
 ) -> (Arc<McpPlugin>, PluginHost) {
     let plugin = Arc::new(McpPlugin::with_cwd(agent_dir, cwd));
-    let host = PluginHost::build(None, vec![plugin.clone() as Arc<dyn AgentPlugin>]);
+    let host = PluginHost::build_with_agent_dir(
+        None,
+        vec![plugin.clone() as Arc<dyn AgentPlugin>],
+        Some(agent_dir),
+    );
     (plugin, host)
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn default_direct_does_not_activate_codemode() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("plugin-default");
     std::fs::write(
         agent.0.join("mcp.json"),
         r#"{ "mcpServers": { "docs": { "command": "true" } } }"#,
     )
     .expect("write mcp.json");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
 
     let (plugin, _host) = build_plugin(&agent.0, &agent.0);
     assert!(plugin.builtin_tools(), "the flag defaults to true");
@@ -365,14 +359,12 @@ async fn default_direct_does_not_activate_codemode() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn builtin_tools_false_restores_the_codemode_default() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("plugin-off");
     std::fs::write(
         agent.0.join("mcp.json"),
         r#"{ "mcpServers": { "docs": { "command": "true" } }, "builtinTools": false }"#,
     )
     .expect("write mcp.json");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
 
     let (plugin, _host) = build_plugin(&agent.0, &agent.0);
     assert!(!plugin.builtin_tools());
@@ -386,7 +378,6 @@ async fn builtin_tools_false_restores_the_codemode_default() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn explicit_exposure_still_drives_activation_under_builtin_tools() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("plugin-explicit");
     std::fs::write(
         agent.0.join("mcp.json"),
@@ -398,7 +389,6 @@ async fn explicit_exposure_still_drives_activation_under_builtin_tools() {
         }"#,
     )
     .expect("write mcp.json");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
 
     let (plugin, _host) = build_plugin(&agent.0, &agent.0);
     assert!(plugin.builtin_tools());
@@ -412,7 +402,6 @@ async fn explicit_exposure_still_drives_activation_under_builtin_tools() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn legacy_flat_file_keeps_the_codemode_default() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("plugin-legacy");
     // Legacy flat shape: no `mcpServers`, so the file has no flag slot and
     // its servers keep upstream's codemode default even though the merged
@@ -422,7 +411,6 @@ async fn legacy_flat_file_keeps_the_codemode_default() {
         r#"{ "docs": { "command": "true" } }"#,
     )
     .expect("write mcp.json");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
 
     let (plugin, _host) = build_plugin(&agent.0, &agent.0);
     assert!(plugin.builtin_tools(), "the file-level default is true");
@@ -436,7 +424,6 @@ async fn legacy_flat_file_keeps_the_codemode_default() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn project_flag_overrides_global() {
-    let _guard = env_guard().await;
     let agent = TempDir::new("plugin-merge-agent");
     let cwd = TempDir::new("plugin-merge-cwd");
     std::fs::write(
@@ -450,7 +437,6 @@ async fn project_flag_overrides_global() {
         r#"{ "mcpServers": {}, "builtinTools": true }"#,
     )
     .expect("write project mcp.json");
-    std::env::set_var("PIR_AGENT_DIR", &agent.0);
     std::env::set_var("PIR_TRUST_PROJECT", "1");
 
     let (plugin, _host) = build_plugin(&agent.0, &cwd.0);

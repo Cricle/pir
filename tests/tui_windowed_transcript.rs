@@ -97,10 +97,16 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, u64, i64) {
     (value, events, live)
 }
 
+/// Serializes every frame-measuring test in this binary through the SHARED
+/// counter lock ([`crate::common::tui_frame_counter_lock`]).
+///
+/// `RowsWork`/`ToolMemoWork` are process-global atomics, so a `static` mutex
+/// private to this file does not exclude `tui_frame_reuse` or
+/// `tui_100k_frame` (all three land in the same merged binary): a sibling's
+/// frame between this file's `reset()` and `snapshot()` inflates
+/// `pool_growth`/`row_writes` and fails a steady-frame assertion.
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::common::tui_frame_counter_lock()
 }
 
 fn warm_theme() {

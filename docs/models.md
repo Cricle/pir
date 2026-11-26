@@ -2,7 +2,7 @@
 
 pir resolves models through (in order): `--provider/--model`, `--models` patterns (or the settings
 `enabledModels` scope), settings `defaultProvider`/`defaultModel`, and the built-in catalog
-(`src/ai/providers/catalog/*.json`, 43 providers).
+(`crates/pir-core/src/ai/providers/catalog/*.json`, 43 providers / 1,767 model entries).
 
 ## models.json
 
@@ -33,14 +33,14 @@ Place `models.json` in the agent dir (`~/.pi/agent/models.json`, or `PIR_AGENT_D
 ```
 
 A model's `cost` object requires all four per-Mtok rates — `input`, `output`, `cacheRead`, `cacheWrite`; the
-schema validator rejects a definition that omits any of them (`src/ai/providers/pi_config.rs:477`).
+schema validator rejects a definition that omits any of them (`crates/pir-core/src/ai/providers/pi_config.rs:477`).
 
 `$ENV` and `!command` templates are allowed for `apiKey` (upstream parity). `api` selects the adapter:
 `openai-completions` (alias `openai-chat`), `openai-responses`, `anthropic-messages`, `google-generative-ai`,
 `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`, `azure-openai-responses`,
 `openai-codex-responses`, `pi-messages` (Radius). An omitted `api` falls back to the provider config, then a
-catalog model default, then `openai-chat` (`src/ai/providers/pi_config.rs:1013`); the OpenAI-compatible adapter
-auto-detects its compat knobs from the provider id/base URL (`src/ai/api/openai/compat_detect.rs`).
+catalog model default, then `openai-chat` (`crates/pir-core/src/ai/providers/pi_config.rs:1013`); the OpenAI-compatible adapter
+auto-detects its compat knobs from the provider id/base URL (`crates/pir-core/src/ai/api/openai/compat_detect.rs`).
 
 ## Claude Code environment compatibility
 

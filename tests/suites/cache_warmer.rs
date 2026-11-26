@@ -415,6 +415,7 @@ fn session_with_warming_model(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     agent.set_cache_warming(warming);
     (agent, path)
@@ -965,6 +966,7 @@ async fn decision_payload_carries_economics_and_warm_usage_is_appended() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![recorder as Arc<dyn AgentPlugin>],
     ));

@@ -5,6 +5,95 @@ use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+const MAX_DEVICE_ID_BYTES: usize = 256;
+const MAX_DEVICE_NAME_BYTES: usize = 256;
+const MAX_PLATFORM_BYTES: usize = 128;
+const MAX_SESSION_ID_BYTES: usize = 256;
+const MAX_SESSION_NAME_BYTES: usize = 512;
+const MAX_SESSION_CWD_BYTES: usize = 4096;
+const MAX_SESSION_ERROR_BYTES: usize = 4096;
+const MAX_MODEL_FIELD_BYTES: usize = 256;
+const MAX_CUSTOM_EVENTS: usize = 128;
+const MAX_CUSTOM_EVENT_NAME_BYTES: usize = 128;
+
+/// Validate agent-controlled hello metadata before it is stored or broadcast.
+pub fn validate_agent_hello(hello: &AgentHello) -> Result<(), &'static str> {
+    if hello.device_id.is_empty() || hello.device_id.len() > MAX_DEVICE_ID_BYTES {
+        return Err("deviceId is empty or too long");
+    }
+    if hello
+        .device_name
+        .as_deref()
+        .is_some_and(|value| value.len() > MAX_DEVICE_NAME_BYTES)
+    {
+        return Err("deviceName is too long");
+    }
+    if hello
+        .platform
+        .as_deref()
+        .is_some_and(|value| value.len() > MAX_PLATFORM_BYTES)
+    {
+        return Err("platform is too long");
+    }
+    if hello.custom_events.len() > MAX_CUSTOM_EVENTS
+        || hello
+            .custom_events
+            .iter()
+            .any(|value| value.len() > MAX_CUSTOM_EVENT_NAME_BYTES)
+    {
+        return Err("customEvents exceeds the metadata limit");
+    }
+    for descriptor in &hello.sessions {
+        validate_session_descriptor(descriptor)?;
+    }
+    Ok(())
+}
+
+/// Validate agent-controlled session metadata before it is stored or broadcast.
+pub fn validate_session_descriptor(descriptor: &SessionDescriptor) -> Result<(), &'static str> {
+    if descriptor.id.is_empty() || descriptor.id.len() > MAX_SESSION_ID_BYTES {
+        return Err("session id is empty or too long");
+    }
+    if descriptor
+        .session_id
+        .as_deref()
+        .is_some_and(|value| value.len() > MAX_SESSION_ID_BYTES)
+        || descriptor
+            .label
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_SESSION_NAME_BYTES)
+        || descriptor
+            .kind
+            .as_deref()
+            .is_some_and(|value| value.len() > 64)
+        || descriptor
+            .cwd
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_SESSION_CWD_BYTES)
+        || descriptor
+            .thinking_level
+            .as_deref()
+            .is_some_and(|value| value.len() > 64)
+        || descriptor
+            .last_error
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_SESSION_ERROR_BYTES)
+    {
+        return Err("session metadata field exceeds its limit");
+    }
+    if descriptor.model.as_ref().is_some_and(|model| {
+        model.provider.len() > MAX_MODEL_FIELD_BYTES
+            || model.id.len() > MAX_MODEL_FIELD_BYTES
+            || model
+                .name
+                .as_deref()
+                .is_some_and(|value| value.len() > MAX_MODEL_FIELD_BYTES)
+    }) {
+        return Err("model metadata field exceeds its limit");
+    }
+    Ok(())
+}
+
 pub const SERVER_CAPABILITIES: &[&str] = &[
     "sessions",
     "tools",
@@ -184,27 +273,4 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ClientEnvelope;
-
-    #[test]
-    fn client_envelope_accepts_numeric_and_string_request_id() {
-        // The PWA sends `Date.now()`; older clients/tests send strings.
-        let numeric: ClientEnvelope = serde_json::from_str(
-            r#"{"kind":"load-earlier-messages","before":0,"count":20,"requestId":1729000000000}"#,
-        )
-        .expect("numeric requestId must parse");
-        assert_eq!(
-            numeric.request_id.unwrap(),
-            serde_json::json!(1729000000000u64)
-        );
-
-        let string: ClientEnvelope =
-            serde_json::from_str(r#"{"kind":"load-earlier-messages","requestId":"req-1"}"#)
-                .expect("string requestId must parse");
-        assert_eq!(string.request_id.unwrap(), serde_json::json!("req-1"));
-    }
 }

@@ -61,7 +61,13 @@ const NODE_COMPAT_VERSION: &str = "v24.19.0";
 
 /// Script-mode boot overlay (see `extensions/api/js/script_boot.js.txt`):
 /// argv/execPath placeholders are replaced with JSON literals before eval.
-const SCRIPT_BOOT: &str = include_str!("../extensions/api/js/script_boot.js.txt");
+///
+/// Read through the engine's accessor rather than `include_str!`: the asset
+/// moved into `crates/pir-core` with the engine split, so a relative
+/// `include_str!` from this crate no longer resolves.
+fn script_boot() -> &'static str {
+    pir::extensions::api::script_boot_source()
+}
 
 /// Stack for the script thread: the entry module transpile (swc) and the
 /// QuickJS runtime both recurse on deep module graphs; match the generous
@@ -467,6 +473,12 @@ async fn run_script(
         // Explicit injection: the standalone script runner must not inherit
         // the extension host's heap policy (see [`script_limits`]).
         limits: Some(script_limits()),
+        // The standalone runner owns the whole process, so `process.exit(n)`
+        // in the script is the intended way to set its exit code (the boot
+        // overlay calls `__pir_host.exitProcess`). An extension, context-mode
+        // or worker runtime does NOT get that bridge — see
+        // `extensions::runtime::host_functions`.
+        allow_process_exit: true,
         ..Default::default()
     };
     let runtime = match ExtensionRuntime::new(config).await {
@@ -494,7 +506,7 @@ async fn run_script(
 
     // Script-mode overlay: argv/execPath/execArgv + real-stdio console +
     // process.exit.
-    let boot = SCRIPT_BOOT
+    let boot = script_boot()
         .replace(
             "__PIR_SCRIPT_ARGV__",
             &serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_string()),
@@ -565,6 +577,9 @@ async fn run_eval(
         // Explicit injection: the standalone script runner must not inherit
         // the extension host's heap policy (see [`script_limits`]).
         limits: Some(script_limits()),
+        // Same reasoning as the entry-module runner above: this process exists
+        // only to run the script, so `process.exit(n)` must reach the host.
+        allow_process_exit: true,
         ..Default::default()
     };
     let runtime = match ExtensionRuntime::new(config).await {
@@ -581,7 +596,7 @@ async fn run_eval(
     // Script-mode overlay: argv/execPath/execArgv + real-stdio console +
     // process.exit (the overlay's `__pirScriptRun` module runner stays unused
     // here).
-    let boot = SCRIPT_BOOT
+    let boot = script_boot()
         .replace(
             "__PIR_SCRIPT_ARGV__",
             &serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_string()),

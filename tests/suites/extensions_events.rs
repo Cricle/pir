@@ -49,6 +49,8 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -533,6 +535,7 @@ async fn loop_events_reach_extensions() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1091,6 +1094,7 @@ async fn register_provider_records_defs_and_session_applies_them() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1273,6 +1277,11 @@ async fn ctx_facade_reports_session_model_and_thinking() {
                     scopedModels: ctx.scopedModels.length,
                     sessionId: ctx.sessionManager.getSessionId(),
                     sessionPath: ctx.sessionManager.getSessionPath(),
+                    // Upstream `ReadonlySessionManager.getSessionDir()`: the
+                    // accessor exists on `ctx.sessionManager` (a read-only
+                    // session may have no directory).
+                    hasSessionDir: typeof ctx.sessionManager.getSessionDir === "function",
+                    sessionDir: ctx.sessionManager.getSessionDir(),
                     modelId: ctx.model ? ctx.model.id : null,
                     contextWindow: ctx.model ? ctx.model.contextWindow : null,
                     models: ctx.modelRegistry.listModels().length,
@@ -1303,6 +1312,7 @@ async fn ctx_facade_reports_session_model_and_thinking() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     agent.steer("queued message");
     let _ = agent
@@ -1339,6 +1349,12 @@ async fn ctx_facade_reports_session_model_and_thinking() {
     // accessor exists and returns a defined shape.
     assert!(ctx["sessionId"].is_null() || ctx["sessionId"].is_string());
     assert!(ctx["sessionPath"].is_null() || ctx["sessionPath"].is_string());
+    assert_eq!(
+        ctx["hasSessionDir"],
+        json!(true),
+        "upstream ReadonlySessionManager exposes getSessionDir()"
+    );
+    assert!(ctx["sessionDir"].is_null() || ctx["sessionDir"].is_string());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1460,6 +1476,7 @@ async fn set_model_and_thinking_level_apply_and_emit_events() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1714,6 +1731,7 @@ async fn late_timer_registered_handler_is_not_gated_off() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -2099,6 +2117,7 @@ async fn provider_stream_events_are_dispatched_in_order_and_awaited() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -2277,6 +2296,7 @@ async fn provider_stream_events_after_abort_are_dropped() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     // The aborted run may surface as an error; the dispatch contract is what
     // this test pins.
@@ -2434,6 +2454,7 @@ async fn before_agent_start_system_prompt_options_are_mutable() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -2959,6 +2980,7 @@ async fn model_thinking_and_name_mutations_share_one_entry_and_source() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     let session_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3237,6 +3259,7 @@ async fn input_event_reports_source_and_handled_swallows_the_prompt() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let noop: pir::agent_session::EventHandler = Arc::new(|_| {});
 
@@ -3465,6 +3488,7 @@ async fn session_start_send_user_message_is_pumped_exactly_once() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     // The startup dispatch: the handler runs and its `pi.sendUserMessage`

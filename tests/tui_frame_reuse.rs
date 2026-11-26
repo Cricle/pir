@@ -243,16 +243,22 @@ fn measure_allocations<T>(f: impl FnOnce() -> T) -> (T, AllocStats) {
 // Test serialization + shared helpers
 // ---------------------------------------------------------------------------
 
-/// Serializes this binary's tests. The theme is process-global: a swap in one
-/// test must not land inside another test's measured steady-state frame (the
-/// per-binary analogue of the `g_tui` suites' `tui_system_theme::lock()`
-/// rationale). Every test in this file takes it first.
-static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+/// Serializes every frame-measuring test in this binary.
+///
+/// The theme is process-global: a swap in one test must not land inside
+/// another test's measured steady-state frame (the per-binary analogue of the
+/// `g_tui` suites' `tui_system_theme::lock()` rationale).
+///
+/// It must be the SHARED counter lock, not a `static` declared here: the frame
+/// counters (`RowsWork`/`ToolMemoWork`) are process-global atomics, so a
+/// sibling suite drawing a frame between this file's `reset()` and `snapshot()`
+/// inflates `pool_growth` and fails the steady-frame assertions. A per-file
+/// mutex does not exclude a different file's mutex.
+/// [`crate::common::tui_frame_counter_lock`] is included once per test binary,
+/// so every frame-measuring suite in this binary shares it. Every test in this
+/// file takes it first.
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::common::tui_frame_counter_lock()
 }
 
 /// Swap the process-global theme for one test and restore the startup `dark`

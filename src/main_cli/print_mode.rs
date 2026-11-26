@@ -71,6 +71,17 @@ pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> 
         json_output,
     } = request;
     let (prompts, images) = expand_print_subcommand_prompt(cli, settings_manager, prompts, images)?;
+    // A detached `foreman run` job marks its child with this env var: the
+    // model layer settles normally after the reviewer-gate budget is spent, so
+    // the child must translate the journal phase into a nonzero exit itself.
+    #[cfg(feature = "subagent")]
+    let strict_session = std::env::var_os("PIR_FOREMAN_STRICT_EXIT")
+        .is_some()
+        .then(|| match &plan {
+            pir::coding_agent::session_resolve::SessionPlan::Open(path) => Some(path.clone()),
+            _ => None,
+        })
+        .flatten();
     let outcome = pir::coding_agent::run_print(
         PrintOptions {
             prompt: prompts.initial_message.unwrap_or_default(),
@@ -122,6 +133,12 @@ pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> 
     if outcome.exit_code != 0 {
         std::process::exit(outcome.exit_code);
     }
+    #[cfg(feature = "subagent")]
+    if let Some(session) = strict_session {
+        if let Some(message) = pir::foreman::unverified_exit_error(&session) {
+            return Err(anyhow::anyhow!("{message}"));
+        }
+    }
     Ok(())
 }
 
@@ -142,7 +159,7 @@ pub(super) async fn run_print_mode(request: PrintModeRequest<'_>) -> Result<()> 
 /// - the builtin plugin factories' facts for this exact extension plan
 ///   (`builtin_plan_available_tools`, derived with the loader's own flag
 ///   semantics: `--no-extensions`/`-e builtin:<name>`, `--no-mcp`,
-///   `pythonTool`), needed because the exclude-only and
+///   `disabledBuiltinExtensions`), needed because the exclude-only and
 ///   `--no-builtin-tools` bases follow upstream
 ///   `_isActivatedOnRegistration` and cannot guess a plugin tool's
 ///   `exposure`/`defaultActive`;
@@ -192,7 +209,7 @@ pub(super) fn resolve_interactive_tool_selection(
     let mut available_tools =
         pir::coding_agent::tool_selection::AvailableTool::from_registry(&registry);
     // The same disabled-builtin composition the run's extension plan uses
-    // (`disabledBuiltinExtensions`, `pythonTool: false`, `--no-mcp`), so a
+    // (`disabledBuiltinExtensions`, `--no-mcp`), so a
     // builtin the host will not load contributes no selectable name.
     let disabled_builtins = settings_manager
         .disabled_builtins_with_flags(&pir::plugins::disabled_from_flags(cli.no_mcp));

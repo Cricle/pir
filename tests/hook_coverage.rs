@@ -628,7 +628,7 @@ fn has_dispatch_for_literal(
 /// record a registry (follow-up if one is ever added).
 #[test]
 fn every_wired_event_has_a_static_emit_site() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/pir-core/src");
     let mut files = Vec::new();
     collect_rust_sources(&root, &mut files);
     files.sort();
@@ -835,6 +835,8 @@ fn extension_config(cwd: &Path, has_ui: bool) -> ExtensionConfig {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -856,6 +858,7 @@ fn session_config(cwd: &Path, handle: &ExtensionHandle) -> AgentSessionConfig {
         event_stream: None,
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -1773,26 +1776,9 @@ async fn native_tools_expanded_reads_and_writes_the_shared_cell() {
 // mcp_servers_change: native + JS delivery from the MCP registry rebuild
 // ---------------------------------------------------------------------------
 
-/// Isolate the global agent dir (where `mcp.json` lives) for one test and
-/// restore the previous value on drop.
-struct AgentDirGuard(Option<std::ffi::OsString>);
-
-impl AgentDirGuard {
-    fn isolate(path: &Path) -> Self {
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", path);
-        Self(previous)
-    }
-}
-
-impl Drop for AgentDirGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-    }
-}
+/// The tests below pass their agent directory explicitly (`McpPlugin::with_cwd`,
+/// `AgentSession::new_arc_with_plugins_and_host_in`), so nothing here pins
+/// `PIR_AGENT_DIR` and nothing has to be serialized against a sibling suite.
 
 /// One registry change (add, remove, reload rebuild) coalesces into one
 /// upstream-shaped event; the JS face keeps its historic direct-handle copy
@@ -1804,7 +1790,6 @@ async fn mcp_servers_change_reaches_the_native_face_once_per_registry_change() {
     use pir::plugins::builtin::McpPlugin;
 
     let temp = TempDir::new("mcp-native-change");
-    let _agent_dir = AgentDirGuard::isolate(&temp.0);
     let extension_path = temp.0.join("mcp_ext.ts");
     std::fs::write(
         &extension_path,
@@ -2551,16 +2536,19 @@ async fn native_project_trust_observes_on_init_first_on_a_multi_thread_runtime()
     }
 
     let temp = TempDir::new("project-trust-init-order");
-    let _agent_dir = AgentDirGuard::isolate(&temp.0);
     let handle = ExtensionHandle::start_plan_only(extension_config(&temp.0, false));
     let trace = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::new(InitOrderRecorder {
         info: PluginInfo::inline("hook-coverage-project-trust-order"),
         trace: Arc::clone(&trace),
     });
-    let _session = AgentSession::new_arc_with_plugins(
+    // Explicit agent dir: the session (and its trust resolution) is bound to the
+    // fixture as an argument, so no process pin — and no lock — is needed.
+    let _session = AgentSession::new_arc_with_plugins_and_host_in(
         session_config(&temp.0, &handle),
         vec![recorder as Arc<dyn AgentPlugin>],
+        None,
+        Some(temp.0.clone()),
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);

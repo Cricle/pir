@@ -253,6 +253,12 @@ async fn wait_for_tool_entry(entered: &Arc<AtomicUsize>) {
 /// Per-test temp session dir.
 struct TempDir(std::path::PathBuf);
 
+/// The two scratch roots a prompt-capturing agent owns, dropped together.
+struct AgentDirs {
+    cwd: TempDir,
+    agent_dir: TempDir,
+}
+
 impl TempDir {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
@@ -1125,10 +1131,10 @@ async fn unknown_builtin_name_fails_build_with_upstream_error() {
 }
 
 /// P2-K: `.builtin(...)` must obey the agent directory's settings gates
-/// (`pythonTool: false` / `disabledBuiltinExtensions`), exactly like the
+/// (`disabledBuiltinExtensions`), exactly like the
 /// extension plan does. A requested builtin that settings disable fails
 /// `build()` naming the setting — never a silently absent plugin.
-#[cfg(any(feature = "subagent", feature = "python"))]
+#[cfg(any(feature = "subagent", feature = "context-mode"))]
 #[tokio::test]
 async fn builtin_by_name_obeys_settings_gates() {
     let temp = TempDir::new("builtin-settings-gate");
@@ -1166,21 +1172,24 @@ async fn builtin_by_name_obeys_settings_gates() {
         );
     }
 
-    #[cfg(feature = "python")]
+    #[cfg(feature = "context-mode")]
     {
-        std::fs::write(temp.0.join("settings.json"), r#"{ "pythonTool": false }"#)
-            .expect("write settings.json");
+        std::fs::write(
+            temp.0.join("settings.json"),
+            r#"{ "disabledBuiltinExtensions": ["context-mode"] }"#,
+        )
+        .expect("write settings.json");
         let error = AgentBuilder::new()
             .with_registry(Arc::clone(&registry), fake_model())
             .agent_dir(temp.0.clone())
             .no_session()
-            .builtin("python")
+            .builtin("context-mode")
             .build()
             .await
-            .expect_err("pythonTool: false must fail an explicit .builtin(\"python\")");
+            .expect_err("a settings-disabled builtin must fail the explicit .builtin(..)");
         let message = error.to_string();
         assert!(
-            message.contains("builtin:python") && message.contains("disabled by settings"),
+            message.contains("builtin:context-mode") && message.contains("disabled by settings"),
             "the diagnostic must name the builtin and the setting: {message}"
         );
     }
@@ -1213,7 +1222,6 @@ fn builtin_feature_diagnostics_are_pinned() {
         ("tool-repair", "tool-repair"),
         ("tool-search", "tool-search"),
         ("mcp", "mcp"),
-        ("python", "python"),
         ("codemode", "extensions"),
         ("todo", "todo"),
         ("memory", "memory"),
@@ -1858,8 +1866,9 @@ async fn session_storage_failures_classify_through_the_run_boundary() {
 async fn prompt_capturing_agent(
     explicit: Option<&str>,
     append: Option<&str>,
-) -> (Agent, Arc<Mutex<Vec<Option<String>>>>, TempDir) {
+) -> (Agent, Arc<Mutex<Vec<Option<String>>>>, AgentDirs) {
     let cwd = TempDir::new("sdk-prompt");
+    let agent_dir = TempDir::new("sdk-prompt-agent");
     let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_for_provider = Arc::clone(&seen);
     let registry = fake_registry(Arc::new(move |_index, context| {
@@ -1875,6 +1884,7 @@ async fn prompt_capturing_agent(
         .no_session()
         .no_compaction()
         .cwd(cwd.0.clone())
+        .agent_dir(agent_dir.0.clone())
         .thinking_level(ThinkingLevel::Off);
     if let Some(prompt) = explicit {
         builder = builder.system_prompt(prompt);
@@ -1883,7 +1893,8 @@ async fn prompt_capturing_agent(
         builder = builder.append_system_prompt(text);
     }
     let agent = builder.build().await.expect("build agent");
-    (agent, seen, cwd)
+    // Keep the agent dir alive with the agent: it is the builder's scratch root.
+    (agent, seen, AgentDirs { cwd, agent_dir })
 }
 
 /// Run one prompt and return the system prompt the request carried.
@@ -1904,8 +1915,7 @@ async fn observed_system_prompt(agent: &Agent, seen: &Arc<Mutex<Vec<Option<Strin
 /// `<tools>`/`<rules>`/`<cwd>` sections and stop active-set rebuilds).
 #[tokio::test]
 async fn append_only_extends_the_derived_system_prompt() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("sdk-append-prompt", None).await;
-    let (agent, seen, _cwd) = prompt_capturing_agent(None, Some("APPENDIX-FROM-CALLER")).await;
+    let (agent, seen, _dirs) = prompt_capturing_agent(None, Some("APPENDIX-FROM-CALLER")).await;
     let prompt = observed_system_prompt(&agent, &seen).await;
 
     assert!(
@@ -1930,8 +1940,7 @@ async fn append_only_extends_the_derived_system_prompt() {
 /// An explicit `.system_prompt(..)` still replaces the derived prompt.
 #[tokio::test]
 async fn explicit_system_prompt_still_replaces_the_derived_prompt() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("sdk-explicit-prompt", None).await;
-    let (agent, seen, _cwd) = prompt_capturing_agent(Some("CALLER PROMPT"), None).await;
+    let (agent, seen, _dirs) = prompt_capturing_agent(Some("CALLER PROMPT"), None).await;
     let prompt = observed_system_prompt(&agent, &seen).await;
 
     assert_eq!(prompt, "CALLER PROMPT");
@@ -1945,8 +1954,7 @@ async fn explicit_system_prompt_still_replaces_the_derived_prompt() {
 /// EXPLICIT prompt (the pre-existing contract).
 #[tokio::test]
 async fn explicit_system_prompt_with_append_keeps_the_explicit_prompt() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("sdk-explicit-append", None).await;
-    let (agent, seen, _cwd) =
+    let (agent, seen, _dirs) =
         prompt_capturing_agent(Some("CALLER PROMPT"), Some("CALLER APPENDIX")).await;
     let prompt = observed_system_prompt(&agent, &seen).await;
 
@@ -1961,8 +1969,7 @@ async fn explicit_system_prompt_with_append_keeps_the_explicit_prompt() {
 /// prompt (the P7 behavior append-only must not regress).
 #[tokio::test]
 async fn no_explicit_prompt_yields_the_derived_system_prompt() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("sdk-derived-prompt", None).await;
-    let (agent, seen, _cwd) = prompt_capturing_agent(None, None).await;
+    let (agent, seen, _dirs) = prompt_capturing_agent(None, None).await;
     let prompt = observed_system_prompt(&agent, &seen).await;
 
     assert!(
@@ -2124,12 +2131,11 @@ fn resume_endpoint() -> (String, Arc<Mutex<Vec<String>>>) {
 #[tokio::test(flavor = "current_thread")]
 async fn resumed_session_restores_the_recorded_virtual_model_selection() {
     let (base_url, requested_models) = resume_endpoint();
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+    let agent_dir = crate::common::scratch_agent_dir(
         "sdk-resume-virtual",
         Some(r#"{"defaultProvider":"fake","defaultModel":"fake-model"}"#),
-    )
-    .await;
-    let agent_dir = _env.dir().expect("scratch dir").to_path_buf();
+    );
+    let agent_dir = agent_dir.path().to_path_buf();
     write_resume_models(&agent_dir, &base_url);
     let sessions = TempDir::new("resume-virtual");
     let path = record_virtual_session(&sessions.0, Some(virtual_state()));
@@ -2188,12 +2194,11 @@ async fn resumed_session_restores_the_recorded_virtual_model_selection() {
 /// model-resolution error instead of silently keeping its default.
 #[tokio::test(flavor = "current_thread")]
 async fn unresolvable_recorded_virtual_model_fails_the_resume() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+    let agent_dir = crate::common::scratch_agent_dir(
         "sdk-resume-virtual-bad",
         Some(r#"{"defaultProvider":"fake","defaultModel":"fake-model"}"#),
-    )
-    .await;
-    let agent_dir = _env.dir().expect("scratch dir").to_path_buf();
+    );
+    let agent_dir = agent_dir.path().to_path_buf();
     write_resume_models(&agent_dir, "http://127.0.0.1:9");
     let sessions = TempDir::new("resume-virtual-bad");
     // Malformed: `physical` is required by `VirtualModelRegistration::from_wire`.
@@ -2223,12 +2228,11 @@ async fn unresolvable_recorded_virtual_model_fails_the_resume() {
 /// default) rather than failing the build.
 #[tokio::test(flavor = "current_thread")]
 async fn physical_resume_behavior_is_unchanged() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+    let agent_dir = crate::common::scratch_agent_dir(
         "sdk-resume-physical",
         Some(r#"{"defaultProvider":"fake","defaultModel":"fake-model"}"#),
-    )
-    .await;
-    let agent_dir = _env.dir().expect("scratch dir").to_path_buf();
+    );
+    let agent_dir = agent_dir.path().to_path_buf();
     write_resume_models(&agent_dir, "http://127.0.0.1:9");
 
     let sessions = TempDir::new("resume-physical");
@@ -2412,15 +2416,14 @@ async fn model_thinking_suffix_is_pinned_on_resume_and_attach() {
 /// live model cannot use (the next request would silently send `off`).
 #[tokio::test(flavor = "current_thread")]
 async fn attach_session_reclamps_thinking_when_the_branch_records_no_level() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+    let agent_dir = crate::common::scratch_agent_dir(
         "sdk-attach-thinking-clamp",
         Some(
             r#"{"defaultProvider":"fake","defaultModel":"reasoning-model",
                 "defaultThinkingLevel":"high"}"#,
         ),
-    )
-    .await;
-    let agent_dir = _env.dir().expect("scratch dir").to_path_buf();
+    );
+    let agent_dir = agent_dir.path().to_path_buf();
     std::fs::write(
         agent_dir.join("models.json"),
         serde_json::json!({

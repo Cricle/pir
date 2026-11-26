@@ -306,7 +306,7 @@ async fn finish_turn_runs_before_turn_end_and_receives_turn_state() {
             let seen = Arc::clone(&seen_for_hook);
             Box::pin(async move {
                 order.lock().unwrap().push("finish_turn".into());
-                for result in &turn.tool_results {
+                for result in turn.tool_results.iter() {
                     seen.lock()
                         .unwrap()
                         .push(text_of(&Message::ToolResult(result.clone())));
@@ -885,6 +885,8 @@ async fn nested_calls_flow_through_the_extension_gates_with_parent_attribution()
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     };
     let runtime = ExtensionHandle::start(config).expect("runtime");
     let loaded = runtime
@@ -1304,6 +1306,8 @@ async fn load_extension(temp: &std::path::Path, source: &str) -> ExtensionHandle
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     };
     let runtime = ExtensionHandle::start(config).expect("runtime");
     let loaded = runtime
@@ -1363,6 +1367,7 @@ async fn agent_settled_payload_carries_aborted_flag() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     }));
 
     let prompt_task = tokio::spawn({
@@ -1424,6 +1429,7 @@ async fn session_hooks_passthrough_finish_turn_and_prepare_request() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     let _ = std::fs::remove_dir_all(&temp);
 
@@ -1496,6 +1502,7 @@ async fn entry_appended_fires_for_messages_appended_to_storage() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     agent
         .prompt("hi", Arc::new(|_event| {}))

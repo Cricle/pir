@@ -9,10 +9,18 @@
 //! executes model calls against the declared set only).
 //!
 //! The settings tests count the caching-path loads through
-//! [`pir::plugins::codemode::settings_load_count`]: constructing the builtin
-//! plugin reads settings once, script executions read none, and `/reload`
-//! reads once more (also picking up a changed `codemode.mode`). The agent dir
-//! is a temp directory (`PIR_AGENT_DIR`), never `~/.pi`.
+//! [`pir::plugins::codemode::watch_settings_loads`] (the per-agent-dir
+//! counter — the process-wide [`pir::plugins::codemode::settings_load_count`]
+//! is moved by every session any sibling suite constructs, which made the
+//! assertion racy inside a merged harness): constructing the builtin plugin
+//! reads settings once, script executions read none, and `/reload` reads once
+//! more (also picking up a changed `codemode.mode`).
+//!
+//! Every test owns a scratch agent dir and builds the builtin through
+//! [`pir::plugins::codemode::new_codemode_plugin_in`], and the session through
+//! an explicit agent-dir constructor: the settings scope, the project cwd and
+//! the session's agent dir are all arguments, so nothing here reads or writes
+//! `PIR_AGENT_DIR` / `PIR_TRUST_PROJECT` and no lock is needed.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,13 +42,9 @@ use pir::ai::types::{
 use pir::coding_agent::ToolSelection;
 use pir::config::settings::CodemodeMode;
 use pir::plugins::codemode::{
-    new_codemode_plugin, settings_load_count, CodemodeConfig, CodemodePlugin, CodemodeTool,
+    new_codemode_plugin_in, watch_settings_loads, CodemodeConfig, CodemodePlugin, CodemodeTool,
 };
-use pir::plugins::PluginHost;
-
-/// Serializes this binary's tests: they share the process-wide settings-load
-/// counter and the `PIR_AGENT_DIR` environment variable.
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use pir::plugins::{AgentPlugin, PluginHost};
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -70,23 +74,37 @@ impl Drop for TempDir {
     }
 }
 
-/// Restores `PIR_AGENT_DIR` when the test ends (panic included).
-struct AgentDirGuard(Option<std::ffi::OsString>);
-
-impl AgentDirGuard {
-    fn set(dir: &std::path::Path) -> Self {
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", dir);
-        Self(previous)
-    }
+/// A scratch agent dir plus the project cwd for one test, both removed on drop.
+struct Scratch {
+    agent_dir: TempDir,
+    cwd: TempDir,
 }
 
-impl Drop for AgentDirGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
+impl Scratch {
+    fn new(label: &str) -> Self {
+        Self {
+            agent_dir: TempDir::new(&format!("{label}-agent")),
+            cwd: TempDir::new(&format!("{label}-cwd")),
         }
+    }
+
+    /// The builtin plugin bound to THIS scratch scope (agent dir + cwd), so its
+    /// settings read is attributable and never shared.
+    fn plugin(&self) -> Arc<dyn AgentPlugin> {
+        new_codemode_plugin_in(self.agent_dir.0.clone(), self.cwd.0.clone())
+    }
+
+    fn session(
+        &self,
+        config: AgentSessionConfig,
+        plugins: Vec<Arc<dyn AgentPlugin>>,
+    ) -> Arc<AgentSession> {
+        AgentSession::new_arc_with_plugins_and_host_in(
+            config,
+            plugins,
+            None,
+            Some(self.agent_dir.0.clone()),
+        )
     }
 }
 
@@ -280,6 +298,7 @@ fn session_config(
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     }
 }
 
@@ -329,7 +348,7 @@ fn request_names(requests: &Arc<Mutex<Vec<Vec<String>>>>) -> Vec<Vec<String>> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn codemode_reports_upstream_model_only_and_inactive_default() {
-    let _lock = TEST_LOCK.lock().await;
+    let scope = Scratch::new("exposure");
     let tool = CodemodeTool::default();
     assert_eq!(
         tool.exposure(),
@@ -342,7 +361,7 @@ async fn codemode_reports_upstream_model_only_and_inactive_default() {
     );
 
     // The registered definition carries the same values to the registry.
-    let host = PluginHost::build(None, vec![new_codemode_plugin()]);
+    let host = PluginHost::build(None, vec![scope.plugin()]);
     let def = host
         .tool_defs()
         .into_iter()
@@ -358,8 +377,7 @@ async fn codemode_reports_upstream_model_only_and_inactive_default() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn default_session_neither_declares_nor_executes_codemode() {
-    let _lock = TEST_LOCK.lock().await;
-    let temp = TempDir::new("default");
+    let scope = Scratch::new("default");
     let harness = fake_registry(Arc::new(|index, _context| {
         if index == 0 {
             assistant(
@@ -370,15 +388,15 @@ async fn default_session_neither_declares_nor_executes_codemode() {
             assistant(vec![text("done")], StopReason::Stop)
         }
     }));
-    let agent = Arc::new(AgentSession::new_with_plugins(
+    let agent = scope.session(
         session_config(
             Arc::clone(&harness.registry),
             ToolRegistry::new(),
-            &temp,
+            &scope.cwd,
             None,
         ),
-        vec![new_codemode_plugin()],
-    ));
+        vec![scope.plugin()],
+    );
 
     let result = run_prompt(&agent, "run codemode").await;
     let requests = request_names(&harness.requests);
@@ -405,8 +423,7 @@ async fn default_session_neither_declares_nor_executes_codemode() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn selected_codemode_is_declared_and_runs() {
-    let _lock = TEST_LOCK.lock().await;
-    let temp = TempDir::new("selected");
+    let scope = Scratch::new("selected");
     let harness = fake_registry(Arc::new(|index, _context| {
         if index == 0 {
             assistant(
@@ -417,15 +434,15 @@ async fn selected_codemode_is_declared_and_runs() {
             assistant(vec![text("done")], StopReason::Stop)
         }
     }));
-    let agent = Arc::new(AgentSession::new_with_plugins(
+    let agent = scope.session(
         session_config(
             Arc::clone(&harness.registry),
             ToolRegistry::new(),
-            &temp,
+            &scope.cwd,
             Some(selection(&["codemode"])),
         ),
-        vec![new_codemode_plugin()],
-    ));
+        vec![scope.plugin()],
+    );
 
     let result = run_prompt(&agent, "run codemode").await;
     let requests = request_names(&harness.requests);
@@ -446,8 +463,7 @@ async fn selected_codemode_is_declared_and_runs() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn mode_only_hides_direct_declarations_for_an_active_codemode() {
-    let _lock = TEST_LOCK.lock().await;
-    let temp = TempDir::new("mode-only");
+    let scope = Scratch::new("mode-only");
     let harness = fake_registry(Arc::new(|index, _context| {
         if index == 0 {
             assistant(
@@ -467,15 +483,15 @@ async fn mode_only_hides_direct_declarations_for_an_active_codemode() {
         mode: CodemodeMode::Only,
         ..CodemodeConfig::default()
     });
-    let agent = Arc::new(AgentSession::new_with_plugins(
+    let agent = scope.session(
         session_config(
             Arc::clone(&harness.registry),
             tools,
-            &temp,
+            &scope.cwd,
             Some(selection(&["codemode", "echo"])),
         ),
         vec![Arc::new(plugin)],
-    ));
+    );
 
     let result = run_prompt(&agent, "run codemode").await;
     let requests = request_names(&harness.requests);
@@ -503,20 +519,27 @@ async fn mode_only_hides_direct_declarations_for_an_active_codemode() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn settings_load_once_per_construction_and_once_more_on_reload() {
-    let _lock = TEST_LOCK.lock().await;
-    let agent_dir = TempDir::new("agent-dir");
-    let temp = TempDir::new("cwd");
-    let _env = AgentDirGuard::set(&agent_dir.0);
+    // No lock and no environment: the agent dir, the session cwd and the
+    // plugin's settings scope are all arguments below.
+    let scope = Scratch::new("loads");
+    let agent_dir = &scope.agent_dir;
+    let temp = &scope.cwd;
     std::fs::write(
         agent_dir.0.join("settings.json"),
         json!({ "codemode": { "mode": "on" } }).to_string(),
     )
     .expect("write initial settings");
 
-    let before = settings_load_count();
-    let plugin = new_codemode_plugin();
+    // The ATTRIBUTABLE per-agent-dir counter, not the process-wide one: every
+    // `AgentSession` in this binary registers the default codemode builtin, so
+    // a sibling suite's session construction bumps the global count between the
+    // reads (observed `left: 9, right: 6`). This counts only loads against the
+    // agent dir pinned above.
+    let loads = watch_settings_loads(&agent_dir.0);
+    let before = loads.count();
+    let plugin = scope.plugin();
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 1,
         "plugin construction resolves settings exactly once"
     );
@@ -544,7 +567,7 @@ async fn settings_load_once_per_construction_and_once_more_on_reload() {
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(EchoTool));
     let requests = Arc::clone(&harness.requests);
-    let agent = Arc::new(AgentSession::new_with_plugins(
+    let agent = scope.session(
         session_config(
             Arc::clone(&harness.registry),
             tools,
@@ -552,12 +575,12 @@ async fn settings_load_once_per_construction_and_once_more_on_reload() {
             Some(selection(&["codemode", "echo"])),
         ),
         vec![plugin],
-    ));
+    );
 
     let first = run_prompt(&agent, "two scripts").await;
     assert!(tool_result_text(&first, "codemode").1.contains("one"));
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 1,
         "script executions must not read settings"
     );
@@ -577,14 +600,14 @@ async fn settings_load_once_per_construction_and_once_more_on_reload() {
         .await
         .expect("reload");
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 2,
         "`/reload` resolves settings exactly once more"
     );
 
     let second = run_prompt(&agent, "after reload").await;
     assert_eq!(
-        settings_load_count(),
+        loads.count(),
         before + 2,
         "the post-reload script execution must not read settings"
     );

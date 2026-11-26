@@ -67,6 +67,8 @@ fn start_handle(dir: &std::path::Path) -> ExtensionHandle {
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start")
 }
@@ -494,4 +496,101 @@ fn renderers_receive_host_resolved_keybinding_hints() {
         vec!["entry:ctrl+e|ctrl+e to expand".to_string()],
         "entry renderers must receive keyText/keyHint in their options"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Markdown transformer surfaces (upstream v1.5.2 #11756)
+//
+// `registerMarkdownTransformer(fn, { messageTypes })` selects the surfaces the
+// transformer runs on; an unselected surface leaves the markdown unchanged.
+// ---------------------------------------------------------------------------
+
+fn invoke_on_surface(invoker: &dyn RendererInvoker, markdown: &str, message_type: &str) -> String {
+    let outcome = invoker
+        .invoke(&RendererRequest {
+            kind: RendererKind::Markdown,
+            key: String::new(),
+            payload: json!({ "markdown": markdown }),
+            options: json!({ "messageType": message_type, "isStreaming": false, "width": 60 }),
+        })
+        .expect("markdown invoke");
+    outcome.text.unwrap_or_else(|| markdown.to_owned())
+}
+
+#[test]
+fn markdown_transformer_runs_only_on_its_registered_surfaces() {
+    let temp = TempDir::new("markdown-surfaces");
+    let handle = start_handle(&temp.0);
+    // Upstream bare-transformer form with explicit surfaces.
+    load_extension(
+        &handle,
+        &temp.0,
+        "summary.ts",
+        r#"
+        export default function (pi) {
+          pi.registerMarkdownTransformer(
+            (markdown) => "S:" + markdown,
+            { messageTypes: ["summary"] },
+          );
+        }
+        "#,
+    );
+    // No options: the transcript trio only.
+    load_extension(
+        &handle,
+        &temp.0,
+        "all.ts",
+        r#"
+        export default function (pi) {
+          pi.registerMarkdownTransformer((markdown) => markdown + "-default");
+        }
+        "#,
+    );
+    let invoker = ExtensionRendererInvoker::new(Arc::new(handle));
+
+    // Each transformer runs only on its own surfaces; the two surface sets do
+    // not overlap here, so the output names exactly which one ran.
+    assert_eq!(
+        invoke_on_surface(&invoker, "hi", "summary"),
+        "S:hi",
+        "the summary transformer runs on summary; the default one does not"
+    );
+    assert_eq!(
+        invoke_on_surface(&invoker, "hi", "user"),
+        "hi-default",
+        "the default transformer runs on user markdown"
+    );
+    assert_eq!(
+        invoke_on_surface(&invoker, "hi", "assistant-thinking"),
+        "hi-default",
+        "the transcript trio is the default surface set"
+    );
+    assert_eq!(
+        invoke_on_surface(&invoker, "hi", "changelog"),
+        "hi",
+        "a surface nobody opted into stays untouched"
+    );
+}
+
+#[test]
+fn markdown_transformer_coerces_explicit_surfaces_to_a_set() {
+    let temp = TempDir::new("markdown-surfaces-two");
+    let handle = start_handle(&temp.0);
+    load_extension(
+        &handle,
+        &temp.0,
+        "two.ts",
+        r#"
+        export default function (pi) {
+          pi.registerMarkdownTransformer(
+            (markdown) => markdown.toUpperCase(),
+            { messageTypes: ["custom", "changelog"] },
+          );
+        }
+        "#,
+    );
+    let invoker = ExtensionRendererInvoker::new(Arc::new(handle));
+    assert_eq!(invoke_on_surface(&invoker, "x", "custom"), "X");
+    assert_eq!(invoke_on_surface(&invoker, "x", "changelog"), "X");
+    assert_eq!(invoke_on_surface(&invoker, "x", "user"), "x");
 }

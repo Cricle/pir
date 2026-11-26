@@ -22,44 +22,26 @@ use pir::system_prompt::{
     SystemPromptInput, SystemPromptSection, SystemPromptSections, ToolInfo,
 };
 
-/// Acquire the binary-wide environment lock (`tests/common/mod.rs`) from a
-/// sync test. `PI_PACKAGE_DIR` is process-global, and the other suites in this
-/// merged binary serialize their `PIR_AGENT_DIR`/`HOME` mutations on the same
-/// tokio mutex; a module-local lock would not exclude them.
-fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime");
-    runtime.block_on(crate::common::agent_dir_env_lock().lock())
+/// Set `PI_PACKAGE_DIR` to `path` for the lifetime of the returned pin.
+///
+/// `package_dir()` is deliberately an environment read — the override exists so
+/// an operator (a Nix/Guix store path) can point the `<docs>` section at a
+/// package root — so the tests that exercise it pin the variable and take a
+/// private process (`crate::common::skip_without_nextest_package`) instead of
+/// adding an argument production never passes.
+fn package_dir_var(path: &Path) -> crate::common::ProcessEnvPin {
+    crate::common::ProcessEnvPin::isolate(
+        &["PI_PACKAGE_DIR"],
+        &[(
+            "PI_PACKAGE_DIR",
+            path.to_str().expect("temp paths are UTF-8"),
+        )],
+    )
 }
 
-/// Set (or remove) `PI_PACKAGE_DIR` for the lifetime of the guard, restoring
-/// the previous value on drop — including a panic mid-test, so a failed test
-/// cannot leak a package dir into its neighbours.
-struct PackageDirVar(Option<std::ffi::OsString>);
-
-impl PackageDirVar {
-    fn set(path: &Path) -> Self {
-        let previous = std::env::var_os("PI_PACKAGE_DIR");
-        std::env::set_var("PI_PACKAGE_DIR", path.as_os_str());
-        Self(previous)
-    }
-
-    fn removed() -> Self {
-        let previous = std::env::var_os("PI_PACKAGE_DIR");
-        std::env::remove_var("PI_PACKAGE_DIR");
-        Self(previous)
-    }
-}
-
-impl Drop for PackageDirVar {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(value) => std::env::set_var("PI_PACKAGE_DIR", value),
-            None => std::env::remove_var("PI_PACKAGE_DIR"),
-        }
-    }
+/// Clear `PI_PACKAGE_DIR` for the lifetime of the returned pin.
+fn package_dir_removed() -> crate::common::ProcessEnvPin {
+    crate::common::ProcessEnvPin::isolate(&["PI_PACKAGE_DIR"], &[])
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +140,6 @@ fn sample_input<'a>(
 
 #[test]
 fn sections_are_ordered_and_xml_wrapped() {
-    // Containment against the docs tests' PI_PACKAGE_DIR mutation.
-    let _guard = env_lock();
     let project_files = vec![(PathBuf::from("AGENTS.md"), "be nice".to_string())];
     let skills = vec![SkillInfo {
         name: "code-review".to_string(),
@@ -255,8 +235,6 @@ fn sections_are_ordered_and_xml_wrapped() {
 
 #[test]
 fn rules_include_the_conditional_bash_file_operations_rule() {
-    // Containment against the docs tests' PI_PACKAGE_DIR mutation.
-    let _guard = env_lock();
     // Only bash is active: the file-operations rule is added (upstream
     // buildRules fires when a shell is declared without grep/find/ls).
     let tools = vec![ToolInfo::new("bash", "Execute bash commands")];
@@ -305,8 +283,6 @@ fn rules_include_the_conditional_bash_file_operations_rule() {
 
 #[test]
 fn tools_without_snippets_are_not_listed() {
-    // Containment against the docs tests' PI_PACKAGE_DIR mutation.
-    let _guard = env_lock();
     // Upstream builds the tools section from snippet-carrying tools only
     // (agent-session.ts:1701-1706); the description is never a fallback.
     let tools = vec![ToolInfo::new("read", "Read the contents of a file.\nMore.")];
@@ -335,8 +311,6 @@ fn tools_without_snippets_are_not_listed() {
 
 #[test]
 fn custom_sections_are_appended_in_order_and_validated() {
-    // Containment against the docs tests' PI_PACKAGE_DIR mutation.
-    let _guard = env_lock();
     let tools: Vec<ToolInfo> = Vec::new();
     let input = SystemPromptInput {
         preamble_override: None,
@@ -374,17 +348,21 @@ fn custom_sections_are_appended_in_order_and_validated() {
 
 #[test]
 fn docs_section_is_emitted_when_package_docs_exist() {
-    let _guard = env_lock();
+    if crate::common::skip_without_nextest_package(
+        "system_prompt::docs_section_is_emitted_when_package_docs_exist",
+    ) {
+        return;
+    }
     let root = TempDir::new("docs-section");
     let package = root.child("package");
     fs::write(package.join("README.md"), "# pir").unwrap();
     fs::create_dir_all(package.join("docs")).unwrap();
     fs::create_dir_all(package.join("examples")).unwrap();
 
-    // Pinned for the whole test (restored by the guard). Like the real
+    // Pinned for the whole test (restored by the pin's `Drop`). Like the real
     // callers the test resolves the package dir up front and threads it into
     // the input.
-    let _package = PackageDirVar::set(&package);
+    let _package = package_dir_var(&package);
     let package_dir = pir::config::env::package_dir();
     let tools = default_tools();
     let mut input = sample_input(&tools, &[], &[]);
@@ -409,8 +387,12 @@ fn docs_section_is_emitted_when_package_docs_exist() {
 
 #[test]
 fn docs_section_is_absent_without_package_docs() {
-    let _guard = env_lock();
-    let _package = PackageDirVar::removed();
+    if crate::common::skip_without_nextest_package(
+        "system_prompt::docs_section_is_absent_without_package_docs",
+    ) {
+        return;
+    }
+    let _package = package_dir_removed();
     let tools = default_tools();
     // `sample_input` threads no package dir: no Docs section regardless of the
     // process environment (the builder never reads it).
@@ -425,7 +407,11 @@ fn docs_section_is_absent_without_package_docs() {
 /// process state, decides the `Docs` section and the order stays deterministic.
 #[test]
 fn docs_section_follows_the_threaded_package_dir_not_the_process_env() {
-    let _guard = env_lock();
+    if crate::common::skip_without_nextest_package(
+        "system_prompt::docs_section_follows_the_threaded_package_dir_not_the_process_env",
+    ) {
+        return;
+    }
     let root = TempDir::new("docs-regression");
     let package = root.child("package");
     fs::write(package.join("README.md"), "# pir").unwrap();
@@ -433,8 +419,8 @@ fn docs_section_follows_the_threaded_package_dir_not_the_process_env() {
     fs::create_dir_all(package.join("examples")).unwrap();
 
     // Hostile ambient state: the env var names a real package with docs
-    // (restored by the guard when the test ends).
-    let _package = PackageDirVar::set(&package);
+    // (restored by the pin when the test ends).
+    let _package = package_dir_var(&package);
 
     // A caller that resolves the value up front and threads it in gets Docs
     // between Rules and Addendum, deterministically.
@@ -483,8 +469,6 @@ fn docs_section_follows_the_threaded_package_dir_not_the_process_env() {
 
 #[test]
 fn empty_tools_render_none_fallback_and_no_optional_sections_when_empty() {
-    // Containment against the docs tests' PI_PACKAGE_DIR mutation.
-    let _guard = env_lock();
     let input = SystemPromptInput {
         preamble_override: None,
         append: Vec::new(),
@@ -515,8 +499,6 @@ fn empty_tools_render_none_fallback_and_no_optional_sections_when_empty() {
 
 #[test]
 fn preamble_override_replaces_tools_and_rules() {
-    // Containment against the docs tests' PI_PACKAGE_DIR mutation.
-    let _guard = env_lock();
     let input = SystemPromptInput {
         preamble_override: Some("You are a specialist.".to_string()),
         append: vec!["tail".to_string()],
@@ -1596,7 +1578,12 @@ fn prompt_fake_model() -> Model {
 /// A session whose prompt is context-derived (`system_prompt: None`) and whose
 /// declared set is `active` (the host's `--tools` selection), with the real
 /// `codemode` plugin registered in `mode`.
-fn codemode_prompt_session(mode: CodemodeMode, active: Vec<String>, cwd: &Path) -> AgentSession {
+fn codemode_prompt_session(
+    mode: CodemodeMode,
+    active: Vec<String>,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> AgentSession {
     let mut tools = ToolRegistry::new();
     register_core_tools(&mut tools);
     tools.register(std::sync::Arc::new(PromptProbeTool {
@@ -1615,7 +1602,7 @@ fn codemode_prompt_session(mode: CodemodeMode, active: Vec<String>, cwd: &Path) 
         exposure: ToolExposure::ModelOnly,
         default_active: true,
     }));
-    AgentSession::new_with_plugins(
+    AgentSession::new_with_plugins_and_agent_dir(
         AgentSessionConfig {
             performance: Default::default(),
             provider_registry: std::sync::Arc::new(ProviderRegistry::default()),
@@ -1636,6 +1623,7 @@ fn codemode_prompt_session(mode: CodemodeMode, active: Vec<String>, cwd: &Path) 
                 modifiers: Vec::new(),
                 uses_default_tools: false,
             }),
+            phone_child: None,
         },
         vec![std::sync::Arc::new(CodemodePlugin::with_config(
             CodemodeConfig {
@@ -1644,6 +1632,7 @@ fn codemode_prompt_session(mode: CodemodeMode, active: Vec<String>, cwd: &Path) 
                 sandbox_memory_bytes: Some(pir::plugins::codemode::default_sandbox_memory_bytes()),
             },
         ))],
+        agent_dir,
     )
 }
 
@@ -1664,12 +1653,19 @@ fn codemode_active_set() -> Vec<String> {
 /// prompt must agree (print does the same after CL2).
 #[tokio::test]
 async fn session_prompt_applies_prepare_loadout_hidden_declarations() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("sysprompt-codemode", None).await;
+    // An explicit agent dir keeps the config/trust lookups hermetic; neither
+    // build below reads the process environment for it.
+    let agent_dir = crate::common::scratch_agent_dir("sysprompt-codemode", None);
     // A context file makes the context-derived prompt render.
     let cwd = TempDir::new("codemode-hidden");
     fs::write(cwd.path().join("AGENTS.md"), "project instructions").unwrap();
 
-    let session = codemode_prompt_session(CodemodeMode::Only, codemode_active_set(), cwd.path());
+    let session = codemode_prompt_session(
+        CodemodeMode::Only,
+        codemode_active_set(),
+        cwd.path(),
+        agent_dir.path(),
+    );
     let prompt = session
         .system_prompt_snapshot()
         .expect("a context file produces the context-derived prompt");
@@ -1739,7 +1735,12 @@ async fn session_prompt_applies_prepare_loadout_hidden_declarations() {
     );
 
     // Contrast: the default mode leaves the direct declarations in place.
-    let session = codemode_prompt_session(CodemodeMode::On, codemode_active_set(), cwd.path());
+    let session = codemode_prompt_session(
+        CodemodeMode::On,
+        codemode_active_set(),
+        cwd.path(),
+        agent_dir.path(),
+    );
     let prompt = session
         .system_prompt_snapshot()
         .expect("a context file produces the context-derived prompt");
@@ -1809,6 +1810,27 @@ fn mcp_servers_section_lists_each_state() {
 
     // Empty: no section at all.
     assert!(render_mcp_servers_section(&[]).is_none());
+}
+
+/// A hyphenated server name renders through the same `mcpNamespace` rule the
+/// MCP registry uses. The prompt module keeps a literal fallback for builds
+/// without the `mcp` feature, so this pins the two spellings equal: a drifted
+/// fallback would advertise a tool namespace the registry never registers.
+#[test]
+fn mcp_servers_section_namespace_matches_the_registry_rule() {
+    use pir::system_prompt::{render_mcp_servers_section, McpServerListing, McpServerState};
+
+    let servers = vec![McpServerListing {
+        name: "my-server".to_owned(),
+        reach: "direct",
+        state: McpServerState::Ready { tool_count: 1 },
+    }];
+    let section = render_mcp_servers_section(&servers).expect("one server renders");
+    assert!(
+        section.contains("- mcp__my_server ("),
+        "a hyphen becomes an underscore in the namespace: {section}"
+    );
+    assert!(!section.contains("mcp__my-server"), "{section}");
 }
 
 /// A failure reason is bounded to one line (CL24's `bounded_reason` rule):
@@ -1934,28 +1956,32 @@ fn mcp_section_is_appended_after_the_builtins() {
 /// prompt cache).
 #[tokio::test]
 async fn cli_prompt_overrides_keep_structure_and_rebuild() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("sysprompt-overrides", None).await;
+    let agent_dir = crate::common::scratch_agent_dir("sysprompt-overrides", None);
     let cwd = TempDir::new("prompt-overrides");
     fs::write(cwd.path().join("AGENTS.md"), "project instructions").unwrap();
 
     let mut tools = ToolRegistry::new();
     register_core_tools(&mut tools);
-    let session = AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: std::sync::Arc::new(ProviderRegistry::default()),
-        model: prompt_fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools,
-        session: None,
-        compaction: None,
-        max_turns: 1,
-        system_prompt: None,
-        cwd: Some(cwd.path().to_path_buf()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: None,
-    });
+    let session = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: std::sync::Arc::new(ProviderRegistry::default()),
+            model: prompt_fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools,
+            session: None,
+            compaction: None,
+            max_turns: 1,
+            system_prompt: None,
+            cwd: Some(cwd.path().to_path_buf()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        agent_dir.path(),
+    );
     let before = session
         .system_prompt_snapshot()
         .expect("a context file produces the context-derived prompt");

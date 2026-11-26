@@ -12,7 +12,8 @@ TIMEOUT = 240
 MOCK_SCRIPT = [
     # 1. The planner submits a concrete plan for approval.
     {"tool_call": {"name": "submit_plan",
-                   "arguments": {"plan": "1. write the plan proof file\n2. verify it"}}},
+                   "arguments": {"plan": "1. write the plan proof file\n2. verify it",
+                                 "verification": ["test -f plan.txt"]}}},
     # 2. The planner settles and waits for the decision.
     {"text": "waiting for plan approval", "chunks": 8, "chunk_delay_ms": 100},
     # 3. After approval, the follow-up runs in NORMAL mode and implements.

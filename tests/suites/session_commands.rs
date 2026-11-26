@@ -156,6 +156,7 @@ fn agent(session: SessionManager, temp: &TempDir) -> Arc<AgentSession> {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }))
 }
 
@@ -176,6 +177,7 @@ fn ephemeral_agent(temp: &TempDir) -> Arc<AgentSession> {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }))
 }
 
@@ -389,6 +391,8 @@ fn command_extension_config(cwd: &std::path::Path) -> pir::extensions::Extension
         system_prompt: String::new(),
         is_idle: true,
         limits: Some(Default::default()),
+        allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -431,6 +435,7 @@ fn agent_with_extensions(
         event_stream: None,
         extensions: Some(handle),
         tool_selection: None,
+        phone_child: None,
     }))
 }
 

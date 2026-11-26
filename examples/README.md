@@ -15,7 +15,7 @@ declares only the features needed to compile it (`required-features` in
 `Cargo.toml`): `sdk` for most, `sdk,session` for `sessions`, `sdk,subagent`
 for `builtin`, `sdk,extensions` for `extension`, and `sdk,session,skills` for
 `real_endpoint`. The `tools` example compiles with `sdk` and its documented
-command adds the optional `tools` feature. TUI, CLI, Python, and MCP stay off;
+command adds the optional `tools` feature. TUI, CLI, context-mode, and MCP stay off;
 only the `extension` example turns on the embedded QuickJS runtime:
 
 ```bash
@@ -45,9 +45,9 @@ cargo run --example session_compaction --no-default-features --features "sdk,ses
 # no-op).
 cargo run --example tools --no-default-features --features "sdk,tools"
 
-# A real end-to-end repair: the scripted model reads/edits a broken Python
+# A real end-to-end repair: the scripted model reads/edits a broken shell
 # module with the built-in tools and runs the real test suite.
-PIR_PYTHON=/path/to/python cargo run --example mini_coding --no-default-features --features "sdk,tools"
+cargo run --example mini_coding --no-default-features --features "sdk,tools"
 
 # Compiled-in builtin (`subagent`).
 cargo run --example builtin --no-default-features --features "sdk,subagent"
@@ -64,7 +64,7 @@ cargo run --example real_endpoint --no-default-features \
   --features "sdk,session,skills,provider-openai"
 ```
 
-`--no-default-features` drops `full` (TUI, CLI, extensions, Python, MCP, phone,
+`--no-default-features` drops `full` (TUI, CLI, extensions, context-mode, MCP, phone,
 and the extra tools); each command above adds back only what it needs.
 
 The whole offline set, in these exact feature shapes, is also available as one
@@ -187,7 +187,7 @@ profile and numbers.
 - `tools` adds the built-in coding tools (`read`/`write`/`edit`/`bash`/
   `powershell`/`ls` and the background controls). `grep-find` adds the
   `grep`/`find` tools; `image-tools` adds inline images.
-- `subagent`, `tool-repair`, `tool-search`, `todo`, `python`, `mcp`, and
+- `subagent`, `tool-repair`, `tool-search`, `todo`, `context-mode`, `mcp`, and
   `extensions` gate compiled-in builtins / JS extensions. Calling
   `.builtin("name")` without its feature fails `build()` with an explicit
   diagnostic; `extension_paths` with an on-disk file fails the same way

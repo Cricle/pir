@@ -1,0 +1,308 @@
+//! Tests for AI error types.
+
+use pir_ai_types::error::{AiError, AiResult, TurnRetryClass};
+
+#[test]
+fn stream_not_terminated_display() {
+    let e = AiError::StreamNotTerminated;
+    assert!(e.to_string().contains("stream ended without"));
+    assert!(!e.to_string().is_empty());
+}
+
+#[test]
+fn unknown_provider_display() {
+    let e = AiError::UnknownProvider("ollama".into());
+    assert!(e.to_string().contains("ollama"));
+}
+
+#[test]
+fn retry_exhausted_display() {
+    let e = AiError::RetryExhausted {
+        attempts: 3,
+        message: "timeout".into(),
+    };
+    let s = e.to_string();
+    assert!(s.contains("3"));
+    assert!(s.contains("timeout"));
+}
+
+#[test]
+fn aborted_stop_reason() {
+    let e = AiError::Aborted;
+    assert_eq!(e.stop_reason(), pir_ai_types::StopReason::Aborted);
+    assert_eq!(e.user_message(), "Request was aborted");
+}
+
+#[test]
+fn non_retryable_stop_reason() {
+    let e = AiError::NonRetryable("quota".into());
+    assert_eq!(e.stop_reason(), pir_ai_types::StopReason::Error);
+}
+
+#[test]
+fn retryable_provider_frame_keeps_text_and_retries_turn() {
+    let e = AiError::Retryable("Rate limit reached".into());
+    assert_eq!(e.stop_reason(), pir_ai_types::StopReason::Error);
+    assert_eq!(e.user_message(), "Rate limit reached");
+    assert_eq!(e.turn_retry_class(), TurnRetryClass::RetryableTurn);
+}
+
+#[test]
+fn stream_truncated_is_retryable_turn() {
+    let e = AiError::StreamTruncated("stream ended early".into());
+    assert_eq!(e.turn_retry_class(), TurnRetryClass::RetryableTurn);
+}
+
+#[test]
+fn json_parse_error_stays_non_retryable() {
+    let json_err = serde_json::from_str::<()>("not json").unwrap_err();
+    let e = AiError::Json(json_err);
+    assert_eq!(e.turn_retry_class(), TurnRetryClass::NonRetryable);
+}
+
+/// PIR-BIN-086: an HTTP-status error the transport retried as far as its
+/// budget allowed belongs to the AGENT-level ladder (upstream
+/// `retryProviderRequest` `maxRetries ?? 0`, then `isRetryableAssistantError`
+/// re-issues the turn). A status that was never retryable — or a verdict with
+/// no transport HTTP shape (auth, configuration, parse, adapter text) — stays
+/// terminal.
+#[test]
+fn exhausted_retryable_http_status_is_retryable_turn() {
+    for status in [
+        "408", "409", "429", "500", "502", "503", "504", "520", "524",
+    ] {
+        let e = AiError::NonRetryable(format!("HTTP {status}: transient"));
+        assert_eq!(
+            e.turn_retry_class(),
+            TurnRetryClass::RetryableTurn,
+            "an exhausted {status} must be re-issuable by the agent loop"
+        );
+    }
+    for text in [
+        "HTTP 401: Incorrect API key provided",
+        "HTTP 400: invalid request",
+        "HTTP 404: model not found",
+        "HTTP 425: too early",
+        "HTTP 429",
+        "invalid_request_error: bad tools",
+        "quota exceeded",
+    ] {
+        let e = AiError::NonRetryable(text.to_string());
+        assert_eq!(
+            e.turn_retry_class(),
+            TurnRetryClass::NonRetryable,
+            "{text} must stay non-retryable"
+        );
+    }
+    assert_eq!(
+        AiError::Authentication("bad key".into()).turn_retry_class(),
+        TurnRetryClass::NonRetryable
+    );
+    let json_err = serde_json::from_str::<()>("not json").unwrap_err();
+    assert_eq!(
+        AiError::Json(json_err).turn_retry_class(),
+        TurnRetryClass::NonRetryable
+    );
+}
+
+#[test]
+fn retry_exhausted_truncation_never_splits_a_codepoint() {
+    // 360 bytes of 3-byte characters: a byte slice at index 200 lands mid
+    // codepoint and used to panic.
+    let e = AiError::RetryExhausted {
+        attempts: 2,
+        message: "错误".repeat(60),
+    };
+    let rendered = e.user_message();
+    assert!(rendered.ends_with("..."), "{rendered}");
+    assert!(rendered.is_char_boundary(rendered.len()));
+}
+
+#[test]
+fn retry_exhausted_user_message_truncated() {
+    let long = "x".repeat(300);
+    let e = AiError::RetryExhausted {
+        attempts: 5,
+        message: long.clone(),
+    };
+    let msg = e.user_message();
+    assert!(msg.len() <= 203, "msg len: {}", msg.len());
+    assert!(msg.ends_with("..."));
+}
+
+#[test]
+fn retry_exhausted_user_message_short() {
+    let e = AiError::RetryExhausted {
+        attempts: 2,
+        message: "brief".into(),
+    };
+    assert_eq!(e.user_message(), "brief");
+}
+
+#[test]
+fn io_error_from_source() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+    let e = AiError::Io(io_err);
+    assert!(e.to_string().contains("file not found"));
+}
+
+#[test]
+fn json_error_from_source() {
+    let json_err = serde_json::from_str::<()>("not json").unwrap_err();
+    let e = AiError::Json(json_err);
+    assert!(e.to_string().contains("not json") || e.to_string().contains("expected"));
+}
+
+#[test]
+fn ai_result_type_alias() {
+    fn ok() -> AiResult<i32> {
+        Ok(42)
+    }
+    assert_eq!(ok().unwrap(), 42);
+}
+
+// ---------------------------------------------------------------------------
+// Retry-class carrier removal (CL38 R3: foreign/duplicated markers)
+// ---------------------------------------------------------------------------
+
+fn carrier_message() -> pir_ai_types::AssistantMessage {
+    pir_ai_types::AssistantMessage {
+        api: "test-api".into(),
+        provider: "test".into(),
+        model: "test-model".into(),
+        stop_reason: pir_ai_types::StopReason::Error,
+        error_message: Some("stream ended without a terminal event".into()),
+        timestamp: 1,
+        ..Default::default()
+    }
+}
+
+fn push_carrier(message: &mut pir_ai_types::AssistantMessage, code: Option<&str>, diag_type: &str) {
+    message.diagnostics.push(pir_ai_types::DiagnosticInfo {
+        diag_type: diag_type.to_string(),
+        timestamp: 1,
+        error_message: None,
+        error_name: None,
+        error_stack: None,
+        error_code: code.map(|code| serde_json::Value::String(code.to_string())),
+        details: None,
+    });
+}
+
+/// A duplicated carrier must not survive the take: a JS `streamSimple`
+/// provider hands its events over whole, so it can plant or duplicate the
+/// marker. Only the FIRST carrier decides the verdict; every carrier is
+/// removed.
+#[test]
+fn take_turn_retry_class_removes_every_carrier_and_first_wins() {
+    let mut message = carrier_message();
+    push_carrier(
+        &mut message,
+        Some("non_retryable"),
+        pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC,
+    );
+    // A foreign duplicate AFTER the genuine marker: it must neither survive
+    // the take nor override the verdict.
+    push_carrier(
+        &mut message,
+        Some("retryable_turn"),
+        pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC,
+    );
+    // An unrelated diagnostic is not a carrier and stays.
+    push_carrier(&mut message, None, "provider_warning");
+    // A duplicated carrier BEFORE the genuine marker decides (first wins).
+    message.diagnostics.insert(
+        0,
+        pir_ai_types::DiagnosticInfo {
+            diag_type: pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC.to_string(),
+            timestamp: 0,
+            error_message: None,
+            error_name: None,
+            error_stack: None,
+            error_code: Some(serde_json::Value::String("transport_exhausted".into())),
+            details: None,
+        },
+    );
+
+    assert_eq!(
+        pir_ai_types::error::take_turn_retry_class(&mut message),
+        Some(pir_ai_types::error::TurnRetryClass::TransportExhausted),
+        "the FIRST carrier decides, deterministically"
+    );
+    assert!(
+        !message
+            .diagnostics
+            .iter()
+            .any(|d| d.diag_type == pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC),
+        "no carrier may survive the take: {:?}",
+        message.diagnostics
+    );
+    assert_eq!(
+        message.diagnostics.len(),
+        1,
+        "the unrelated diagnostic survives: {:?}",
+        message.diagnostics
+    );
+    assert_eq!(message.diagnostics[0].diag_type, "provider_warning");
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("stream ended without a terminal event"),
+        "the real error text is untouched"
+    );
+}
+
+/// A malformed FIRST carrier (no/unrecognized `error.code`) fails closed: the
+/// take can never be "rescued" by a well-formed duplicate, and every carrier
+/// is still removed.
+#[test]
+fn take_turn_retry_class_fails_closed_on_a_malformed_first_carrier() {
+    let mut message = carrier_message();
+    push_carrier(
+        &mut message,
+        None,
+        pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC,
+    );
+    push_carrier(
+        &mut message,
+        Some("retryable_turn"),
+        pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC,
+    );
+
+    assert_eq!(
+        pir_ai_types::error::take_turn_retry_class(&mut message),
+        None,
+        "an unparseable leading carrier is not retryable"
+    );
+    assert!(
+        message.diagnostics.is_empty(),
+        "both carriers are removed: {:?}",
+        message.diagnostics
+    );
+}
+
+/// `strip_turn_retry_class` removes every carrier without interpreting any of
+/// them and reports the count, leaving unrelated diagnostics alone.
+#[test]
+fn strip_turn_retry_class_removes_all_carriers_and_counts_them() {
+    let mut message = carrier_message();
+    push_carrier(&mut message, None, "provider_warning");
+    push_carrier(
+        &mut message,
+        Some("retryable_turn"),
+        pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC,
+    );
+    push_carrier(
+        &mut message,
+        Some("garbage"),
+        pir_ai_types::error::RETRY_CLASS_DIAGNOSTIC,
+    );
+
+    assert_eq!(pir_ai_types::error::strip_turn_retry_class(&mut message), 2);
+    assert_eq!(message.diagnostics.len(), 1);
+    assert_eq!(message.diagnostics[0].diag_type, "provider_warning");
+    assert_eq!(
+        pir_ai_types::error::strip_turn_retry_class(&mut message),
+        0,
+        "idempotent"
+    );
+}

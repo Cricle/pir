@@ -282,7 +282,6 @@ async fn server_tool_surface_excludes_extension_only_builtins() {
     for plugin_tool in [
         "todo",
         "subagent",
-        "python",
         "ctx_execute",
         "ctx_search",
         "tool_search",

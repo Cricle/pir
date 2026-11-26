@@ -238,6 +238,7 @@ fn settle_abort_config(temp: &TempDir) -> pir::agent_session::AgentSessionConfig
         event_stream: Some(stream),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -686,11 +687,36 @@ async fn finish_turn_sees_the_runs_shared_transcript() {
 
 use std::path::PathBuf;
 
-/// Hermetic `PIR_AGENT_DIR` pin shared with every other suite in this merged
-/// binary: the env is process-global, so a module-local lock would not exclude
-/// the SDK suites' own pins (`tests/common/mod.rs::AgentDirEnvGuard`).
-async fn hermetic_agent_dir(label: &str) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::scratch(label, None).await
+/// A scratch agent dir for one test, removed on drop.
+///
+/// The session is built with this directory as an explicit agent dir, so the
+/// suite needs no process-wide `PIR_AGENT_DIR` pin and no lock.
+struct HermeticAgentDir(PathBuf);
+
+impl HermeticAgentDir {
+    fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "pir-agent-core-w11-agent-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch agent dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for HermeticAgentDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A scratch cwd for the probe's `pid.txt`.
@@ -821,26 +847,33 @@ fn bash_available() -> bool {
     pir::coding_agent::tools::resolve_shell_config(None).is_ok()
 }
 
-fn bash_drop_session(cwd: PathBuf) -> pir::agent_session::AgentSession {
+fn bash_drop_session(
+    cwd: PathBuf,
+    agent_dir: &std::path::Path,
+) -> pir::agent_session::AgentSession {
     use pir::agent_session::{AgentSession, AgentSessionConfig};
     use pir::ai::provider::ProviderRegistry;
 
-    AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(ProviderRegistry::default()),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools: ToolRegistry::new(),
-        session: None,
-        compaction: None,
-        max_turns: 2,
-        system_prompt: None,
-        cwd: Some(cwd),
-        event_stream: None,
-        extensions: None,
-        tool_selection: None,
-    })
+    AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(ProviderRegistry::default()),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: None,
+            compaction: None,
+            max_turns: 2,
+            system_prompt: None,
+            cwd: Some(cwd),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        agent_dir,
+    )
 }
 
 /// Cancelling the `execute_bash` future (a closed RPC bridge, a host aborting
@@ -849,12 +882,12 @@ fn bash_drop_session(cwd: PathBuf) -> pir::agent_session::AgentSession {
 /// `sleep` survives the dropped future.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_execute_bash_future_kills_the_whole_process_tree() {
-    let _agent_dir = hermetic_agent_dir("bash-drop").await;
+    let agent_dir = HermeticAgentDir::new("bash-drop");
     if !bash_available() {
         return;
     }
     let fixture = ProbeFixture::new("bash-drop");
-    let session = Arc::new(bash_drop_session(fixture.dir.clone()));
+    let session = Arc::new(bash_drop_session(fixture.dir.clone(), agent_dir.path()));
 
     let task = tokio::spawn({
         let session = Arc::clone(&session);
