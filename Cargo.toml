@@ -16,8 +16,8 @@ name = "pir-sdk"
 # `version.workspace = true`. pir uses its own semver; `.migration-info`
 # records the upstream pi mapping.
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 # Integration-test auto-discovery is disabled on purpose: every tests/*.rs
 # file used to be its own test target, and each one statically linked the
 # whole engine. scripts/gen_merged_tests.ps1 folds them into 8 generated
@@ -25,9 +25,9 @@ rust-version = "1.97"
 # this file). Run it after adding/removing a tests/*.rs file.
 autotests = false
 description = "Pi coding agent, reimagined in Rust"
-license = "MIT OR Apache-2.0"
-authors = ["Earendil Works <team@earendil.works>"]
-repository = "https://github.com/Cricle/pir"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 readme = "README.md"
 # docs.rs indexes crates by *package* name, so this follows [package].name
 # (`pir-sdk`), not the `pir` library name.
@@ -720,8 +720,11 @@ resolver = "2"
 # release workflow parses this section (prereleases like `0.3.2-rc.1` are valid).
 [workspace.package]
 version = "0.3.2"
-# Shared metadata for the published support crates (plugin API + builtins).
-# `pir-core`/`pir-tui`/`pir-sdk` keep their own explicit values.
+# Language/toolchain contract for the whole workspace. Every member inherits
+# these via `edition.workspace = true` / `rust-version.workspace = true`, so a
+# bump is one edit here instead of twenty.
+edition = "2021"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 authors = ["Earendil Works <team@earendil.works>"]
 repository = "https://github.com/Cricle/pir"

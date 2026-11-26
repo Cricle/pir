@@ -1,14 +1,16 @@
 [package]
 name = "pir-native-shell"
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 description = "Native Shell desktop front end for pir"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/Cricle/pir"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
 publish = false
 
-include = ["/Cargo.toml", "/LICENSE-MIT", "/LICENSE-APACHE", "/src/**", "/assets/**"]
+include = ["/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/src/**", "/assets/**"]
 
 [lints.rust]
 unsafe_code = "deny"

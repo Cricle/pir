@@ -1,13 +1,14 @@
 [package]
 name = "pir-builtins"
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 description = "Aggregate catalog of the pir builtin plugin implementations (registration order, default-enable flags)"
+readme = "README.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-include = ["/Cargo.toml", "/src/**", "/tests/**"]
+include = ["/Cargo.toml", "/README.md", "/src/**", "/tests/**"]
 
 [lints.rust]
 unsafe_code = "deny"

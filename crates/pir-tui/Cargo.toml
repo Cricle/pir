@@ -3,12 +3,13 @@ name = "pir-tui"
 # Library crate name; consumers import it as `pir_tui`. The `pir-sdk` facade
 # re-exports it as `pir::tui`, which is the supported embedding path.
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 description = "Terminal UI for the pi coding agent (crossterm event loop, renderers, themes, clipboard)"
-license = "MIT OR Apache-2.0"
-authors = ["Earendil Works <team@earendil.works>"]
-repository = "https://github.com/Cricle/pir"
+readme = "README.md"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 include = ["/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/src/**"]
 

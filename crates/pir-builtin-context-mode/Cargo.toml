@@ -1,13 +1,14 @@
 [package]
 name = "pir-builtin-context-mode"
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 description = "Host-neutral pure core of the pir context-mode builtin: batch validation, fetch normalization, document chunking, journal shaping"
+readme = "README.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-include = ["/Cargo.toml", "/src/**", "/tests/**"]
+include = ["/Cargo.toml", "/README.md", "/src/**", "/tests/**"]
 
 [lints.rust]
 unsafe_code = "deny"

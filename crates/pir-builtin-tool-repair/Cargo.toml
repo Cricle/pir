@@ -1,13 +1,14 @@
 [package]
 name = "pir-builtin-tool-repair"
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 description = "Pure repair pipeline (grammar recovery, live-schema repair, alias normalization) for assistant tool calls in the pir coding agent"
+readme = "README.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-include = ["/Cargo.toml", "/src/**", "/tests/**"]
+include = ["/Cargo.toml", "/README.md", "/src/**", "/tests/**"]
 
 [lints.rust]
 unsafe_code = "deny"
