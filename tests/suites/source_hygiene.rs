@@ -180,9 +180,7 @@ const FORBIDDEN_MARKERS: [&str; 3] = ["#[test]", "#[tokio::test]", "#[cfg(test)]
 /// binary, so its items are bin-private and no crate-level `tests/` file can
 /// name them. Making it testable would mean moving the CLI parse types into the
 /// library — a restructure, recorded as TEST-6-2.
-const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 1] = [
-    "src/main_cli/cli_preprocess.rs",
-];
+const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 1] = ["src/main_cli/cli_preprocess.rs"];
 
 #[test]
 fn src_tree_contains_no_inline_test_modules() {
