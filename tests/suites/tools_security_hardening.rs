@@ -900,6 +900,9 @@ async fn a_pre_existing_permissive_channel_directory_is_not_adopted() {
         "the pool must record that it refused the suspicious path"
     );
 
+    // This pool is test-local: its cached member would otherwise outlive the
+    // test and hold the harness process open (see the seam's doc).
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
@@ -1005,6 +1008,9 @@ async fn a_channel_directory_whose_deny_ace_was_lifted_is_rejected() {
             "a directory whose deny ACE was lifted was used as a channel directory: \
              {observed_channel_files:?}"
         );
+        // Test-local pool: hand the cached member back instead of letting it
+        // hold the harness process open.
+        pool.release_member_for_tests();
         let entries: Vec<_> = std::fs::read_dir(&channel)
             .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -1142,7 +1148,10 @@ async fn a_channel_directory_tampered_mid_call_fails_closed() {
                     "echo canary; sleep 0.3",
                     Some(30.0),
                 )
-                .await
+                .await;
+            // The canary pool only exists to force the shared runtime to make
+            // progress; release its member so it cannot outlive the test.
+            canary_pool.release_member_for_tests();
         });
         let _ = tokio::time::timeout(Duration::from_secs(15), canary).await;
         let _ = std::fs::remove_dir_all(&canary_cleanup);
@@ -1188,6 +1197,7 @@ async fn a_channel_directory_tampered_mid_call_fails_closed() {
         }
     }
     assert!(pool.channel_directory_rejections_for_tests() > 0);
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
