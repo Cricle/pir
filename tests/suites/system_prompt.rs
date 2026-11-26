@@ -1519,7 +1519,10 @@ fn symlinked_system_md_is_still_discovered() {
         return;
     }
     // The links are followed only if they are recognised as files at all.
-    assert!(system_link.is_file(), "the fixture link must resolve to a file");
+    assert!(
+        system_link.is_file(),
+        "the fixture link must resolve to a file"
+    );
 
     let (preamble, append) = discover_system_md(&cwd, &global_dir, true);
     assert_eq!(preamble.as_deref(), Some("shared preamble"));
