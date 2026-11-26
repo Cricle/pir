@@ -128,6 +128,7 @@ async fn new_runtime(up: &Upstream) -> ExtensionRuntime {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     };
     ExtensionRuntime::new(config)
         .await

@@ -588,6 +588,18 @@ impl PhonePlugin {
         (STATUS_KEY, status_line(self.state.is_running()))
     }
 
+    /// Publish an environment entry for the pool children this phone spawns.
+    ///
+    /// A host that owns its agent directory — or a test that runs a pool next
+    /// to other sessions in the same process — passes `PIR_AGENT_DIR` here
+    /// instead of mutating the process environment, which every session in the
+    /// process shares. Entries apply only to this phone's children; call
+    /// before the first `phone-start` creates the pool.
+    #[doc(hidden)]
+    pub fn set_pool_child_env(&self, key: impl Into<String>, value: impl Into<String>) {
+        self.state.set_pool_child_env(key, value);
+    }
+
     /// Whether the outbound central-server link is active.
     pub fn is_running(&self) -> bool {
         self.state.is_running()

@@ -1052,6 +1052,19 @@ pub struct ToolContext {
     /// call is expected to outlive the turn, so the 120 s default cap does not
     /// apply to it (an explicit per-call `timeout` still does).
     pub background: bool,
+    /// The global agent directory this call's session was built with, when the
+    /// host resolved one (`AgentSessionConfig::agent_dir`, an SDK
+    /// `.agent_dir(..)`, or the CLI's startup value).
+    ///
+    /// Shell tools read their `shellCommandPrefix`/`shellPath`/`shellPool`/
+    /// `tools.commandTimeoutMs` settings from here instead of re-resolving
+    /// `PIR_AGENT_DIR`, so a session keeps the settings it started with even
+    /// if the process environment changes underneath it — and an embedder
+    /// that runs several sessions against different directories gets each
+    /// session's own settings instead of whichever directory the process
+    /// happens to name. `None` keeps the ambient resolution
+    /// ([`ToolContext::new`], the CLI's own path).
+    pub agent_dir: Option<Arc<std::path::PathBuf>>,
 }
 
 impl ToolContext {
@@ -1065,7 +1078,33 @@ impl ToolContext {
             held_mutation_keys: None,
             on_update: None,
             background: false,
+            agent_dir: None,
         }
+    }
+
+    /// Bind this call to an explicit global agent directory: tools that read
+    /// agent-dir settings (the shell tools' `shellCommandPrefix` / `shellPath`
+    /// / `shellPool` / `tools.commandTimeoutMs`) use it instead of resolving
+    /// `PIR_AGENT_DIR` from the process environment. See
+    /// [`ToolContext::agent_dir`].
+    pub fn with_agent_dir(mut self, agent_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.agent_dir = Some(Arc::new(agent_dir.into()));
+        self
+    }
+
+    /// The agent directory tools should read: this context's explicit one,
+    /// else the enclosing session's (passed by hosts that populate
+    /// [`ToolSessionEnv`]), else the process value.
+    pub fn resolve_agent_dir(&self) -> std::path::PathBuf {
+        if let Some(dir) = &self.agent_dir {
+            return dir.as_ref().clone();
+        }
+        if let Some(env) = &self.session_env {
+            if let Some(dir) = &env.agent_dir {
+                return dir.clone();
+            }
+        }
+        crate::coding_agent::context::agent_dir()
     }
 
     /// Rebind the nested-call scope to `call_id` so nested calls made by this
@@ -1100,6 +1139,7 @@ impl ToolContext {
                     held_mutation_keys: Some(held_mutation_keys),
                     on_update: self.on_update.clone(),
                     background: self.background,
+                    agent_dir: self.agent_dir.clone(),
                 }
             }
             None => self.clone(),
@@ -1146,6 +1186,7 @@ impl std::fmt::Debug for ToolContext {
             .field("session_env", &self.session_env)
             .field("held_mutation_keys", &self.held_mutation_keys.is_some())
             .field("on_update", &self.on_update.is_some())
+            .field("agent_dir", &self.agent_dir)
             .finish()
     }
 }

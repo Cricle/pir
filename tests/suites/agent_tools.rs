@@ -453,6 +453,7 @@ async fn abort_marks_remaining_calls_as_errors() {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     };
     // Abort before execution: scheduler returns error results for every call.
     signal.abort();

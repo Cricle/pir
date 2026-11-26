@@ -52,33 +52,21 @@ impl Drop for TempDir {
     }
 }
 
-/// Serializes the process-global `PIR_AGENT_DIR` pin across the tests in this
-/// binary (the env is process-wide and `cargo test` runs the tests in parallel
-/// threads of one process).
-static AGENT_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Hermetic agent-dir pin for tests that run the real shell path.
+/// A scratch agent directory for tests that run the real shell path.
 ///
-/// `execute_bash` resolves its shell through `current_shell_prefs()` ->
-/// `agent_dir()`, so an ambient `~/.pi/agent/settings.json` (`shellPath`,
-/// `shellCommandPrefix`, `shellPool: false`) would silently change what these
-/// tests execute. Holding this guard points the process-global `PIR_AGENT_DIR`
-/// at a fresh, empty directory (no settings.json, no trust store) for the
-/// test's duration, so the preferences fall back to the built-in defaults, and
-/// restores the previous value (and removes the directory) on drop. The env
-/// lock is held for the whole test, so no other test in this binary observes
-/// the temporary value.
+/// `execute_bash` resolves its shell through `shell_prefs_in(&agent_dir)`, and
+/// these tests hand the directory to the session as an EXPLICIT agent dir
+/// (`ToolContext::resolve_agent_dir` prefers it over the environment), so an
+/// ambient `~/.pi/agent/settings.json` (`shellPath`, `shellCommandPrefix`,
+/// `shellPool: false`) neither changes what these tests run nor lets two
+/// concurrent tests interfere: the value is per-test state, not a
+/// process-global environment variable.
 struct HermeticAgentDir {
-    /// Dropped after `Drop::drop` restored the env, keeping the restore
-    /// serialized with the pin itself.
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-    previous: Option<OsString>,
     dir: PathBuf,
 }
 
 impl HermeticAgentDir {
-    async fn new(label: &str) -> Self {
-        let lock = AGENT_DIR_ENV_LOCK.lock().await;
+    fn new(label: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "pir-bash-abort-set-agent-dir-{label}-{}-{}",
             std::process::id(),
@@ -87,23 +75,18 @@ impl HermeticAgentDir {
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::create_dir_all(&dir).expect("create pinned agent dir");
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", &dir);
-        Self {
-            _lock: lock,
-            previous,
-            dir,
-        }
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch agent dir");
+        Self { dir }
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
     }
 }
 
 impl Drop for HermeticAgentDir {
     fn drop(&mut self) {
-        match self.previous.as_deref() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -140,25 +123,31 @@ fn fake_model() -> Model {
     }
 }
 
-/// An in-memory session scoped to `cwd` (no provider is ever called: these
-/// tests only exercise `execute_bash` / `abort_bash`).
-fn session_in(cwd: &Path) -> Arc<AgentSession> {
-    Arc::new(AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(ProviderRegistry::default()),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools: ToolRegistry::new(),
-        session: None,
-        compaction: None,
-        max_turns: 4,
-        system_prompt: None,
-        cwd: Some(cwd.to_path_buf()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: None,
-    }))
+/// An in-memory session scoped to `cwd` and to an EXPLICIT agent dir (no
+/// provider is ever called: these tests only exercise `execute_bash` /
+/// `abort_bash`). The agent dir is what the shell preference read follows, so
+/// the caller's scratch directory fully determines the shell setup.
+fn session_in(cwd: &Path, agent_dir: &Path) -> Arc<AgentSession> {
+    Arc::new(AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(ProviderRegistry::default()),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: ToolRegistry::new(),
+            session: None,
+            compaction: None,
+            max_turns: 4,
+            system_prompt: None,
+            cwd: Some(cwd.to_path_buf()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        agent_dir,
+    ))
 }
 
 /// A command that touches `marker` (relative to the session cwd) and then
@@ -188,9 +177,9 @@ fn wait_for_marker(marker: &Path, timeout: Duration) -> bool {
 /// (upstream aborts every controller in the Set).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_bash_all_cancelled_by_single_abort() {
-    let _agent_dir = HermeticAgentDir::new("both").await;
+    let agent_dir = HermeticAgentDir::new("both");
     let temp = TempDir::new("both");
-    let agent = session_in(&temp.0);
+    let agent = session_in(&temp.0, agent_dir.path());
 
     let first = {
         let agent = agent.clone();
@@ -232,9 +221,9 @@ async fn concurrent_bash_all_cancelled_by_single_abort() {
 /// short command replaced the signal and the sibling became uncancellable.
 #[tokio::test(flavor = "multi_thread")]
 async fn finished_bash_keeps_sibling_cancellable() {
-    let _agent_dir = HermeticAgentDir::new("sibling").await;
+    let agent_dir = HermeticAgentDir::new("sibling");
     let temp = TempDir::new("sibling");
-    let agent = session_in(&temp.0);
+    let agent = session_in(&temp.0, agent_dir.path());
 
     let long = {
         let agent = agent.clone();
@@ -264,9 +253,9 @@ async fn finished_bash_keeps_sibling_cancellable() {
 /// Aborting with no active bash is a no-op (empty Set iteration).
 #[tokio::test]
 async fn abort_with_no_active_bash_is_noop() {
-    let _agent_dir = HermeticAgentDir::new("noop").await;
+    let agent_dir = HermeticAgentDir::new("noop");
     let temp = TempDir::new("noop");
-    let agent = session_in(&temp.0);
+    let agent = session_in(&temp.0, agent_dir.path());
     agent.abort_bash();
     agent.abort_bash();
 

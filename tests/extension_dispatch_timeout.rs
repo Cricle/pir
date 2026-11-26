@@ -162,6 +162,7 @@ export default function (pi) {
         is_idle: true,
         limits: Some(limits),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("start the extension actor");
     handle
@@ -223,6 +224,7 @@ fn test_config(cwd: &std::path::Path) -> ExtensionConfig {
             ..ExtensionLimits::default()
         }),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

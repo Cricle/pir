@@ -51,12 +51,18 @@ fn cached_global_settings(agent_dir: &Path, cwd: &Path) -> Settings {
 /// clients without a full settings snapshot (upstream applies the setting as
 /// HTTP_PROXY/HTTPS_PROXY for Pi-managed HTTP clients).
 pub fn current_http_proxy() -> Option<String> {
-    let global_dir = crate::coding_agent::context::agent_dir();
+    current_http_proxy_in(&crate::coding_agent::context::agent_dir())
+}
+
+/// [`current_http_proxy`] against an EXPLICIT global agent dir, so a host that
+/// builds its own HTTP client reads the settings of the directory it owns
+/// instead of whichever one the process environment names.
+pub fn current_http_proxy_in(agent_dir: &Path) -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // The proxy applies to Pi-managed clients regardless of project trust
     // (global scope only, matching the cost/side-effect profile of
     // `cacheWarming`).
-    cached_global_settings(&global_dir, &cwd)
+    cached_global_settings(agent_dir, &cwd)
         .http_proxy
         .filter(|proxy| !proxy.is_empty())
 }

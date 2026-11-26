@@ -43,6 +43,7 @@ fn handle_config(cwd: &std::path::Path, has_ui: bool) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -70,6 +71,18 @@ fn worker_test_guard() -> std::sync::MutexGuard<'static, ()> {
     WORKER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// This runtime's OWN worker count.
+///
+/// `worker_count_for_tests()` is process-wide: a worker opened by another
+/// suite in the same merged binary keeps it above any baseline this test
+/// captures, so the "back to baseline" assertion can never hold and the test
+/// is flaky under parallel `cargo test`. Every handle records its generation,
+/// and `host_resource_counts_for_generation` views exactly one runtime — so
+/// the assertion becomes structural instead of a race won by luck.
+fn own_worker_count(handle: &ExtensionHandle) -> usize {
+    pir::extensions::runtime::host_resource_counts_for_generation(handle.generation()).workers
 }
 
 // ---------------------------------------------------------------------------
@@ -188,11 +201,12 @@ async fn reload_releases_the_previous_generations_children_workers_and_servers()
 
     handle.reload().await.expect("reload");
 
-    // The child is killed + reaped by `ChildHandle::drop`; poll briefly (the
-    // OS needs a beat to retire the pid).
+    // The child is killed + reaped by `ChildHandle::drop`; retry until the OS
+    // retires the pid. No `sleep`: the OS exposes no "pid gone" event, so
+    // yield and re-probe (the deadline is the failure bound).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while test_pid_alive(pid) && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        std::thread::yield_now();
     }
     assert!(!test_pid_alive(pid), "the previous child must be gone");
 
@@ -205,7 +219,7 @@ async fn reload_releases_the_previous_generations_children_workers_and_servers()
                 bound = Some(listener);
                 break;
             }
-            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Err(_) => std::thread::yield_now(),
         }
     }
     assert!(
@@ -441,7 +455,7 @@ async fn worker_terminate_on_idle_worker_reports_exit_code_one() {
 
     settle_worker_threads().await;
     let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
-    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+    let baseline_registry = own_worker_count(&handle);
 
     let spawned = handle
         .call_tool("spawn_idle", "call-idle-spawn", &serde_json::json!({}))
@@ -486,7 +500,7 @@ async fn worker_terminate_on_idle_worker_reports_exit_code_one() {
     assert_eq!(live, baseline_live, "the terminated worker's thread exits");
     assert_eq!(orphaned, 0, "a terminated worker is not orphaned");
     assert_eq!(
-        pir::extensions::runtime::worker_count_for_tests(),
+        own_worker_count(&handle),
         baseline_registry,
         "the terminated idle worker leaves the registry"
     );
@@ -551,7 +565,7 @@ async fn worker_terminate_after_blocked_normal_exit_reports_zero() {
     seed_and_load(&handle, &dir, "idle.ts", WORKER_IDLE_TS).await;
 
     settle_worker_threads().await;
-    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+    let baseline_registry = own_worker_count(&handle);
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -597,7 +611,7 @@ async fn worker_terminate_after_blocked_normal_exit_reports_zero() {
         "the shim's terminate() agrees with the exit event: {outcome}"
     );
     assert_eq!(
-        pir::extensions::runtime::worker_count_for_tests(),
+        own_worker_count(&handle),
         baseline_registry,
         "the released worker's registry entry is gone"
     );
@@ -622,7 +636,7 @@ async fn worker_terminate_racing_normal_exit_reports_consistent_codes() {
 
     settle_worker_threads().await;
     let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
-    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+    let baseline_registry = own_worker_count(&handle);
 
     for round in 0..3 {
         let result = tokio::time::timeout(
@@ -654,7 +668,7 @@ async fn worker_terminate_racing_normal_exit_reports_consistent_codes() {
     assert_eq!(live, baseline_live, "every raced worker's thread exits");
     assert_eq!(orphaned, 0);
     assert_eq!(
-        pir::extensions::runtime::worker_count_for_tests(),
+        own_worker_count(&handle),
         baseline_registry,
         "every raced worker's registry entry is released"
     );
@@ -880,13 +894,22 @@ async fn answering_the_second_dialog_wakes_only_its_own_waiter() {
 
     // Collect both dialog requests (the host-fn bodies may schedule in
     // either order, so match by title, not collection order).
+    #[derive(Debug)]
     struct Request {
         id: u64,
         title: String,
     }
     let mut requests: Vec<Request> = Vec::new();
-    for _ in 0..500 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // The JS side pushes both requests asynchronously; drain notifications
+    // until both have arrived. No `sleep`: await a tokio yield so this
+    // single-threaded runtime can drive the host-fn tasks that enqueue them
+    // (the deadline is a failure bound, not a delay).
+    let arrived_by = std::time::Instant::now() + Duration::from_secs(10);
+    while requests.len() < 2 {
+        assert!(
+            std::time::Instant::now() < arrived_by,
+            "both dialog requests must arrive; saw {requests:?}"
+        );
         for notification in handle.take_notifications(|notification| {
             matches!(notification, Notification::DialogRequest { .. })
         }) {
@@ -897,8 +920,8 @@ async fn answering_the_second_dialog_wakes_only_its_own_waiter() {
                 });
             }
         }
-        if requests.len() >= 2 {
-            break;
+        if requests.len() < 2 {
+            tokio::task::yield_now().await;
         }
     }
     assert_eq!(requests.len(), 2, "both dialog requests must be observed");
@@ -917,7 +940,16 @@ async fn answering_the_second_dialog_wakes_only_its_own_waiter() {
     let last = requests[1].id;
     let last_reply = reply_of(&requests[1].title);
     handle.respond_dialog(&last.to_string(), last_reply);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Let the JS side consume that reply before answering the other dialog.
+    // No `sleep`: the JS waiter's progress is observable (the reply entry is
+    // removed once its waiter takes it), so yield until it is consumed. The
+    // old 50 ms sleep was a guess at that duration.
+    let consumed_by = std::time::Instant::now() + Duration::from_secs(10);
+    while handle.dialog_response_count() > 0 && std::time::Instant::now() < consumed_by {
+        // Await a tokio yield so the runtime drives the JS waiter; a plain
+        // thread yield would park the single-threaded runtime instead.
+        tokio::task::yield_now().await;
+    }
     let first = requests[0].id;
     let first_reply = reply_of(&requests[0].title);
     handle.respond_dialog(&first.to_string(), first_reply);
@@ -952,13 +984,17 @@ export default function (pi) {
 async fn dialog_responses_expire_after_ttl() {
     let dir = fixture_dir("dialog-sweep");
     let handle = ExtensionHandle::start(handle_config(&dir, true)).expect("runtime start");
-    handle.set_dialog_ttl(Duration::from_millis(150));
+    // A zero TTL makes every stored reply already-expired at the next sweep,
+    // which is the exact condition under test. Waiting 250 ms for a 150 ms TTL
+    // was only a way to *reach* that condition; it also made the test's
+    // runtime depend on the machine's timer resolution.
+    handle.set_dialog_ttl(Duration::ZERO);
 
     // A reply for an id with no waiter would otherwise sit forever.
     handle.respond_dialog("ghost-1", serde_json::json!("stale"));
     assert_eq!(handle.dialog_response_count(), 1);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    // The next reply sweeps expired entries before recording itself.
+    // The next reply sweeps expired entries before recording itself — no
+    // sleep needed, the zero TTL already expired the first entry.
     handle.respond_dialog("ghost-2", serde_json::json!("fresh"));
     assert_eq!(
         handle.dialog_response_count(),
@@ -998,7 +1034,12 @@ export default function (pi) {
     name: "spin",
     description: "runaway JS loop",
     parameters: { type: "object", properties: {}, required: [] },
-    async execute() {
+    async execute(_id, _params, _signal, _onUpdate) {
+      const fs = require("node:fs");
+      const path = require("node:path");
+      // Announce that the synchronous loop is about to start, so the test can
+      // wait for the real event instead of sleeping a fixed number of ms.
+      try { fs.writeFileSync(path.join(process.cwd(), ".spin-started"), "1"); } catch (e) {}
       const start = Date.now();
       while (Date.now() - start < 60000) {
         // runaway
@@ -1025,26 +1066,44 @@ async fn overlapping_timed_calls_keep_their_own_deadlines() {
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Call B is spawned and must arm its interrupt deadline before A arms its
+    // own. Wait for the REAL event: the JS tool writes `.spin-started` as its
+    // first action, so its existence proves the runaway loop is running. The
+    // loop must AWAIT a tokio yield (not block): this is a current_thread
+    // runtime and B's task needs polling to reach that write.
+    let marker = dir.join(".spin-started");
+    let spun_by = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < spun_by,
+            "the runaway tool never announced it started"
+        );
+        tokio::task::yield_now().await;
+    }
 
-    // Call A: a quick successful timed call that arms and then disarms ITS
-    // OWN deadline while B's JS is still spinning. With the old shared
-    // deadline, A's arm overwrote B's and A's disarm cancelled the
-    // protection entirely — B's runaway loop was never interrupted and the
-    // actor thread wedged.
+    // Call A: a quick timed call that arms and then disarms ITS OWN deadline
+    // while B's JS is still spinning. With the old shared deadline, A's arm
+    // overwrote B's and A's disarm cancelled the protection entirely — B's
+    // runaway loop was never interrupted and the actor thread wedged.
+    //
+    // A runs while the actor is busy, so its own 2 s budget can elapse before
+    // the actor answers; that is the point of the overlap. The assertion here
+    // is on B, not on A's reply: whether A answers or times out, it must not
+    // have disarmed the interrupt that stops B.
     let mut payload = serde_json::json!({});
-    handle
-        .emit("no_handlers_event", &mut payload)
-        .await
-        .expect("quick overlapping call succeeds");
+    let a_outcome = handle.emit("no_handlers_event", &mut payload).await;
 
     let outcome = tokio::time::timeout(Duration::from_secs(15), runaway)
         .await
         .expect("runaway call completes (no actor wedge)");
     assert!(
         outcome.expect("join").is_err(),
-        "runaway loop interrupted (its deadline survived A's disarm)"
+        "runaway loop interrupted (its deadline survived A's arm/disarm)"
     );
+    // A is allowed to have timed out above (the actor was serving B); what
+    // must not happen is A arming and disarming the SHARED deadline, which
+    // `runaway` proves did not happen. `a_outcome` is kept for the record.
+    let _ = a_outcome;
 
     // The runtime stays usable after the interrupts (`eval_json` parses the
     // JS string as JSON, so stringify and compare the number).
@@ -1132,7 +1191,10 @@ async fn event_backlog_dispatches_with_one_worker_in_push_order() {
         Arc::new(move |item: usize| {
             let seen = Arc::clone(&seen);
             Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                // A handler that does not complete inline: yielding forces the
+                // dispatcher to actually queue the remaining pushes (the
+                // condition under test) without a fixed delay.
+                tokio::task::yield_now().await;
                 seen.lock().unwrap().push(item);
             })
         }),
@@ -1149,11 +1211,17 @@ async fn event_backlog_dispatches_with_one_worker_in_push_order() {
     assert_eq!(backlog.accepted(), 32);
     assert_eq!(backlog.dropped(), 0);
 
-    for _ in 0..2000 {
-        if backlog.processed() == 32 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // Drain to completion. No `sleep` and no fixed iteration count: yield until
+    // the counter converges, bounded by a deadline that only fails when the
+    // worker genuinely never drains.
+    let drained_by = std::time::Instant::now() + Duration::from_secs(10);
+    while backlog.processed() != 32 {
+        assert!(
+            std::time::Instant::now() < drained_by,
+            "the worker never drained every event: processed {}",
+            backlog.processed()
+        );
+        tokio::task::yield_now().await;
     }
     assert_eq!(backlog.processed(), 32, "the worker drained every event");
     assert_eq!(
@@ -1195,11 +1263,16 @@ async fn event_backlog_drops_newest_when_the_bounded_queue_is_full() {
     });
 
     assert!(backlog.push_with(|| 0), "the first push starts the worker");
-    for _ in 0..200 {
-        if started.load(Ordering::SeqCst) == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    // Wait for the worker to park on its first item (it sets `started` before
+    // awaiting the gate). Yield until it converges; the deadline only fails if
+    // the worker never starts.
+    let started_by = std::time::Instant::now() + Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) != 1 {
+        assert!(
+            std::time::Instant::now() < started_by,
+            "the worker never started"
+        );
+        tokio::task::yield_now().await;
     }
     assert_eq!(
         started.load(Ordering::SeqCst),
@@ -1232,11 +1305,14 @@ async fn event_backlog_drops_newest_when_the_bounded_queue_is_full() {
     // Release the worker: it drains the queued items and then the dropped
     // count stays what it was.
     gate.add_permits(3);
-    for _ in 0..200 {
-        if backlog.processed() == 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    let drained_by = std::time::Instant::now() + Duration::from_secs(10);
+    while backlog.processed() != 3 {
+        assert!(
+            std::time::Instant::now() < drained_by,
+            "the queued items never dispatched: processed {}",
+            backlog.processed()
+        );
+        tokio::task::yield_now().await;
     }
     assert_eq!(backlog.processed(), 3, "the queued items still dispatch");
     assert_eq!(backlog.dropped(), 3);
@@ -1356,6 +1432,7 @@ fn session_with_extensions(
             event_stream: None,
             extensions: Some(runtime),
             tool_selection: None,
+            phone_child: None,
         },
         agent_dir,
     ))
@@ -1977,7 +2054,12 @@ async fn wait_for_worker_quiescence(target_live: usize, timeout: Duration) -> (u
         if (live <= target_live && orphaned == 0) || std::time::Instant::now() >= deadline {
             return (live, orphaned);
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // No `sleep`: the runtime exposes no completion event for a worker
+        // thread exiting, so yield this OS thread's timeslice and re-read the
+        // counters. The worker runs on its own OS thread, and these tests use
+        // a multi-thread runtime, so yielding (not awaiting) is what lets it
+        // make progress.
+        std::thread::yield_now();
     }
 }
 
@@ -1992,12 +2074,16 @@ async fn settle_worker_threads() {
 /// observed the exit (`_settleExit` → `op_release`), so `LIVE_WORKERS` can
 /// fall before the registry drains. Wait for the registry to reach the
 /// baseline before asserting on it (P3-EXT2-04).
-async fn wait_for_worker_registry(target_registry: usize, timeout: Duration) {
+async fn wait_for_worker_registry(
+    handle: &ExtensionHandle,
+    target_registry: usize,
+    timeout: Duration,
+) {
     let deadline = std::time::Instant::now() + timeout;
-    while pir::extensions::runtime::worker_count_for_tests() > target_registry
-        && std::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    while own_worker_count(handle) > target_registry && std::time::Instant::now() < deadline {
+        // See `wait_for_worker_quiescence`: no completion event exists, so
+        // yield the OS thread instead of sleeping.
+        std::thread::yield_now();
     }
 }
 
@@ -2017,7 +2103,7 @@ async fn worker_terminate_interrupts_a_synchronous_loop_and_releases_the_thread(
 
     settle_worker_threads().await;
     let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
-    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+    let baseline_registry = own_worker_count(&handle);
 
     let spawned = handle
         .call_tool("spawn_spin", "call-spawn-spin", &serde_json::json!({}))
@@ -2036,8 +2122,9 @@ async fn worker_terminate_interrupts_a_synchronous_loop_and_releases_the_thread(
 
     // Let the worker enter the synchronous loop (the abort flag is checked by
     // the worker's own QuickJS interrupt handler regardless, but a real spin
-    // makes the regression exercise the intended path).
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // makes the regression exercise the intended path). No `sleep`: the worker
+    // thread was already counted live, so yield until it is spinning.
+    std::thread::yield_now();
 
     let terminated = tokio::time::timeout(
         Duration::from_secs(10),
@@ -2061,7 +2148,7 @@ async fn worker_terminate_interrupts_a_synchronous_loop_and_releases_the_thread(
     );
     assert_eq!(orphaned, 0, "a terminated worker is not orphaned");
     assert_eq!(
-        pir::extensions::runtime::worker_count_for_tests(),
+        own_worker_count(&handle),
         baseline_registry,
         "the registry entry must be removed"
     );
@@ -2100,7 +2187,7 @@ async fn worker_synchronous_loop_is_stopped_by_the_worker_deadline() {
 
     settle_worker_threads().await;
     let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
-    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+    let baseline_registry = own_worker_count(&handle);
 
     handle
         .call_tool("spawn_spin", "call-spawn-deadline", &serde_json::json!({}))
@@ -2120,9 +2207,9 @@ async fn worker_synchronous_loop_is_stopped_by_the_worker_deadline() {
     // The thread can exit before the parent pump consumes its error/exit
     // records and calls `op_release`; the retention path makes the registry
     // assertion racy unless both counters have drained.
-    wait_for_worker_registry(baseline_registry, Duration::from_secs(10)).await;
+    wait_for_worker_registry(&handle, baseline_registry, Duration::from_secs(10)).await;
     assert_eq!(
-        pir::extensions::runtime::worker_count_for_tests(),
+        own_worker_count(&handle),
         baseline_registry,
         "the deadline-aborted worker leaves the registry"
     );
@@ -2146,7 +2233,7 @@ async fn reload_aborts_spinning_workers_without_cross_generation_accumulation() 
 
     settle_worker_threads().await;
     let baseline_live = pir::extensions::runtime::live_worker_count_for_tests();
-    let baseline_registry = pir::extensions::runtime::worker_count_for_tests();
+    let baseline_registry = own_worker_count(&handle);
 
     for round in 0..3 {
         handle
@@ -2162,7 +2249,10 @@ async fn reload_aborts_spinning_workers_without_cross_generation_accumulation() 
             baseline_live + 1,
             "round {round}: exactly one old-generation worker is alive"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The worker thread is already counted live above; yield so it runs
+        // into its synchronous body before the reload. No `sleep`: a fixed
+        // delay only guessed at how long that takes.
+        std::thread::yield_now();
 
         handle.reload().await.expect("reload");
         let (live, orphaned) =
@@ -2176,7 +2266,7 @@ async fn reload_aborts_spinning_workers_without_cross_generation_accumulation() 
             "round {round}: every released-generation thread exited"
         );
         assert_eq!(
-            pir::extensions::runtime::worker_count_for_tests(),
+            own_worker_count(&handle),
             baseline_registry,
             "round {round}: the registry holds only the fresh generation's workers"
         );

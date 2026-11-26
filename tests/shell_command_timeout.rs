@@ -15,7 +15,6 @@
 //!    started to outlive the turn) but an explicit per-call timeout still
 //!    caps it.
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,20 +24,17 @@ use pir::coding_agent::register_core_tools;
 use pir::coding_agent::tools::resolve_shell_config;
 use pir::config::settings::{shell_prefs_from, Settings};
 
-/// Serializes the process-global `PIR_AGENT_DIR` pin (the env is process-wide;
-/// this file's tests each pin it to their own scratch directory).
-static AGENT_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Pin `PIR_AGENT_DIR` at a scratch directory holding `settings.json`.
-struct HermeticAgentDir {
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-    previous: Option<OsString>,
-    dir: PathBuf,
-}
+/// One scratch agent directory holding this call's `settings.json`, removed on
+/// drop.
+///
+/// It is passed to the tool as `ToolContext::with_agent_dir`, so the suite
+/// never touches `PIR_AGENT_DIR`: the settings are an argument, every test owns
+/// its own directory, and nothing has to be serialized against a sibling suite
+/// in the same merged harness.
+struct HermeticAgentDir(PathBuf);
 
 impl HermeticAgentDir {
-    async fn new(label: &str, settings_json: &str) -> Self {
-        let lock = AGENT_DIR_ENV_LOCK.lock().await;
+    fn new(label: &str, settings_json: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "pir-shell-command-timeout-{label}-{}-{}",
             std::process::id(),
@@ -47,25 +43,15 @@ impl HermeticAgentDir {
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0)
         ));
-        std::fs::create_dir_all(&dir).expect("create pinned agent dir");
+        std::fs::create_dir_all(&dir).expect("create scratch agent dir");
         std::fs::write(dir.join("settings.json"), settings_json).expect("write pinned settings");
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", &dir);
-        Self {
-            _lock: lock,
-            previous,
-            dir,
-        }
+        Self(dir)
     }
 }
 
 impl Drop for HermeticAgentDir {
     fn drop(&mut self) {
-        match self.previous.as_deref() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -119,12 +105,15 @@ async fn run_bash_timed(
     args: serde_json::Value,
     background: bool,
 ) -> (bool, String, std::time::Duration) {
-    let _agent_dir = HermeticAgentDir::new(label, settings_json).await;
+    let agent_dir = HermeticAgentDir::new(label, settings_json);
     let cwd = TempDir::new(label);
     let mut registry = ToolRegistry::new();
     register_core_tools(&mut registry);
     let tool = registry.get("bash").expect("bash tool registered");
-    let mut context = ToolContext::new(cwd.0.clone());
+    // The settings come from the context's explicit agent dir, so the fixture
+    // is an argument: this suite never writes `PIR_AGENT_DIR`, and no sibling
+    // suite in the merged harness can observe (or race) it.
+    let mut context = ToolContext::new(cwd.0.clone()).with_agent_dir(&agent_dir.0);
     context.background = background;
     let started = Instant::now();
     let result = tool.run(&args, &context).await;
@@ -395,7 +384,7 @@ async fn an_abort_while_waiting_for_a_pool_member_starts_nothing() {
     if resolve_shell_config(None).is_err() {
         return; // no shell on this host
     }
-    let _agent_dir = HermeticAgentDir::new("abort-pool-wait", r#"{ "shellPool": true }"#).await;
+    let _agent_dir = HermeticAgentDir::new("abort-pool-wait", r#"{ "shellPool": true }"#);
     let cwd = TempDir::new("abort-pool-wait-shared");
     let mut registry = ToolRegistry::new();
     register_core_tools(&mut registry);
@@ -406,7 +395,7 @@ async fn an_abort_while_waiting_for_a_pool_member_starts_nothing() {
     // leaves >4x margin); the old 3 s sleep was pure wall time.
     let holder = {
         let tool = Arc::clone(&tool);
-        let context = ToolContext::new(cwd.0.clone());
+        let context = ToolContext::new(cwd.0.clone()).with_agent_dir(&_agent_dir.0);
         tokio::spawn(async move {
             tool.run(&serde_json::json!({ "command": "sleep 1.5" }), &context)
                 .await
@@ -422,7 +411,7 @@ async fn an_abort_while_waiting_for_a_pool_member_starts_nothing() {
     });
 
     let marker = cwd.0.join("target-ran");
-    let mut target_context = ToolContext::new(cwd.0.clone());
+    let mut target_context = ToolContext::new(cwd.0.clone()).with_agent_dir(&_agent_dir.0);
     target_context.signal = Some(signal);
     let command = format!(
         "touch '{}'; echo ran",

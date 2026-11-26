@@ -292,6 +292,7 @@ fn session_declared(
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     });
     let (session_registry, active) = session.active_tool_snapshot(None);
     let mut declared: Vec<String> = declared_tools(&session_registry, &active)
@@ -322,6 +323,7 @@ fn session_callable(
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     });
     let (session_registry, active) = session.active_tool_snapshot(None);
     let mut callable: Vec<String> = callable_tools(&session_registry, &active)

@@ -1710,6 +1710,7 @@ fn build_session_agent(
         // `ServerState::with_tool_selection`): the ACTIVE override over the
         // policy-filtered core registry, never a registry filter (F12).
         tool_selection,
+        phone_child: None,
     });
     // A server client's steering is a batch of user messages that must reach
     // the next request together (the RPC protocol has no per-message mode UI);

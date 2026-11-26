@@ -48,6 +48,7 @@ fn handle_config(cwd: &std::path::Path, has_ui: bool) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -1217,6 +1218,7 @@ async fn boundary_events_commit_entries_and_honor_continue() {
         event_stream: None,
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let noop: Arc<Mutex<Vec<()>>> = Default::default();
     let _ = noop;
@@ -1330,6 +1332,7 @@ async fn session_compact_carries_the_persisted_compaction_entry() {
         event_stream: None,
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let result = agent.compact(None).await.expect("manual compact");
 

@@ -9,7 +9,9 @@
 //!
 //! Everything here is hermetic: scripted providers capture the
 //! `StreamOptions` they are handed (never a network call), and `models.json`
-//! is written into a scratch agent directory pinned with `PIR_AGENT_DIR`.
+//! is written into a scratch agent directory handed to the session as its
+//! explicit agent dir — no process environment variable is set and no lock is
+//! taken, so this suite cannot interact with a sibling one.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -21,11 +23,34 @@ use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
 use pir::ai::types::*;
 
-use crate::common::AgentDirEnvGuard;
-
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
+
+/// A scratch agent dir owned by the test, removed on drop.
+struct AgentDir(std::path::PathBuf);
+
+impl AgentDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "pir-w17c-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch agent dir");
+        Self(path)
+    }
+}
+
+impl Drop for AgentDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 fn model(provider: &str, id: &str) -> Model {
     Model {
@@ -159,6 +184,7 @@ fn session_config(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -210,22 +236,25 @@ fn only_key(seen: &SeenKeys, what: &str) -> Option<String> {
 
 #[tokio::test]
 async fn cross_provider_switch_sends_the_new_providers_credential() {
-    let guard = AgentDirEnvGuard::scratch("w17c-cross", None).await;
-    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let agent_dir = AgentDir::new("w17c-cross");
+    let dir = agent_dir.0.clone();
     write_models_json(
         &dir,
         &[("w17a", "key-from-models-a"), ("w17b", "key-from-models-b")],
     );
 
     let (registry, seen_a, seen_b) = two_provider_registry();
-    let session = AgentSession::new(session_config(
-        registry,
-        model("w17a", "a-one"),
-        // The session is constructed with provider A's key. Before the fix this
-        // single value was put on EVERY request, so the switch below sent
-        // "key-a" to provider B — a 401 whenever B's key was valid.
-        Some("key-a"),
-    ));
+    let session = AgentSession::new_with_agent_dir(
+        session_config(
+            registry,
+            model("w17a", "a-one"),
+            // The session is constructed with provider A's key. Before the fix this
+            // single value was put on EVERY request, so the switch below sent
+            // "key-a" to provider B — a 401 whenever B's key was valid.
+            Some("key-a"),
+        ),
+        &dir,
+    );
 
     prompt_once(&session).await;
     assert_eq!(only_key(&seen_a, "first request").as_deref(), Some("key-a"));
@@ -247,17 +276,16 @@ async fn cross_provider_switch_sends_the_new_providers_credential() {
 
 #[tokio::test]
 async fn explicit_api_key_wins_for_its_own_provider() {
-    let guard = AgentDirEnvGuard::scratch("w17c-explicit", None).await;
-    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let agent_dir = AgentDir::new("w17c-explicit");
+    let dir = agent_dir.0.clone();
     // models.json also configures provider A: the explicit key must beat it.
     write_models_json(&dir, &[("w17a", "key-from-models-a")]);
 
     let (registry, seen_a, _seen_b) = two_provider_registry();
-    let session = AgentSession::new(session_config(
-        registry,
-        model("w17a", "a-one"),
-        Some("explicit-a"),
-    ));
+    let session = AgentSession::new_with_agent_dir(
+        session_config(registry, model("w17a", "a-one"), Some("explicit-a")),
+        &dir,
+    );
 
     prompt_once(&session).await;
     assert_eq!(
@@ -273,16 +301,15 @@ async fn explicit_api_key_wins_for_its_own_provider() {
 
 #[tokio::test]
 async fn same_provider_switch_keeps_the_same_credential() {
-    let guard = AgentDirEnvGuard::scratch("w17c-same", None).await;
-    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let agent_dir = AgentDir::new("w17c-same");
+    let dir = agent_dir.0.clone();
     write_models_json(&dir, &[("w17a", "key-from-models-a")]);
 
     let (registry, seen_a, _seen_b) = two_provider_registry();
-    let session = AgentSession::new(session_config(
-        registry,
-        model("w17a", "a-one"),
-        Some("explicit-a"),
-    ));
+    let session = AgentSession::new_with_agent_dir(
+        session_config(registry, model("w17a", "a-one"), Some("explicit-a")),
+        &dir,
+    );
 
     prompt_once(&session).await;
     let target = session.find_model("w17a", "a-two").expect("model a-two");
@@ -309,17 +336,16 @@ async fn same_provider_switch_keeps_the_same_credential() {
 
 #[tokio::test]
 async fn provider_without_a_credential_sends_none() {
-    let guard = AgentDirEnvGuard::scratch("w17c-none", None).await;
-    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let agent_dir = AgentDir::new("w17c-none");
+    let dir = agent_dir.0.clone();
     // Only provider A is configured: provider B has no key anywhere.
     write_models_json(&dir, &[("w17a", "key-from-models-a")]);
 
     let (registry, _seen_a, seen_b) = two_provider_registry();
-    let session = AgentSession::new(session_config(
-        registry,
-        model("w17a", "a-one"),
-        Some("key-a"),
-    ));
+    let session = AgentSession::new_with_agent_dir(
+        session_config(registry, model("w17a", "a-one"), Some("key-a")),
+        &dir,
+    );
 
     let target = session.find_model("w17b", "b-one").expect("model b-one");
     session.set_model(target).await.expect("set_model");
@@ -351,12 +377,15 @@ async fn unconfigured_provider_is_reported_as_not_configured() {
 /// a per-request resolution stays cheap.
 #[tokio::test]
 async fn models_json_keys_are_cached_per_agent_directory() {
-    let guard = AgentDirEnvGuard::scratch("w17c-cache", None).await;
-    let dir = guard.dir().expect("scratch agent dir").to_path_buf();
+    let agent_dir = AgentDir::new("w17c-cache");
+    let dir = agent_dir.0.clone();
     write_models_json(&dir, &[("w17a", "first-key")]);
 
     let (registry, seen_a, _seen_b) = two_provider_registry();
-    let session = AgentSession::new(session_config(registry, model("w17a", "a-one"), None));
+    let session = AgentSession::new_with_agent_dir(
+        session_config(registry, model("w17a", "a-one"), None),
+        &dir,
+    );
 
     prompt_once(&session).await;
     // Rewriting the file changes its stamp, so the next request re-reads it:

@@ -597,17 +597,18 @@ fn docs_section_sits_between_rules_and_addendum() {
 /// `PI_PACKAGE_DIR` still wins when set; a bare build tree next to the binary
 /// (no README.md/docs) resolves no package dir, so a `cargo test` run on a
 /// developer machine does not silently grow a `<docs>` section.
+///
+/// `package_dir()` is deliberately an environment read (the upstream
+/// `getPackageDir` override), so this pins the variable rather than adding an
+/// argument production would never pass — which needs a private process.
 #[test]
 fn package_dir_prefers_the_override_and_needs_a_package_root_next_to_the_binary() {
-    // The process-wide env guard (`tests/common/mod.rs`) is shared with the
-    // system_prompt suite; both mutate PI_PACKAGE_DIR.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime");
-    let _guard = runtime.block_on(crate::common::agent_dir_env_lock().lock());
-
-    let previous = std::env::var_os("PI_PACKAGE_DIR");
+    if crate::common::skip_without_nextest(
+        "prompt_loadout_w22::package_dir_prefers_the_override_and_needs_a_package_root_next_to_the_binary",
+    ) {
+        return;
+    }
+    let _pin = crate::common::ProcessEnvPin::isolate(&["PI_PACKAGE_DIR"], &[]);
 
     // The override wins regardless of the binary's directory.
     let override_dir = std::path::PathBuf::from("/override/package");
@@ -635,10 +636,5 @@ fn package_dir_prefers_the_override_and_needs_a_package_root_next_to_the_binary(
         Err(_) => {
             assert!(pir::config::env::package_dir().is_none());
         }
-    }
-
-    match previous {
-        Some(value) => std::env::set_var("PI_PACKAGE_DIR", value),
-        None => std::env::remove_var("PI_PACKAGE_DIR"),
     }
 }

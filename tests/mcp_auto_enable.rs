@@ -45,18 +45,11 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-
-/// `PIR_AGENT_DIR` is process-wide; the MCP plugin reads it in `register()`.
-/// Every test in this binary serializes on this lock.
-async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    use tokio::sync::OnceCell;
-    static ENV_LOCK: OnceCell<tokio::sync::Mutex<()>> = OnceCell::const_new();
-    ENV_LOCK
-        .get_or_init(|| async { tokio::sync::Mutex::new(()) })
-        .await
-        .lock()
-        .await
-}
+//
+// Every scenario owns a scratch agent dir and passes it explicitly
+// (`McpPlugin::with_cwd`, `AgentSession::…_and_agent_dir`,
+// `ExtensionConfig::agent_dir`), so no test pins the process-global
+// `PIR_AGENT_DIR` and none serializes on an env lock.
 
 struct TempDir(PathBuf);
 
@@ -173,7 +166,7 @@ impl Provider for CapturingProvider {
     }
 }
 
-/// Write the global `mcp.json` (`PIR_AGENT_DIR` points at `dir`).
+/// Write the global `mcp.json` into `dir` (the scenario's agent dir).
 fn write_mcp_json(dir: &Path, auto_enable_codemode: bool, servers: Value) {
     let document = json!({
         "autoEnableCodemode": auto_enable_codemode,
@@ -197,6 +190,7 @@ type CapturedToolSets = Arc<Mutex<Vec<Vec<String>>>>;
 
 fn build_session(
     cwd: &Path,
+    agent_dir: &Path,
     plugins: Vec<Arc<dyn AgentPlugin>>,
     tool_selection: Option<ToolSelection>,
 ) -> (Arc<AgentSession>, CapturedToolSets) {
@@ -206,7 +200,7 @@ fn build_session(
         calls: AtomicUsize::new(0),
         captured: Arc::clone(&captured),
     }));
-    let session = AgentSession::new_arc_with_plugins(
+    let session = AgentSession::new_arc_with_plugins_and_agent_dir(
         AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::new(registry),
@@ -222,8 +216,10 @@ fn build_session(
             event_stream: None,
             extensions: None,
             tool_selection,
+            phone_child: None,
         },
         plugins,
+        agent_dir,
     );
     (session, captured)
 }
@@ -279,13 +275,12 @@ fn config_with_enabled(config: &McpServerConfig, enabled: bool) -> McpServerConf
 
 #[tokio::test(flavor = "current_thread")]
 async fn codemode_exposure_auto_activates_codemode_in_the_next_loadout() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("codemode");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(&dir.0, true, json!({ "docs": server("codemode") }));
 
     let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
     let (session, captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         None,
@@ -320,13 +315,12 @@ async fn codemode_exposure_auto_activates_codemode_in_the_next_loadout() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn deferred_exposure_auto_activates_tool_search() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("deferred");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(&dir.0, true, json!({ "search": server("deferred") }));
 
     let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
     let (session, captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         None,
@@ -351,13 +345,12 @@ async fn deferred_exposure_auto_activates_tool_search() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn auto_enable_codemode_false_leaves_codemode_inactive() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("no-auto");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(&dir.0, false, json!({ "docs": server("codemode") }));
 
     let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
     let (session, captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         None,
@@ -385,9 +378,7 @@ async fn auto_enable_codemode_false_leaves_codemode_inactive() {
 /// (it used to be suppressed by the first matching active tool).
 #[tokio::test(flavor = "current_thread")]
 async fn unreachable_discovery_warns_per_needed_tool() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("unreachable-warning");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(
         &dir.0,
         false,
@@ -428,9 +419,7 @@ async fn unreachable_discovery_warns_per_needed_tool() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn removing_or_disabling_servers_removes_only_auto_added_names() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("ownership");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(
         &dir.0,
         true,
@@ -442,6 +431,7 @@ async fn removing_or_disabling_servers_removes_only_auto_added_names() {
 
     let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
     let (session, _captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         None,
@@ -497,9 +487,7 @@ async fn removing_or_disabling_servers_removes_only_auto_added_names() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn an_explicit_codemode_selection_is_never_removed() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("external");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(&dir.0, true, json!({ "docs": server("codemode") }));
 
     let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
@@ -509,6 +497,7 @@ async fn an_explicit_codemode_selection_is_never_removed() {
         uses_default_tools: false,
     };
     let (session, _captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         Some(selection),
@@ -545,13 +534,12 @@ async fn an_explicit_codemode_selection_is_never_removed() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_command_lists_servers_with_tool_counts_and_updates_activation() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("command");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(&dir.0, true, json!({ "docs": server("codemode") }));
 
     let mcp = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
     let (session, _captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         None,
@@ -632,9 +620,7 @@ async fn mcp_command_lists_servers_with_tool_counts_and_updates_activation() {
 /// auto-activated or declared would fail the test.
 #[tokio::test(flavor = "current_thread")]
 async fn excluded_discovery_tool_is_not_activated() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("discovery-excluded");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     write_mcp_json(
         &dir.0,
         true,
@@ -651,6 +637,7 @@ async fn excluded_discovery_tool_is_not_activated() {
         uses_default_tools: true,
     };
     let (session, captured) = build_session(
+        &dir.0,
         &dir.0,
         vec![builtin("codemode"), builtin("tool-search"), mcp.clone()],
         Some(selection),
@@ -796,6 +783,7 @@ mod direct_bridge {
             is_idle: true,
             limits: Some(Default::default()),
             allow_process_exit: false,
+            agent_dir: Some(dir.to_path_buf()),
         })
         .expect("extension runtime")
     }
@@ -849,7 +837,7 @@ mod direct_bridge {
             calls: AtomicUsize::new(0),
             captured,
         }));
-        let session = AgentSession::new_arc_with_plugins(
+        let session = AgentSession::new_arc_with_plugins_and_agent_dir(
             AgentSessionConfig {
                 performance: Default::default(),
                 provider_registry: Arc::new(registry),
@@ -865,6 +853,7 @@ mod direct_bridge {
                 event_stream: None,
                 extensions: Some(runtime_at(dir)),
                 tool_selection: selection,
+                phone_child: None,
             },
             vec![
                 Arc::new(ToolSetPlugin {
@@ -873,6 +862,7 @@ mod direct_bridge {
                 }) as Arc<dyn AgentPlugin>,
                 mcp.clone() as Arc<dyn AgentPlugin>,
             ],
+            dir,
         );
         (session, mcp, bridge)
     }
@@ -903,9 +893,7 @@ mod direct_bridge {
     ///   found" (the incident's exact symptom).
     #[tokio::test(flavor = "current_thread")]
     async fn a_js_snapshot_without_mcp_names_keeps_direct_bridges_active() {
-        let _guard = env_guard().await;
         let dir = TempDir::new("direct-keep");
-        std::env::set_var("PIR_AGENT_DIR", &dir.0);
         let (session, mcp, bridge) =
             session_with_bridge(&dir.0, None, McpExposure::Direct, "mymcp");
 
@@ -960,9 +948,7 @@ mod direct_bridge {
     /// widens it with registration-time MCP names.
     #[tokio::test(flavor = "current_thread")]
     async fn an_explicit_selection_never_gains_direct_bridges() {
-        let _guard = env_guard().await;
         let dir = TempDir::new("direct-explicit");
-        std::env::set_var("PIR_AGENT_DIR", &dir.0);
         let selection = ToolSelection {
             enabled: names(&["read"]),
             modifiers: Vec::new(),
@@ -997,9 +983,7 @@ mod direct_bridge {
     /// base set).
     #[tokio::test(flavor = "current_thread")]
     async fn an_excluded_bridge_is_not_reactivated() {
-        let _guard = env_guard().await;
         let dir = TempDir::new("direct-excluded");
-        std::env::set_var("PIR_AGENT_DIR", &dir.0);
         let selection = ToolSelection {
             enabled: names(&["read"]),
             modifiers: names(&["-mcp__mymcp__search"]),
@@ -1023,9 +1007,7 @@ mod direct_bridge {
     /// MCP discovery exposures to the registry's `Deferred`).
     #[tokio::test(flavor = "current_thread")]
     async fn a_non_direct_bridge_is_not_unioned() {
-        let _guard = env_guard().await;
         let dir = TempDir::new("direct-codemode");
-        std::env::set_var("PIR_AGENT_DIR", &dir.0);
         let (session, mcp, bridge) =
             session_with_bridge(&dir.0, None, McpExposure::Codemode, "mymcp");
         let name = bridge.name().to_owned();
@@ -1063,9 +1045,7 @@ mod direct_bridge {
     /// what must not happen.
     #[tokio::test(flavor = "current_thread")]
     async fn a_disabled_servers_bridges_are_not_woken() {
-        let _guard = env_guard().await;
         let dir = TempDir::new("direct-disabled");
-        std::env::set_var("PIR_AGENT_DIR", &dir.0);
         let (session, mcp, bridge) =
             session_with_bridge(&dir.0, None, McpExposure::Direct, "mymcp");
         let name = bridge.name().to_owned();

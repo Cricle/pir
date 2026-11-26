@@ -99,6 +99,14 @@ pub struct ServerSecurityConfig {
     pub idle_timeout: Duration,
     pub allow_remote_bash: bool,
     pub allow_remote_agent: bool,
+    /// Explicit allowlist of extra roots [`Self::allows_cwd`] accepts, as an
+    /// alternative to `PIR_SERVER_ALLOWED_ROOTS`. Empty (every host path)
+    /// keeps the environment lookup, which is what the CLI relies on.
+    ///
+    /// A caller that owns its roots — an embedder, a test with a scratch
+    /// session dir — states them here, so two servers in one process cannot
+    /// widen (or narrow) each other's allowlist.
+    pub allowed_roots: Vec<std::path::PathBuf>,
 }
 
 impl fmt::Debug for ServerSecurityConfig {
@@ -114,6 +122,7 @@ impl fmt::Debug for ServerSecurityConfig {
             .field("idle_timeout", &self.idle_timeout)
             .field("allow_remote_bash", &self.allow_remote_bash)
             .field("allow_remote_agent", &self.allow_remote_agent)
+            .field("allowed_roots", &self.allowed_roots)
             .finish()
     }
 }
@@ -151,6 +160,7 @@ impl ServerSecurityConfig {
             allow_remote_bash: false,
             // Preserve the historical Server::bind prompt behavior.
             allow_remote_agent: true,
+            allowed_roots: Vec::new(),
         };
         if let Some(value) = lookup(MAX_SESSIONS_ENV)
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -279,6 +289,17 @@ impl ServerSecurityConfig {
         }
         if !self.allow_remote_agent {
             return None;
+        }
+        // An explicit allowlist wins over the environment: a caller that owns
+        // its roots (an embedder, a test) states them, so no process-level
+        // variable has to be set for it.
+        if !self.allowed_roots.is_empty() {
+            return self
+                .allowed_roots
+                .iter()
+                .filter_map(|root| std::fs::canonicalize(root).ok())
+                .any(|root| path_within(&candidate, &root))
+                .then_some(candidate);
         }
         let roots = allowed_roots()?;
         roots

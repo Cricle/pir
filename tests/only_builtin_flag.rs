@@ -64,6 +64,7 @@ fn extension_config(cwd: &Path) -> pir::extensions::ExtensionConfig {
         is_idle: true,
         limits: None,
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

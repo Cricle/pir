@@ -212,6 +212,7 @@ fn session_factory(handle: Option<ExtensionHandle>) -> SessionFactory {
             event_stream: None,
             extensions: handle.clone(),
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }

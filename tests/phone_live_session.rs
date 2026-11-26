@@ -119,6 +119,7 @@ fn session_config(release: Arc<Mutex<Option<oneshot::Receiver<()>>>>) -> AgentSe
         event_stream: Some(gated_stream(release)),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -192,6 +193,16 @@ struct LiveStack {
 /// agent, and an `AgentSession` driven by a scripted stream that completes
 /// every turn immediately.
 async fn start_live_stack(tag: &str) -> LiveStack {
+    start_live_stack_at(tag, None).await
+}
+
+/// [`start_live_stack`] with an isolated agent dir for the pool CHILDREN this
+/// phone spawns (`None` leaves the children on the default resolution).
+///
+/// The directory is published to the plugin, not the process environment: the
+/// pool children are separate processes, and a process-wide `PIR_AGENT_DIR`
+/// would re-point every other session in the merged binary.
+async fn start_live_stack_at(tag: &str, pool_agent_dir: Option<&str>) -> LiveStack {
     let dir = std::env::temp_dir().join(format!("pir-phone-relay-{tag}-{}", uuid::Uuid::new_v4()));
     let store = PhoneStore::open(&dir).expect("open phone store");
     let user = store.create_user("relay-user", None).expect("create user");
@@ -223,6 +234,9 @@ async fn start_live_stack(tag: &str) -> LiveStack {
 
     let release: Arc<Mutex<Option<oneshot::Receiver<()>>>> = Arc::new(Mutex::new(None));
     let plugin = Arc::new(PhonePlugin::new());
+    if let Some(model_dir) = pool_agent_dir {
+        install_pool_test_env(&plugin, model_dir);
+    }
     let session = AgentSession::new_arc_with_plugins(
         session_config(release),
         vec![plugin.clone() as Arc<dyn AgentPlugin>],
@@ -337,18 +351,17 @@ fn pool_test_model_dir() -> Option<String> {
         .filter(|dir| !dir.trim().is_empty())
 }
 
-/// Point the pool child at the isolated agent dir and the just-built `pir`
-/// binary. Same wiring the single-child pool branch uses.
+/// Point the pool children of `plugin` at the isolated agent dir and the
+/// just-built `pir` binary. Same wiring the single-child pool branch uses.
 ///
-/// Takes and returns the process-wide `crate::common::agent_dir_env_lock()`
-/// guard so a call site cannot forget it: the two variables written here are
-/// process-global, so a file-local lock would only exclude this file's tests
-/// from each other while the rest of the merged harness keeps racing them.
-/// The caller must bind the guard (`let _env = …`) so the pin outlives the
-/// whole test — the pool children resolve `PIR_AGENT_DIR` when they spawn.
-async fn install_pool_test_env(model_dir: &str) -> tokio::sync::MutexGuard<'static, ()> {
-    let guard = crate::common::agent_dir_env_lock().lock().await;
-    std::env::set_var("PIR_AGENT_DIR", model_dir);
+/// The values go to the PLUGIN, not the process environment: the phone pool
+/// spawns separate child processes, and those children are the only things
+/// that need them. Publishing them through `PIR_AGENT_DIR` process-wide would
+/// re-point every other session in the merged binary (and force an env lock);
+/// per-plugin entries reach exactly this phone's children. Call before the
+/// first `phone-start` creates the pool.
+fn install_pool_test_env(plugin: &PhonePlugin, model_dir: &str) {
+    plugin.set_pool_child_env("PIR_AGENT_DIR", model_dir);
     if std::env::var_os("PI_PHONE_SESSION_POOL_EXECUTABLE").is_none() {
         let pir_binary = std::env::current_exe()
             .ok()
@@ -358,9 +371,11 @@ async fn install_pool_test_env(model_dir: &str) -> tokio::sync::MutexGuard<'stat
                     .map(|debug| debug.join("pir"))
             })
             .expect("target debug directory");
-        std::env::set_var("PI_PHONE_SESSION_POOL_EXECUTABLE", pir_binary);
+        plugin.set_pool_child_env(
+            "PI_PHONE_SESSION_POOL_EXECUTABLE",
+            pir_binary.display().to_string(),
+        );
     }
-    guard
 }
 
 /// Send one rpc command to the selected session and return its raw response
@@ -617,17 +632,17 @@ async fn phone_plugin_connects_to_central_relay() {
         let _ = phone_http::serve(listener, server_state).await;
     });
 
-    // The pool child resolves `PIR_AGENT_DIR` when it spawns, so the pin must be
-    // taken here (before the connect below) and held for the rest of the test.
+    // The pool children resolve `PIR_AGENT_DIR` when they spawn. The value goes
+    // to the PLUGIN (below), not the process environment: a process-wide pin
+    // would re-point every other session in the merged binary.
     let real_pool_model_dir = std::env::var("PIR_PHONE_TEST_MODEL_DIR").ok();
-    let _env = match &real_pool_model_dir {
-        Some(model_dir) => Some(install_pool_test_env(model_dir).await),
-        None => None,
-    };
 
     let (release_tx, release_rx) = oneshot::channel();
     let release = Arc::new(Mutex::new(Some(release_rx)));
     let plugin = Arc::new(PhonePlugin::new());
+    if let Some(model_dir) = real_pool_model_dir.as_deref() {
+        install_pool_test_env(&plugin, model_dir);
+    }
     let session = AgentSession::new_arc_with_plugins(
         session_config(release),
         vec![plugin.clone() as Arc<dyn AgentPlugin>],
@@ -791,8 +806,7 @@ async fn phone_pool_multi_child_routing_isolation_and_resync() {
         eprintln!("PIR_PHONE_TEST_MODEL_DIR not set; skipping phone pool multi-child coverage");
         return;
     };
-    let _env = install_pool_test_env(&model_dir).await;
-    let stack = start_live_stack("pool-full").await;
+    let stack = start_live_stack_at("pool-full", Some(&model_dir)).await;
 
     let mut phone = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut phone).await;
@@ -1181,8 +1195,7 @@ async fn phone_pool_child_correlated_response_is_emitted_once() {
         );
         return;
     };
-    let _env = install_pool_test_env(&model_dir).await;
-    let stack = start_live_stack("pool-response-once").await;
+    let stack = start_live_stack_at("pool-response-once", Some(&model_dir)).await;
 
     let mut phone = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut phone).await;
@@ -1240,8 +1253,7 @@ async fn phone_pool_two_clients_same_child_command_get_own_response_only() {
         eprintln!("PIR_PHONE_TEST_MODEL_DIR not set; skipping two-client pool response coverage");
         return;
     };
-    let _env = install_pool_test_env(&model_dir).await;
-    let stack = start_live_stack("pool-two-clients").await;
+    let stack = start_live_stack_at("pool-two-clients", Some(&model_dir)).await;
 
     let mut first = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut first).await;
@@ -1371,8 +1383,7 @@ async fn phone_pool_two_clients_prompt_same_child_stream_attribution() {
         eprintln!("PIR_PHONE_TEST_MODEL_DIR not set; skipping dual-prompt pool coverage");
         return;
     };
-    let _env = install_pool_test_env(&model_dir).await;
-    let stack = start_live_stack("pool-dual-prompt").await;
+    let stack = start_live_stack_at("pool-dual-prompt", Some(&model_dir)).await;
 
     let mut first = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut first).await;
@@ -1731,8 +1742,7 @@ async fn start_slow_pool_with_two_clients(tag: &str) -> (LiveStack, RelayWs, Rel
 /// Shared pool-child + two-client setup against an arbitrary isolated agent
 /// dir (the spawn target and model provider come from that dir's models.json).
 async fn start_pool_with_two_clients(tag: &str, model_dir: &str) -> (LiveStack, RelayWs, RelayWs) {
-    let _env = install_pool_test_env(model_dir).await;
-    let stack = start_live_stack(tag).await;
+    let stack = start_live_stack_at(tag, Some(model_dir)).await;
 
     let mut first = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut first).await;
@@ -3233,8 +3243,7 @@ async fn phone_pool_extension_ui_dialog_round_trip_clears_pending_state() {
         eprintln!("PIR_PHONE_TEST_DIALOG not set; skipping pool dialog coverage");
         return;
     };
-    let _env = install_pool_test_env(&model_dir).await;
-    let stack = start_live_stack("pool-dialog").await;
+    let stack = start_live_stack_at("pool-dialog", Some(&model_dir)).await;
     let mut ws = connect_phone(stack.addr, &stack.user_token).await;
     let parent_id = parent_session_id(&mut ws).await;
     select_session(&mut ws, &parent_id).await;

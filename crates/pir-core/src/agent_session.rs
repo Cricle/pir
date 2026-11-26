@@ -200,11 +200,11 @@ pub use queue::ClearedQueue;
 pub(crate) use runtime_loader::partition_cached_extension_failures;
 pub use runtime_loader::{
     adopt_pre_trust_extension_runtime, apply_cli_extension_flags, discard_extension_runtime,
-    dispatch_project_trust, dispatch_user_bash, dispatch_user_bash_with_host,
-    extension_config_matches_for_handoff, load_extension_runtime, load_extension_runtime_bootstrap,
-    load_extension_runtime_strict, load_extension_runtime_strict_with_catalog,
-    load_extension_runtime_with_catalog, stash_validated_extension_runtime,
-    CliExtensionFlagDiagnostic, ModelCatalog,
+    dispatch_project_trust, dispatch_project_trust_in, dispatch_user_bash,
+    dispatch_user_bash_with_host, extension_config_matches_for_handoff, load_extension_runtime,
+    load_extension_runtime_bootstrap, load_extension_runtime_strict,
+    load_extension_runtime_strict_with_catalog, load_extension_runtime_with_catalog,
+    stash_validated_extension_runtime, CliExtensionFlagDiagnostic, ModelCatalog,
 };
 pub use session_commands::{
     apply_session_command_to_storage, commit_navigation_to_storage, generate_navigation_summary,
@@ -290,6 +290,15 @@ pub struct AgentSessionConfig {
     /// exactly when the selection names them. MCP tools the allowlist keeps are
     /// already part of the resolved selection.
     pub tool_selection: Option<crate::coding_agent::ToolSelection>,
+    /// Explicit override for the "parallel phone child" flag
+    /// (`PI_PHONE_CHILD=1`, see [`AgentSession::is_phone_child`]).
+    ///
+    /// `None` (every host path) reads the process environment once at build,
+    /// exactly as before: the phone pool spawns each child with the variable
+    /// set. An embedder or a test that constructs a child session in-process
+    /// states the flag here instead of mutating the process environment, which
+    /// would decide the flag for every other session built concurrently.
+    pub phone_child: Option<bool>,
 }
 
 /// Sharable stream override: same shape as the loop's [`EventStreamFn`] but

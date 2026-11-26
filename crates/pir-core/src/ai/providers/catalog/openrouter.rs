@@ -237,7 +237,16 @@ pub async fn personalize_openrouter_catalog(
 /// else the stored OAuth access token, else `$OPENROUTER_API_KEY` (upstream
 /// resolves the credential the provider is registered with).
 pub fn openrouter_api_key() -> Option<String> {
-    let stored = crate::ai::auth::FileAuthStorage::default_storage()
+    openrouter_api_key_in(&crate::ai::providers::agent_dir())
+}
+
+/// [`openrouter_api_key`] against an EXPLICIT global agent dir: the stored
+/// credential is read from `<agent_dir>/auth.json` instead of the process
+/// environment's directory. The `$OPENROUTER_API_KEY` fallback still applies
+/// (upstream's registration credential), so a caller that wants no environment
+/// involvement reads the credential itself.
+pub fn openrouter_api_key_in(agent_dir: &std::path::Path) -> Option<String> {
+    let stored = crate::ai::auth::FileAuthStorage::in_agent_dir(agent_dir)
         .read_stored("openrouter")
         .ok()
         .flatten();
@@ -259,7 +268,13 @@ pub fn openrouter_api_key() -> Option<String> {
 /// `providers.openrouter.baseUrl`, regional endpoints), else
 /// [`OPENROUTER_BASE_URL`].
 pub fn configured_base_url() -> String {
-    let path = crate::ai::providers::agent_dir().join("models.json");
+    configured_base_url_in(&crate::ai::providers::agent_dir())
+}
+
+/// [`configured_base_url`] against an EXPLICIT global agent dir: `models.json`
+/// is read from `agent_dir` instead of the process environment.
+pub fn configured_base_url_in(agent_dir: &std::path::Path) -> String {
+    let path = agent_dir.join("models.json");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|contents| crate::ai::providers::parse_pi_config(&contents).ok())

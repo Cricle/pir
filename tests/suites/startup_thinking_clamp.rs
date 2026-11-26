@@ -292,6 +292,7 @@ async fn session_build_clamps_before_the_first_request() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         &dir,
     );

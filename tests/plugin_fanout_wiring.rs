@@ -153,6 +153,7 @@ fn session_config(cwd: PathBuf) -> AgentSessionConfig {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 

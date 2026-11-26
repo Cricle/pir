@@ -350,6 +350,11 @@ pub struct ToolRepairPlugin {
     /// Lazily loaded package config (env + `extensions/pi-tool-repair.json`);
     /// `None` until the first access so construction is side-effect free.
     config: OnceLock<config::ToolRepairConfig>,
+    /// The agent directory the config file is read from. `None` = the process
+    /// environment's ([`crate::ai::providers::agent_dir`]), the CLI factory
+    /// path; `Some(dir)` is an embedder's or a test's own directory, so no
+    /// process-level state is consulted.
+    agent_dir: Option<std::path::PathBuf>,
     /// The model id the host last pushed (`on_session_context`), the model
     /// gate for the `before_provider_request` handler. `None` before the first
     /// push (and for hosts that push a non-model snapshot): the gate then
@@ -360,6 +365,13 @@ pub struct ToolRepairPlugin {
 
 impl ToolRepairPlugin {
     fn new() -> Self {
+        Self::with_agent_dir(None)
+    }
+
+    /// The builtin around an EXPLICIT agent directory: its
+    /// `extensions/pi-tool-repair.json` is read from `agent_dir` instead of
+    /// the process environment's agent dir.
+    pub fn with_agent_dir(agent_dir: Option<std::path::PathBuf>) -> Self {
         // The name is the crate's (its identity and this host's must match).
         let mut info = PluginInfo::builtin(pir_builtin_tool_repair::TOOL_REPAIR_PLUGIN_NAME);
         // Mirrors the builtin table's `replaceable` flag. Inert for name-based
@@ -373,6 +385,7 @@ impl ToolRepairPlugin {
         Self {
             info,
             config: OnceLock::new(),
+            agent_dir,
             model_id: RwLock::new(None),
         }
     }
@@ -388,7 +401,11 @@ impl ToolRepairPlugin {
     /// directory as a parameter so it needs no environment access.
     pub fn config(&self) -> &config::ToolRepairConfig {
         self.config.get_or_init(|| {
-            config::ToolRepairConfig::load_from_agent_dir(&crate::ai::providers::agent_dir())
+            let dir = match &self.agent_dir {
+                Some(dir) => dir.clone(),
+                None => crate::ai::providers::agent_dir(),
+            };
+            config::ToolRepairConfig::load_from_agent_dir(&dir)
         })
     }
 
@@ -524,6 +541,13 @@ impl AgentPlugin for ToolRepairPlugin {
 /// like `tool-search`).
 pub fn new_tool_repair_plugin() -> Arc<dyn AgentPlugin> {
     Arc::new(ToolRepairPlugin::new())
+}
+
+/// [`new_tool_repair_plugin`] around an EXPLICIT agent directory: the builtin
+/// with its production behavior, reading `extensions/pi-tool-repair.json` from
+/// `agent_dir` instead of the process environment's directory.
+pub fn new_tool_repair_plugin_at(agent_dir: impl Into<std::path::PathBuf>) -> Arc<dyn AgentPlugin> {
+    Arc::new(ToolRepairPlugin::with_agent_dir(Some(agent_dir.into())))
 }
 
 /// The `tool-repair` builtin's host capability (see

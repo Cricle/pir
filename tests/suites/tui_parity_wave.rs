@@ -590,6 +590,7 @@ async fn thinking_cycle_clamps_to_model_supported_levels() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     // The supported ladder stops at `high` (xhigh mapped to null, max
     // unnamed) — cycling from `off` walks only the supported levels.
@@ -625,6 +626,7 @@ async fn thinking_cycle_clamps_to_model_supported_levels() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     assert!(plain.cycle_thinking_level().await.is_none());
 }
@@ -661,6 +663,7 @@ async fn prompt_resources_hot_refresh_swaps_in_place() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
     ));
     // The Arc-safe seam (`/reload` drives this through the worker) swaps
@@ -717,6 +720,7 @@ async fn dequeue_drains_both_queues() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
     ));
     // Queue one steering and one follow-up message while idle, then drain

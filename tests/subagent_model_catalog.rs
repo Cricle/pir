@@ -435,6 +435,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -449,6 +450,7 @@ async fn start_parent_runtime(cwd: &Path, ext_path: &Path) -> ExtensionHandle {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start");
     handle.set_path_plan(vec![ext_path.to_path_buf()]);

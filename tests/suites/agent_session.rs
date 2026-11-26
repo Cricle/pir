@@ -426,6 +426,7 @@ async fn prompt_round_trips_session_storage() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let events: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -496,6 +497,7 @@ async fn startup_append_runs_off_thread_and_keeps_message_order() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Long enough that a synchronous append would hold this single-threaded
@@ -615,6 +617,7 @@ async fn steer_during_run_redirects_next_model_request() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let events: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -669,6 +672,7 @@ async fn abort_mid_run_stops_the_loop() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let events: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -725,6 +729,7 @@ async fn runtime_dispose_settles_an_interrupted_tool_result() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let runtime =
         AgentSessionRuntime::new(Arc::clone(&agent), temp.0.clone(), temp.0.clone(), None);
@@ -814,6 +819,7 @@ async fn compaction_hook_invoked_and_persisted_over_threshold() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let events: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -893,6 +899,7 @@ async fn manual_compact_returns_summary_and_persists() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Seed a transcript with a complete turn before the cut point.
@@ -953,6 +960,7 @@ async fn prompt_while_streaming_is_rejected() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let events: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -1008,6 +1016,7 @@ async fn ephemeral_session_keeps_history_across_prompts() {
         event_stream: Some(registry_stream_override(registry, fake_model())),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
     agent
@@ -1050,6 +1059,7 @@ fn rpc_factory() -> SessionFactory {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -1084,6 +1094,7 @@ fn rpc_factory_gated(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -1405,6 +1416,7 @@ async fn multi_turn_run_persists_intermediate_assistant_messages() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     agent
@@ -1532,6 +1544,7 @@ async fn overflow_error_triggers_one_compact_and_retry() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Prompt 1 fills the transcript with a big tool result.
@@ -1655,6 +1668,7 @@ async fn session_overflow_recovery_persists_compaction_entry() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Prompt 1 fills the transcript with a big tool result.
@@ -1826,6 +1840,7 @@ async fn length_with_tool_calls_omits_attempt_and_results_together() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     // A length turn with tool calls normally continues (the synthetic results
     // invite a re-issue); end it explicitly so the run's transitive tail is
@@ -1918,6 +1933,7 @@ async fn length_with_tool_calls_omits_attempt_and_results_together() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let terminal = resumed
         .prompt("resume", event_handler(EventLog::default()))
@@ -1960,6 +1976,7 @@ async fn non_overflow_error_is_not_omitted() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let terminal = agent
         .prompt("hi", event_handler(EventLog::default()))
@@ -2030,6 +2047,7 @@ async fn failed_prompt_keeps_steering_deliverable() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     agent.steer("redirect");
@@ -2341,6 +2359,7 @@ async fn steer_and_follow_up_report_real_dispositions_and_queue_texts() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Idle: the messages will be delivered immediately (handled).
@@ -2383,6 +2402,7 @@ async fn steer_while_streaming_reports_queued() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let prompt_task = tokio::spawn({
@@ -2440,6 +2460,7 @@ async fn assistant_message_is_persisted_before_the_run_settles() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let prompt_task = tokio::spawn({
@@ -2513,6 +2534,7 @@ async fn record_bash_result_appends_context_and_excluded_records() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let result = pir::agent_session::BashResult {
@@ -2606,6 +2628,7 @@ async fn bash_records_are_guarded_by_the_session_storage_generation() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let generation = agent.session_storage_generation();
 
@@ -2706,6 +2729,7 @@ async fn branch_with_summary_appends_a_branch_summary_entry() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let entry_id = agent
@@ -2757,6 +2781,7 @@ async fn queued_commands_keep_fifo_order_and_clear_drains_all() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Enqueues land on the single consumer queue in call order; the peek
@@ -2823,6 +2848,7 @@ async fn session_swap_drops_queued_steering_and_follow_up() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     assert_eq!(
@@ -2883,6 +2909,7 @@ async fn steering_delivers_one_message_per_turn() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let prompt_task = tokio::spawn({
@@ -2959,6 +2986,7 @@ async fn ephemeral_history_reads_observe_the_same_transcript() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // Empty baseline.
@@ -3066,6 +3094,7 @@ async fn user_message_events_carry_the_message_json() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(MessageRecordingPlugin::new(Arc::clone(&seen)))],
     ));
@@ -3186,6 +3215,7 @@ async fn turn_end_payload_keeps_its_field_contract() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(TurnEndRecordingPlugin::new(Arc::clone(&seen)))],
     ));
@@ -3307,6 +3337,7 @@ async fn sub_threshold_provider_requests_do_not_materialize_the_projection() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     pir::compaction::reset_projection_materializations();
@@ -3376,6 +3407,7 @@ async fn threshold_triggering_provider_request_materializes_the_projection_once(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     pir::compaction::reset_projection_materializations();
@@ -3528,6 +3560,7 @@ fn race_agent_config(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -4247,8 +4280,8 @@ impl AgentPlugin for ActiveSetHandle {
 #[tokio::test]
 async fn system_prompt_follows_a_runtime_active_set_change() {
     // A clean agent dir keeps the discovery hermetic: the cwd's AGENTS.md is
-    // the only context input beyond the shared process environment.
-    let _env = crate::common::AgentDirEnvGuard::scratch("d6-runtime", None).await;
+    // the only context input. The dir is explicit, so no env lock is needed.
+    let agent_dir = crate::common::scratch_agent_dir("d6-runtime", None);
     let temp = TempDir::new("d6-runtime");
     std::fs::write(temp.0.join("AGENTS.md"), "project instructions").expect("write AGENTS.md");
 
@@ -4270,7 +4303,7 @@ async fn system_prompt_follows_a_runtime_active_set_change() {
             .push(context.system_prompt.clone());
         assistant(vec![text("ok")], StopReason::Stop)
     }));
-    let session = AgentSession::new_with_plugins(
+    let session = AgentSession::new_with_plugins_and_agent_dir(
         AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::clone(&registry),
@@ -4287,8 +4320,10 @@ async fn system_prompt_follows_a_runtime_active_set_change() {
             event_stream: Some(registry_stream_override(registry, fake_model())),
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![handle.clone()],
+        agent_dir.path(),
     );
 
     let before = session
@@ -4368,16 +4403,12 @@ async fn system_prompt_follows_a_runtime_active_set_change() {
 /// the model never saw the tool list or the rules.
 #[tokio::test]
 async fn bare_workspace_session_still_builds_the_base_prompt() {
-    // A clean agent dir AND a clean home keep discovery hermetic: otherwise a
-    // user-global `~/.agents/skills` on the machine would make the prompt
-    // non-empty for the wrong reason and the test could pass without the fix.
-    let env_home = TempDir::new("bare-prompt-home");
-    let agent_dir = env_home.0.join("agent");
-    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-    let home = env_home.0.to_string_lossy().into_owned();
-    let _env =
-        crate::common::AgentDirEnvGuard::at(&agent_dir, &[("HOME", &home), ("USERPROFILE", &home)])
-            .await;
+    // A clean agent dir keeps the config/trust lookup hermetic. The user-global
+    // `~/.agents/skills` root is HOME-derived and deliberately NOT pinned: the
+    // property under test is that a bare workspace still renders the preamble,
+    // `<tools>`, `<rules>` and `<cwd>`, and those sections are unconditional —
+    // an ambient skill cannot make any of the three assertions pass.
+    let agent_dir = crate::common::scratch_agent_dir("bare-prompt", None);
     let temp = TempDir::new("bare-prompt");
     assert!(
         !temp.0.join("AGENTS.md").exists() && !temp.0.join("CLAUDE.md").exists(),
@@ -4395,23 +4426,27 @@ async fn bare_workspace_session_still_builds_the_base_prompt() {
     }));
     let mut tools = ToolRegistry::new();
     pir::coding_agent::register_core_tools(&mut tools);
-    let session = AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::clone(&registry),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools,
-        session: None,
-        compaction: None,
-        max_turns: 2,
-        // No explicit override: the context builder owns the prompt.
-        system_prompt: None,
-        cwd: Some(temp.0.clone()),
-        event_stream: Some(registry_stream_override(registry, fake_model())),
-        extensions: None,
-        tool_selection: None,
-    });
+    let session = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::clone(&registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools,
+            session: None,
+            compaction: None,
+            max_turns: 2,
+            // No explicit override: the context builder owns the prompt.
+            system_prompt: None,
+            cwd: Some(temp.0.clone()),
+            event_stream: Some(registry_stream_override(registry, fake_model())),
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        agent_dir.path(),
+    );
 
     let prompt = session
         .system_prompt_snapshot()
@@ -4457,29 +4492,33 @@ async fn bare_workspace_session_still_builds_the_base_prompt() {
 /// (P7 must not regress the explicit override).
 #[tokio::test]
 async fn explicit_system_prompt_override_is_not_replaced_by_the_base_prompt() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("override-prompt", None).await;
+    let agent_dir = crate::common::scratch_agent_dir("override-prompt", None);
     let temp = TempDir::new("override-prompt");
     let registry = fake_registry(Arc::new(|_index, _context| {
         assistant(vec![text("ok")], StopReason::Stop)
     }));
     let mut tools = ToolRegistry::new();
     pir::coding_agent::register_core_tools(&mut tools);
-    let session = AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::clone(&registry),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools,
-        session: None,
-        compaction: None,
-        max_turns: 2,
-        system_prompt: Some("caller supplied".into()),
-        cwd: Some(temp.0.clone()),
-        event_stream: Some(registry_stream_override(registry, fake_model())),
-        extensions: None,
-        tool_selection: None,
-    });
+    let session = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::clone(&registry),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools,
+            session: None,
+            compaction: None,
+            max_turns: 2,
+            system_prompt: Some("caller supplied".into()),
+            cwd: Some(temp.0.clone()),
+            event_stream: Some(registry_stream_override(registry, fake_model())),
+            extensions: None,
+            tool_selection: None,
+            phone_child: None,
+        },
+        agent_dir.path(),
+    );
     assert_eq!(
         session.system_prompt_snapshot().as_deref(),
         Some("caller supplied")
@@ -4557,6 +4596,7 @@ async fn model_complete_json_payload_never_carries_the_retry_class() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = handle
@@ -4626,6 +4666,7 @@ async fn model_complete_json_payload_never_carries_the_retry_class() {
         event_stream: None,
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     // The session pushes the completion capability (a pre-run push is a
     // cached no-op when nothing moved, so the result is not asserted).
@@ -4712,6 +4753,7 @@ async fn model_complete_host_op_does_not_emit_provider_stream_events() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = handle
@@ -4789,6 +4831,7 @@ async fn model_complete_host_op_does_not_emit_provider_stream_events() {
         event_stream: None,
         extensions: Some(handle.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     agent.push_session_context_for_test().await;
 
@@ -4854,6 +4897,7 @@ async fn load_message_lifecycle_extension(
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = handle
@@ -4930,6 +4974,7 @@ async fn starting_user_message_end_replacement_enters_the_request_and_storage() 
         event_stream: None,
         extensions: Some(handler.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let log = EventLog::default();
     agent
@@ -5039,6 +5084,7 @@ async fn prompt_builds_one_projection_when_no_compaction_runs() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     agent.prompt("hi", Arc::new(|_| {})).await.expect("prompt");
@@ -5075,6 +5121,7 @@ async fn prompt_with_extension_builds_one_projection_for_snapshot_and_gate() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("extension runtime");
     let agent = Arc::new(AgentSession::new_with_plugins(
@@ -5095,6 +5142,7 @@ async fn prompt_with_extension_builds_one_projection_for_snapshot_and_gate() {
             event_stream: None,
             extensions: Some(handle),
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     ));
@@ -5162,6 +5210,7 @@ async fn paged_run_widens_off_the_runtime_thread() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let prompt = tokio::spawn({
@@ -5413,6 +5462,7 @@ async fn before_agent_start_append_invalidates_the_reused_projection() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     });
     // A large window keeps the threshold hook idle: the gate must BUILD and
     // then REUSE its projection on prompt 2 (a compaction would rebuild it
@@ -5439,6 +5489,7 @@ async fn before_agent_start_append_invalidates_the_reused_projection() {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(BeforeAgentStartInterest::new())],
     ));
@@ -5637,6 +5688,7 @@ async fn in_flight_prompt_does_not_persist_into_replaced_session_storage() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     // The prompt run is parked INSIDE its first provider request: the sink
@@ -5835,6 +5887,7 @@ async fn run_start_swap_does_not_persist_into_replaced_session_storage() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(GatePlugin {
             info: PluginInfo::inline("before-agent-start-gate"),
@@ -5952,6 +6005,7 @@ async fn post_run_batch_does_not_replay_into_replaced_session_storage() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(GatePlugin {
             info: PluginInfo::inline("turn-end-gate"),
@@ -6373,6 +6427,7 @@ async fn threshold_compaction_swap_does_not_write_into_replaced_session_storage(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(GatePlugin {
             info: PluginInfo::inline("threshold-compact-gate"),
@@ -6478,6 +6533,7 @@ async fn extension_compaction_swap_does_not_write_into_replaced_session_storage(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(ReplacementCompactionPlugin {
             info: PluginInfo::inline("extension-compaction-replacement"),
@@ -6624,6 +6680,7 @@ async fn in_loop_threshold_swap_with_fresh_snapshot_does_not_write_into_replaced
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     ));
@@ -6756,6 +6813,7 @@ async fn in_loop_threshold_swap_with_stale_rebuilt_context_does_not_write_into_r
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     ));
@@ -6896,6 +6954,7 @@ async fn threshold_compaction_retry_after_failed_append_does_not_write_into_repl
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![
             Arc::new(GatePlugin {
@@ -7059,6 +7118,7 @@ async fn in_loop_threshold_compaction_still_succeeds_without_swap() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     ));
@@ -7184,6 +7244,7 @@ async fn agent_settled_and_entry_appended_reach_each_face_once_per_run() {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(SettledEntryCounter {
             info: PluginInfo::inline("settled-entry-counter"),
@@ -7340,6 +7401,7 @@ async fn js_only_plan_receives_compaction_and_background_session_events() {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         // JS-only: no inline native plugin, so `has_non_js_plugins()` is false.
         Vec::new(),
@@ -7495,6 +7557,7 @@ async fn js_only_manual_compact_and_bash_before_first_run_reach_pi_on_exactly_on
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         // JS-only: no inline native plugin -> `has_non_js_plugins()` is false.
         Vec::new(),
@@ -7673,6 +7736,7 @@ async fn js_only_manual_compaction_orders_its_lifecycle_events() {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         // JS-only: no inline native plugin.
         Vec::new(),
@@ -7753,6 +7817,7 @@ async fn js_only_threshold_compaction_orders_its_lifecycle_events() {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     );
@@ -7831,6 +7896,7 @@ async fn manual_compact_succeeds_when_usage_is_near_window_with_tiny_history() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -7902,6 +7968,7 @@ async fn manual_compact_succeeds_for_large_session_on_small_window() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -7985,6 +8052,7 @@ async fn manual_compact_cuts_a_twenty_turn_session_at_32k() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let noop: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -8385,6 +8453,7 @@ async fn steer_and_follow_up_during_streaming_deliver_in_order_once() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let prompt_task = tokio::spawn({
@@ -8474,6 +8543,7 @@ async fn interactive_prompt_expands_file_and_image_references_into_the_request()
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     agent
@@ -8562,6 +8632,7 @@ async fn interactive_prompt_missing_file_reference_fails_before_the_request() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
 
     let error = agent
@@ -8814,6 +8885,7 @@ fn ephemeral_agent(registry: Arc<ProviderRegistry>, temp: &TempDir) -> AgentSess
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     })
 }
 
@@ -8925,6 +8997,7 @@ async fn a_persisted_session_never_announces_an_ephemeral_trim() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }));
     let session_log: SessionEventLog = Arc::new(Mutex::new(Vec::new()));
     agent.on_session_event(session_event_handler(Arc::clone(&session_log)));
@@ -8983,6 +9056,7 @@ async fn fork_entry_swaps_in_a_new_parent_linked_session_file() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     for prompt in ["u1 alpha", "u2 bravo", "u3 charlie"] {
         agent

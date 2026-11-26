@@ -49,16 +49,15 @@ use pir::plugins::PluginHost;
 mod mock_mcp_helper;
 
 // ---------------------------------------------------------------------------
-// Environment serialization (env-var-dependent tests share one process)
+// Agent directory: every scenario owns a scratch dir, passed explicitly
 // ---------------------------------------------------------------------------
-
-/// The SHARED per-binary agent-dir lock, not a `static` declared here: the env
-/// is process-global, so a file-local mutex only serializes this file's tests
-/// and leaves them racing every other suite in `zz_merged_1` that pins
-/// `PIR_AGENT_DIR`.
-async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    crate::common::agent_dir_env_lock().lock().await
-}
+//
+// These tests used to pin the process-global `PIR_AGENT_DIR` and serialize
+// themselves behind a shared env lock. Every directory-dependent seam now
+// takes the directory as an argument — `McpPlugin::with_cwd`,
+// `McpManager::new`, `PluginHost::build_with_agent_dir`,
+// `ExtensionConfig::agent_dir`, `run_mcp_command_code_in` — so each test keeps
+// its own scratch dir and none of them touches (or waits on) process state.
 
 struct TempDir(PathBuf);
 
@@ -890,10 +889,8 @@ async fn stdio_slow_call_does_not_block_a_concurrent_ping() {
 
 #[tokio::test]
 async fn stdio_concurrent_requests_keep_their_own_responses() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("concurrent");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
-    let manager = McpManager::without_log(&std::env::current_dir().expect("cwd"));
+    let manager = McpManager::new(&dir.0, &std::env::current_dir().expect("cwd"));
     let (command, args) = mock_server_spawn();
     let config: McpServerConfig = serde_json::from_value(json!({
         "command": command,
@@ -1040,7 +1037,6 @@ async fn stdio_close_kills_the_whole_process_tree() {
 /// answering prove the drain is alive and the pipe open.
 #[tokio::test]
 async fn stdio_stderr_drain_logs_lines_and_keeps_the_server_alive() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("stderr");
     let log_path = dir.0.join("mcp.log");
     let manager = McpManager::with_log(log_path.clone(), &std::env::current_dir().expect("cwd"));
@@ -1420,13 +1416,11 @@ async fn server_notifications_are_recorded_for_the_refresh_path() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_registers_lazily_and_exposes_tools() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("plugin");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let (command, args) = mock_server_spawn();
-    let plugin = Arc::new(McpPlugin::new());
-    let host = PluginHost::build(None, vec![plugin.clone()]);
+    let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
+    let host = PluginHost::build_with_agent_dir(None, vec![plugin.clone()], Some(&dir.0));
 
     // Registration must not have started any server (lazy connect).
     let states = plugin.manager().connection_states().await;
@@ -1558,13 +1552,11 @@ async fn plugin_registers_lazily_and_exposes_tools() {
 /// entry, exactly like every other lazy first use.
 #[tokio::test(flavor = "current_thread")]
 async fn reload_leaves_connections_lazy_and_the_next_call_reconnects() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("reload-lazy");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let (command, args) = mock_server_spawn();
-    let plugin = Arc::new(McpPlugin::new());
-    let host = PluginHost::build(None, vec![plugin.clone()]);
+    let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
+    let host = PluginHost::build_with_agent_dir(None, vec![plugin.clone()], Some(&dir.0));
     let config_value = json!({
         "command": command,
         "args": args,
@@ -1633,13 +1625,11 @@ async fn reload_leaves_connections_lazy_and_the_next_call_reconnects() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_maps_exposure_config_and_deferred_tools_stay_callable() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("exposure");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let (command, args) = mock_server_spawn();
-    let plugin = Arc::new(McpPlugin::new());
-    let host = PluginHost::build(None, vec![plugin.clone()]);
+    let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
+    let host = PluginHost::build_with_agent_dir(None, vec![plugin.clone()], Some(&dir.0));
     let make_config = |exposure: &str| -> McpServerConfig {
         serde_json::from_value(json!({
             "command": command,
@@ -3187,9 +3177,7 @@ async fn every_read_only_operation_retries_once() {
 
 #[tokio::test]
 async fn js_extension_registers_servers_and_receives_change_events() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("js");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let extension = dir.0.join("mcp-ext.ts");
     std::fs::write(
@@ -3219,6 +3207,7 @@ async fn js_extension_registers_servers_and_receives_change_events() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: Some(dir.0.clone()),
     };
     let js = pir::extensions::ExtensionHandle::start(config).expect("runtime");
     let result = js
@@ -3238,7 +3227,11 @@ async fn js_extension_registers_servers_and_receives_change_events() {
     };
     assert_eq!(servers[0]["name"], "js-server");
 
-    let host = PluginHost::build(Some(js.clone()), vec![Arc::new(McpPlugin::new())]);
+    let host = PluginHost::build_with_agent_dir(
+        Some(js.clone()),
+        vec![Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0))],
+        Some(&dir.0),
+    );
 
     // The builtin's registry consumed the JS registration.
     let manager = host.mcp_manager().expect("mcp manager");
@@ -3299,10 +3292,7 @@ async fn js_extension_registers_servers_and_receives_change_events() {
 
 #[tokio::test]
 async fn cli_check_connects_and_reports() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("cli");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
-    std::env::remove_var("PIR_TRUST_PROJECT");
     let (command, args) = mock_server_spawn();
     let mcp_json = json!({
         "mock": {
@@ -3318,21 +3308,31 @@ async fn cli_check_connects_and_reports() {
     )
     .expect("write mcp.json");
 
-    let outcome =
-        pir::coding_agent::cli::run_mcp_command(pir::coding_agent::cli::McpCommand::Check {
+    let outcome = pir::coding_agent::cli::run_mcp_command_code_in(
+        pir::coding_agent::cli::McpCommand::Check {
             server: Some("mock".into()),
             json: true,
-        })
-        .await;
-    assert!(outcome.is_ok(), "check succeeded: {outcome:?}");
+        },
+        None,
+        &dir.0,
+    )
+    .await;
+    assert_eq!(
+        outcome.as_ref().ok(),
+        Some(&0),
+        "check succeeded: {outcome:?}"
+    );
 
     // Unknown servers error.
-    let outcome =
-        pir::coding_agent::cli::run_mcp_command(pir::coding_agent::cli::McpCommand::Check {
+    let outcome = pir::coding_agent::cli::run_mcp_command_code_in(
+        pir::coding_agent::cli::McpCommand::Check {
             server: Some("nope".into()),
             json: false,
-        })
-        .await;
+        },
+        None,
+        &dir.0,
+    )
+    .await;
     assert!(outcome.is_err());
 }
 
@@ -3353,6 +3353,7 @@ fn flush_timing_extension_config(cwd: &Path, session: &str) -> pir::extensions::
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: Some(cwd.to_path_buf()),
     }
 }
 
@@ -3396,9 +3397,7 @@ async fn recorded_mcp_changes(js: &pir::extensions::ExtensionHandle, global: &st
 /// survived the whole host step and waited for a *second* dispatch.
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_server_change_is_delivered_by_the_registration_rebuild() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("flush-registration");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     // The recorder loads first: it only records change payloads.
     let recorder = dir.0.join("mcp-recorder.ts");
@@ -3426,9 +3425,10 @@ async fn mcp_server_change_is_delivered_by_the_registration_rebuild() {
     assert!(result.errors.is_empty(), "load errors: {:?}", result.errors);
 
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(js.clone()),
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
 
@@ -3535,9 +3535,7 @@ async fn mcp_server_change_is_delivered_by_the_registration_rebuild() {
 /// this test dispatches no event at all).
 #[tokio::test(flavor = "current_thread")]
 async fn reload_publishes_queued_mcp_server_changes_without_an_event() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("flush-reload");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let extension = dir.0.join("mcp-reload.ts");
     std::fs::write(
@@ -3565,9 +3563,10 @@ async fn reload_publishes_queued_mcp_server_changes_without_an_event() {
     ))
     .expect("runtime");
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(js.clone()),
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
     let result = js
@@ -3676,6 +3675,7 @@ fn flush_timing_session_config(
         event_stream: None,
         extensions,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -3693,9 +3693,7 @@ fn flush_timing_session_config(
 /// cases use.
 #[tokio::test(flavor = "current_thread")]
 async fn mcp_wait_hook_is_a_rebuild_point_that_flushes_queued_changes() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("flush-wait-hook");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let recorder = dir.0.join("mcp-hook-recorder.ts");
     std::fs::write(
@@ -3815,7 +3813,7 @@ fn lazy_mock_host(dir: &Path) -> (Arc<McpPlugin>, PluginHost) {
     )
     .expect("write mcp.json");
     let plugin = Arc::new(McpPlugin::with_cwd(dir, dir));
-    let host = PluginHost::build(None, vec![plugin.clone()]);
+    let host = PluginHost::build_with_agent_dir(None, vec![plugin.clone()], Some(dir));
     (plugin, host)
 }
 
@@ -3856,9 +3854,7 @@ fn resource_tool_call() -> Vec<AgentToolCall> {
 /// to register, so such a server stayed unreachable for the whole session.
 #[tokio::test(flavor = "current_thread")]
 async fn lazy_wait_publishes_the_discovered_snapshot_and_marks_it_dirty() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("lazy-publish");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     let (plugin, host) = lazy_mock_host(&dir.0);
     let manager = host.mcp_manager().expect("mcp manager");
     assert!(
@@ -3932,9 +3928,7 @@ async fn lazy_wait_publishes_the_discovered_snapshot_and_marks_it_dirty() {
 /// server.
 #[tokio::test(flavor = "current_thread")]
 async fn lazy_wait_publication_registers_callable_bridges_at_the_next_rebuild() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("lazy-bridges");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     let (plugin, host) = lazy_mock_host(&dir.0);
     let manager = host.mcp_manager().expect("mcp manager");
 
@@ -4017,9 +4011,7 @@ async fn lazy_wait_publication_registers_callable_bridges_at_the_next_rebuild() 
 /// the snapshot write is exactly what turns the wait into a rebuild.
 #[tokio::test(flavor = "current_thread")]
 async fn session_wait_hook_publishes_the_lazy_discovery_and_consumes_its_flag() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("lazy-hook");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     std::fs::write(
         dir.0.join("mcp.json"),
         json!({ "mock": mock_mcp_json_entry() }).to_string(),
@@ -4077,9 +4069,7 @@ async fn session_wait_hook_publishes_the_lazy_discovery_and_consumes_its_flag() 
 /// so a check never registers `mcp__*` bridges behind the session's back.
 #[tokio::test(flavor = "current_thread")]
 async fn discover_server_probe_publishes_nothing_for_the_check_command() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("probe");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     let (_plugin, host) = lazy_mock_host(&dir.0);
     let manager = host.mcp_manager().expect("mcp manager");
 
@@ -4190,7 +4180,6 @@ fn silent_server_spawn() -> (String, Vec<String>) {
 /// P1-3): the mock's request counter moves to 2 after the second call.
 #[tokio::test(flavor = "current_thread")]
 async fn readiness_cache_lists_once_for_consecutive_calls() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("readiness-once");
     let counter = dir.0.join("tools-list-count");
     let counter_text = counter.to_string_lossy().into_owned();
@@ -4242,7 +4231,6 @@ async fn readiness_cache_lists_once_for_consecutive_calls() {
 /// file, so the event lands strictly between two calls.
 #[tokio::test(flavor = "current_thread")]
 async fn readiness_cache_relists_after_tools_list_changed() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("readiness-changed");
     let counter = dir.0.join("tools-list-count");
     let trigger = dir.0.join("notify-trigger");
@@ -4330,7 +4318,16 @@ async fn readiness_cache_relists_after_tools_list_changed() {
 /// from the cached error immediately.
 #[tokio::test(flavor = "current_thread")]
 async fn readiness_cache_backs_off_an_unreachable_server() {
-    let _guard = env_guard().await;
+    // Timing-sensitive by construction: it asserts the FIRST call pays the 1 s
+    // connect timeout and the second returns from the cached error immediately.
+    // Under a shared process the sibling suites' child-process churn can push
+    // the "immediate" leg past its bound, so the test needs a private process —
+    // which `cargo nextest` gives every test.
+    if crate::common::skip_without_nextest(
+        "mcp_integration::readiness_cache_backs_off_an_unreachable_server",
+    ) {
+        return;
+    }
     let dir = TempDir::new("readiness-backoff");
     let counter = dir.0.join("tools-list-count");
     let counter_text = counter.to_string_lossy().into_owned();
@@ -4410,7 +4407,6 @@ async fn readiness_cache_backs_off_an_unreachable_server() {
 /// next call would return without listing the NEW child's tools.
 #[tokio::test(flavor = "current_thread")]
 async fn readiness_cache_invalidates_on_reconnect() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("readiness-reconnect");
     let counter = dir.0.join("tools-list-count");
     let counter_text = counter.to_string_lossy().into_owned();
@@ -4609,9 +4605,7 @@ async fn forget_discovered_drops_the_snapshot_entry_without_marking_dirty() {
 /// the old `deferred` exposure instead of the new `direct` one.
 #[tokio::test(flavor = "current_thread")]
 async fn an_exposure_only_definition_change_marks_the_registry_dirty() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("sync-exposure");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     let (plugin, host) = lazy_mock_host(&dir.0);
     let manager = host.mcp_manager().expect("mcp manager");
 
@@ -4747,9 +4741,7 @@ async fn load_offline_server_registration(
 /// true).
 #[tokio::test(flavor = "current_thread")]
 async fn mid_session_mcp_json_removal_drops_the_snapshot_and_the_connection() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("sync-removal");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     std::fs::write(
         dir.0.join("mcp.json"),
         json!({ "mock": mock_mcp_json_entry() }).to_string(),
@@ -4759,9 +4751,10 @@ async fn mid_session_mcp_json_removal_drops_the_snapshot_and_the_connection() {
     let js = ExtensionHandle::start(flush_timing_extension_config(&dir.0, "sync-removal"))
         .expect("runtime");
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(js.clone()),
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
     assert!(
@@ -4839,9 +4832,7 @@ async fn mid_session_mcp_json_removal_drops_the_snapshot_and_the_connection() {
 /// appears).
 #[tokio::test(flavor = "current_thread")]
 async fn mid_session_mcp_json_change_releases_the_stale_connection_and_registers_the_new_entry() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("sync-change");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
     std::fs::write(
         dir.0.join("mcp.json"),
         json!({ "mock": mock_mcp_json_entry() }).to_string(),
@@ -4851,9 +4842,10 @@ async fn mid_session_mcp_json_change_releases_the_stale_connection_and_registers
     let js = ExtensionHandle::start(flush_timing_extension_config(&dir.0, "sync-change"))
         .expect("runtime");
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(js.clone()),
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
 
@@ -4988,9 +4980,7 @@ fn js_mock_server_registration(extra_env: &[(&str, &str)]) -> String {
 /// the live new connection the discovery leaves behind.
 #[tokio::test(flavor = "current_thread")]
 async fn mid_session_js_config_change_releases_the_stale_connection() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("sync-js-change");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     // The extension registers the mock server with env A (echo/fail/slow).
     let extension = dir.0.join("mcp-js-server.ts");
@@ -5004,9 +4994,10 @@ async fn mid_session_js_config_change_releases_the_stale_connection() {
     assert!(result.errors.is_empty(), "load errors: {:?}", result.errors);
 
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(js.clone()),
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
     assert!(
@@ -5118,9 +5109,7 @@ async fn mid_session_js_config_change_releases_the_stale_connection() {
 /// (`expect("the JS re-add re-discovered the server")` panics).
 #[tokio::test(flavor = "current_thread")]
 async fn mid_session_js_readd_after_config_removal_rediscovers_the_server() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("sync-js-readd");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     // The JS extension registers `mock` with env B, shadowed by the same-name
     // `mcp.json` entry (env A) for as long as the file carries it.
@@ -5144,9 +5133,10 @@ async fn mid_session_js_readd_after_config_removal_rediscovers_the_server() {
     assert!(result.errors.is_empty(), "load errors: {:?}", result.errors);
 
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         Some(js.clone()),
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
     let entry = manager.registry().get("mock").expect("registered");
@@ -5236,9 +5226,7 @@ async fn mid_session_js_readd_after_config_removal_rediscovers_the_server() {
 /// `UnknownServer`, and the session would believe the server is available).
 #[tokio::test(flavor = "current_thread")]
 async fn a_snapshot_entry_for_an_unregistered_server_registers_no_bridges() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("registry-filter");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
 
     let plugin = Arc::new(McpPlugin::with_cwd(&dir.0, &dir.0));
     let (command, args) = mock_server_spawn();
@@ -5255,9 +5243,10 @@ async fn a_snapshot_entry_for_an_unregistered_server_registers_no_bridges() {
         // JS runtime is attached, so nothing re-registers it.
         source: pir::mcp::registry::McpServerSource::Extension("registry-filter-test".to_owned()),
     });
-    let host = PluginHost::build(
+    let host = PluginHost::build_with_agent_dir(
         None,
         vec![plugin.clone() as Arc<dyn pir::plugins::AgentPlugin>],
+        Some(&dir.0),
     );
     let manager = host.mcp_manager().expect("mcp manager");
 
@@ -5321,10 +5310,8 @@ async fn a_snapshot_entry_for_an_unregistered_server_registers_no_bridges() {
 /// assertion on the error fails instead.
 #[tokio::test(flavor = "current_thread")]
 async fn disconnect_detaches_the_connection_so_an_in_flight_call_cannot_reconnect() {
-    let _guard = env_guard().await;
     let dir = TempDir::new("detach");
-    std::env::set_var("PIR_AGENT_DIR", &dir.0);
-    let manager = McpManager::without_log(&dir.0);
+    let manager = McpManager::new(&dir.0, &dir.0);
     let (command, args) = mock_server_spawn();
     let config: McpServerConfig = serde_json::from_value(json!({
         "command": command,

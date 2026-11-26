@@ -2855,7 +2855,11 @@ impl LiveProviderService {
             // Cold first call: one synchronous read is allowed. The refresh
             // flag is cleared on every exit path, including a panic.
             let providers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                load_authenticated_providers(&self.state.registry, &self.state.cwd)
+                load_authenticated_providers(
+                    &self.state.registry,
+                    &self.state.cwd,
+                    &self.state.agent_dir,
+                )
             }))
             .unwrap_or_else(|_| Arc::from(Vec::new()));
             let mut cache = self
@@ -2883,10 +2887,11 @@ impl LiveProviderService {
     fn spawn_auth_refresh(&self) {
         let registry = Arc::clone(&self.state.registry);
         let cwd = Arc::clone(&self.state.cwd);
+        let agent_dir = Arc::clone(&self.state.agent_dir);
         let auth = Arc::clone(&self.state.auth);
         let refresh = move || {
             let providers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                load_authenticated_providers(&registry, &cwd)
+                load_authenticated_providers(&registry, &cwd, &agent_dir)
             }))
             .unwrap_or_else(|_| Arc::from(Vec::new()));
             let mut cache = auth
@@ -2912,14 +2917,27 @@ impl LiveProviderService {
 /// One credential-environment read shared by the cold and background paths.
 /// Counted by the host's `#[doc(hidden)]` `live_auth_disk_reads` probe so a
 /// test can pin "one read for N hot-path calls".
-fn load_authenticated_providers(registry: &ProviderRegistry, cwd: &Path) -> Arc<[Arc<str>]> {
+///
+/// `agent_dir` is the SESSION's resolved agent directory: the credential scan
+/// (`models.json` `apiKey` entries and `auth.json` live there) follows it
+/// instead of the process environment, so an embedder or a test that owns its
+/// agent dir never observes another agent's credentials.
+fn load_authenticated_providers(
+    registry: &ProviderRegistry,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> Arc<[Arc<str>]> {
     crate::plugins::host::record_live_auth_disk_read();
-    match crate::ai::providers::load_pi_environment(Some(cwd)) {
+    match crate::ai::providers::load_pi_environment_in(agent_dir, Some(cwd)) {
         Ok(environment) => registry
             .providers()
             .iter()
             .filter(|provider| {
-                crate::ai::providers::has_configured_auth(provider.id(), &environment.api_keys)
+                crate::ai::providers::has_configured_auth_in(
+                    agent_dir,
+                    provider.id(),
+                    &environment.api_keys,
+                )
             })
             .map(|provider| Arc::<str>::from(provider.id()))
             .collect::<Vec<_>>()

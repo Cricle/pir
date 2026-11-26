@@ -236,24 +236,42 @@ fn registry_available(registry: &ToolRegistry) -> Vec<AvailableTool> {
     available
 }
 
-fn session(registry: &ToolRegistry, selection: Option<ToolSelection>) -> AgentSession {
-    AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(ProviderRegistry::default()),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools: registry.clone(),
-        session: None,
-        compaction: None,
-        max_turns: 1,
-        // Avoid ambient discovery: these tests only read the loadout.
-        system_prompt: Some("base system prompt".into()),
-        cwd: Some(std::env::temp_dir()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: selection,
+/// A read-only agent dir shared by the loadout-only sessions below.
+///
+/// These sessions never WRITE their agent dir (they only read the loadout), so
+/// one empty directory is enough for all of them: the contention this suite
+/// used to have came from pinning `PIR_AGENT_DIR` in the process environment,
+/// not from two tests reading the same empty directory.
+fn read_only_agent_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = unique_temp_cwd("readonly-agent");
+        dir
     })
+}
+
+fn session(registry: &ToolRegistry, selection: Option<ToolSelection>) -> AgentSession {
+    AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(ProviderRegistry::default()),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: registry.clone(),
+            session: None,
+            compaction: None,
+            max_turns: 1,
+            // Avoid ambient discovery: these tests only read the loadout.
+            system_prompt: Some("base system prompt".into()),
+            cwd: Some(std::env::temp_dir()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: selection,
+            phone_child: None,
+        },
+        read_only_agent_dir(),
+    )
 }
 
 fn session_declared(registry: &ToolRegistry, selection: Option<ToolSelection>) -> Vec<String> {
@@ -824,30 +842,64 @@ fn unique_temp_cwd(label: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A scratch AGENT dir for one test, so its session's agent-scoped reads (no
+/// global context file, no `~/.pi/agent` skills) never see the operator's real
+/// directory or a sibling suite's. Removed on drop.
+///
+/// This replaces the process-wide `PIR_AGENT_DIR` pin: the session is built
+/// with an explicit agent dir instead, which is per-test state and therefore
+/// needs no lock.
+struct ScrubbedAgentDir(std::path::PathBuf);
+
+impl ScrubbedAgentDir {
+    fn new(label: &str) -> Self {
+        Self(unique_temp_cwd(&format!("agent-{label}")))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScrubbedAgentDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A session that lets the context builder own the prompt (`system_prompt:
 /// None`) and returns the resulting system prompt. `cwd` must contain an
 /// `AGENTS.md` so the builder has a `project_context` section to emit.
+///
+/// `agent_dir` is the test's own scratch directory: the prompt builder reads
+/// the agent dir's global context file and skills, so an explicit empty one
+/// keeps the derived prompt to the cwd fixture alone.
 fn context_prompt(
     registry: &ToolRegistry,
     selection: Option<ToolSelection>,
     cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
 ) -> String {
-    let session = AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(ProviderRegistry::default()),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools: registry.clone(),
-        session: None,
-        compaction: None,
-        max_turns: 1,
-        system_prompt: None,
-        cwd: Some(cwd.to_path_buf()),
-        event_stream: None,
-        extensions: None,
-        tool_selection: selection,
-    });
+    let session = AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(ProviderRegistry::default()),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: registry.clone(),
+            session: None,
+            compaction: None,
+            max_turns: 1,
+            system_prompt: None,
+            cwd: Some(cwd.to_path_buf()),
+            event_stream: None,
+            extensions: None,
+            tool_selection: selection,
+            phone_child: None,
+        },
+        agent_dir,
+    );
     session
         .system_prompt_snapshot()
         .expect("a context file must produce the context-derived prompt")
@@ -864,7 +916,7 @@ fn context_prompt(
 async fn the_session_system_prompt_lists_the_declared_tools_not_the_base_registry() {
     // A clean agent dir keeps this hermetic: no global context file/skills
     // beyond the cwd fixture.
-    let _env = crate::common::AgentDirEnvGuard::scratch("w16-d6", None).await;
+    let agent_dir = ScrubbedAgentDir::new("d6");
     let cwd = unique_temp_cwd("declared");
     std::fs::write(cwd.join("AGENTS.md"), "project instructions").expect("write AGENTS.md");
 
@@ -888,7 +940,7 @@ async fn the_session_system_prompt_lists_the_declared_tools_not_the_base_registr
         false,
     );
     assert_eq!(selection.enabled, names(&["ctx_execute"]));
-    let prompt = context_prompt(&registry, Some(selection), &cwd);
+    let prompt = context_prompt(&registry, Some(selection), &cwd, agent_dir.path());
     assert!(
         prompt.contains("- ctx_execute: Run code in a context sandbox"),
         "the selected plugin tool must be advertised: {prompt}"
@@ -908,7 +960,7 @@ async fn the_session_system_prompt_lists_the_declared_tools_not_the_base_registr
     // defaults (the same names the request declares); `powershell` is
     // registered with `default_active: false` and is never declared, so the
     // prompt never advertises it.
-    let prompt = context_prompt(&registry, None, &cwd);
+    let prompt = context_prompt(&registry, None, &cwd, agent_dir.path());
     assert!(
         prompt.contains("- read: Read file contents"),
         "the default startup prompt keeps its core tools: {prompt}"
@@ -931,6 +983,7 @@ async fn the_session_system_prompt_lists_the_declared_tools_not_the_base_registr
             uses_default_tools: false,
         }),
         &cwd,
+        agent_dir.path(),
     );
     assert!(
         prompt.contains("<tools>\n(none)\n"),
@@ -962,7 +1015,7 @@ export default function (pi) {
 }
 "#;
 
-fn extension_runtime(cwd: &std::path::Path) -> ExtensionHandle {
+fn extension_runtime(cwd: &std::path::Path, agent_dir: &std::path::Path) -> ExtensionHandle {
     ExtensionHandle::start(ExtensionConfig {
         cwd: cwd.to_path_buf(),
         mode: "test".to_owned(),
@@ -973,6 +1026,7 @@ fn extension_runtime(cwd: &std::path::Path) -> ExtensionHandle {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: Some(agent_dir.to_path_buf()),
     })
     .expect("extension runtime")
 }
@@ -982,23 +1036,28 @@ fn session_with_extensions(
     selection: Option<ToolSelection>,
     extensions: Option<ExtensionHandle>,
     cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
 ) -> AgentSession {
-    AgentSession::new(AgentSessionConfig {
-        performance: Default::default(),
-        provider_registry: Arc::new(ProviderRegistry::default()),
-        model: fake_model(),
-        api_key: None,
-        thinking: ThinkingLevel::Off,
-        tools: registry.clone(),
-        session: None,
-        compaction: None,
-        max_turns: 1,
-        system_prompt: Some("base system prompt".into()),
-        cwd: Some(cwd.to_path_buf()),
-        event_stream: None,
-        extensions,
-        tool_selection: selection,
-    })
+    AgentSession::new_with_agent_dir(
+        AgentSessionConfig {
+            performance: Default::default(),
+            provider_registry: Arc::new(ProviderRegistry::default()),
+            model: fake_model(),
+            api_key: None,
+            thinking: ThinkingLevel::Off,
+            tools: registry.clone(),
+            session: None,
+            compaction: None,
+            max_turns: 1,
+            system_prompt: Some("base system prompt".into()),
+            cwd: Some(cwd.to_path_buf()),
+            event_stream: None,
+            extensions,
+            tool_selection: selection,
+            phone_child: None,
+        },
+        agent_dir,
+    )
 }
 
 fn session_declared_with_extensions(
@@ -1006,8 +1065,9 @@ fn session_declared_with_extensions(
     selection: Option<ToolSelection>,
     extensions: Option<ExtensionHandle>,
     cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
 ) -> Vec<String> {
-    let session = session_with_extensions(registry, selection, extensions, cwd);
+    let session = session_with_extensions(registry, selection, extensions, cwd, agent_dir);
     let (merged, active) = session.active_tool_snapshot(session.plugin_host());
     sorted(
         declared_tools(&merged, &active)
@@ -1034,9 +1094,9 @@ fn session_declared_with_extensions(
 /// pattern are checked through the same shared resolver.
 #[tokio::test]
 async fn on_disk_extension_tool_is_selectable_after_the_runtime_loads() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("w16-d10", None).await;
+    let agent_dir = ScrubbedAgentDir::new("d10");
     let cwd = unique_temp_cwd("d10");
-    let runtime = extension_runtime(&cwd);
+    let runtime = extension_runtime(&cwd, agent_dir.path());
     let path = cwd.join("my-extension.js");
     std::fs::write(&path, D10_EXTENSION_SOURCE).expect("write extension");
     let loaded = runtime
@@ -1108,6 +1168,7 @@ async fn on_disk_extension_tool_is_selectable_after_the_runtime_loads() {
         Some(selection),
         Some(runtime.clone()),
         &cwd,
+        agent_dir.path(),
     );
     assert_eq!(
         declared,
@@ -1143,6 +1204,7 @@ async fn on_disk_extension_tool_is_selectable_after_the_runtime_loads() {
         Some(excluded),
         Some(runtime.clone()),
         &cwd,
+        agent_dir.path(),
     );
     assert!(
         !declared.iter().any(|name| name == "my_js_tool"),
@@ -1163,9 +1225,9 @@ async fn on_disk_extension_tool_is_selectable_after_the_runtime_loads() {
 /// selectable after the runtime loads, while an empty request stays a no-op.
 #[tokio::test]
 async fn rpc_host_selection_sees_an_on_disk_extension_tool() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("q66-rpc", None).await;
+    let agent_dir = ScrubbedAgentDir::new("q66-rpc");
     let cwd = unique_temp_cwd("q66-rpc");
-    let runtime = extension_runtime(&cwd);
+    let runtime = extension_runtime(&cwd, agent_dir.path());
     let path = cwd.join("rpc-extension.js");
     std::fs::write(&path, D10_EXTENSION_SOURCE).expect("write extension");
     let loaded = runtime

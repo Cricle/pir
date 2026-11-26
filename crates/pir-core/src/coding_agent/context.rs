@@ -1149,9 +1149,16 @@ pub fn partition_file_args_with_options(
     cwd: &Path,
     options: Option<ImageAttachmentOptions>,
 ) -> crate::Result<(String, Vec<crate::ai::types::ImageContent>)> {
+    // Only the image branch reads the file incrementally; the text-only
+    // fallback reads it through `read_remaining_capped`, so a minimal build
+    // must not import the trait (it would be an unused import there).
+    #[cfg(any(feature = "print", feature = "tool-read"))]
     use std::io::Read as _;
 
     let mut text = String::new();
+    // `mut` is used only by the image branch (the text-only fallback never
+    // pushes here), so a minimal build would warn without the allow.
+    #[allow(unused_mut)]
     let mut images = Vec::new();
     for file_arg in file_args {
         let path = resolve_file_arg_path(file_arg, cwd);

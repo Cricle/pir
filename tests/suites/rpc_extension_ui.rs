@@ -216,6 +216,7 @@ fn session_factory(handle: ExtensionHandle) -> SessionFactory {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -312,6 +313,7 @@ fn gated_session_factory(
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         })))
     });
     (factory, entered)

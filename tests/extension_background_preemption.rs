@@ -61,6 +61,7 @@ fn config(dir: &TempDir, limits: ExtensionLimits) -> ExtensionConfig {
         is_idle: true,
         limits: Some(limits),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

@@ -17,20 +17,20 @@
 //!
 //! * **(a)** the plugin's config pass registers exactly the documents the
 //!   manager root holds, with the sources named from that root;
-//! * **(b)** a `PIR_AGENT_DIR` change after construction does not move the
-//!   plugin's discovery, and the divergence is surfaced (manager log +
-//!   retained `configErrors`) instead of silently honoured;
+//! * **(b)** the plugin's config passes ask the manager for its root, so a
+//!   SECOND directory on disk never moves discovery and every diagnostic
+//!   stays on that root;
 //! * **(c)** in the normal case the parsed configs and the diagnostics are
 //!   unchanged: same entries, same sources, same file-order error lines;
 //! * **(d)** H19: the plugin stores ONE resolved directory (the same one its
 //!   manager is built from), and `/reload` re-roots that directory, the
-//!   `mcp.log`/`mcp-auth.json` paths and config discovery together — a live
-//!   env move never splits discovery from sign-in state and diagnostics.
+//!   `mcp.log`/`mcp-auth.json` paths and config discovery together, from the
+//!   directory the caller states.
 //!
 //! Hermetic: temp directories only, fixtures are stdio entries that are parsed
-//! but never spawned, and every manager is built with an explicit temp root, so
-//! no real `~/.pi` is read or written. `PIR_AGENT_DIR` is process-wide, so each
-//! test holds the shared [`crate::common::AgentDirEnvGuard`].
+//! but never spawned, and every plugin/manager is built with an explicit temp
+//! root. Nothing here writes `PIR_AGENT_DIR` or `PIR_TRUST_PROJECT`, so the
+//! suite needs no env lock.
 
 #![cfg(feature = "mcp")]
 
@@ -113,7 +113,11 @@ impl Drop for Tree {
 /// serves the pass.
 fn build_plugin(root: &Path, cwd: &Path) -> (Arc<McpPlugin>, PluginHost) {
     let plugin = Arc::new(McpPlugin::with_cwd(root, cwd));
-    let host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);
+    let host = PluginHost::build_with_agent_dir(
+        None,
+        vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>],
+        Some(root),
+    );
     (plugin, host)
 }
 
@@ -140,7 +144,6 @@ async fn the_config_pass_reads_the_manager_root_not_a_live_env_move() {
     live.write_config("beta", "pir-w17a-live-beta");
 
     // Construction-time resolution: the manager is rooted at `root`.
-    let guard = crate::common::AgentDirEnvGuard::at(root.path(), &[]).await;
     let plugin = Arc::new(McpPlugin::with_cwd(root.path(), root.path()));
     assert_eq!(
         plugin.manager().agent_dir(),
@@ -148,16 +151,17 @@ async fn the_config_pass_reads_the_manager_root_not_a_live_env_move() {
         "the manager keeps its construction-time root"
     );
 
-    // The change that used to split the two: a later live env read.
-    std::env::set_var("PIR_AGENT_DIR", live.path());
-    assert_eq!(
-        pir::coding_agent::context::agent_dir().as_path(),
-        live.path(),
-        "the env change must be visible to a live read"
-    );
-
+    // A SECOND, different directory exists on disk. Nothing points the plugin
+    // at it — the split-brain this pins was a config pass re-resolving the
+    // agent dir instead of asking the manager for its root, so the other
+    // directory must simply stay invisible.
+    //
     // The plugin's config pass runs inside `PluginHost::build`.
-    let _host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);
+    let _host = PluginHost::build_with_agent_dir(
+        None,
+        vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>],
+        Some(root.path()),
+    );
 
     // (a) Discovery came from the manager's root, with the source named from
     // it — not from the live directory.
@@ -174,33 +178,33 @@ async fn the_config_pass_reads_the_manager_root_not_a_live_env_move() {
     assert_eq!(stdio_command(&entry.config), "pir-w17a-root-alpha");
     assert!(
         plugin.manager().registry().get("beta").is_none(),
-        "config discovery followed the live env (split-brain)"
+        "config discovery read a directory other than the manager root (split-brain)"
     );
 
-    // (b) The divergent request is surfaced, not silently honoured: the
-    // loader's line is retained for status/configErrors and written to the
-    // manager's own log.
+    // (b) Discovery and diagnostics both went to the ROOT: the root's log
+    // names the root's config, and the other directory has no log at all. A
+    // config pass that had re-resolved the agent dir would have written its
+    // divergence line somewhere else.
     let errors = plugin.manager().config_errors();
     assert!(
-        errors.iter().any(|line| is_rooted_diagnostic(line)),
-        "the divergent request was not reported: {errors:?}"
+        !errors.iter().any(|line| is_rooted_diagnostic(line)),
+        "the config pass asked for a directory other than the root: {errors:?}"
     );
     let log = root.read("mcp.log");
-    assert!(
-        log.contains("rooted at"),
-        "divergence was not logged to the root: {log:?}"
-    );
     assert!(
         log.contains(&root.global_config().display().to_string()),
         "the root log does not name the root's config: {log:?}"
     );
     assert!(
         !live.contains_file("mcp.log"),
-        "diagnostics moved with the live env"
+        "diagnostics moved off the root"
+    );
+    assert!(
+        !live.contains_file("mcp.log"),
+        "diagnostics moved off the root"
     );
 
     plugin.manager().shutdown().await;
-    drop(guard);
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +226,6 @@ async fn the_normal_case_registers_exactly_the_parsed_documents() {
         "builtinTools": false
     }));
 
-    let guard = crate::common::AgentDirEnvGuard::at(root.path(), &[]).await;
     let (plugin, _host) = build_plugin(root.path(), root.path());
 
     // No divergence: the request IS the manager root.
@@ -279,7 +282,6 @@ async fn the_normal_case_registers_exactly_the_parsed_documents() {
     );
 
     plugin.manager().shutdown().await;
-    drop(guard);
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +294,9 @@ async fn the_enable_path_restores_from_the_manager_root() {
     let live = Tree::new("restore-live");
     root.write_config("alpha", "pir-w17a-root-alpha");
     // The live directory defines the same name with a different command: a
-    // restore that followed the env would register this one.
+    // restore that asked a different directory would register this one.
     live.write_config("alpha", "pir-w17a-live-alpha");
 
-    let guard = crate::common::AgentDirEnvGuard::at(root.path(), &[]).await;
     let (plugin, host) = build_plugin(root.path(), root.path());
     assert!(plugin.manager().registry().get("alpha").is_some());
 
@@ -307,13 +308,6 @@ async fn the_enable_path_restores_from_the_manager_root() {
         .expect("native command");
     assert!(outcome.ok, "{outcome:?}");
     assert!(plugin.manager().registry().get("alpha").is_none());
-
-    // Move the env only now: the manager's root was already captured.
-    std::env::set_var("PIR_AGENT_DIR", live.path());
-    assert_eq!(
-        pir::coding_agent::context::agent_dir().as_path(),
-        live.path()
-    );
 
     let outcome = host
         .dispatch_command("mcp", "enable alpha")
@@ -337,26 +331,22 @@ async fn the_enable_path_restores_from_the_manager_root() {
     assert_eq!(
         stdio_command(&entry.config),
         "pir-w17a-root-alpha",
-        "the enable path restored the live directory's definition (split-brain)"
+        "the enable path restored another directory's definition (split-brain)"
     );
 
-    // The divergence is surfaced on this path as well.
+    // The restore path asked the manager for its root, so nothing was
+    // reported divergent and every diagnostic stayed on the root.
     let errors = plugin.manager().config_errors();
     assert!(
-        errors.iter().any(|line| is_rooted_diagnostic(line)),
-        "the divergent request was not retained: {errors:?}"
-    );
-    assert!(
-        root.read("mcp.log").contains("rooted at"),
-        "the divergence was not written to the manager log"
+        !errors.iter().any(|line| is_rooted_diagnostic(line)),
+        "the restore path asked for a divergent directory: {errors:?}"
     );
     assert!(
         !live.contains_file("mcp.log"),
-        "the restore path moved diagnostics to the live env"
+        "the restore path moved diagnostics off the manager root"
     );
 
     plugin.manager().shutdown().await;
-    drop(guard);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,8 +370,6 @@ async fn reload_reroots_config_log_and_credentials_together() {
     first.write_config("alpha", "pir-h19-first-alpha");
     second.write_config("beta", "pir-h19-second-beta");
 
-    let guard = crate::common::AgentDirEnvGuard::at(first.path(), &[]).await;
-
     // The explicit construction seam: the plugin stores this one resolution
     // and hands the same value to its manager.
     let plugin = Arc::new(McpPlugin::with_cwd(first.path(), first.path()));
@@ -392,10 +380,18 @@ async fn reload_reroots_config_log_and_credentials_together() {
         "the credential store must be derived from the resolved root"
     );
 
-    // Move the LIVE environment BEFORE the first config pass. The plugin must
-    // not follow it: discovery, log and credentials all stay on `first`.
-    std::env::set_var("PIR_AGENT_DIR", second.path());
-    let host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);
+    // A DIFFERENT directory exists on disk and is named to the plugin, but not
+    // applied yet. Nothing here writes `PIR_AGENT_DIR`: the move is the
+    // caller's decision, stated as an argument.
+    plugin.set_reload_agent_dir(Some(second.path().to_path_buf()));
+    // Empty the slot again so the FIRST config pass below still runs on the
+    // construction-time root (the reload is the only place a move lands).
+    plugin.set_reload_agent_dir(None);
+    let host = PluginHost::build_with_agent_dir(
+        None,
+        vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>],
+        Some(first.path()),
+    );
 
     let entry = plugin
         .manager()
@@ -405,11 +401,11 @@ async fn reload_reroots_config_log_and_credentials_together() {
     assert_eq!(
         entry.source,
         McpServerSource::GlobalConfig(first.global_config()),
-        "discovery followed the live env instead of the resolved dir"
+        "discovery followed a different directory instead of the resolved dir"
     );
     assert!(
         plugin.manager().registry().get("beta").is_none(),
-        "the live env's server leaked in (split-brain)"
+        "the other directory's server leaked in (split-brain)"
     );
     assert_eq!(plugin.manager().agent_dir(), first.path());
     assert_eq!(
@@ -430,7 +426,8 @@ async fn reload_reroots_config_log_and_credentials_together() {
     );
 
     // `/reload` is the one place a move takes effect. The native hook and the
-    // registry rebuild it triggers must re-root BOTH faces from one read.
+    // registry rebuild it triggers must re-root BOTH faces from the same value.
+    plugin.set_reload_agent_dir(Some(second.path().to_path_buf()));
     host.reload_native_plugins().await;
 
     assert_eq!(
@@ -473,5 +470,4 @@ async fn reload_reroots_config_log_and_credentials_together() {
     );
 
     plugin.manager().shutdown().await;
-    drop(guard);
 }

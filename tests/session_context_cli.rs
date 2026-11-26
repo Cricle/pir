@@ -809,7 +809,7 @@ fn cross_project_session_ids_fork_into_the_current_project() {
 #[test]
 fn open_session_manager_materializes_plans() {
     let dir = temp_session_dir("materialize");
-    let cwd_owned = std::env::temp_dir().join("pir-session-context-proj");
+    let cwd_owned = crate::common::unique_temp_path("session-context-proj");
     let cwd = cwd_owned.to_str().expect("temp dir path is valid UTF-8");
 
     // Ephemeral → None.
@@ -1113,7 +1113,7 @@ async fn json_mode_emits_parseable_event_lines_without_partials() {
 #[test]
 fn session_header_serializes_as_first_json_line() {
     let dir = temp_session_dir("json-header");
-    let cwd_owned = std::env::temp_dir().join("pir-session-context-proj");
+    let cwd_owned = crate::common::unique_temp_path("session-context-proj");
     let cwd = cwd_owned.to_str().expect("temp dir path is valid UTF-8");
     let session = SessionManager::create(cwd, dir.path()).unwrap();
     let header = session

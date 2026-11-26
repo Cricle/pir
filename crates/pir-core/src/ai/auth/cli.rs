@@ -313,7 +313,18 @@ pub async fn resolve_printable_credential(
     provider: &str,
     no_refresh: bool,
 ) -> AiResult<Option<(String, String)>> {
-    let storage = Arc::new(storage());
+    resolve_printable_credential_in(&crate::ai::providers::agent_dir(), provider, no_refresh).await
+}
+
+/// [`resolve_printable_credential`] against an EXPLICIT agent directory (the
+/// credential store and the OAuth refresh both follow that directory).
+#[doc(hidden)]
+pub async fn resolve_printable_credential_in(
+    agent_dir: &std::path::Path,
+    provider: &str,
+    no_refresh: bool,
+) -> AiResult<Option<(String, String)>> {
+    let storage = Arc::new(FileAuthStorage::in_agent_dir(agent_dir));
     match storage.read_stored(provider)? {
         Some(StoredCredential::OAuth(credential)) => {
             let Some(flow) = oauth_flow_for(provider, None) else {
@@ -355,8 +366,9 @@ pub async fn resolve_printable_credential(
             // models.json `apiKey` providers are the same credentials the
             // request path uses (docs/models.md); upstream's auth check
             // resolves through the model runtime, so a custom provider with a
-            // literal key is ready (PIR-BIN-033).
-            if let Ok(environment) = crate::ai::providers::load_pi_environment(None) {
+            // literal key is ready (PIR-BIN-033). The layer is the SAME agent
+            // dir this call was scoped to.
+            if let Ok(environment) = crate::ai::providers::load_pi_environment_in(agent_dir, None) {
                 if let Some(key) = environment
                     .api_keys
                     .get(provider)
@@ -416,12 +428,29 @@ pub fn resolve_provider_from_flags(
     model: Option<&str>,
     requirement: &str,
 ) -> AiResult<String> {
+    resolve_provider_from_flags_in(
+        &crate::ai::providers::agent_dir(),
+        provider,
+        model,
+        requirement,
+    )
+}
+
+/// [`resolve_provider_from_flags`] against an EXPLICIT agent directory: the
+/// `models.json` layer and the stored-credential scan both follow that
+/// directory instead of the process environment's.
+pub fn resolve_provider_from_flags_in(
+    agent_dir: &std::path::Path,
+    provider: Option<&str>,
+    model: Option<&str>,
+    requirement: &str,
+) -> AiResult<String> {
     let provider = provider.map(str::trim).filter(|value| !value.is_empty());
     let model = model.map(str::trim).filter(|value| !value.is_empty());
     // Upstream unknown-provider gate: the explicit provider must name a
     // provider the runtime knows (credential-print.ts:57-59).
     if let Some(provider) = provider {
-        if !known_provider(provider) {
+        if !known_provider_in(agent_dir, provider) {
             return Err(AiError::Authentication(format!(
                 "Unknown provider \"{provider}\". Use --list-models to see available providers."
             )));
@@ -429,7 +458,7 @@ pub fn resolve_provider_from_flags(
     }
     match (provider, model) {
         (Some(provider), Some(model)) => {
-            let resolved = provider_for_model_pattern(model)?;
+            let resolved = provider_for_model_pattern_in(agent_dir, model)?;
             if resolved == provider {
                 Ok(provider.to_string())
             } else {
@@ -443,8 +472,8 @@ pub fn resolve_provider_from_flags(
             // Upstream ambiguity gate (credential-print.ts:74-88): only
             // providers with a configured credential are candidates, and
             // several matches require `--provider`.
-            let configured = configured_credential_providers();
-            let matched = providers_matching_model(model, &configured)?;
+            let configured = configured_credential_providers_in(agent_dir);
+            let matched = providers_matching_model_in(agent_dir, model, &configured)?;
             match matched.as_slice() {
                 // The one configured provider that resolves the pattern wins
                 // (upstream takes the credential scan's single match).
@@ -452,7 +481,7 @@ pub fn resolve_provider_from_flags(
                 // No configured credential resolves the pattern: keep the
                 // plain pattern resolution (canonical shortcut, upstream-style
                 // "Model not found" for unknown patterns).
-                [] => provider_for_model_pattern(model),
+                [] => provider_for_model_pattern_in(agent_dir, model),
                 // Upstream ambiguity gate (credential-print.ts:84-85).
                 multiple => Err(AiError::Authentication(format!(
                     "Multiple configured providers matched ({}). Specify --provider.",
@@ -468,6 +497,12 @@ pub fn resolve_provider_from_flags(
 /// `modelRuntime.getProvider`): a built-in catalog provider, an OAuth
 /// provider, an env-key provider, or a custom `models.json` provider.
 fn known_provider(provider: &str) -> bool {
+    known_provider_in(&crate::ai::providers::agent_dir(), provider)
+}
+
+/// [`known_provider`] against an EXPLICIT agent directory (its `models.json`
+/// layer supplies the custom-provider set).
+fn known_provider_in(agent_dir: &std::path::Path, provider: &str) -> bool {
     if crate::ai::providers::catalog::CATALOG_FILES
         .iter()
         .any(|(id, _)| *id == provider)
@@ -482,7 +517,7 @@ fn known_provider(provider: &str) -> bool {
     }
     // Custom providers from `models.json` (fail open on load errors: the
     // credential resolution below reports the real problem).
-    crate::ai::providers::load_pi_environment(None)
+    crate::ai::providers::load_pi_environment_in(agent_dir, None)
         .map(|environment| {
             environment
                 .models
@@ -495,16 +530,18 @@ fn known_provider(provider: &str) -> bool {
 /// The providers with a resolvable credential (upstream `credentialTypes`
 /// from `listCredentials`): a stored `auth.json` entry or a set env API
 /// key. Sorted for deterministic output.
-fn configured_credential_providers() -> Vec<String> {
-    let mut configured: std::collections::BTreeSet<String> = storage()
-        .list_stored()
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(|(provider_id, _)| provider_id)
-                .collect()
-        })
-        .unwrap_or_default();
+/// [`configured_credential_providers_in`] for the AMBIENT agent directory.
+fn configured_credential_providers_in(agent_dir: &std::path::Path) -> Vec<String> {
+    let mut configured: std::collections::BTreeSet<String> =
+        FileAuthStorage::in_agent_dir(agent_dir)
+            .list_stored()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(provider_id, _)| provider_id)
+                    .collect()
+            })
+            .unwrap_or_default();
     for (provider, env_vars) in env_api_keys::all() {
         if env_vars.iter().any(|env_var| {
             std::env::var(env_var)
@@ -516,7 +553,7 @@ fn configured_credential_providers() -> Vec<String> {
     }
     // models.json `apiKey` providers are configured credentials too
     // (PIR-BIN-033): `--model` resolution and `auth check` must see them.
-    if let Ok(environment) = crate::ai::providers::load_pi_environment(None) {
+    if let Ok(environment) = crate::ai::providers::load_pi_environment_in(agent_dir, None) {
         configured.extend(
             environment
                 .api_keys
@@ -533,8 +570,18 @@ fn configured_credential_providers() -> Vec<String> {
 /// `resolveModelReference` with an always-usable model pool). A fallback
 /// custom model id (the "Using custom model id" warning) does not count as a
 /// match.
-fn providers_matching_model(pattern: &str, configured: &[String]) -> AiResult<Vec<String>> {
-    let environment = crate::ai::providers::load_pi_environment(None)?;
+/// The configured providers whose model list resolves `pattern` (upstream
+/// credential-print.ts:74-88 scanning configured credentials through
+/// `resolveModelReference` with an always-usable model pool). A fallback
+/// custom model id (the "Using custom model id" warning) does not count as a
+/// match. `agent_dir` supplies both the `models.json` layer and the
+/// credential store, so a caller that owns its directory scans only its own.
+fn providers_matching_model_in(
+    agent_dir: &std::path::Path,
+    pattern: &str,
+    configured: &[String],
+) -> AiResult<Vec<String>> {
+    let environment = crate::ai::providers::load_pi_environment_in(agent_dir, None)?;
     let models = environment.models.clone();
     let usable = |_: &str| true;
     let mut matched = Vec::new();
@@ -715,6 +762,17 @@ pub async fn check(
 /// upstream text (credential-print.ts:110-112) instead of printing the
 /// OAuth-derived key.
 pub async fn print_api_key(provider: Option<&str>, model: Option<&str>) -> AiResult<()> {
+    print_api_key_in(&crate::ai::providers::agent_dir(), provider, model).await
+}
+
+/// [`print_api_key`] against an EXPLICIT agent directory: stored credentials
+/// are read from `<agent_dir>/auth.json` instead of the process environment's
+/// agent dir, so an embedder or a test never touches global credential state.
+pub async fn print_api_key_in(
+    agent_dir: &std::path::Path,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> AiResult<()> {
     let provider = resolve_provider_from_flags(
         provider,
         model,
@@ -724,14 +782,14 @@ pub async fn print_api_key(provider: Option<&str>, model: Option<&str>) -> AiRes
     // (credential-print.ts:92-94) and then reports the dedicated error
     // (credential-print.ts:110-112).
     if matches!(
-        storage().read_stored(&provider)?,
+        FileAuthStorage::in_agent_dir(agent_dir).read_stored(&provider)?,
         Some(StoredCredential::OAuth(_))
     ) {
         return Err(AiError::Authentication(format!(
             "Provider \"{provider}\" is configured with OAuth, not an API key"
         )));
     }
-    match resolve_printable_credential(&provider, false).await? {
+    match resolve_printable_credential_in(agent_dir, &provider, false).await? {
         Some((key, _source)) => {
             println!("{key}");
             Ok(())
@@ -752,6 +810,15 @@ const DEFAULT_BEARER_TOKEN_MIN_EXPIRY_SECS: u64 = 30 * 60;
 /// `resolveCliModel`): exact `provider/model` / bare-id match first, then a
 /// fuzzy match over the configured model environment. Public for tests/.
 pub fn provider_for_model_pattern(pattern: &str) -> AiResult<String> {
+    provider_for_model_pattern_in(&crate::ai::providers::agent_dir(), pattern)
+}
+
+/// [`provider_for_model_pattern`] against an EXPLICIT agent directory (its
+/// `models.json` layer is the model environment the fuzzy match runs over).
+pub fn provider_for_model_pattern_in(
+    agent_dir: &std::path::Path,
+    pattern: &str,
+) -> AiResult<String> {
     if let Some((provider, model_id)) = pattern.split_once('/') {
         // A canonical `provider/model` reference needs no environment lookup.
         if !provider.trim().is_empty()
@@ -761,7 +828,7 @@ pub fn provider_for_model_pattern(pattern: &str) -> AiResult<String> {
             return Ok(provider.trim().to_string());
         }
     }
-    let environment = crate::ai::providers::load_pi_environment(None)?;
+    let environment = crate::ai::providers::load_pi_environment_in(agent_dir, None)?;
     let models = environment.models.clone();
     let parsed = crate::ai::providers::resolution::parse_model_pattern(pattern, &models, false);
     if let Some(model) = parsed.model {

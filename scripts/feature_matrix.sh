@@ -77,7 +77,7 @@
 #          pulls sibling suites that need `tui`/`extensions`.
 #          `smoke(cli,tool-read)` pins the partial build: `read` is available
 #          while every other leaf reports its own missing feature.
-#   TOTAL 119 cargo invocations (87 root-package rows + 32 support-crate rows).
+#   TOTAL 123 cargo invocations (87 root-package rows + 36 support-crate rows).
 #
 # It runs in the cargo target dir the caller selects (`CARGO_TARGET_DIR`,
 # default `target-alt`); lanes run it in their own `target-lane-*` dir so an
@@ -320,6 +320,11 @@ for row in "${SMOKE_CONFIGS[@]}"; do
 # build on its own with no default features AND with its full feature set: a
 # published crate that only compiles as a dependency of the engine would break
 # a consumer's `cargo install`.
+#
+# `pir-core` and `pir-tui` are here too: they are published workspace members
+# (release.yml publishes both), so a feature that only compiles as a dependency
+# of `pir-sdk` would break the crate's own consumers the same way. They are
+# listed last because their no-default build takes the longest.
 SUPPORT_CRATES=(
   pir-plugin-api
   pir-protocol
@@ -337,8 +342,10 @@ SUPPORT_CRATES=(
   pir-builtin-todo
   pir-builtin-memory
   pir-builtin-phone
+  pir-core
+  pir-tui
 )
-EXPECTED_SUPPORT_ROWS=32
+EXPECTED_SUPPORT_ROWS=36
 SUPPORT_ROWS=0
 for crate in "${SUPPORT_CRATES[@]}"; do
   run_row "crate:$crate" check -p "$crate" --no-default-features --lib

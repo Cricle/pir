@@ -293,6 +293,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -606,6 +607,7 @@ fn plan_only_parent() -> pir::extensions::ExtensionHandle {
             is_idle: true,
             limits: Some(Default::default()),
             allow_process_exit: false,
+            agent_dir: None,
         });
     handle.set_path_plan(vec![PathBuf::from("builtin:subagent")]);
     handle

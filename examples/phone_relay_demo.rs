@@ -104,6 +104,8 @@ fn demo_config() -> AgentSessionConfig {
         event_stream: Some(scripted_stream()),
         extensions: None,
         tool_selection: None,
+        // The demo drives the phone-child inline-image path directly.
+        phone_child: Some(true),
     }
 }
 

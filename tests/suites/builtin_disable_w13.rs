@@ -28,10 +28,10 @@
 //!   dropped) and the generator reproduces the committed artifact.
 //!
 //! NOTE: this file is registered by the foreman (`#[path = "suites/
-//! builtin_disable_w13.rs"]` in a `g_*` merged binary). It uses
-//! `crate::common::AgentDirEnvGuard` for the process-wide `PIR_AGENT_DIR`
-//! pin, so register it in a binary that includes `mod common;`
-//! (`tests/g_tools.rs` / `tests/g_agent.rs`).
+//! builtin_disable_w13.rs"]` in a `g_*` merged binary) and needs
+//! `mod common;` for the scratch agent-dir helper (`tests/g_tools.rs` /
+//! `tests/g_agent.rs`). The two host tests pass that directory explicitly, so
+//! they take no process-wide lock.
 
 use std::path::{Path, PathBuf};
 #[cfg(feature = "context-mode")]
@@ -163,6 +163,7 @@ fn session_config(
         event_stream: None,
         extensions: Some(extensions.clone()),
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -332,18 +333,20 @@ fn default_plan_with_context_mode() -> Vec<PathBuf> {
 #[cfg(feature = "context-mode")]
 #[tokio::test(flavor = "current_thread")]
 async fn settings_disable_removes_the_builtin_from_a_session_host() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+    // An explicit agent dir carries the settings file the gate reads; nothing
+    // resolves through the process environment.
+    let agent_dir = crate::common::scratch_agent_dir(
         "builtin-disable-session",
         Some(r#"{ "disabledBuiltinExtensions": ["context-mode"] }"#),
-    )
-    .await;
+    );
 
     let cwd = TempDir::new("session-cwd");
     let plan = default_plan_with_context_mode();
     let handle = plan_only_handle(cwd.path(), &plan);
-    let session = pir::agent_session::AgentSession::new_with_plugins(
+    let session = pir::agent_session::AgentSession::new_with_plugins_and_agent_dir(
         session_config(cwd.path(), &handle),
         Vec::new(),
+        agent_dir.path(),
     );
 
     let host = session
@@ -374,17 +377,17 @@ async fn settings_disable_removes_the_builtin_from_a_session_host() {
 #[cfg(feature = "context-mode")]
 #[tokio::test(flavor = "current_thread")]
 async fn settings_disable_removes_the_builtin_from_a_print_host() {
-    let _env = crate::common::AgentDirEnvGuard::scratch(
+    let agent_dir = crate::common::scratch_agent_dir(
         "builtin-disable-print",
         Some(r#"{ "disabledBuiltinExtensions": ["context-mode"] }"#),
-    )
-    .await;
+    );
 
     let cwd = TempDir::new("print-cwd");
     let plan = default_plan_with_context_mode();
     let handle = plan_only_handle(cwd.path(), &plan);
-    let host = pir::coding_agent::print::print_plugin_host(Some(&handle))
-        .expect("the runtime builds the print host");
+    let host =
+        pir::coding_agent::print::print_plugin_host_in(Some(&handle), Some(agent_dir.path()))
+            .expect("the runtime builds the print host");
 
     let paths: Vec<String> = host
         .plugins()

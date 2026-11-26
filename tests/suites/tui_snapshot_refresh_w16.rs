@@ -14,16 +14,14 @@
 //! access, so the steady-state frame pays nothing.
 //!
 //! NOTE: registered by the foreman (`#[path = "suites/tui_snapshot_refresh_w16.rs"]`
-//! in a `g_*` merged binary). The suite is self-contained (a local
-//! `PIR_AGENT_DIR` guard instead of `crate::common`), so it needs no
-//! `mod common;`. The steady-state test reads the process-global
-//! `session_list_file_reads` probe, so register it in a binary whose other
-//! suites do not call `SessionManager::list_sessions` concurrently —
-//! `tests/g_tui.rs` today (the only such suites are in `tests/g_agent.rs`).
+//! in a `g_*` merged binary). The suite is self-contained — every path
+//! derivation takes its agent dir explicitly — so it needs no `mod common;`
+//! and no process-global env guard. The steady-state test reads the
+//! per-directory `session_list_file_reads` probe, so register it in a binary
+//! whose other suites do not call `SessionManager::list_sessions` against the
+//! SAME directory — `tests/g_tui.rs` today.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 
 use pir::session_manager::{
     reset_session_list_file_reads, session_list_file_reads, SessionManager,
@@ -33,40 +31,6 @@ use pir::tui::terminal::{default_session_dir_under, SessionDirSource};
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-
-/// `PIR_AGENT_DIR` is process-global; serialize the tests that move it (the
-/// same discipline as `tests/common::AgentDirEnvGuard`, kept local so this
-/// suite needs no `mod common;`).
-static AGENT_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-struct AgentDirGuard {
-    _lock: MutexGuard<'static, ()>,
-    saved: Option<OsString>,
-}
-
-impl AgentDirGuard {
-    fn pin(dir: &Path) -> Self {
-        let lock = AGENT_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let saved = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", dir);
-        Self { _lock: lock, saved }
-    }
-
-    fn switch_to(&mut self, dir: &Path) {
-        std::env::set_var("PIR_AGENT_DIR", dir);
-    }
-}
-
-impl Drop for AgentDirGuard {
-    fn drop(&mut self) {
-        match self.saved.take() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-    }
-}
 
 fn temp_dir(name: &str) -> PathBuf {
     let stamp = std::time::SystemTime::now()
@@ -173,18 +137,20 @@ fn a_new_session_after_the_switch_is_created_under_the_new_root() {
 }
 
 #[test]
-fn resolve_follows_the_live_agent_dir_environment() {
+fn resolve_follows_the_live_agent_dir() {
     let cwd = test_cwd();
     let agent_a = temp_dir("env-a");
     let agent_b = temp_dir("env-b");
-    let mut guard = AgentDirGuard::pin(&agent_a);
 
     let startup = startup_root(&agent_a);
     let source = SessionDirSource::from_startup(&startup, &cwd, None, None, &agent_a);
-    assert_eq!(source.resolve(&cwd), startup);
+    assert_eq!(source.resolve_with(&agent_a, &cwd), startup);
 
-    guard.switch_to(&agent_b);
-    let after = source.resolve(&cwd);
+    // A live agent-dir change: the re-resolvable default follows the NEW
+    // directory. `resolve_with` takes the directory explicitly, so this is the
+    // same decision a mid-process `PIR_AGENT_DIR` move produces without
+    // mutating the process environment.
+    let after = source.resolve_with(&agent_b, &cwd);
     assert_eq!(after, default_session_dir_under(&agent_b, &cwd));
     assert_ne!(after, startup);
 }
@@ -228,15 +194,13 @@ fn pinned_root_ignores_a_live_agent_dir_switch() {
     let cwd = test_cwd();
     let agent_a = temp_dir("pinned-env-a");
     let agent_b = temp_dir("pinned-env-b");
-    let mut guard = AgentDirGuard::pin(&agent_a);
 
     let cli_choice = temp_dir("pinned-env-cli").join("sessions");
     let cli_text = cli_choice.to_string_lossy().into_owned();
     let source = SessionDirSource::from_startup(&cli_text, &cwd, None, None, &agent_a);
 
-    guard.switch_to(&agent_b);
     assert_eq!(
-        source.resolve(&cwd),
+        source.resolve_with(&agent_b, &cwd),
         cli_text,
         "an explicit `--session-dir` must not follow the agent dir"
     );
@@ -245,16 +209,15 @@ fn pinned_root_ignores_a_live_agent_dir_switch() {
 #[test]
 fn default_layout_matches_the_session_manager_resolution() {
     // The TUI's explicit-agent-dir derivation must stay byte-identical to
-    // `session_manager::default_session_dir_path` under the same agent dir,
-    // so startup keeps today's path and the pickers list the same tree.
+    // `session_manager::default_session_dir_path_in` under the same agent dir,
+    // so startup keeps today's path and the pickers list the same tree. Both
+    // sides take the directory explicitly.
     let cwd = test_cwd();
     let agent_dir = temp_dir("layout");
-    let guard = AgentDirGuard::pin(&agent_dir);
-    let shared = pir::session_manager::default_session_dir_path(&cwd)
+    let shared = pir::session_manager::default_session_dir_path_in(&agent_dir, &cwd)
         .to_string_lossy()
         .into_owned();
     assert_eq!(default_session_dir_under(&agent_dir, &cwd), shared);
-    drop(guard);
 }
 
 // ---------------------------------------------------------------------------

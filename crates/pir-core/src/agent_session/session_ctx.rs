@@ -2697,7 +2697,11 @@ session does not have"
         ModelCatalogFingerprint {
             providers,
             virtual_models,
-            credentials: credential_environment_fingerprint(&self.cwd, trusted_project),
+            credentials: credential_environment_fingerprint(
+                &self.agent_dir,
+                &self.cwd,
+                trusted_project,
+            ),
         }
     }
 
@@ -2783,7 +2787,7 @@ session does not have"
             .credential_environment_loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let failures_before = crate::ai::providers::models_json_load_failures();
-        match crate::ai::providers::load_pi_environment(Some(&self.cwd)) {
+        match crate::ai::providers::load_pi_environment_in(&self.agent_dir, Some(&self.cwd)) {
             Ok(environment) => {
                 // Providers can come from THREE places: the session registry
                 // (plugin-registered), the models.json-composed environment
@@ -2802,7 +2806,11 @@ session does not have"
                 {
                     let id = provider.id();
                     if !authenticated.iter().any(|known| known == id)
-                        && crate::ai::providers::has_configured_auth(id, &environment.api_keys)
+                        && crate::ai::providers::has_configured_auth_in(
+                            &self.agent_dir,
+                            id,
+                            &environment.api_keys,
+                        )
                     {
                         authenticated.push(id.to_owned());
                     }
@@ -2995,16 +3003,17 @@ session does not have"
 }
 
 /// Identity of every file [`crate::ai::providers::load_pi_environment`] reads
-/// for the session's credential state. The loader resolves the GLOBAL agent
-/// dir through the process environment (same as `auth.json` reads in
-/// `has_configured_auth`), so the stamps use that same directory; the project
-/// settings scope is included because a malformed project settings file turns
-/// the whole load into an empty authenticated list.
+/// for the session's credential state. The stamps use the SESSION's agent dir
+/// (the same directory [`AgentSession::authenticated_providers`] loads from),
+/// so an embedder or test that owns its agent dir never fingerprints another
+/// agent's `settings.json` / `models.json` / `auth.json`; the project settings
+/// scope is included because a malformed project settings file turns the whole
+/// load into an empty authenticated list.
 fn credential_environment_fingerprint(
+    agent_dir: &Path,
     cwd: &Path,
     project_trusted: bool,
 ) -> CredentialEnvironmentFingerprint {
-    let agent_dir = crate::ai::providers::agent_dir();
     // Every env var `has_configured_auth` consults ...
     let mut env_names: BTreeSet<String> = crate::ai::auth::env_api_keys::all()
         .into_iter()
@@ -3038,7 +3047,7 @@ fn credential_environment_fingerprint(
         })
         .collect();
     CredentialEnvironmentFingerprint {
-        agent_dir,
+        agent_dir: agent_dir.to_path_buf(),
         cwd: cwd.to_path_buf(),
         project_trusted,
         files,

@@ -3,6 +3,9 @@
 /target-*/
 **/*.rs.bk
 Cargo.lock.bak
+# Zero-byte `<name>.rs\u200d.tmp` leftovers from an editor/tool save that
+# targets a file by a zero-width-joined name; they are never real sources.
+**/*.rs*.tmp
 
 # Local build/test artifacts (never stage; the eval harness owns target/)
 /target-alt/

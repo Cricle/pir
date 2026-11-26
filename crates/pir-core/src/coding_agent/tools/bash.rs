@@ -745,8 +745,35 @@ impl ShellConfig {
     /// async tree-kill path. A stdin-transport shell (legacy WSL bash) gets
     /// the command on stdin, so the caller must write it there and close it.
     pub fn spawn(&self, command: &str) -> std::io::Result<std::process::Child> {
+        self.spawn_inner(command, None)
+    }
+
+    /// [`Self::spawn`] with the child's `PIR_AGENT_DIR` pinned to `agent_dir`.
+    ///
+    /// A `!command` config value (`"!cat \"$PIR_AGENT_DIR/key.txt\""`, the
+    /// documented idiom) reads that variable, so a host resolving the value
+    /// against an EXPLICIT agent dir must hand it to the child too — otherwise
+    /// the command expands the process env's directory while its result is
+    /// cached under, and invalidated by, the caller's. `None` keeps the
+    /// inherited environment (the pre-existing behavior).
+    pub fn spawn_with_agent_dir(
+        &self,
+        command: &str,
+        agent_dir: Option<&std::path::Path>,
+    ) -> std::io::Result<std::process::Child> {
+        self.spawn_inner(command, agent_dir)
+    }
+
+    fn spawn_inner(
+        &self,
+        command: &str,
+        agent_dir: Option<&std::path::Path>,
+    ) -> std::io::Result<std::process::Child> {
         let mut spawn = std::process::Command::new(&self.program);
         spawn.args(&self.args);
+        if let Some(agent_dir) = agent_dir {
+            spawn.env("PIR_AGENT_DIR", agent_dir);
+        }
         if self.stdin_transport {
             spawn.stdin(std::process::Stdio::piped());
         } else {
@@ -2115,8 +2142,10 @@ impl AgentTool for BashTool {
         // are only ever cleared here.
         let session_env = ctx.session_env.clone();
         // Shell preferences (settings `shellCommandPrefix` / `shellPath` /
-        // `shellPool` / `tools.commandTimeoutMs`).
-        let prefs = crate::config::settings::current_shell_prefs();
+        // `shellPool` / `tools.commandTimeoutMs`), read from the directory this
+        // call's session was built with rather than re-resolving
+        // `PIR_AGENT_DIR` per command.
+        let prefs = crate::config::settings::shell_prefs_in(&ctx.resolve_agent_dir());
         // Effective timeout: the per-call argument wins; otherwise
         // `tools.commandTimeoutMs` applies (120 s unless configured or
         // disabled with 0 — a deliberate deviation from upstream). A detached

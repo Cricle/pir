@@ -493,12 +493,60 @@ pub fn load_codemode_config(cwd: &std::path::Path) -> CodemodeConfig {
 ///
 /// Both faces share this one implementation, so the env override, the
 /// diagnostic routing and the settings-scope shape can never diverge between
-/// the CLI and an embedded agent.
+/// the CLI and an embedded agent. The `PIR_TRUST_PROJECT` override is still read
+/// from the process environment here; the fully explicit form is
+/// [`load_codemode_config_in_with`].
 pub fn load_codemode_config_in(
     agent_dir: &std::path::Path,
     cwd: &std::path::Path,
 ) -> CodemodeConfig {
-    let trusted = std::env::var("PIR_TRUST_PROJECT").is_ok_and(|value| value == "1");
+    load_codemode_config_in_with(
+        agent_dir,
+        cwd,
+        crate::extensions::project_trust::env_override_decision(),
+    )
+}
+
+/// [`load_codemode_config_in`] with the `PIR_TRUST_PROJECT` operator override
+/// supplied by the caller. `None` means "no operator override", exactly the
+/// value [`crate::extensions::project_trust::env_override_decision`] returns
+/// when the variable is unset or spelled differently from the documented `1`.
+pub fn load_codemode_config_in_with(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    operator_override: Option<bool>,
+) -> CodemodeConfig {
+    load_codemode_config_scoped(
+        agent_dir,
+        cwd,
+        operator_override,
+        sandbox_memory_env_override(),
+    )
+}
+
+/// The FULLY explicit form: agent dir, project dir, the trust override and the
+/// sandbox-memory override are all arguments, so this load reads no
+/// process-level state at all. A host or test that owns its directories calls
+/// this instead of any ambient form.
+pub fn load_codemode_config_in_full(scope: &CodemodeScope) -> CodemodeConfig {
+    load_codemode_config_scoped(
+        &scope.agent_dir,
+        &scope.cwd,
+        scope.operator_override,
+        scope.sandbox_memory_override,
+    )
+}
+
+/// The one implementation every face funnels through: the settings scope, the
+/// trust flag and the heap cap can never diverge between the CLI, an SDK agent
+/// and an explicit test scope.
+fn load_codemode_config_scoped(
+    agent_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    operator_override: Option<bool>,
+    sandbox_memory_override: Option<Option<usize>>,
+) -> CodemodeConfig {
+    let trusted = operator_override == Some(true);
     let mut manager =
         crate::config::settings::SettingsManager::load(agent_dir, &cwd.join(".pi"), cwd, trusted);
     // Log-only: the host's startup printer already reported each distinct
@@ -512,7 +560,7 @@ pub fn load_codemode_config_in(
         );
     }
     let mut config = codemode_config_from(&manager);
-    if let Some(override_bytes) = sandbox_memory_env_override() {
+    if let Some(override_bytes) = sandbox_memory_override {
         config.sandbox_memory_bytes = override_bytes;
     }
     config
@@ -636,19 +684,44 @@ fn settings_load_watches_cell() -> &'static std::sync::OnceLock<
 /// caching path funnels through here so the count is exactly the number of
 /// disk reads product code performed.
 fn counted_load_codemode_config(cwd: &std::path::Path) -> CodemodeConfig {
+    counted_load_codemode_config_scope(&ambient_codemode_scope(cwd))
+}
+
+/// A scope whose agent dir is given but whose two overrides come from the
+/// process environment (the shape the ambient loaders always had, with the
+/// directory supplied instead of resolved).
+fn scope_at(agent_dir: &std::path::Path, cwd: &std::path::Path) -> CodemodeScope {
+    CodemodeScope {
+        agent_dir: agent_dir.to_path_buf(),
+        cwd: cwd.to_path_buf(),
+        operator_override: crate::extensions::project_trust::env_override_decision(),
+        sandbox_memory_override: sandbox_memory_env_override(),
+    }
+}
+
+/// The AMBIENT scope: the process environment's agent directory plus the two
+/// environment overrides, i.e. exactly what the pre-explicit loaders read.
+fn ambient_codemode_scope(cwd: &std::path::Path) -> CodemodeScope {
+    scope_at(&crate::coding_agent::context::agent_dir(), cwd)
+}
+
+/// [`counted_load_codemode_config`] against an EXPLICIT scope: the counter is
+/// bumped for THAT agent dir and the load reads only the scope's values, so a
+/// caller that owns its directories (an SDK agent, a test) neither reads nor
+/// moves any process-level state, and a sibling suite's watch stays untouched.
+fn counted_load_codemode_config_scope(scope: &CodemodeScope) -> CodemodeConfig {
     SETTINGS_LOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let agent_dir = crate::coding_agent::context::agent_dir();
     if let Some(watches) = try_settings_load_watches() {
         let watched = watches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&agent_dir)
+            .get(&scope.agent_dir)
             .cloned();
         if let Some(count) = watched {
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    load_codemode_config(cwd)
+    load_codemode_config_in_full(scope)
 }
 
 /// The process working directory the builtin factory resolves settings
@@ -658,45 +731,88 @@ fn process_cwd() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// Process-wide config cache for the extension sandbox route
-/// ([`start_extension_run`]): that route has no [`CodemodePlugin`] instance to
-/// carry a config, and it must not re-read settings once per run.
-fn extension_config_cache() -> &'static StdMutex<Option<CodemodeConfig>> {
-    static CONFIG: std::sync::OnceLock<StdMutex<Option<CodemodeConfig>>> =
-        std::sync::OnceLock::new();
-    CONFIG.get_or_init(|| StdMutex::new(None))
+/// Config cache for the extension sandbox route ([`start_extension_run`]):
+/// that route has no [`CodemodePlugin`] instance to carry a config, and it
+/// must not re-read settings once per run.
+///
+/// Keyed by AGENT DIR: the one thing the extension route and a plugin
+/// constructed around an explicit directory share is the settings scope, and a
+/// single global slot would make every agent publish its config into every
+/// other agent's route. An entry is inserted on first read for that directory
+/// and replaced by its own `/reload`.
+fn extension_config_cache(
+) -> &'static StdMutex<std::collections::HashMap<std::path::PathBuf, CodemodeConfig>> {
+    static CONFIG: std::sync::OnceLock<
+        StdMutex<std::collections::HashMap<std::path::PathBuf, CodemodeConfig>>,
+    > = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
 }
 
-/// The extension sandbox route's codemode config, resolved from the process
-/// working directory on first use and cached thereafter (env override
-/// included). [`reload_cached_codemode_config`] replaces it, which the
-/// codemode plugin's `/reload` hook does.
+/// The extension sandbox route's codemode config for the AMBIENT agent dir,
+/// resolved from the process environment on first use and cached thereafter
+/// (env override included). [`reload_cached_codemode_config`] replaces it,
+/// which the codemode plugin's `/reload` hook does.
 pub fn cached_codemode_config() -> CodemodeConfig {
+    cached_codemode_config_in(&crate::coding_agent::context::agent_dir())
+}
+
+/// [`cached_codemode_config`] for an EXPLICIT agent directory: the extension
+/// route of an embedder that owns its agent dir reads that directory's config,
+/// never the process environment's.
+///
+/// The two operator overrides are still read from the environment here; the
+/// fully explicit form is [`cached_codemode_config_for`].
+pub fn cached_codemode_config_in(agent_dir: &std::path::Path) -> CodemodeConfig {
+    cached_codemode_config_for(&scope_at(agent_dir, &process_cwd()))
+}
+
+/// [`cached_codemode_config_in`] with EVERY scope input supplied: the agent
+/// dir, the project cwd and both operator overrides. Nothing process-level is
+/// read, and the cache entry is this agent dir's own.
+pub fn cached_codemode_config_for(scope: &CodemodeScope) -> CodemodeConfig {
     let mut cached = extension_config_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(config) = *cached {
+    if let Some(config) = cached.get(&scope.agent_dir).copied() {
         return config;
     }
-    let config = counted_load_codemode_config(&process_cwd());
-    *cached = Some(config);
+    let config = counted_load_codemode_config_scope(scope);
+    cached.insert(scope.agent_dir.clone(), config);
     config
 }
 
-/// Replace the process-wide extension-route config with a fresh settings read
-/// (the `/reload` invalidation). Returns the new config.
+/// Replace the AMBIENT agent dir's extension-route config with a fresh settings
+/// read (the `/reload` invalidation). Returns the new config.
 pub fn reload_cached_codemode_config() -> CodemodeConfig {
-    let config = counted_load_codemode_config(&process_cwd());
-    store_cached_codemode_config(config);
+    reload_cached_codemode_config_in(&crate::coding_agent::context::agent_dir())
+}
+
+/// [`reload_cached_codemode_config`] for an EXPLICIT agent directory (the two
+/// operator overrides still come from the process environment).
+pub fn reload_cached_codemode_config_in(agent_dir: &std::path::Path) -> CodemodeConfig {
+    reload_cached_codemode_config_for(&scope_at(agent_dir, &process_cwd()))
+}
+
+/// [`reload_cached_codemode_config_in`] with every scope input supplied.
+pub fn reload_cached_codemode_config_for(scope: &CodemodeScope) -> CodemodeConfig {
+    let config = counted_load_codemode_config_scope(scope);
+    store_cached_codemode_config_in(&scope.agent_dir, config);
     config
 }
 
-/// Publish an already-resolved config into the process-wide cache (the
-/// plugin's reload reuses its single read instead of loading twice).
-fn store_cached_codemode_config(config: CodemodeConfig) {
-    *extension_config_cache()
+/// [`store_cached_codemode_config_in`]: publish an already-resolved config into
+/// an agent dir's extension-route cache (the plugin's reload reuses its single
+/// read instead of loading twice).
+fn store_cached_codemode_config_in(agent_dir: &std::path::Path, config: CodemodeConfig) {
+    extension_config_cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(agent_dir.to_path_buf(), config);
+}
+
+/// [`store_cached_codemode_config_in`] for the ambient agent directory.
+fn store_cached_codemode_config(config: CodemodeConfig) {
+    store_cached_codemode_config_in(&crate::coding_agent::context::agent_dir(), config);
 }
 
 // ---------------------------------------------------------------------------
@@ -4055,6 +4171,43 @@ async fn execute(
 // The plugin
 // ---------------------------------------------------------------------------
 
+/// The settings scope a [`CodemodePlugin`] was constructed with: the agent dir
+/// whose `settings.json` holds the `codemode` block, the project directory
+/// whose trust state gates the project scope, and the two process-environment
+/// overrides a caller may pin instead of reading them.
+///
+/// Everything the ambient loaders read from the environment is here as a
+/// value, so a plugin built from an explicit scope (and its `/reload`) touches
+/// no process-level state.
+#[derive(Debug, Clone)]
+pub struct CodemodeScope {
+    /// The agent dir (`<agent_dir>/settings.json`).
+    pub agent_dir: std::path::PathBuf,
+    /// The session's working directory.
+    pub cwd: std::path::PathBuf,
+    /// The `PIR_TRUST_PROJECT` operator override (`None` = not set to `1`).
+    pub operator_override: Option<bool>,
+    /// The `PIR_CODEMODE_MEMORY_MB` override, in its parsed form
+    /// ([`sandbox_memory_env_override`] shape: outer `None` = unset/invalid).
+    pub sandbox_memory_override: Option<Option<usize>>,
+}
+
+impl CodemodeScope {
+    /// A scope for a caller that owns both directories and has no environment
+    /// override to declare: no project-trust override, no heap-cap override.
+    pub fn new(
+        agent_dir: impl Into<std::path::PathBuf>,
+        cwd: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            agent_dir: agent_dir.into(),
+            cwd: cwd.into(),
+            operator_override: None,
+            sandbox_memory_override: None,
+        }
+    }
+}
+
 /// The `codemode` builtin plugin: registers the [`CodemodeTool`] on the
 /// unified plugin registry (upstream `createCodemodeExtension()`).
 pub struct CodemodePlugin {
@@ -4067,6 +4220,11 @@ pub struct CodemodePlugin {
     /// settings (the embedder owns the settings lifecycle). The extension
     /// route's process-wide cache is still refreshed.
     pinned: bool,
+    /// Explicit settings scope `(agent_dir, cwd)` for a host that owns its
+    /// directories. `None` = the ambient scope (the process environment's agent
+    /// dir and working directory), which is what the CLI factory uses.
+    /// `/reload` re-reads through whichever scope was chosen at construction.
+    scope: Option<CodemodeScope>,
     /// Activation signal shared with every [`CodemodeTool`] this plugin
     /// registers: set when a loadout declares the tool (see the tool's field
     /// docs), so an inactive codemode refuses a direct call.
@@ -4086,11 +4244,41 @@ impl CodemodePlugin {
     /// ONCE from the PROCESS working directory here; the CLI assembles
     /// sessions from that cwd. `/reload` re-reads them.
     fn new() -> Self {
+        Self::from_scope(None)
+    }
+
+    /// [`CodemodePlugin::new`] against an EXPLICIT settings scope: the plugin
+    /// reads `<agent_dir>/settings.json` and trusts `cwd` only as an argument,
+    /// so an embedder (or a test) that owns both directories shares no state
+    /// with any other agent. `/reload` re-reads the same scope.
+    pub fn new_in(
+        agent_dir: impl Into<std::path::PathBuf>,
+        cwd: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_scope(CodemodeScope::new(agent_dir, cwd))
+    }
+
+    /// [`CodemodePlugin::new_in`] with every scope input spelled out.
+    pub fn with_scope(scope: CodemodeScope) -> Self {
+        Self::from_scope(Some(scope))
+    }
+
+    fn from_scope(scope: Option<CodemodeScope>) -> Self {
         Self {
             info: Self::builtin_info(),
-            config: std::sync::RwLock::new(counted_load_codemode_config(&process_cwd())),
+            config: std::sync::RwLock::new(Self::load_scope(&scope)),
             pinned: false,
+            scope,
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Resolve the config for `scope` (ambient when `None`). The single read
+    /// point shared by construction and `/reload`, so both stay identical.
+    fn load_scope(scope: &Option<CodemodeScope>) -> CodemodeConfig {
+        match scope {
+            Some(scope) => counted_load_codemode_config_scope(scope),
+            None => counted_load_codemode_config(&process_cwd()),
         }
     }
 
@@ -4104,6 +4292,7 @@ impl CodemodePlugin {
             info: Self::builtin_info(),
             config: std::sync::RwLock::new(config),
             pinned: true,
+            scope: None,
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -4143,16 +4332,35 @@ impl AgentPlugin for CodemodePlugin {
     /// way.
     fn on_reload(&self) -> super::plugin::PluginFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
-            if self.pinned {
-                let _ = reload_cached_codemode_config();
-            } else {
-                let config = counted_load_codemode_config(&process_cwd());
-                *self
-                    .config
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
-                // One read serves both the plugin and the extension route.
-                store_cached_codemode_config(config);
+            // The extension route's cache is keyed by agent dir, so publishing
+            // here can only ever replace THIS agent's entry. An explicit scope
+            // publishes under its own dir and its own overrides; the ambient
+            // form under the process environment's.
+            match &self.scope {
+                Some(scope) => {
+                    if self.pinned {
+                        let _ = reload_cached_codemode_config_for(scope);
+                    } else {
+                        let config = Self::load_scope(&self.scope);
+                        *self
+                            .config
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+                        store_cached_codemode_config_in(&scope.agent_dir, config);
+                    }
+                }
+                None => {
+                    if self.pinned {
+                        let _ = reload_cached_codemode_config();
+                    } else {
+                        let config = Self::load_scope(&self.scope);
+                        *self
+                            .config
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+                        store_cached_codemode_config(config);
+                    }
+                }
             }
             Ok(())
         })
@@ -4162,4 +4370,23 @@ impl AgentPlugin for CodemodePlugin {
 /// Factory for [`super::builtin::BUILTIN_EXTENSION_FACTORIES`].
 pub fn new_codemode_plugin() -> Arc<dyn AgentPlugin> {
     Arc::new(CodemodePlugin::new())
+}
+
+/// [`new_codemode_plugin`] around an EXPLICIT settings scope (see
+/// [`CodemodePlugin::new_in`]): the builtin with all of its production
+/// registration behavior, but reading `<agent_dir>/settings.json` instead of
+/// the process environment's agent dir. Embedders and tests that own both
+/// directories construct the builtin through here.
+pub fn new_codemode_plugin_in(
+    agent_dir: impl Into<std::path::PathBuf>,
+    cwd: impl Into<std::path::PathBuf>,
+) -> Arc<dyn AgentPlugin> {
+    Arc::new(CodemodePlugin::new_in(agent_dir, cwd))
+}
+
+/// [`new_codemode_plugin`] around a fully explicit [`CodemodeScope`]: the
+/// builtin with all of its production registration behavior, reading only the
+/// directories and overrides the caller supplied.
+pub fn new_codemode_plugin_with_scope(scope: CodemodeScope) -> Arc<dyn AgentPlugin> {
+    Arc::new(CodemodePlugin::with_scope(scope))
 }

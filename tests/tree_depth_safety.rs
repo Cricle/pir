@@ -835,6 +835,7 @@ fn agent_config(cwd: &Path, session: SessionManager) -> AgentSessionConfig {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -858,6 +859,7 @@ fn extension_config(cwd: &Path) -> pir::extensions::ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

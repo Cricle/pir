@@ -176,6 +176,7 @@ fn worker_like_session(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     })
 }
 

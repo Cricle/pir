@@ -107,6 +107,7 @@ fn idle_factory() -> SessionFactory {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }

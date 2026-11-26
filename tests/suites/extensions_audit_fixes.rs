@@ -30,12 +30,12 @@ use std::time::Duration;
 
 use pir::agent::tool_execution::ToolRegistry;
 use pir::agent_session::{
-    dispatch_project_trust, dispatch_user_bash, take_session_command_actions, AgentSession,
+    dispatch_project_trust_in, dispatch_user_bash, take_session_command_actions, AgentSession,
     AgentSessionConfig, SessionCommandAction, UserBashOutcome,
 };
 use pir::ai::event_stream::AssistantMessageEventStream;
 use pir::ai::provider::{Provider, ProviderRegistry};
-use pir::ai::providers::load_pi_environment;
+use pir::ai::providers::load_pi_environment_in_with;
 use pir::ai::types::{
     AssistantMessage, ContentBlock, Context, Model, ModelCost, ModelCostRates, StopReason,
     StreamOptions, TerminalReason, ThinkingLevel,
@@ -43,8 +43,8 @@ use pir::ai::types::{
 use pir::config::settings::SettingsManager;
 use pir::config::trust::ProjectTrustStore;
 use pir::extensions::project_trust::{
-    clear_recorded_decisions, override_or_extension_decision, pin_decision, resolve_project_trust,
-    resolved_decision, ProjectTrustDecision,
+    clear_recorded_decision, override_or_extension_decision_with, pin_decision,
+    resolve_project_trust_with, resolved_decision_with, ProjectTrustDecision,
 };
 use pir::extensions::{ExtensionConfig, ExtensionHandle, Notification};
 use pir::skills::SkillInfo;
@@ -73,6 +73,7 @@ fn handle_config(cwd: &Path, has_ui: bool) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -1222,48 +1223,37 @@ async fn notification_queue_is_capped_and_coalesces_tool_updates() {
 // Audit §4 #2: the extension `project_trust` decision actually applies
 // ---------------------------------------------------------------------------
 
-/// Serializes tests that mutate `PIR_TRUST_PROJECT` / `PIR_AGENT_DIR`. These
-/// tests hold the guard across their async body on purpose (the environment
-/// must stay pinned for the whole scenario).
+/// Drops the in-process extension decision recorded for ONE project directory
+/// at the end of a test.
 ///
-/// The SHARED per-binary lock ([`crate::common::agent_dir_env_lock`]), not a
-/// `static` declared here: both variables are process-global, so a file-local
-/// mutex only serializes this suite and leaves it racing every other suite in
-/// `zz_merged_3` that pins `PIR_AGENT_DIR` — which surfaced as a trust-store
-/// lock collision on another suite's `trust.json.lock`.
-fn trust_env_lock() -> &'static tokio::sync::Mutex<()> {
-    crate::common::agent_dir_env_lock()
+/// Everything a trust test needs is an argument: the agent dir goes to the
+/// explicit-directory API ([`load_pi_environment_in`], `ProjectTrustStore::new`,
+/// `resolve_project_trust_with`) and the operator override goes in as
+/// `Some(true)`/`None`, so no test in this module writes the process
+/// environment. That is what makes the module safe to run in parallel inside a
+/// merged harness: `PIR_TRUST_PROJECT` is a PROCESS-level flag, and a test that
+/// set it would silently flip every sibling's trust resolution — directory
+/// isolation cannot cover it, because the flag has no directory.
+///
+/// The teardown is equally narrow: `clear_recorded_decision` drops the entry
+/// for THIS test's scratch cwd. The registry is keyed by cwd and lives for the
+/// whole process, so a process-wide `clear_recorded_decisions()` would erase a
+/// sibling test's in-flight pin mid-run.
+struct TrustDecisionGuard {
+    cwd: PathBuf,
 }
 
-/// Panic-safe pin of `PIR_AGENT_DIR` with `PIR_TRUST_PROJECT` unset.
-struct TrustEnvGuard {
-    trust: Option<std::ffi::OsString>,
-    agent: Option<std::ffi::OsString>,
-}
-
-impl TrustEnvGuard {
-    fn new(agent_dir: &Path) -> Self {
-        let guard = Self {
-            trust: std::env::var_os("PIR_TRUST_PROJECT"),
-            agent: std::env::var_os("PIR_AGENT_DIR"),
-        };
-        std::env::remove_var("PIR_TRUST_PROJECT");
-        std::env::set_var("PIR_AGENT_DIR", agent_dir);
-        guard
+impl TrustDecisionGuard {
+    fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+        }
     }
 }
 
-impl Drop for TrustEnvGuard {
+impl Drop for TrustDecisionGuard {
     fn drop(&mut self) {
-        match self.trust.take() {
-            Some(value) => std::env::set_var("PIR_TRUST_PROJECT", value),
-            None => std::env::remove_var("PIR_TRUST_PROJECT"),
-        }
-        match self.agent.take() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-        clear_recorded_decisions();
+        clear_recorded_decision(&self.cwd);
     }
 }
 
@@ -1281,8 +1271,7 @@ async fn project_trust_extension_decision_changes_the_trust_result() {
     )
     .expect("project settings");
 
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
     seed_and_load(
@@ -1298,10 +1287,10 @@ async fn project_trust_extension_decision_changes_the_trust_result() {
     .await;
 
     let cwd_text = dir.display().to_string();
-    let decision = dispatch_project_trust(Some(&handle), None, &cwd_text).await;
+    let decision = dispatch_project_trust_in(Some(&handle), None, &cwd_text, &agent_dir).await;
     assert_eq!(decision, ProjectTrustDecision::Yes);
     assert!(
-        resolve_project_trust(&dir, &agent_dir),
+        resolve_project_trust_with(&dir, &agent_dir, None),
         "the recorded decision must be the trust result"
     );
     // `remember: true` persists to <agent_dir>/trust.json.
@@ -1316,7 +1305,7 @@ async fn project_trust_extension_decision_changes_the_trust_result() {
         &agent_dir,
         &dir.join(".pi"),
         &dir,
-        resolve_project_trust(&dir, &agent_dir),
+        resolve_project_trust_with(&dir, &agent_dir, None),
     );
     assert_eq!(
         settings.settings.theme.as_deref(),
@@ -1338,13 +1327,15 @@ async fn project_trust_extension_decision_changes_the_trust_result() {
         "#,
     )
     .await;
-    let denied = dispatch_project_trust(Some(&handle_no), None, &cwd_text).await;
+    let denied = dispatch_project_trust_in(Some(&handle_no), None, &cwd_text, &agent_dir).await;
     assert_eq!(denied, ProjectTrustDecision::No);
-    assert!(!resolve_project_trust(&dir, &agent_dir));
-    std::env::set_var("PIR_TRUST_PROJECT", "1");
+    assert!(!resolve_project_trust_with(&dir, &agent_dir, None));
+    // The operator override is an argument, not a process-level variable: a
+    // test that set `PIR_TRUST_PROJECT` would flip every sibling in this
+    // harness.
     assert!(
-        resolve_project_trust(&dir, &agent_dir),
-        "PIR_TRUST_PROJECT=1 overrides an extension denial"
+        resolve_project_trust_with(&dir, &agent_dir, Some(true)),
+        "the PIR_TRUST_PROJECT=1 operator override beats an extension denial"
     );
 }
 
@@ -1362,11 +1353,10 @@ async fn project_trust_extension_grant_without_remember_is_session_only() {
     )
     .expect("project settings");
 
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     assert_eq!(
-        override_or_extension_decision(&dir),
+        override_or_extension_decision_with(&dir, None),
         None,
         "no extension has decided yet"
     );
@@ -1383,14 +1373,16 @@ async fn project_trust_extension_grant_without_remember_is_session_only() {
     )
     .await;
 
-    let decision = dispatch_project_trust(Some(&handle), None, &dir.display().to_string()).await;
+    let decision =
+        dispatch_project_trust_in(Some(&handle), None, &dir.display().to_string(), &agent_dir)
+            .await;
     assert_eq!(decision, ProjectTrustDecision::Yes);
     assert_eq!(
-        override_or_extension_decision(&dir),
+        override_or_extension_decision_with(&dir, None),
         Some(true),
         "the extension decision is the run gate's input"
     );
-    assert!(resolve_project_trust(&dir, &agent_dir));
+    assert!(resolve_project_trust_with(&dir, &agent_dir, None));
     // `remember` omitted => nothing persisted.
     let store = ProjectTrustStore::new(&agent_dir);
     assert_eq!(
@@ -1415,12 +1407,11 @@ async fn project_trust_extension_denial_overrides_a_stored_grant() {
     std::fs::create_dir_all(dir.join(".pi")).expect("project dir");
     std::fs::write(dir.join(".pi/settings.json"), "{}").expect("project settings");
 
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     let store = ProjectTrustStore::new(&agent_dir);
     store.set(&dir, Some(true)).expect("seed the store");
-    assert!(resolve_project_trust(&dir, &agent_dir));
+    assert!(resolve_project_trust_with(&dir, &agent_dir, None));
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
     seed_and_load(
@@ -1434,15 +1425,17 @@ async fn project_trust_extension_denial_overrides_a_stored_grant() {
         "#,
     )
     .await;
-    let decision = dispatch_project_trust(Some(&handle), None, &dir.display().to_string()).await;
+    let decision =
+        dispatch_project_trust_in(Some(&handle), None, &dir.display().to_string(), &agent_dir)
+            .await;
     assert_eq!(decision, ProjectTrustDecision::No);
     assert_eq!(
-        override_or_extension_decision(&dir),
+        override_or_extension_decision_with(&dir, None),
         Some(false),
         "the extension decision precedes the trust store"
     );
     assert!(
-        !resolve_project_trust(&dir, &agent_dir),
+        !resolve_project_trust_with(&dir, &agent_dir, None),
         "an extension denial must override a stored yes"
     );
     // A denial without `remember` leaves the stored decision untouched.
@@ -1465,24 +1458,23 @@ async fn project_trust_without_an_extension_falls_back_to_store_and_policy() {
     // trusted and the store is never consulted.
     std::fs::write(dir.join(".pi/settings.json"), "{}").expect("project settings");
 
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
-    assert_eq!(override_or_extension_decision(&dir), None);
+    assert_eq!(override_or_extension_decision_with(&dir, None), None);
     let store = ProjectTrustStore::new(&agent_dir);
     store.set(&dir, Some(true)).expect("store yes");
     assert!(
-        resolve_project_trust(&dir, &agent_dir),
+        resolve_project_trust_with(&dir, &agent_dir, None),
         "no extension decision => stored yes"
     );
     store.set(&dir, Some(false)).expect("store no");
     assert!(
-        !resolve_project_trust(&dir, &agent_dir),
+        !resolve_project_trust_with(&dir, &agent_dir, None),
         "no extension decision => stored no"
     );
     store.set(&dir, None).expect("clear store");
     assert!(
-        !resolve_project_trust(&dir, &agent_dir),
+        !resolve_project_trust_with(&dir, &agent_dir, None),
         "no decision at all => headless ask resolves to untrusted"
     );
 }
@@ -1496,8 +1488,7 @@ async fn project_trust_pinned_run_decision_survives_a_later_dispatch() {
     let agent_dir = dir.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     pin_decision(&dir, false);
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
@@ -1512,13 +1503,15 @@ async fn project_trust_pinned_run_decision_survives_a_later_dispatch() {
         "#,
     )
     .await;
-    let decision = dispatch_project_trust(Some(&handle), None, &dir.display().to_string()).await;
+    let decision =
+        dispatch_project_trust_in(Some(&handle), None, &dir.display().to_string(), &agent_dir)
+            .await;
     assert_eq!(decision, ProjectTrustDecision::Yes);
     assert!(
-        !resolve_project_trust(&dir, &agent_dir),
+        !resolve_project_trust_with(&dir, &agent_dir, None),
         "the pinned run decision must not be overwritten by the final load"
     );
-    assert_eq!(override_or_extension_decision(&dir), Some(false));
+    assert_eq!(override_or_extension_decision_with(&dir, None), Some(false));
     // A pinned run also refuses the later load's `remember: true`: the
     // startup override (`--no-approve`, a session-only "do not trust") must
     // not leak into the persistent store.
@@ -1560,8 +1553,7 @@ fn print_environment_project(test_name: &str) -> (PathBuf, PathBuf) {
 #[tokio::test(flavor = "current_thread")]
 async fn print_model_environment_reads_project_settings_after_an_extension_grant() {
     let (dir, agent_dir) = print_environment_project("print-env-grant");
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
     seed_and_load(
@@ -1575,10 +1567,13 @@ async fn print_model_environment_reads_project_settings_after_an_extension_grant
         "#,
     )
     .await;
-    let decision = dispatch_project_trust(Some(&handle), None, &dir.display().to_string()).await;
+    let decision =
+        dispatch_project_trust_in(Some(&handle), None, &dir.display().to_string(), &agent_dir)
+            .await;
     assert_eq!(decision, ProjectTrustDecision::Yes);
 
-    let environment = load_pi_environment(Some(&dir)).expect("print model environment");
+    let environment =
+        load_pi_environment_in_with(&agent_dir, Some(&dir), None).expect("print model environment");
     assert_eq!(
         environment.settings.theme.as_deref(),
         Some("project-theme"),
@@ -1591,12 +1586,12 @@ async fn print_model_environment_reads_project_settings_after_an_extension_grant
 #[tokio::test(flavor = "current_thread")]
 async fn print_model_environment_skips_project_settings_after_an_extension_denial() {
     let (dir, agent_dir) = print_environment_project("print-env-deny");
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     let store = ProjectTrustStore::new(&agent_dir);
     store.set(&dir, Some(true)).expect("seed stored grant");
-    let stored = load_pi_environment(Some(&dir)).expect("stored-grant environment");
+    let stored = load_pi_environment_in_with(&agent_dir, Some(&dir), None)
+        .expect("stored-grant environment");
     assert_eq!(
         stored.settings.theme.as_deref(),
         Some("project-theme"),
@@ -1615,10 +1610,13 @@ async fn print_model_environment_skips_project_settings_after_an_extension_denia
         "#,
     )
     .await;
-    let decision = dispatch_project_trust(Some(&handle), None, &dir.display().to_string()).await;
+    let decision =
+        dispatch_project_trust_in(Some(&handle), None, &dir.display().to_string(), &agent_dir)
+            .await;
     assert_eq!(decision, ProjectTrustDecision::No);
 
-    let environment = load_pi_environment(Some(&dir)).expect("denied environment");
+    let environment =
+        load_pi_environment_in_with(&agent_dir, Some(&dir), None).expect("denied environment");
     assert_eq!(
         environment.settings.theme, None,
         "an extension denial must keep the print model environment off the project settings"
@@ -1631,8 +1629,7 @@ async fn print_model_environment_skips_project_settings_after_an_extension_denia
 #[tokio::test(flavor = "current_thread")]
 async fn print_model_environment_honors_a_pinned_no_approve_over_an_extension_grant() {
     let (dir, agent_dir) = print_environment_project("print-env-no-approve");
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     let handle = ExtensionHandle::start(handle_config(&dir, false)).expect("runtime");
     seed_and_load(
@@ -1646,18 +1643,21 @@ async fn print_model_environment_honors_a_pinned_no_approve_over_an_extension_gr
         "#,
     )
     .await;
-    let decision = dispatch_project_trust(Some(&handle), None, &dir.display().to_string()).await;
+    let decision =
+        dispatch_project_trust_in(Some(&handle), None, &dir.display().to_string(), &agent_dir)
+            .await;
     assert_eq!(decision, ProjectTrustDecision::Yes);
-    assert_eq!(override_or_extension_decision(&dir), Some(true));
+    assert_eq!(override_or_extension_decision_with(&dir, None), Some(true));
 
     // What the startup host does after resolving an explicit `--no-approve`.
     pin_decision(&dir, false);
-    // The pinned explicit decision outranks the environment override.
-    std::env::set_var("PIR_TRUST_PROJECT", "1");
-    assert_eq!(resolved_decision(&dir), Some(false));
-    assert!(!resolve_project_trust(&dir, &agent_dir));
+    // The pinned explicit decision outranks the operator override — supplied
+    // as an argument, never as a process-level `PIR_TRUST_PROJECT`.
+    assert_eq!(resolved_decision_with(&dir, Some(true)), Some(false));
+    assert!(!resolve_project_trust_with(&dir, &agent_dir, Some(true)));
 
-    let environment = load_pi_environment(Some(&dir)).expect("pinned environment");
+    let environment = load_pi_environment_in_with(&agent_dir, Some(&dir), Some(true))
+        .expect("pinned environment");
     assert_eq!(
         environment.settings.theme, None,
         "--no-approve must keep the print model environment off the project settings"
@@ -1669,22 +1669,24 @@ async fn print_model_environment_honors_a_pinned_no_approve_over_an_extension_gr
 #[tokio::test(flavor = "current_thread")]
 async fn print_model_environment_without_an_extension_decision_keeps_store_and_policy_fallback() {
     let (dir, agent_dir) = print_environment_project("print-env-fallback");
-    let _lock = trust_env_lock().lock().await;
-    let _guard = TrustEnvGuard::new(&agent_dir);
+    let _guard = TrustDecisionGuard::new(&dir);
 
     // No decision + the headless `ask` default => untrusted.
-    let untrusted = load_pi_environment(Some(&dir)).expect("default environment");
+    let untrusted =
+        load_pi_environment_in_with(&agent_dir, Some(&dir), None).expect("default environment");
     assert_eq!(untrusted.settings.theme, None);
 
     // No extension decision => the stored yes decides.
     let store = ProjectTrustStore::new(&agent_dir);
     store.set(&dir, Some(true)).expect("store yes");
-    let stored_yes = load_pi_environment(Some(&dir)).expect("stored-yes environment");
+    let stored_yes =
+        load_pi_environment_in_with(&agent_dir, Some(&dir), None).expect("stored-yes environment");
     assert_eq!(stored_yes.settings.theme.as_deref(), Some("project-theme"));
 
     // ... and the stored no still denies.
     store.set(&dir, Some(false)).expect("store no");
-    let stored_no = load_pi_environment(Some(&dir)).expect("stored-no environment");
+    let stored_no =
+        load_pi_environment_in_with(&agent_dir, Some(&dir), None).expect("stored-no environment");
     assert_eq!(stored_no.settings.theme, None);
 
     // No store entry => the `defaultProjectTrust` policy decides.
@@ -1694,7 +1696,8 @@ async fn print_model_environment_without_an_extension_decision_keeps_store_and_p
         r#"{"defaultProjectTrust":"always"}"#,
     )
     .expect("agent settings");
-    let policy = load_pi_environment(Some(&dir)).expect("policy environment");
+    let policy =
+        load_pi_environment_in_with(&agent_dir, Some(&dir), None).expect("policy environment");
     assert_eq!(
         policy.settings.theme.as_deref(),
         Some("project-theme"),
@@ -1833,6 +1836,7 @@ async fn send_user_message_preserves_images_and_expands_prompt_templates() {
         event_stream: None,
         extensions: Some(handle),
         tool_selection: None,
+        phone_child: None,
     });
     session.set_prompt_resources(
         vec![SkillInfo {

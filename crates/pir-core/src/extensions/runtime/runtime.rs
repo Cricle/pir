@@ -578,9 +578,11 @@ impl ExtensionRuntime {
             //    session; a host that knows its own executable publishes it
             //    rather than relying on `pir` being on PATH.
             // Both are additive: an operator-set value always wins.
-            match crate::extensions::loader::ensure_host_pi_package_root(
-                &crate::coding_agent::context::agent_dir(),
-            ) {
+            let agent_dir = config
+                .agent_dir
+                .clone()
+                .unwrap_or_else(crate::coding_agent::context::agent_dir);
+            match crate::extensions::loader::ensure_host_pi_package_root(&agent_dir) {
                 Ok(root) => {
                     super::loader::register_allowed_root(&allowed_roots, &root);
                     let root_text = root.display().to_string();

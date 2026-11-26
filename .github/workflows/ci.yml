@@ -159,15 +159,37 @@ jobs:
       # gate invokes. `pir-native-shell` stays excluded with the rest of this
       # workflow (it needs the opt-in `desktop`/GPUI backend).
       #
-      # nextest is also what makes two process-global test fixtures reliable,
-      # because it gives every test its own process:
-      #   * `bash_eviction_utf8::eviction_cut_lands_on_a_utf8_boundary`
-      #     re-points TMP/TEMP/TMPDIR at a regular file to force spill creation
-      #     to fail, which would break any concurrently running suite; it gates
-      #     itself on NEXTEST_RUN_ID and SKIPs under plain `cargo test --test`.
-      #   * `plugin_services_hardening::has_auth_serves_warm_cache...` and
-      #     `mcp_integration::reload_leaves_connections_lazy...` need the
-      #     process-global PIR_AGENT_DIR to stay put for their whole run.
+      # nextest is also what makes the process-global test fixtures reliable,
+      # because it gives every test its own process. Almost every suite passes
+      # its agent dir / package dir explicitly (`*_in`, `.agent_dir(..)`,
+      # `ToolContext::with_agent_dir`), so it needs no environment pin at all.
+      # The exceptions are the tests whose property IS the process environment
+      # (variable precedence, a default-built session following the env, a
+      # child process inheriting it, a HOME-anchored skill scan, the crash
+      # hook's live-dir read). Those call
+      # `tests/common/mod.rs::skip_without_nextest` and print a SKIP line
+      # instead of running when the process is shared — which is why plain
+      # `cargo test` would silently drop that coverage rather than just racing:
+      #   * `bash_eviction_utf8` re-points TMP/TEMP/TMPDIR at a regular file to
+      #     force spill creation to fail;
+      #   * `agent_dir_identity_w16`, `env_identity_w18`,
+      #     `sdk_agent_isolation_w16`, `provider_config_fixes`,
+      #     `agent_bootstrap`, `session_manager_ext`, `system_prompt`,
+      #     `prompt_loadout_w22`, `extensions_runtime` and
+      #     `context_mode_exposure_w13` move `PIR_AGENT_DIR` /
+      #     `PI_PACKAGE_DIR` / `HOME` mid-test or hand the inherited
+      #     environment to a child process.
+      #
+      # The same gate covers assertions that read a PROCESS-GLOBAL seam or are
+      # timing-bound (the gate is not environment-only):
+      #   * `session_context_snapshot_cache::model_catalog_push_*` — the catalog
+      #     fingerprint hashes every provider API-key variable;
+      #   * `rss_a_entry_append_materialization` — reads/resets the global
+      #     `entry_appended_wire_builds` counter;
+      #   * `sdk_extended::low_level_create_agent_session_…` — full SDK build
+      #     whose discovery walk cannot survive a sibling's fixture churn;
+      #   * `mcp_integration::readiness_cache_backs_off_…` — asserts a second
+      #     call returns immediately after a 1 s connect timeout.
       # Keep the `--test zz_merged_*` groups on nextest for that reason; running
       # them with plain `cargo test` reintroduces the shared-process races
       # documented in TEST-2 (`.audit/review-2026-11-23/findings.jsonl`).

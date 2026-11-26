@@ -155,7 +155,9 @@ fn image_command_transcodes_non_png_files_for_kitty() {
         render_image_with_terminal, ImageSettings, DEFAULT_IMAGE_WIDTH_CELLS,
     };
 
-    let dir = std::env::temp_dir().join("pir-image-transcode-test");
+    // Private per run: the JPEG fixture must not collide with, or inherit from,
+    // another run.
+    let dir = crate::common::unique_temp_path("image-transcode-test");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let path = dir.join("photo.jpg");
     std::fs::write(&path, encode_image(::image::ImageFormat::Jpeg)).expect("write");

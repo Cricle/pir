@@ -21,7 +21,31 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 fn client() -> AiResult<reqwest::Client> {
-    crate::ai::transport::pi_reqwest_client_builder()?
+    client_in(&crate::coding_agent::context::agent_dir())
+}
+
+/// [`client`] against an EXPLICIT global agent dir: the `httpProxy` setting is
+/// read from that directory instead of the process environment. The
+/// `PI_HTTP_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` environment layer still
+/// applies (that is how a deployment behind a proxy configures egress without
+/// a settings file), and the rest of the policy is unchanged (no cross-host
+/// redirect, so an OAuth credential in a header is never replayed to another
+/// host).
+pub fn client_in(agent_dir: &std::path::Path) -> AiResult<reqwest::Client> {
+    crate::ai::transport::pi_reqwest_client_builder_in(agent_dir)?
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| AiError::Http(error.to_string()))
+}
+
+/// [`client`] with the proxy already resolved by the caller: `None` means the
+/// caller established there is no proxy, so this build consults neither the
+/// settings nor the environment. A test that wants a proxy-free client for a
+/// loopback endpoint states that as an argument instead of clearing
+/// process-wide `HTTP_PROXY` variables out from under its siblings.
+pub fn client_with(proxy: Option<String>) -> AiResult<reqwest::Client> {
+    crate::ai::transport::pi_reqwest_client_builder_with(proxy, None)?
         .timeout(REQUEST_TIMEOUT)
         // OAuth endpoints carry credentials in headers; never follow a
         // cross-host redirect that would replay them.
@@ -158,7 +182,49 @@ pub async fn post_json_with_headers(
     body: &Value,
     extra_headers: &[(&str, &str)],
 ) -> AiResult<HttpResponseWithHeaders> {
-    let client = client()?;
+    post_json_with_headers_in(
+        &crate::coding_agent::context::agent_dir(),
+        url,
+        body,
+        extra_headers,
+    )
+    .await
+}
+
+/// [`post_json_with_headers`] against an EXPLICIT global agent dir: the
+/// `httpProxy` setting (and so the client's egress) follows `agent_dir`
+/// instead of the process environment. The environment proxy layer still
+/// applies — see [`client_in`].
+pub async fn post_json_with_headers_in(
+    agent_dir: &std::path::Path,
+    url: &str,
+    body: &Value,
+    extra_headers: &[(&str, &str)],
+) -> AiResult<HttpResponseWithHeaders> {
+    let client = client_in(agent_dir)?;
+    send_json_with_headers(client, url, body, extra_headers).await
+}
+
+/// [`post_json_with_headers`] with the proxy already resolved by the caller
+/// (see [`client_with`]): `None` means "no proxy", and no settings or
+/// environment read happens at all.
+pub async fn post_json_with_headers_and_proxy(
+    proxy: Option<String>,
+    url: &str,
+    body: &Value,
+    extra_headers: &[(&str, &str)],
+) -> AiResult<HttpResponseWithHeaders> {
+    let client = client_with(proxy)?;
+    send_json_with_headers(client, url, body, extra_headers).await
+}
+
+/// The request/response half shared by every `post_json*` face.
+async fn send_json_with_headers(
+    client: reqwest::Client,
+    url: &str,
+    body: &Value,
+    extra_headers: &[(&str, &str)],
+) -> AiResult<HttpResponseWithHeaders> {
     let mut request = client
         .post(url)
         .header("content-type", "application/json")

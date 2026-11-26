@@ -152,6 +152,11 @@ pub fn is_decision_pinned(cwd: &Path) -> bool {
 
 /// Drop every recorded decision and pin (test/embedding reset seam; not part
 /// of the extension API).
+///
+/// This is a PROCESS-wide wipe: in a binary running several independent
+/// scenarios at once, one caller's teardown erases another's in-flight pin.
+/// A caller that owns exactly one directory (one scratch project per
+/// scenario) uses [`clear_recorded_decision`] instead.
 #[doc(hidden)]
 pub fn clear_recorded_decisions() {
     DECISIONS
@@ -164,15 +169,41 @@ pub fn clear_recorded_decisions() {
         .clear();
 }
 
+/// Drop the recorded decision and pin for ONE `cwd`, leaving every other
+/// directory's state untouched (the per-scenario teardown).
+#[doc(hidden)]
+pub fn clear_recorded_decision(cwd: &Path) {
+    let key = crate::config::trust::normalize_cwd(cwd);
+    DECISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+    PINNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key);
+}
+
+/// [`env_override_decision`] against an EXPLICIT raw environment value: only
+/// the documented `1` spelling forces trust; every other value (and an absent
+/// variable) leaves the decision to the extension / store, because upstream
+/// has no "force untrusted" environment override.
+///
+/// Pure, so a caller that owns its resolution inputs — an embedder, or a test
+/// that must not write the process environment — states the operator override
+/// as an argument instead of racing every other consumer in the process.
+pub fn env_override_decision_value(value: Option<&str>) -> Option<bool> {
+    value.is_some_and(|text| text == "1").then_some(true)
+}
+
 /// The explicit operator override (`PIR_TRUST_PROJECT=1`) as a decision.
 ///
-/// Only the documented `1` spelling forces trust; every other value leaves
-/// the decision to the extension / store (upstream has no "force untrusted"
-/// environment override).
+/// The only ambient read in the trust chain: it is the process-level operator
+/// flag. Everything downstream takes the resolved override as an argument
+/// (the `_with` forms), so adding another environment layer here is the whole
+/// exposure.
 pub fn env_override_decision() -> Option<bool> {
-    std::env::var("PIR_TRUST_PROJECT")
-        .is_ok_and(|value| value == "1")
-        .then_some(true)
+    env_override_decision_value(std::env::var("PIR_TRUST_PROJECT").ok().as_deref())
 }
 
 /// The first two layers of the upstream trust order: the operator override,
@@ -189,7 +220,16 @@ pub fn env_override_decision() -> Option<bool> {
 /// pinned explicit `--approve`/`--no-approve` is not undone by the environment
 /// layer.
 pub fn override_or_extension_decision(cwd: &Path) -> Option<bool> {
-    env_override_decision().or_else(|| recorded_decision(cwd))
+    override_or_extension_decision_with(cwd, env_override_decision())
+}
+
+/// [`override_or_extension_decision`] with the operator override supplied by
+/// the caller instead of read from `PIR_TRUST_PROJECT`.
+pub fn override_or_extension_decision_with(
+    cwd: &Path,
+    operator_override: Option<bool>,
+) -> Option<bool> {
+    operator_override.or_else(|| recorded_decision(cwd))
 }
 
 /// The trust decision consumers that load project-scoped state AFTER the
@@ -203,18 +243,34 @@ pub fn override_or_extension_decision(cwd: &Path) -> Option<bool> {
 /// outranks `PIR_TRUST_PROJECT=1`. Re-applying the environment layer here (as
 /// [`override_or_extension_decision`] does) would undo a `--no-approve`.
 pub fn resolved_decision(cwd: &Path) -> Option<bool> {
+    resolved_decision_with(cwd, env_override_decision())
+}
+
+/// [`resolved_decision`] with the operator override supplied by the caller
+/// instead of read from `PIR_TRUST_PROJECT`.
+pub fn resolved_decision_with(cwd: &Path, operator_override: Option<bool>) -> Option<bool> {
     if is_decision_pinned(cwd) {
         return recorded_decision(cwd);
     }
-    override_or_extension_decision(cwd)
+    override_or_extension_decision_with(cwd, operator_override)
 }
 
 /// Resolve whether `cwd` is a trusted project using the full upstream order
 /// (the pinned run decision, else env override, extension decision, trust
 /// store / policy).
 pub fn resolve_project_trust(cwd: &Path, agent_dir: &Path) -> bool {
-    if let Some(trusted) = resolved_decision(cwd) {
+    resolve_project_trust_with(cwd, agent_dir, env_override_decision())
+}
+
+/// [`resolve_project_trust`] with the operator override supplied by the
+/// caller instead of read from `PIR_TRUST_PROJECT`.
+pub fn resolve_project_trust_with(
+    cwd: &Path,
+    agent_dir: &Path,
+    operator_override: Option<bool>,
+) -> bool {
+    if let Some(trusted) = resolved_decision_with(cwd, operator_override) {
         return trusted;
     }
-    crate::config::trust::resolve_cwd_trust(cwd, agent_dir)
+    crate::config::trust::resolve_cwd_trust_with(cwd, agent_dir, operator_override)
 }

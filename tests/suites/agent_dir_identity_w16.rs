@@ -15,8 +15,12 @@
 //! 3. with no explicit override the directory still follows the environment,
 //!    resolved ONCE at build time, so a later change cannot re-point it.
 //!
-//! Every test holds `crate::common::AgentDirEnvGuard`, the process-wide lock
-//! for `PIR_AGENT_DIR` mutations in the merged test binary.
+//! Every test here pins `PIR_AGENT_DIR` on purpose — the MOVING VARIABLE is
+//! what D1 is about, and no argument can carry "the environment changed
+//! mid-process" — so each one first asks
+//! [`crate::common::skip_without_nextest`] for a private process and then pins
+//! with [`crate::common::ProcessEnvPin`], which restores on drop and takes no
+//! lock.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,6 +115,7 @@ fn config(cwd: &Path) -> AgentSessionConfig {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -146,10 +151,17 @@ fn stored_key(storage: &FileAuthStorage, provider: &str) -> Option<String> {
 
 #[tokio::test]
 async fn explicit_agent_dir_keeps_reading_a_after_env_moves_to_b() {
-    let guard = crate::common::AgentDirEnvGuard::scratch("w16a-explicit-a", None).await;
-    let dir_a = guard.dir().expect("scratch agent dir").to_path_buf();
-    write_settings(&dir_a, "all");
-    write_auth(&dir_a, "w16a-provider", "key-a");
+    if crate::common::skip_without_nextest(
+        "agent_dir_identity_w16::explicit_agent_dir_keeps_reading_a_after_env_moves_to_b",
+    ) {
+        return;
+    }
+    let dir_a = ScratchDir::new("w16a-explicit-a");
+    // The build-time environment names A; the two lower-precedence aliases are
+    // cleared so nothing can outrank it.
+    let _pin = crate::common::ProcessEnvPin::agent_dir(dir_a.path());
+    write_settings(dir_a.path(), "all");
+    write_auth(dir_a.path(), "w16a-provider", "key-a");
 
     let dir_b = ScratchDir::new("w16a-explicit-b");
     write_settings(dir_b.path(), "one-at-a-time");
@@ -157,11 +169,11 @@ async fn explicit_agent_dir_keeps_reading_a_after_env_moves_to_b() {
 
     // An explicit identity: the session is pinned to A, not to whatever the
     // environment says later.
-    let session = AgentSession::new_with_agent_dir(config(&dir_a), dir_a.as_path());
-    assert_eq!(session.agent_dir(), dir_a.as_path());
+    let session = AgentSession::new_with_agent_dir(config(dir_a.path()), dir_a.path());
+    assert_eq!(session.agent_dir(), dir_a.path());
 
     // The D1 trigger: the process environment moves to B while the session is
-    // live (the guard still restores the original value on drop).
+    // live (the pin still restores the original value on drop).
     std::env::set_var("PIR_AGENT_DIR", dir_b.path());
     assert_eq!(
         pir::ai::providers::agent_dir(),
@@ -170,7 +182,7 @@ async fn explicit_agent_dir_keeps_reading_a_after_env_moves_to_b() {
     );
 
     // Every session-scoped read still resolves A.
-    assert_eq!(session.agent_dir(), dir_a.as_path());
+    assert_eq!(session.agent_dir(), dir_a.path());
     assert_eq!(
         session.session_settings().steering_mode(),
         SteeringMode::All,
@@ -181,13 +193,13 @@ async fn explicit_agent_dir_keeps_reading_a_after_env_moves_to_b() {
         Some("key-a"),
         "session credentials must come from A/auth.json, not B/auth.json"
     );
-    assert_eq!(session.sessions_dir(), dir_a.join("sessions"));
+    assert_eq!(session.sessions_dir(), dir_a.path().join("sessions"));
 
     // The override also wins over an environment that ALREADY points
     // elsewhere: building explicitly at A while the process says B yields an
     // A session (an override, not a deferral of env resolution).
-    let explicit_a = AgentSession::new_with_agent_dir(config(&dir_a), dir_a.as_path());
-    assert_eq!(explicit_a.agent_dir(), dir_a.as_path());
+    let explicit_a = AgentSession::new_with_agent_dir(config(dir_a.path()), dir_a.path());
+    assert_eq!(explicit_a.agent_dir(), dir_a.path());
     assert_eq!(
         stored_key(&explicit_a.auth_storage(), "w16a-provider").as_deref(),
         Some("key-a")
@@ -200,15 +212,18 @@ async fn explicit_agent_dir_keeps_reading_a_after_env_moves_to_b() {
 
 #[tokio::test]
 async fn fresh_session_picks_up_the_new_agent_dir() {
-    let guard = crate::common::AgentDirEnvGuard::scratch("w16a-fresh-a", None).await;
-    let dir_a = guard.dir().expect("scratch agent dir").to_path_buf();
-    write_settings(&dir_a, "all");
-
+    if crate::common::skip_without_nextest(
+        "agent_dir_identity_w16::fresh_session_picks_up_the_new_agent_dir",
+    ) {
+        return;
+    }
     let dir_b = ScratchDir::new("w16a-fresh-b");
     write_settings(dir_b.path(), "one-at-a-time");
     write_auth(dir_b.path(), "w16a-provider", "key-b");
 
-    std::env::set_var("PIR_AGENT_DIR", dir_b.path());
+    // The environment moves to B BEFORE the build, so a default build follows
+    // it: `AgentSession::new` is the fresh-process path.
+    let _pin = crate::common::ProcessEnvPin::agent_dir(dir_b.path());
 
     let session = AgentSession::new(config(dir_b.path()));
     assert_eq!(session.agent_dir(), dir_b.path());
@@ -229,13 +244,18 @@ async fn fresh_session_picks_up_the_new_agent_dir() {
 
 #[tokio::test]
 async fn default_dir_follows_the_env_and_is_resolved_once() {
-    let guard = crate::common::AgentDirEnvGuard::scratch("w16a-default-a", None).await;
-    let dir_a = guard.dir().expect("scratch agent dir").to_path_buf();
-    write_settings(&dir_a, "all");
+    if crate::common::skip_without_nextest(
+        "agent_dir_identity_w16::default_dir_follows_the_env_and_is_resolved_once",
+    ) {
+        return;
+    }
+    let dir_a = ScratchDir::new("w16a-default-a");
+    write_settings(dir_a.path(), "all");
 
     // No override: the build takes the environment as it is right now.
-    let session = AgentSession::new(config(&dir_a));
-    assert_eq!(session.agent_dir(), dir_a.as_path());
+    let _pin = crate::common::ProcessEnvPin::agent_dir(dir_a.path());
+    let session = AgentSession::new(config(dir_a.path()));
+    assert_eq!(session.agent_dir(), dir_a.path());
     assert_eq!(
         session.session_settings().steering_mode(),
         SteeringMode::All
@@ -246,7 +266,7 @@ async fn default_dir_follows_the_env_and_is_resolved_once() {
     std::env::set_var("PIR_AGENT_DIR", dir_b.path());
 
     // Resolved ONCE: the live session is unaffected by the later change.
-    assert_eq!(session.agent_dir(), dir_a.as_path());
+    assert_eq!(session.agent_dir(), dir_a.path());
     assert_eq!(
         session.session_settings().steering_mode(),
         SteeringMode::All
@@ -276,6 +296,7 @@ fn context_config(cwd: &Path) -> AgentSessionConfig {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
@@ -292,6 +313,11 @@ fn normalized(path: &Path) -> String {
 /// session's stored values.
 #[tokio::test]
 async fn reload_keeps_the_sessions_agent_and_package_dir() {
+    if crate::common::skip_without_nextest(
+        "agent_dir_identity_w16::reload_keeps_the_sessions_agent_and_package_dir",
+    ) {
+        return;
+    }
     let dir_a = ScratchDir::new("d6-reload-a");
     write_settings(dir_a.path(), "all");
     std::fs::write(dir_a.path().join("AGENTS.md"), "GLOBAL-A-MARKER").expect("write A context");
@@ -321,9 +347,20 @@ async fn reload_keeps_the_sessions_agent_and_package_dir() {
     let pkg_b_env = pkg_b.path().to_string_lossy().into_owned();
 
     let cwd = ScratchDir::new("d6-reload-cwd");
-    // Pin the build-time environment to A for BOTH ambient inputs.
-    let _env =
-        crate::common::AgentDirEnvGuard::at(dir_a.path(), &[("PI_PACKAGE_DIR", &pkg_a_env)]).await;
+    // Pin the build-time environment to A for BOTH ambient inputs. The pin is
+    // the ONLY reason this test needs a private process: the session itself is
+    // built with an explicit agent dir, but `package_dir()` (which the
+    // context builder resolves when `system_prompt` is `None`) is env-only.
+    let _pin = crate::common::ProcessEnvPin::isolate(
+        &crate::common::AGENT_DIR_ENV_VARS,
+        &[
+            (
+                "PIR_AGENT_DIR",
+                dir_a.path().to_str().expect("UTF-8 temp path"),
+            ),
+            ("PI_PACKAGE_DIR", &pkg_a_env),
+        ],
+    );
 
     let session = AgentSession::new_with_agent_dir(context_config(cwd.path()), dir_a.path());
     let initial = session

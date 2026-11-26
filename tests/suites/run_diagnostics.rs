@@ -550,6 +550,7 @@ async fn session_stores_last_run_diagnostics() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     assert!(

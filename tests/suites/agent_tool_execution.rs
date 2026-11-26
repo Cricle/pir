@@ -80,6 +80,7 @@ fn tool_context_abort_detection() {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     };
     assert!(ctx2.is_aborted());
 }
@@ -386,6 +387,7 @@ fn aborted_batch_yields_operation_aborted_text() {
             held_mutation_keys: None,
             on_update: None,
             background: false,
+            agent_dir: None,
         };
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool));

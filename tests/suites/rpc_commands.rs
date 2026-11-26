@@ -990,6 +990,7 @@ fn gated_factory(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -1042,6 +1043,7 @@ fn background_gated_factory(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -1480,6 +1482,7 @@ fn recording_factory(captured: Arc<std::sync::Mutex<Option<Context>>>) -> Sessio
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -1799,6 +1802,7 @@ fn compact_factory() -> SessionFactory {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -2008,6 +2012,7 @@ async fn operations_factory(temp: &TempDir) -> SessionFactory {
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -2121,6 +2126,7 @@ async fn compact_payload_factory(temp: &TempDir) -> (SessionFactory, ExtensionHa
             event_stream: None,
             extensions: Some(session_handle.clone()),
             tool_selection: None,
+            phone_child: None,
         })))
     });
     (factory, handle)
@@ -2276,6 +2282,7 @@ fn compact_gated_factory(
                 event_stream: None,
                 extensions: None,
                 tool_selection: None,
+                phone_child: None,
             },
             vec![Arc::new(CompactGatePlugin {
                 info: PluginInfo::inline("rpc-compact-gate"),
@@ -2451,6 +2458,7 @@ fn settle_gated_factory(
                 event_stream: None,
                 extensions: None,
                 tool_selection: None,
+                phone_child: None,
             },
             vec![Arc::new(SettleGatePlugin {
                 info: PluginInfo::inline("rpc-settle-gate"),
@@ -2594,6 +2602,7 @@ fn hanging_factory() -> SessionFactory {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }
@@ -2740,6 +2749,7 @@ fn abort_then_answer_factory(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })))
     })
 }

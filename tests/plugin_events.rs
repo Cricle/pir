@@ -94,6 +94,7 @@ fn extension_config(cwd: &std::path::Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -415,6 +416,7 @@ async fn builtin_only_session_delivers_the_documented_event_set_once() {
             event_stream: Some(shared_scripted_stream()),
             extensions: Some(handle),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(recorder)],
     );
@@ -571,6 +573,7 @@ async fn native_message_update_full_content_is_opt_in() {
             event_stream: Some(shared_scripted_stream()),
             extensions: Some(handle),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(recorder)],
     );
@@ -771,6 +774,7 @@ async fn builtin_only_session_delivers_session_level_events_once() {
             event_stream: Some(shared_scripted_stream()),
             extensions: Some(handle),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(recorder)],
     );
@@ -968,6 +972,7 @@ async fn js_runtime_and_native_plugins_each_observe_session_events_once() {
             event_stream: Some(shared_scripted_stream()),
             extensions: Some(runtime.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(recorder)],
     );
@@ -1214,6 +1219,7 @@ fn hanging_provider_session(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![HangingProviderStreamPlugin::new(Arc::clone(entered)) as Arc<dyn AgentPlugin>],
     );
@@ -1487,6 +1493,7 @@ async fn js_provider_session(
             ..Default::default()
         }),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .ok()?;
     let loaded = handle
@@ -1512,6 +1519,7 @@ async fn js_provider_session(
             event_stream: None,
             extensions: Some(handle.clone()),
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     );

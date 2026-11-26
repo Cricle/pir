@@ -101,8 +101,30 @@ pub fn is_codex_responses_url(url: &str) -> bool {
 /// `redirect(Policy::none())` themselves so 301/302/307/308 cannot forward
 /// `x-api-key`, `api-key`, `x-goog-api-key` or `authorization` to another host.
 pub fn pi_reqwest_client_builder() -> AiResult<reqwest::ClientBuilder> {
+    pi_reqwest_client_builder_in(&crate::coding_agent::context::agent_dir())
+}
+
+/// [`pi_reqwest_client_builder`] against an EXPLICIT global agent dir: the
+/// `httpProxy` setting is read from `agent_dir` instead of the process
+/// environment, so a host that owns its directory gets that directory's proxy
+/// and two hosts in one process cannot reroute each other's traffic.
+pub fn pi_reqwest_client_builder_in(agent_dir: &Path) -> AiResult<reqwest::ClientBuilder> {
+    pi_reqwest_client_builder_with(
+        crate::config::settings::current_http_proxy_in(agent_dir),
+        ProviderRequestConfig::env_proxy_url_without_settings(),
+    )
+}
+
+/// The proxy decision as two explicit inputs: the resolved setting and the
+/// environment fallback. `None` for both builds a client with no proxy, which
+/// is what a caller that has already established there is none needs — no
+/// environment layer is consulted here.
+pub fn pi_reqwest_client_builder_with(
+    setting_proxy: Option<String>,
+    env_proxy: Option<String>,
+) -> AiResult<reqwest::ClientBuilder> {
     let mut builder = reqwest::Client::builder();
-    if let Some(proxy_url) = ProviderRequestConfig::env_proxy_url() {
+    if let Some(proxy_url) = setting_proxy.or(env_proxy) {
         let proxy = reqwest::Proxy::all(&proxy_url)
             .map_err(|error| AiError::Http(format!("invalid proxy URL: {error}")))?
             .no_proxy(reqwest::NoProxy::from_env());
@@ -154,6 +176,13 @@ impl ProviderRequestConfig {
         if let Some(proxy) = crate::config::settings::current_http_proxy() {
             return Some(proxy);
         }
+        Self::env_proxy_url_without_settings()
+    }
+
+    /// The environment-variable layer of [`Self::env_proxy_url`], without the
+    /// settings lookup: [`pi_reqwest_client_builder_in`] reads the setting from
+    /// its explicit agent dir and only falls back here.
+    pub fn env_proxy_url_without_settings() -> Option<String> {
         [
             "PI_HTTP_PROXY",
             "HTTPS_PROXY",

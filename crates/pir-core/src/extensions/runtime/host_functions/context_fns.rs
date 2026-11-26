@@ -203,9 +203,20 @@ pub(super) fn register_context_host_fns(
           -> () {
         crate::extensions::user_bash::deliver_chunk(&token, &data);
     });
-    sync_fn!("getAgentDir", move || -> String {
-        pir_agent_dir().display().to_string()
-    });
+    {
+        // Upstream `getAgentDir()`: the agent config directory this EXTENSION
+        // RUNTIME belongs to. A host that started the runtime for an explicit
+        // agent dir (`ExtensionConfig::agent_dir`) gets THAT directory — a
+        // child session, an embedder, or a test suite that owns its dir must
+        // not be told about whichever agent dir the process environment
+        // happens to hold. Only the ambient case (no explicit dir) falls back
+        // to the documented environment resolution.
+        let st = state.clone();
+        sync_fn!("getAgentDir", move || -> String {
+            let explicit = lock_state(&st).config.agent_dir.clone();
+            explicit.unwrap_or_else(pir_agent_dir).display().to_string()
+        });
+    }
 
     // -- ctx facade ----------------------------------------------------------
 

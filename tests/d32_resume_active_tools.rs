@@ -274,6 +274,7 @@ fn session_with(
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     }));
     Fixture { session, captured }
 }
@@ -312,6 +313,7 @@ fn session_with_plugin(
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin],
     ));

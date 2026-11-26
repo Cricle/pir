@@ -344,8 +344,7 @@ fn extension_servers_unregister_when_removed_from_the_def_list() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp agent dir");
-    std::env::set_var("PIR_AGENT_DIR", &dir);
-    let plugin = pir::plugins::builtin::McpPlugin::new();
+    let plugin = pir::plugins::builtin::McpPlugin::with_cwd(&dir, &dir);
 
     let def = json!({ "name": "ext-srv", "config": { "command": "ext-command" } });
     plugin.apply_js_server_defs(std::slice::from_ref(&def));
@@ -391,8 +390,7 @@ fn apply_js_server_defs_respects_config_precedence() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp agent dir");
-    std::env::set_var("PIR_AGENT_DIR", &dir);
-    let plugin = pir::plugins::builtin::McpPlugin::new();
+    let plugin = pir::plugins::builtin::McpPlugin::with_cwd(&dir, &dir);
     plugin.manager().registry().register(McpServerEntry {
         name: "shared".into(),
         config: serde_json::from_value(json!({ "command": "from-mcp-json" })).expect("config"),

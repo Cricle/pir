@@ -37,6 +37,7 @@ fn js_config(cwd: &std::path::Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -278,6 +279,7 @@ async fn js_stream_provider_streams_events_through_the_session() {
         event_stream: None,
         extensions: Some(handle),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("hi", Arc::new(|_| {})).await.unwrap();
@@ -326,6 +328,7 @@ async fn js_stream_provider_callback_failure_fails_closed() {
         event_stream: None,
         extensions: Some(handle),
         tool_selection: None,
+        phone_child: None,
     });
     // One failing attempt is terminal: no retry loop over the throwing hook.
     agent.set_auto_retry_enabled(false);
@@ -417,6 +420,7 @@ async fn js_virtual_route_callback_routes_and_falls_back_to_static() {
         event_stream: Some(event_stream),
         extensions: Some(handle),
         tool_selection: None,
+        phone_child: None,
     });
 
     // Success: the route callback redirects to the other physical model.

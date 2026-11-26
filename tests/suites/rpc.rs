@@ -585,6 +585,7 @@ fn a_stalled_rpc_client_does_not_deadlock_a_single_worker_runtime() {
                 event_stream: None,
                 extensions: None,
                 tool_selection: None,
+                phone_child: None,
             })))
         })
     }

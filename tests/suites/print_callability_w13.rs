@@ -187,6 +187,7 @@ fn session_view(registry: &ToolRegistry, selection: Option<ToolSelection>) -> Se
         event_stream: None,
         extensions: None,
         tool_selection: selection,
+        phone_child: None,
     });
     let (session_registry, active) = session.active_tool_snapshot(None);
     let declared: Vec<String> =

@@ -112,11 +112,14 @@ pub(super) async fn execute(
     };
 
     // Agent discovery is re-read on EVERY call (upstream contract: mid-session
-    // agent edits take effect immediately).
+    // agent edits take effect immediately). The user-level root is the
+    // enclosing session's own agent dir when the host stated one, else the
+    // environment's — a session built with an explicit `.agent_dir(..)` must
+    // discover ITS `agents/`, never whatever the process happens to name.
     let user_agents_dir = env
         .user_agents_dir
         .clone()
-        .unwrap_or_else(|| crate::coding_agent::context::agent_dir().join("agents"));
+        .unwrap_or_else(|| ctx.resolve_agent_dir().join("agents"));
     let discovery = discover_agents(&ctx.cwd, agent_scope, &user_agents_dir);
     let agents = Arc::new(discovery.agents);
     let builder = DetailsBuilder {

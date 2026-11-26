@@ -14,6 +14,8 @@
 #[cfg(feature = "cli")]
 use clap::{Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(feature = "cli", feature = "mcp"))]
+use std::path::Path;
 
 /// Output/run mode (upstream `Mode = "text" | "json" | "rpc"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2153,10 +2155,31 @@ pub async fn run_mcp_command_code_with_trust(
     command: McpCommand,
     trust_override: Option<bool>,
 ) -> crate::Result<i32> {
-    let agent_dir = crate::coding_agent::context::agent_dir();
+    run_mcp_command_code_in(
+        command,
+        trust_override,
+        &crate::coding_agent::context::agent_dir(),
+    )
+    .await
+}
+
+/// [`run_mcp_command_code_with_trust`] against an EXPLICIT global agent dir.
+///
+/// The agent dir roots `mcp.json` discovery, the manager's log/OAuth store and
+/// the project's trust decision, so a caller that owns its directory (an
+/// embedder, or a test that runs several MCP scenarios side by side) states it
+/// here instead of pointing the process-wide environment at it. The cwd is
+/// still the process cwd: `pir mcp` is a command-line surface for the project
+/// the operator is standing in.
+#[cfg(feature = "cli")]
+pub async fn run_mcp_command_code_in(
+    command: McpCommand,
+    trust_override: Option<bool>,
+    agent_dir: &Path,
+) -> crate::Result<i32> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let project_trusted =
-        trust_override.unwrap_or_else(|| crate::config::trust::resolve_cwd_trust(&cwd, &agent_dir));
+        trust_override.unwrap_or_else(|| crate::config::trust::resolve_cwd_trust(&cwd, agent_dir));
     match command {
         McpCommand::Add {
             name,
@@ -2192,11 +2215,12 @@ pub async fn run_mcp_command_code_with_trust(
                     local,
                 },
                 project_trusted,
+                agent_dir,
             )?;
             Ok(0)
         }
         McpCommand::Remove { name, local } => {
-            run_mcp_remove(&name, local, project_trusted)?;
+            run_mcp_remove(&name, local, project_trusted, agent_dir)?;
             Ok(0)
         }
         // The arms below need the `mcp` module (a live client, OAuth), so
@@ -2204,11 +2228,11 @@ pub async fn run_mcp_command_code_with_trust(
         // that honestly instead of dropping the subcommand silently.
         #[cfg(feature = "mcp")]
         McpCommand::Check { server, json } => {
-            run_mcp_check(server.as_deref(), json, project_trusted).await?;
+            run_mcp_check(server.as_deref(), json, project_trusted, agent_dir).await?;
             Ok(0)
         }
         #[cfg(feature = "mcp")]
-        McpCommand::List { json } => Ok(if run_mcp_list(json, project_trusted).await? {
+        McpCommand::List { json } => Ok(if run_mcp_list(json, project_trusted, agent_dir).await? {
             0
         } else {
             1
@@ -2219,12 +2243,12 @@ pub async fn run_mcp_command_code_with_trust(
             local,
             timeout_seconds,
         } => {
-            run_mcp_login(&server, local, timeout_seconds, project_trusted).await?;
+            run_mcp_login(&server, local, timeout_seconds, project_trusted, agent_dir).await?;
             Ok(0)
         }
         #[cfg(feature = "mcp")]
         McpCommand::Logout { server, local } => {
-            run_mcp_logout(&server, local, project_trusted).await?;
+            run_mcp_logout(&server, local, project_trusted, agent_dir).await?;
             Ok(0)
         }
         #[cfg(not(feature = "mcp"))]
@@ -2616,15 +2640,18 @@ pub fn mcp_config_remove(path: &std::path::Path, name: &str) -> crate::Result<bo
 /// (upstream `add`, extensions/mcp/cli.ts:277-391).
 #[cfg(feature = "cli")]
 #[allow(clippy::too_many_lines)]
-fn run_mcp_add(options: McpAddOptions, project_trusted: bool) -> crate::Result<()> {
+fn run_mcp_add(
+    options: McpAddOptions,
+    project_trusted: bool,
+    agent_dir: &Path,
+) -> crate::Result<()> {
     let name = options.name.trim().to_string();
     let config = build_mcp_add_config(&options)?;
-    let agent_dir = crate::coding_agent::context::agent_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let path = if options.local {
         crate::config::mcp::project_mcp_path(&cwd)
     } else {
-        crate::config::mcp::global_mcp_path(&agent_dir)
+        crate::config::mcp::global_mcp_path(agent_dir)
     };
     let scope = if options.local { "project" } else { "global" };
     let replaced = mcp_config_upsert(&path, &name, &config)
@@ -2665,17 +2692,21 @@ fn run_mcp_add(options: McpAddOptions, project_trusted: bool) -> crate::Result<(
 /// `pir mcp remove <server> [-l]` (upstream `remove`,
 /// extensions/mcp/cli.ts:396-435).
 #[cfg(feature = "cli")]
-fn run_mcp_remove(name: &str, local: bool, _project_trusted: bool) -> crate::Result<()> {
+fn run_mcp_remove(
+    name: &str,
+    local: bool,
+    _project_trusted: bool,
+    agent_dir: &Path,
+) -> crate::Result<()> {
     let name = name.trim();
     if name.is_empty() {
         return Err(anyhow::anyhow!("Usage: pir mcp remove <server> [-l]"));
     }
-    let agent_dir = crate::coding_agent::context::agent_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let path = if local {
         crate::config::mcp::project_mcp_path(&cwd)
     } else {
-        crate::config::mcp::global_mcp_path(&agent_dir)
+        crate::config::mcp::global_mcp_path(agent_dir)
     };
     let scope = if local { "project" } else { "global" };
     let removed = mcp_config_remove(&path, name)
@@ -2693,7 +2724,7 @@ fn run_mcp_remove(name: &str, local: bool, _project_trusted: bool) -> crate::Res
     // project file even when the project is untrusted (execution is still
     // gated elsewhere). Otherwise a remove in the wrong scope cannot name the
     // defining file at all.
-    let other = crate::config::mcp::load_mcp_configs(&agent_dir, &cwd, true)
+    let other = crate::config::mcp::load_mcp_configs(agent_dir, &cwd, true)
         .into_iter()
         .find(|loaded| loaded.path != path && loaded.servers.contains_key(name));
     let hint = other
@@ -2834,11 +2865,11 @@ async fn run_mcp_login(
     local: bool,
     timeout_seconds: u64,
     project_trusted: bool,
+    agent_dir: &Path,
 ) -> crate::Result<()> {
-    let agent_dir = crate::coding_agent::context::agent_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let manager = crate::mcp::manager::McpManager::new(&agent_dir, &cwd);
-    let config_errors = manager.load_config_files(&agent_dir, project_trusted);
+    let manager = crate::mcp::manager::McpManager::new(agent_dir, &cwd);
+    let config_errors = manager.load_config_files(agent_dir, project_trusted);
     let Some(entry) = manager.registry().get(server) else {
         let configured: Vec<String> = manager
             .registry()
@@ -2952,11 +2983,15 @@ async fn run_mcp_login(
 /// `pir mcp logout <server> [-l]` (upstream `logout`): delete the stored
 /// OAuth credentials of the server.
 #[cfg(all(feature = "mcp", feature = "cli"))]
-async fn run_mcp_logout(server: &str, local: bool, project_trusted: bool) -> crate::Result<()> {
-    let agent_dir = crate::coding_agent::context::agent_dir();
+async fn run_mcp_logout(
+    server: &str,
+    local: bool,
+    project_trusted: bool,
+    agent_dir: &Path,
+) -> crate::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let manager = crate::mcp::manager::McpManager::new(&agent_dir, &cwd);
-    let config_errors = manager.load_config_files(&agent_dir, project_trusted);
+    let manager = crate::mcp::manager::McpManager::new(agent_dir, &cwd);
+    let config_errors = manager.load_config_files(agent_dir, project_trusted);
     let Some(entry) = manager.registry().get(server) else {
         let configured: Vec<String> = manager
             .registry()
@@ -3008,11 +3043,15 @@ async fn run_mcp_logout(server: &str, local: bool, project_trusted: bool) -> cra
 
 /// `pir mcp check [server] [--json]`.
 #[cfg(all(feature = "mcp", feature = "cli"))]
-async fn run_mcp_check(only: Option<&str>, json: bool, project_trusted: bool) -> crate::Result<()> {
-    let agent_dir = crate::coding_agent::context::agent_dir();
+async fn run_mcp_check(
+    only: Option<&str>,
+    json: bool,
+    project_trusted: bool,
+    agent_dir: &Path,
+) -> crate::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let manager = crate::mcp::manager::McpManager::new(&agent_dir, &cwd);
-    manager.load_config_files(&agent_dir, project_trusted);
+    let manager = crate::mcp::manager::McpManager::new(agent_dir, &cwd);
+    manager.load_config_files(agent_dir, project_trusted);
 
     let mut names: Vec<String> = manager
         .registry()
@@ -3036,7 +3075,7 @@ async fn run_mcp_check(only: Option<&str>, json: bool, project_trusted: bool) ->
             // the project scope keeps upstream's relative spelling.
             println!(
                 "No MCP servers configured. Add them to {} or .pi/mcp.json.",
-                crate::config::mcp::global_mcp_path(&agent_dir).display()
+                crate::config::mcp::global_mcp_path(agent_dir).display()
             );
         }
         return Ok(());
@@ -3191,11 +3230,10 @@ struct McpListOutput {
 /// listing succeeded (false = exit 1): a config-file error or any enabled
 /// server that is not connected fails the command.
 #[cfg(all(feature = "mcp", feature = "cli"))]
-async fn run_mcp_list(json: bool, project_trusted: bool) -> crate::Result<bool> {
-    let agent_dir = crate::coding_agent::context::agent_dir();
+async fn run_mcp_list(json: bool, project_trusted: bool, agent_dir: &Path) -> crate::Result<bool> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let manager = crate::mcp::manager::McpManager::new(&agent_dir, &cwd);
-    let config_errors = manager.load_config_files(&agent_dir, project_trusted);
+    let manager = crate::mcp::manager::McpManager::new(agent_dir, &cwd);
+    let config_errors = manager.load_config_files(agent_dir, project_trusted);
     let project_config = crate::config::mcp::project_mcp_path(&cwd);
     let untrusted_note = (!project_trusted && project_config.exists()).then(|| {
         format!(
@@ -3343,7 +3381,7 @@ async fn run_mcp_list(json: bool, project_trusted: bool) -> crate::Result<bool> 
     if reports.is_empty() && config_errors.is_empty() {
         println!(
             "No MCP servers configured. Add them to {} or .pi/mcp.json.",
-            crate::config::mcp::global_mcp_path(&agent_dir).display()
+            crate::config::mcp::global_mcp_path(agent_dir).display()
         );
     }
     for report in &reports {

@@ -73,7 +73,9 @@ pub use builtin::{
 };
 pub use builtin_bridge::{adapt_builtin, BuiltinPluginAdapter};
 #[cfg(feature = "extensions")]
-pub use codemode::{CodemodeConfig, CodemodePlugin, CodemodeTool, DEFAULT_INLINE_BUDGET};
+pub use codemode::{
+    CodemodeConfig, CodemodePlugin, CodemodeScope, CodemodeTool, DEFAULT_INLINE_BUDGET,
+};
 pub use coverage::{
     is_native_event, NATIVE_ONLY_EVENTS, UNSUPPORTED_NATIVE_EVENTS, WIRED_NATIVE_EVENTS,
 };
@@ -123,4 +125,4 @@ pub use tool_repair::{
 /// The `tool-repair` builtin's plugin type and factory — gated with the
 /// builtin (and with the module above).
 #[cfg(feature = "tool-repair")]
-pub use tool_repair::{new_tool_repair_plugin, ToolRepairPlugin};
+pub use tool_repair::{new_tool_repair_plugin, new_tool_repair_plugin_at, ToolRepairPlugin};

@@ -24,9 +24,14 @@ struct TempDir(std::path::PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
-        let path =
-            std::path::Path::new(TEST_ROOT).join(format!("rss-a-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+        // `{name}-{pid}` is NOT unique: this file already has two tests using
+        // "entry-append", so both computed the SAME path and the
+        // `remove_dir_all` below deleted the other test's live directory
+        // (`PermissionDenied` from the survivor, audit finding TEST-4). A
+        // process-wide counter makes every fixture private.
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::path::Path::new(TEST_ROOT).join(format!("rss-a-{name}-{seq}"));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self(path)
     }
@@ -144,6 +149,7 @@ fn agent(session: SessionManager) -> AgentSession {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
     )
@@ -170,6 +176,16 @@ fn entry_roles(entries: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
 
 #[tokio::test]
 async fn tui_only_interest_skips_assistant_payloads_but_keeps_user_entries() {
+    // The assertion reads `entry_appended_wire_builds()`, a PROCESS-WIDE
+    // AtomicUsize (`agent_session::events`), and resets it here. Any sibling
+    // suite in the same binary that appends an entry between the reset and the
+    // read changes the count, so this test needs a private process — which
+    // `cargo nextest` gives every test.
+    if crate::common::skip_without_nextest(
+        "rss_a_entry_append_materialization::tui_only_interest_skips_assistant_payloads_but_keeps_user_entries",
+    ) {
+        return;
+    }
     let entries: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&entries);
     let seen: pir::agent_session::SessionEventHandler = Arc::new(move |event| {

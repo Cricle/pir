@@ -62,6 +62,7 @@ fn config(cwd: &Path) -> ExtensionConfig {
         is_idle: true,
         limits: None,
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

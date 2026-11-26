@@ -18,6 +18,14 @@ use pir::extensions::loader::{
 use pir::extensions::{ExtensionConfig, ExtensionRuntime};
 
 fn test_config_at(cwd: &Path) -> ExtensionConfig {
+    test_config_at_in(cwd, None)
+}
+
+/// [`test_config_at`] with the agent directory the runtime's boot-time
+/// pi-package provisioning publishes into (`<agent_dir>/pir/host-pi-package`).
+/// A test that reads that root passes its own directory instead of pinning
+/// `PIR_AGENT_DIR` in the process environment.
+fn test_config_at_in(cwd: &Path, agent_dir: Option<&Path>) -> ExtensionConfig {
     ExtensionConfig {
         cwd: cwd.to_path_buf(),
         mode: "print".to_string(),
@@ -28,6 +36,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: agent_dir.map(Path::to_path_buf),
     }
 }
 
@@ -44,7 +53,13 @@ fn temp_dir(test_name: &str) -> PathBuf {
 
 /// Runtime whose allowed roots are `dir` and the configured cwd `dir`.
 async fn runtime_at(dir: &Path) -> ExtensionRuntime {
-    let rt = ExtensionRuntime::new(test_config_at(dir))
+    runtime_at_in(dir, None).await
+}
+
+/// [`runtime_at`] with an explicit agent directory for the boot-time
+/// pi-package provisioning.
+async fn runtime_at_in(dir: &Path, agent_dir: Option<&Path>) -> ExtensionRuntime {
+    let rt = ExtensionRuntime::new(test_config_at_in(dir, agent_dir))
         .await
         .expect("runtime construction");
     rt.allow_root(dir.to_path_buf());
@@ -374,18 +389,15 @@ fn host_pi_package_provisioning_is_idempotent_and_discoverable() {
 /// package root env is set, and importing that package's entry by `file:` URL
 /// is the same module as the bare host-SDK specifier.
 ///
-/// NOTE: the published root comes from the process-global agent dir
-/// (`runtime.rs` provisions `<agent_dir>/pir/host-pi-package`, and
-/// `agent_dir()` honors `PIR_AGENT_DIR`), so this test must hold the shared
-/// per-binary lock. Without it another suite in `zz_merged_1` can re-point
-/// `PIR_AGENT_DIR` at its own scratch dir (and delete it) between this test's
-/// runtime boot and its probe, which then reads a root under somebody else's
-/// temp dir — observed as `pir-hook-coverage-mcp-native-change-…`.
+/// `runtime.rs` provisions `<agent_dir>/pir/host-pi-package` from the config's
+/// agent directory; the runtime below is given a scratch one explicitly, so
+/// the root this test reads belongs to THIS scenario and never another
+/// suite's `PIR_AGENT_DIR`.
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_publishes_the_host_pi_package_root() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("loader-host-pi-root", None).await;
+    let agent_dir = crate::common::scratch_agent_dir("loader-host-pi-root", None);
     let dir = temp_dir("host-pi-root-env");
-    let rt = runtime_at(&dir).await;
+    let rt = runtime_at_in(&dir, Some(agent_dir.path())).await;
     let probe = r#"
 export default function () {}
 globalThis.__result = { state: "failed", error: "probe did not run" };

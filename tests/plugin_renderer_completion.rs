@@ -127,6 +127,7 @@ fn build_session(plugin: Arc<ProbePlugin>) -> Arc<AgentSession> {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin as Arc<dyn AgentPlugin>],
     )

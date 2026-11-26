@@ -1536,6 +1536,7 @@ mod tool_search_next_request {
                     modifiers: Vec::new(),
                     uses_default_tools: false,
                 }),
+                phone_child: None,
             },
             vec![
                 Arc::new(ToolSearchPlugin::new()),

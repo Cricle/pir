@@ -738,6 +738,18 @@ impl BashOperations for FakeBash {
 }
 
 fn bash_context(root: &Path, session: Option<(String, PathBuf)>) -> ToolContext {
+    bash_context_in(root, session, None)
+}
+
+/// [`bash_context`] with an EXPLICIT agent directory for the session env (the
+/// seam the production loop fills from the session's own agent dir). Passing it
+/// here keeps the test off the process environment: `ToolContext::resolve_agent_dir`
+/// prefers this value over `PIR_AGENT_DIR`.
+fn bash_context_in(
+    root: &Path,
+    session: Option<(String, PathBuf)>,
+    agent_dir: Option<&Path>,
+) -> ToolContext {
     let mut context = ToolContext::new(root);
     if let Some((session_id, session_file)) = session {
         context.session_env = Some(Arc::new(ToolSessionEnv {
@@ -754,7 +766,7 @@ fn bash_context(root: &Path, session: Option<(String, PathBuf)>) -> ToolContext 
             has_ui: false,
             project_trusted: true,
             user_agents_dir: None,
-            agent_dir: None,
+            agent_dir: agent_dir.map(Path::to_path_buf),
             credential: None,
             on_update: None,
             live_tools: None,
@@ -835,7 +847,6 @@ async fn bash_with_operations_streams_and_injects_pi_session_env() {
 
 #[tokio::test]
 async fn bash_local_child_sees_pi_session_environment() {
-    let _agent_dir = crate::common::AgentDirEnvGuard::scratch("pi-session-local", None).await;
     if std::process::Command::new("bash")
         .arg("-c")
         .arg("true")
@@ -850,9 +861,10 @@ async fn bash_local_child_sees_pi_session_environment() {
     let root = temp_workspace("pi-session-local");
     let session_file = root.join("session.jsonl");
     let tool = BashTool::new();
-    let context = bash_context(
+    let context = bash_context_in(
         &root,
         Some(("local-session".to_owned(), session_file.clone())),
+        Some(&root),
     );
     let result = tool
         .run(

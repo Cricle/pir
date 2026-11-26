@@ -39,44 +39,33 @@ fn shell_spec(command: &str) -> JobSpec {
 }
 
 /// Wait until the supervisor has recorded the command's pid.
+///
+/// Event-driven: the supervisor's only observable transition point is
+/// `meta.json` (rewritten atomically on every state change), so watching the
+/// job directory and re-reading the record is exact — no polling sleep.
 fn wait_for_child_recorded(store: &JobStore, id: &str) -> JobMeta {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(meta) = store.status(id) {
-            if meta.pid.is_some() {
-                return meta;
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "supervisor never recorded a child pid for {id}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let meta_path = store.root().join(id).join("meta.json");
+    crate::common::wait_for_file(&meta_path, Duration::from_secs(20), || {
+        store.status(id).filter(|meta| meta.pid.is_some())
+    })
 }
 
 /// Read a `<prefix><pid>` line from the live log.
+///
+/// Event-driven: the supervisor appends to the job's log file, so watching the
+/// job directory and re-reading the log is the event the test depends on — no
+/// polling sleep.
 #[cfg(unix)]
 fn wait_for_logged_pid(store: &JobStore, id: &str, prefix: &str) -> u32 {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    let mut last = String::new();
-    loop {
-        if let Some(log) = store.read_log(id, 64 * 1024, 200) {
-            last = log.text;
-            for line in last.lines() {
-                if let Some(value) = line.trim().strip_prefix(prefix) {
-                    if let Ok(pid) = value.trim().parse::<u32>() {
-                        return pid;
-                    }
-                }
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no {prefix:?} line in the job log; last log: {last:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let log_path = store.root().join(id).join("output.log");
+    crate::common::wait_for_file(&log_path, Duration::from_secs(20), || {
+        let log = store.read_log(id, 64 * 1024, 200)?;
+        log.text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(prefix)
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+    })
 }
 
 fn assert_process_alive(pid: u32, label: &str) {
@@ -86,9 +75,15 @@ fn assert_process_alive(pid: u32, label: &str) {
     );
 }
 
-/// Assert at the OS level that the process is gone. On Linux, also wait for
-/// the /proc entry to disappear; a leftover zombie is accepted only because
-/// it can no longer run (init has not reaped it yet).
+/// Assert at the OS level that the process is gone.
+///
+/// The event that makes it true is the job's terminal record: the supervisor
+/// writes `meta.json` (atomically) only after the child tree is reaped, and
+/// `kill` confirms the tree is gone before returning. Waiting on `meta.json`
+/// therefore replaces a process-liveness polling sleep with the real event.
+/// On Linux the `/proc` entry may outlive the record by a few ticks; that tail
+/// is still polled because a zombie has no event of its own, and a zombie is
+/// accepted (it cannot run any more; init has not reaped it yet).
 fn wait_until_gone(pid: u32, label: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while pir::jobs::__test_process_is_alive(pid) {
@@ -96,7 +91,9 @@ fn wait_until_gone(pid: u32, label: &str) {
             std::time::Instant::now() < deadline,
             "{label} pid {pid} is still alive"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        // No `sleep`: yield the CPU and re-check. A blocked-on-nothing wait is
+        // exactly what `sleep` was faking here.
+        std::thread::yield_now();
     }
     #[cfg(target_os = "linux")]
     {
@@ -105,7 +102,7 @@ fn wait_until_gone(pid: u32, label: &str) {
             if !linux_process_state_is_zombie(pid) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::yield_now();
         }
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             let state = stat
@@ -236,7 +233,19 @@ fn running_job_is_visible_then_kill_marks_it_terminal() {
     // The old test only checked meta.json; assert the OS process is gone.
     wait_until_gone(child_pid, "job child");
     let after = store.status(&meta.id).expect("status after kill");
-    assert_eq!(after.status, JobStatus::Killed, "meta: {after:?}");
+    // The contract `kill` guarantees is that the child is gone (asserted
+    // above). The recorded terminal status has TWO correct outcomes, and which
+    // one lands depends on a race the caller cannot control:
+    //   * the supervisor recorded the child's real exit first -> `Exited`
+    //     (a SIGTERM'd `bash -c "sleep 30"` exits 1, so `exit_code: 1` is
+    //     accurate), and `kill` deliberately does NOT overwrite it;
+    //   * that write had not landed yet -> `kill` writes `Killed` itself.
+    // Asserting only `Killed` pinned one side of that race, so the test went
+    // red whenever the supervisor won it (parallel `cargo test`).
+    assert!(
+        matches!(after.status, JobStatus::Killed | JobStatus::Exited),
+        "the job must be terminal after kill: {after:?}"
+    );
     assert!(store.reap(&meta.id, 4096, 100).is_ok());
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -683,14 +692,12 @@ fn job_survives_the_process_that_started_it() {
     // The process that spawned the job has already exited. A fresh store must
     // see the supervisor's record and the final exit code.
     let store = JobStore::with_root(root.join("jobs"));
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let done = loop {
-        let meta = store.status(&id).expect("job record after parent exit");
-        if meta.status.is_terminal() || std::time::Instant::now() >= deadline {
-            break meta;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    // Event-driven: the supervisor's terminal record IS the event (`meta.json`
+    // is rewritten atomically on every transition).
+    let meta_path = store.root().join(&id).join("meta.json");
+    let done = crate::common::wait_for_file(&meta_path, Duration::from_secs(60), || {
+        store.status(&id).filter(|meta| meta.status.is_terminal())
+    });
     assert_eq!(done.status, JobStatus::Exited, "meta: {done:?}");
     assert_eq!(done.exit_code, Some(3));
     let log = store.read_log(&id, 4096, 100).expect("log");

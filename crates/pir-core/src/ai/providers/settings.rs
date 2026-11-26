@@ -12,19 +12,34 @@ use crate::config::settings::Settings;
 /// (pir), `$PIR_CODING_AGENT_DIR` (pir alias), `$PI_CODING_AGENT_DIR` (pi
 /// compatibility), else `~/.pi/agent`.
 pub fn agent_dir() -> PathBuf {
-    for var in [
-        "PIR_AGENT_DIR",
-        "PIR_CODING_AGENT_DIR",
-        "PI_CODING_AGENT_DIR",
-    ] {
-        if let Some(dir) = std::env::var_os(var) {
-            if !dir.is_empty() {
-                return PathBuf::from(dir);
-            }
+    resolve_agent_dir_at(
+        [
+            std::env::var_os("PIR_AGENT_DIR"),
+            std::env::var_os("PIR_CODING_AGENT_DIR"),
+            std::env::var_os("PI_CODING_AGENT_DIR"),
+        ],
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )
+}
+
+/// The resolution [`agent_dir`] performs, against explicitly supplied variable
+/// values: the three agent-dir spellings in precedence order plus the home
+/// directory used for the `~/.pi/agent` fallback.
+///
+/// The one implementation both faces share, so the precedence (and the
+/// empty-value rule) cannot drift between the process form and a caller that
+/// passes its own values — a harness proving the ordering needs no process
+/// environment writes.
+pub fn resolve_agent_dir_at(
+    candidates: [Option<std::ffi::OsString>; 3],
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    for dir in candidates.into_iter().flatten() {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
         }
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let home = home
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("~").to_path_buf());
     home.join(".pi").join("agent")

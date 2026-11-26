@@ -390,6 +390,7 @@ async fn context_usage_reports_cjk_tokens_not_quarter_chars() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     let usage = agent.context_usage().await.expect("context usage");
     let tokens = usage.tokens.expect("estimated tokens");
@@ -577,6 +578,7 @@ async fn run_gate(label: &str, tools: ToolRegistry) -> (usize, Vec<Context>) {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     agent
         .prompt("next question", Arc::new(|_| {}))

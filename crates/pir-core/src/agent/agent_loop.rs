@@ -2874,6 +2874,14 @@ async fn run_with_options_in_span_inner(
                     }
                 },
                 background: false,
+                // The session's own agent dir reaches every tool call here, so
+                // the shell tools read THIS session's settings instead of
+                // re-resolving `PIR_AGENT_DIR` per command.
+                agent_dir: deps
+                    .session_env
+                    .as_ref()
+                    .and_then(|env| env.agent_dir.clone())
+                    .map(Arc::new),
             };
             // Extension `tool_call` is dispatched by the scheduler itself,
             // after `prepareArguments`/schema validation and before execution

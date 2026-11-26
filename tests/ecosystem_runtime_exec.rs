@@ -17,12 +17,11 @@
 //!
 //! The installed npm tree is user-owned and read-only here: packages are
 //! discovered from `<agent-dir>/npm/node_modules` and pointed at in place.
-//! The runtime itself is redirected to a per-run temp agent dir
-//! (`PIR_AGENT_DIR`) and a temp `XDG_CONFIG_HOME` (the rpiv-* config root), so
-//! neither the engine nor the extensions read or write the operator's
-//! `~/.pi`/`~/.config` state. Those environment writes happen once, before any
-//! runtime starts; integration tests are a dedicated process, so no other test
-//! binary observes them.
+//! The runtime's own agent-dir reads are redirected to a per-run temp agent dir
+//! by [`ExtensionConfig::agent_dir`](pir::extensions::ExtensionConfig), not by
+//! the process environment, so neither the engine nor the extensions read or
+//! write the operator's `~/.pi` state and no other suite in this binary can
+//! observe the redirect.
 //!
 //! Every wait is bounded: actor start and load under an explicit
 //! `tokio::time` budget, event/tool dispatches under the injected
@@ -70,17 +69,14 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// The shorter lifecycle budget `before_agent_start` runs under.
 const BEFORE_AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Temp roots shared by every test in this binary. `PIR_AGENT_DIR` is
-/// process-global, so the directory is created exactly once and every runtime
-/// in this harness points at it.
+/// Temp roots shared by every test in this binary: created once, and every
+/// runtime in this harness is handed the agent dir explicitly.
 struct TestEnv {
-    /// The real agent dir captured before `PIR_AGENT_DIR` was redirected; the
-    /// installed npm tree is read from here, in place and read-only.
+    /// The real agent dir the installed npm tree is read from, in place and
+    /// read-only.
     installed_npm_root: PathBuf,
     agent_dir: PathBuf,
     cwd: PathBuf,
-    /// `~/.config` redirect for the rpiv-* packages' documented lookup rule.
-    config_home: PathBuf,
 }
 
 fn test_env() -> &'static TestEnv {
@@ -98,22 +94,18 @@ fn test_env() -> &'static TestEnv {
         ));
         let agent_dir = root.join("agent");
         let cwd = root.join("cwd");
-        let config_home = root.join("config");
         std::fs::create_dir_all(&agent_dir).expect("create temp agent dir");
         std::fs::create_dir_all(&cwd).expect("create temp cwd");
-        std::fs::create_dir_all(&config_home).expect("create temp XDG config home");
 
         eprintln!(
-            "[ecosystem_runtime_exec] temp agent dir={} cwd={} xdg_config={}",
+            "[ecosystem_runtime_exec] temp agent dir={} cwd={}",
             agent_dir.display(),
-            cwd.display(),
-            config_home.display()
+            cwd.display()
         );
         TestEnv {
             installed_npm_root,
             agent_dir,
             cwd,
-            config_home,
         }
     })
 }
@@ -121,54 +113,6 @@ fn test_env() -> &'static TestEnv {
 impl TestEnv {
     fn agent_dir(&self) -> &Path {
         &self.agent_dir
-    }
-}
-
-/// Pins `PIR_AGENT_DIR` / `XDG_CONFIG_HOME` at this harness's scratch dirs for
-/// ONE test, then restores them.
-///
-/// The variables are **process-global**, and this file's suites live in the
-/// same `zz_merged_4` binary as `codemode_exposure` and `session_resolve_units`.
-/// Setting them once inside `test_env()`'s `OnceLock` initializer (the previous
-/// shape) made the redirect permanent for the whole binary: every later suite
-/// — including ones asserting an exact `agent_dir()` — observed this harness's
-/// temp directory, which is why a DIFFERENT test failed on each full run
-/// (`codemode_exposure::settings_load_once_...` with `/reload` counting one
-/// setting read instead of two, then
-/// `rpc_extension_ui::extension_unanswered_dialog_resolves_null_after_ttl`).
-///
-/// The guard holds `crate::common::agent_dir_env_lock()`, the shared per-binary
-/// lock, so no sibling suite can re-point the variable while this test runs.
-/// It must stay alive across the test's awaits: the extension loader resolves
-/// `PIR_AGENT_DIR` lazily on every load.
-struct PinnedAgentDir {
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl PinnedAgentDir {
-    async fn pin(env: &TestEnv) -> Self {
-        let lock = crate::common::agent_dir_env_lock().lock().await;
-        let mut saved = Vec::with_capacity(2);
-        for (key, value) in [
-            ("PIR_AGENT_DIR", &env.agent_dir),
-            ("XDG_CONFIG_HOME", &env.config_home),
-        ] {
-            saved.push((key, std::env::var_os(key)));
-            std::env::set_var(key, value);
-        }
-        Self { _lock: lock, saved }
-    }
-}
-
-impl Drop for PinnedAgentDir {
-    fn drop(&mut self) {
-        for (key, previous) in self.saved.drain(..).rev() {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 }
 
@@ -208,6 +152,10 @@ fn extension_config(model: Option<&str>, session_id: &str) -> ExtensionConfig {
         is_idle: true,
         limits: Some(limits),
         allow_process_exit: false,
+        // The runtime's own agent-dir reads (the boot-time pi-package
+        // provisioning) follow this harness's scratch dir, so no test here has
+        // to pin the process-wide `PIR_AGENT_DIR`.
+        agent_dir: Some(test_env().agent_dir.clone()),
     }
 }
 
@@ -324,7 +272,6 @@ fn assert_emit_clean(package: &str, event: &str, outcome: &pir::extensions::Emit
 
 #[tokio::test(flavor = "current_thread")]
 async fn rpiv_todo_executes_its_tool_command_and_hooks() {
-    let _pinned = PinnedAgentDir::pin(test_env()).await;
     let package = "@juicesharp/rpiv-todo";
     let Some(root) = installed_package(package) else {
         return;
@@ -444,7 +391,6 @@ async fn rpiv_todo_executes_its_tool_command_and_hooks() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn pi_tool_repair_executes_its_two_hooks() {
-    let _pinned = PinnedAgentDir::pin(test_env()).await;
     let package = "pi-tool-repair";
     let Some(root) = installed_package(package) else {
         return;
@@ -550,7 +496,6 @@ async fn pi_tool_repair_executes_its_two_hooks() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn rpiv_i18n_executes_its_flag_command_and_session_start() {
-    let _pinned = PinnedAgentDir::pin(test_env()).await;
     let package = "@juicesharp/rpiv-i18n";
     let Some(root) = installed_package(package) else {
         return;
@@ -626,7 +571,6 @@ async fn rpiv_i18n_executes_its_flag_command_and_session_start() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn pi_codegraph_registers_its_tools_and_prompt_hook() {
-    let _pinned = PinnedAgentDir::pin(test_env()).await;
     let package = "@vndv/pi-codegraph";
     let Some(root) = installed_package(package) else {
         return;

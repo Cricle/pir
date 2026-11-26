@@ -568,10 +568,31 @@ impl McpManager {
     }
 
     /// A manager with a no-op log (tests).
+    ///
+    /// The OAuth store still points at the default agent dir (a rootless
+    /// manager never loads config from it), so a caller that must not name
+    /// that directory uses [`Self::without_log_at`].
     pub fn without_log(cwd: &Path) -> Arc<Self> {
         Self::build(
             Arc::new(McpLog::disabled()),
             crate::mcp::oauth::McpOAuthCredentialStore::default_store(),
+            cwd,
+            Path::new(""),
+        )
+    }
+
+    /// [`Self::without_log`] with the OAuth credential store rooted at an
+    /// EXPLICIT directory.
+    ///
+    /// The rootless form takes no config root, but its credential store is
+    /// still a real file path; resolving it from the process environment makes
+    /// a test (or an embedder running several scenarios side by side) name a
+    /// directory it does not own. Passing the directory keeps the manager
+    /// entirely inside the caller's scratch tree.
+    pub fn without_log_at(auth_dir: &Path, cwd: &Path) -> Arc<Self> {
+        Self::build(
+            Arc::new(McpLog::disabled()),
+            crate::mcp::oauth::McpOAuthCredentialStore::new(auth_dir.join("mcp-auth.json")),
             cwd,
             Path::new(""),
         )

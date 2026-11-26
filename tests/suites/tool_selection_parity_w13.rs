@@ -178,7 +178,8 @@ impl Drop for TempDir {
 
 #[tokio::test(flavor = "current_thread")]
 async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
-    let _env = crate::common::AgentDirEnvGuard::scratch("tool-selection-w13", None).await;
+    // The host is built with an explicit agent dir below, so this suite needs
+    // no process pin and no lock.
     let dir = TempDir::new("host");
     let plan = pir::plugins::order_extension_paths(&[], &[], false);
     if plan.is_empty() {
@@ -192,7 +193,11 @@ async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
         ..Default::default()
     });
     handle.set_path_plan(plan);
-    let host = Arc::new(PluginHost::build(Some(handle.clone()), Vec::new()));
+    let host = Arc::new(PluginHost::build_with_agent_dir(
+        Some(handle.clone()),
+        Vec::new(),
+        Some(&dir.0),
+    ));
 
     // The registry `merge_plugin_tools` reads: every builtin-registered tool,
     // hidden exposure included (the print host's `available_tools` includes

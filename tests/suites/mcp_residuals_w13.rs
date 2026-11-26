@@ -1151,7 +1151,7 @@ async fn session_start_is_bounded_and_reports_its_failures() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    let _guard = crate::common::AgentDirEnvGuard::at(&agent_dir, &[]).await;
+    // No pin: the manager is rooted at the test's own tree below.
 
     let (command, args) = mock_spawn();
     let entry = |mode: &str| {
@@ -1171,7 +1171,11 @@ async fn session_start_is_bounded_and_reports_its_failures() {
 
     let plugin =
         Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0).with_startup_budget(Duration::from_secs(3)));
-    let host = PluginHost::build(None, vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>]);
+    let host = PluginHost::build_with_agent_dir(
+        None,
+        vec![Arc::clone(&plugin) as Arc<dyn AgentPlugin>],
+        Some(&agent_dir),
+    );
     assert_eq!(plugin.manager().registry().list().len(), 2);
 
     let started = Instant::now();
@@ -1361,9 +1365,13 @@ fn register_unstartable(manager: &McpManager, name: &str) {
 
 /// Build a context-derived session around `plugin`, then return its system
 /// prompt. `system_prompt: None` keeps the context builder as the owner.
-fn session_prompt_with(plugin: Arc<McpPlugin>, cwd: &std::path::Path) -> (String, Arc<McpManager>) {
+fn session_prompt_with(
+    plugin: Arc<McpPlugin>,
+    cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
+) -> (String, Arc<McpManager>) {
     let manager = Arc::clone(plugin.manager());
-    let session = pir::agent_session::AgentSession::new_with_plugins(
+    let session = pir::agent_session::AgentSession::new_with_plugins_and_agent_dir(
         pir::agent_session::AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::new(pir::ai::provider::ProviderRegistry::default()),
@@ -1379,8 +1387,10 @@ fn session_prompt_with(plugin: Arc<McpPlugin>, cwd: &std::path::Path) -> (String
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin as Arc<dyn AgentPlugin>],
+        agent_dir,
     );
     let prompt = session
         .system_prompt_snapshot()
@@ -1408,7 +1418,7 @@ fn the_session_prompt_lists_ready_and_failed_servers() {
             .await;
         assert_eq!(report.failed.len(), 1, "{report:?}");
 
-        let (prompt, manager) = session_prompt_with(Arc::clone(&plugin), &tree.0);
+        let (prompt, manager) = session_prompt_with(Arc::clone(&plugin), &tree.0, &agent_dir);
         assert!(
             prompt.contains("<mcp_servers>") && prompt.contains("</mcp_servers>"),
             "the session prompt carries the section: {prompt}"
@@ -1450,7 +1460,7 @@ fn the_session_prompt_lists_a_pending_server_as_connecting() {
             .await;
         assert_eq!(report.pending, vec!["slow".to_owned()], "{report:?}");
 
-        let (prompt, manager) = session_prompt_with(Arc::clone(&plugin), &tree.0);
+        let (prompt, manager) = session_prompt_with(Arc::clone(&plugin), &tree.0, &agent_dir);
         assert!(
             prompt.contains("- mcp__slow (direct): connecting"),
             "the pending server is listed as connecting: {prompt}"
@@ -1469,7 +1479,9 @@ fn the_session_prompt_lists_a_pending_server_as_connecting() {
 #[test]
 fn no_mcp_means_no_section_and_identical_bytes() {
     let tree = Tree::new("prompt-off");
-    let session = pir::agent_session::AgentSession::new_with_plugins(
+    let agent_dir = tree.0.join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let session = pir::agent_session::AgentSession::new_with_plugins_and_agent_dir(
         pir::agent_session::AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::new(pir::ai::provider::ProviderRegistry::default()),
@@ -1485,8 +1497,10 @@ fn no_mcp_means_no_section_and_identical_bytes() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
+        &agent_dir,
     );
     let prompt = session
         .system_prompt_snapshot()
@@ -1503,7 +1517,7 @@ fn no_mcp_means_no_section_and_identical_bytes() {
             &[],
             &pir::coding_agent::context::ContextOptions {
                 disabled: true,
-                agent_dir: &tree.0,
+                agent_dir: &agent_dir,
                 package_dir: None,
                 max_total_bytes: 0,
             },

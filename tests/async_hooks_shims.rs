@@ -54,6 +54,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

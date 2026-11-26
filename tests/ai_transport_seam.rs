@@ -1536,33 +1536,6 @@ fn spawn_redirect_source(location: &str, requests: Arc<Mutex<Vec<String>>>) -> u
     )
 }
 
-fn clear_proxy_env() -> Vec<(&'static str, Option<String>)> {
-    let names = [
-        "PI_HTTP_PROXY",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-    ];
-    let saved = names
-        .iter()
-        .map(|name| (*name, std::env::var(name).ok()))
-        .collect::<Vec<_>>();
-    for name in names {
-        std::env::remove_var(name);
-    }
-    saved
-}
-
-fn restore_env(saved: Vec<(&'static str, Option<String>)>) {
-    for (name, value) in saved {
-        match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-    }
-}
-
 #[tokio::test]
 async fn reqwest_transport_does_not_follow_cross_host_redirects() {
     let target_requests = Arc::new(Mutex::new(Vec::new()));
@@ -1604,26 +1577,10 @@ async fn reqwest_transport_does_not_follow_cross_host_redirects() {
 
 #[tokio::test]
 async fn oauth_client_does_not_follow_cross_host_redirects() {
-    // The SHARED per-binary agent-dir lock: this test pins `PIR_AGENT_DIR` for
-    // the whole body, and a sibling suite in the same merged harness resolves
-    // provider models through the process environment too (a file-local mutex
-    // would leave both pinned at once and hand a child the wrong agent dir).
-    let _guard = crate::common::agent_dir_env_lock().lock().await;
-    let mut saved = clear_proxy_env();
-    // Pin the global settings scope to an empty directory so a user-level
-    // `httpProxy` setting cannot reroute the loopback request.
-    let agent_dir = std::env::temp_dir().join(format!(
-        "pir-redirect-agent-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
-    ));
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    saved.push(("PIR_AGENT_DIR", std::env::var("PIR_AGENT_DIR").ok()));
-    std::env::set_var("PIR_AGENT_DIR", &agent_dir);
-
+    // The proxy is an ARGUMENT (`None` = "no proxy"), not a process pin: this
+    // test never clears or sets `HTTP_PROXY`, so no sibling suite in the merged
+    // harness can be affected, and the assertion below is about the redirect
+    // policy alone.
     let target_requests = Arc::new(Mutex::new(Vec::new()));
     let target_port = spawn_http_server(
         "HTTP/1.1 200 OK\r\n".to_string(),
@@ -1636,16 +1593,14 @@ async fn oauth_client_does_not_follow_cross_host_redirects() {
         Arc::clone(&source_requests),
     );
 
-    let response = pir::ai::auth::http::post_json_with_headers(
+    let response = pir::ai::auth::http::post_json_with_headers_and_proxy(
+        None,
         &format!("http://127.0.0.1:{source_port}/token"),
         &serde_json::json!({"grant_type": "authorization_code"}),
         &[("authorization", "Bearer oauth-secret")],
     )
     .await
     .expect("the 307 response head is returned, not followed");
-
-    restore_env(saved);
-    let _ = std::fs::remove_dir_all(&agent_dir);
 
     assert_eq!(response.status, 307);
     assert!(

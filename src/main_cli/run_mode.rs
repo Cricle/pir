@@ -1192,6 +1192,8 @@ pub(super) async fn run() -> Result<()> {
                 idle_timeout: pir::server::ServerSecurityConfig::default().idle_timeout,
                 allow_remote_bash: config.allow_remote_bash,
                 allow_remote_agent: config.allow_remote_agent,
+                // The CLI keeps the environment-driven allowlist.
+                allowed_roots: Vec::new(),
             };
             // The global selection is resolved against the server's OWN
             // policy-filtered core registry (shell tools removed when

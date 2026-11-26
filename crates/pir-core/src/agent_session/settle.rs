@@ -1110,6 +1110,12 @@ fn outcome_label(message: &AssistantMessage) -> &'static str {
 /// preview, `outcome`), returned entry drafts are committed to session
 /// storage, and a `continue` result (honored only when the context can still
 /// run) guarantees one more provider request.
+///
+/// The `_with_pending` form below is the one the AgentSession host uses (it
+/// samples its inboxes); this convenience wrapper exists for the print host,
+/// which passes no pending payload — so it is gated on that feature instead of
+/// being dead weight in a minimal SDK build.
+#[cfg(feature = "print")]
 pub async fn dispatch_turn_end_boundary(
     plugins: &PluginHost,
     session: Option<BoundarySession<'_>>,
@@ -1254,7 +1260,9 @@ pub async fn dispatch_turn_end_boundary_with_pending(
     continue_requested
 }
 
-/// Shared `agent_before_settle` boundary dispatch (AgentSession + print).
+/// Shared `agent_before_settle` boundary dispatch for the print host, which
+/// passes no pending payload; see [`dispatch_turn_end_boundary`].
+#[cfg(feature = "print")]
 pub async fn dispatch_agent_before_settle_boundary(
     plugins: &PluginHost,
     session: Option<BoundarySession<'_>>,

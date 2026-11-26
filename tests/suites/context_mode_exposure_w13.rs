@@ -102,6 +102,26 @@ impl Drop for TempDir {
     }
 }
 
+/// Restores `PIR_AGENT_DIR` when the ONE test that mutates it ends (panic
+/// included), so a process that runs the suite without nextest isolation never
+/// leaves a scratch directory behind.
+struct AgentDirRestore(Option<std::ffi::OsString>);
+
+impl AgentDirRestore {
+    fn capture() -> Self {
+        Self(std::env::var_os("PIR_AGENT_DIR"))
+    }
+}
+
+impl Drop for AgentDirRestore {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
+            None => std::env::remove_var("PIR_AGENT_DIR"),
+        }
+    }
+}
+
 /// The host under test plus the things that must outlive it (the extension
 /// handle it was built on, and its temp cwd).
 struct HostFixture {
@@ -545,16 +565,27 @@ fn default_database_path_is_rooted_at_the_agent_dir_base() {
 
 /// The real D10 scenario: the DEFAULT store reads the agent dir per
 /// resolution, so a mid-process `PIR_AGENT_DIR` change moves the database.
-/// Serialized through the binary-wide [`crate::common::AgentDirEnvGuard`] lock,
-/// the same guard the sibling suites in this binary pin with.
+///
+/// The MOVING VARIABLE is the property under test — the default store has no
+/// explicit-base constructor to carry a per-test directory — so this needs a
+/// process of its own and runs under a process-per-test runner (nextest in CI
+/// and the pre-push gate) or when the operator opts in.
 #[tokio::test(flavor = "current_thread")]
 async fn default_database_path_follows_a_changed_agent_dir() {
+    if crate::common::skip_without_nextest(
+        "context_mode_exposure_w13::default_database_path_follows_a_changed_agent_dir",
+    ) {
+        return;
+    }
     let dir = TempDir::new("db-agent-dir-follow");
     let agent_a = dir.0.join("agent-a");
     let agent_b = dir.0.join("agent-b");
     let cwd = dir.0.join("project");
     std::fs::create_dir_all(&cwd).expect("project cwd");
-    let _env = crate::common::AgentDirEnvGuard::at(&agent_a, &[]).await;
+    // Serialized by the nextest guard above; the previous value is restored on
+    // exit so the pin cannot leak into a following test in the same process.
+    let _restore = AgentDirRestore::capture();
+    std::env::set_var("PIR_AGENT_DIR", &agent_a);
 
     let plugin = ContextModePlugin::new();
     push_cwd(&plugin, &cwd);

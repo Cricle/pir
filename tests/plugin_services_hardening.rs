@@ -214,11 +214,12 @@ fn session_config(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 
 fn live_session(temp: &TempDir, plugin: Arc<dyn AgentPlugin>) -> Arc<AgentSession> {
-    AgentSession::new_arc_with_plugins(
+    AgentSession::new_arc_with_plugins_and_agent_dir(
         session_config(
             temp,
             registry_with(vec![TestProvider::new("fake", "model-a")]),
@@ -226,6 +227,7 @@ fn live_session(temp: &TempDir, plugin: Arc<dyn AgentPlugin>) -> Arc<AgentSessio
             ToolRegistry::new(),
         ),
         vec![plugin],
+        temp.path(),
     )
 }
 
@@ -461,52 +463,17 @@ fn concurrent_binds_are_serialized_and_store_the_newest_context() {
 // 3. has_auth: warm cache, async refresh, counted disk reads
 // ---------------------------------------------------------------------------
 
-static AGENT_DIR_LOCK: Mutex<()> = Mutex::new(());
-
-/// Pins the process-global `PIR_AGENT_DIR` for the auth-refresh test and
-/// restores it (while still holding the lock) on drop.
-struct AgentDirGuard {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl AgentDirGuard {
-    fn pin(dir: &Path) -> Self {
-        let lock = AGENT_DIR_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", dir);
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for AgentDirGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-    }
-}
-
 #[test]
 fn has_auth_serves_warm_cache_and_refreshes_in_the_background() {
     let temp = TempDir::new("auth-refresh");
     let agent_dir = temp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    // The process-global pin is REQUIRED here: the background refresh calls
-    // `load_pi_environment`, which resolves the agent dir from the environment
-    // and takes no explicit override. The guard holds this file's env mutex,
-    // which serializes this file's tests but NOT the other suites sharing the
-    // merged binary — so under `cargo test --test zz_merged_5` a sibling suite
-    // can still re-point the variable mid-test. CI runs nextest (one process
-    // per test), where the assumption holds. See TEST-2 in
+
+    // The session owns this agent dir EXPLICITLY: both the cold read and the
+    // background refresh resolve credentials from it (`load_pi_environment_in`),
+    // so nothing here depends on the process-global `PIR_AGENT_DIR` and the
+    // suite needs no env lock. See TEST-2 in
     // `.audit/review-2026-11-23/findings.jsonl`.
-    let _env = AgentDirGuard::pin(&agent_dir);
 
     // Unique ids so the host environment can never answer for them.
     let alpha = format!("hardening-alpha-{}", std::process::id());
@@ -516,7 +483,7 @@ fn has_auth_serves_warm_cache_and_refreshes_in_the_background() {
         TestProvider::new(&beta, "beta-model"),
     ]);
     let probe = ContextProbe::new("auth-probe");
-    let _session = AgentSession::new_arc_with_plugins(
+    let _session = AgentSession::new_arc_with_plugins_and_agent_dir(
         session_config(
             &temp,
             registry,
@@ -524,6 +491,7 @@ fn has_auth_serves_warm_cache_and_refreshes_in_the_background() {
             ToolRegistry::new(),
         ),
         vec![probe.clone() as Arc<dyn AgentPlugin>],
+        &agent_dir,
     );
     let ctx = probe.last_context();
     let providers = ctx.providers().expect("provider service bound");

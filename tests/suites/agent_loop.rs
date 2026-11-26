@@ -1411,6 +1411,7 @@ async fn message_update_dispatch_does_not_gate_the_stream() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = runtime
@@ -1602,6 +1603,7 @@ async fn message_end_fixture(label: &str, source: &str) -> MessageEndFixture {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = runtime
@@ -3189,6 +3191,7 @@ async fn live_message_runtime(
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = runtime
@@ -3700,6 +3703,7 @@ async fn message_update_handler_observes_every_delta_without_touching_the_stream
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime");
     let loaded = runtime

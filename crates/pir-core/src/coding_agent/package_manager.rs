@@ -2310,6 +2310,19 @@ fn provider_credential_configured(agent_dir: &Path, provider_id: &str) -> bool {
 /// here as everywhere else). Public for tests/.
 #[doc(hidden)]
 pub fn update_model_catalogs(agent_dir: &Path) -> crate::Result<()> {
+    update_model_catalogs_in(
+        agent_dir,
+        std::env::var("PI_CATALOG_BASE_URL").ok().as_deref(),
+    )
+}
+
+/// [`update_model_catalogs`] with the catalog base URL supplied by the caller
+/// instead of read from `PI_CATALOG_BASE_URL`. `None` means "use the default
+/// endpoint"; an embedder or a test that owns its inputs states the override as
+/// an argument, so two concurrent refreshes in one process cannot redirect each
+/// other's catalog requests.
+#[doc(hidden)]
+pub fn update_model_catalogs_in(agent_dir: &Path, catalog_base: Option<&str>) -> crate::Result<()> {
     use crate::ai::provider::ProviderRegistry;
     use crate::ai::providers::{RemoteCatalogOverlay, RemoteCatalogOverlayConfig};
     use std::sync::Arc;
@@ -2320,8 +2333,7 @@ pub fn update_model_catalogs(agent_dir: &Path) -> crate::Result<()> {
         println!("Offline mode: skipped model catalog refresh");
         return Ok(());
     }
-    let base = std::env::var("PI_CATALOG_BASE_URL")
-        .ok()
+    let base = catalog_base
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| crate::ai::providers::REMOTE_CATALOG_DEFAULT_BASE_URL.to_string());

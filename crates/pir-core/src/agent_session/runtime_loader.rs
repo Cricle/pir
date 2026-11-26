@@ -414,14 +414,32 @@ impl ModelCatalog {
         registry: &ProviderRegistry,
         cwd: &Path,
     ) -> Self {
+        Self::from_registry_with_authenticated_providers_at(
+            registry,
+            &crate::ai::providers::agent_dir(),
+            cwd,
+        )
+    }
+
+    /// [`Self::from_registry_with_authenticated_providers`] against an EXPLICIT
+    /// agent dir, so a child session (or any embedder that owns its directory)
+    /// resolves the same credential sources its own session will, instead of
+    /// whatever the process environment points at.
+    pub fn from_registry_with_authenticated_providers_at(
+        registry: &ProviderRegistry,
+        agent_dir: &Path,
+        cwd: &Path,
+    ) -> Self {
         let mut catalog = Self::from_registry(registry);
-        if let Ok(environment) = crate::ai::providers::load_pi_environment(Some(cwd)) {
+        if let Ok(environment) = crate::ai::providers::load_pi_environment_in(agent_dir, Some(cwd))
+        {
             catalog.authenticated_providers = Some(
                 registry
                     .providers()
                     .iter()
                     .filter(|provider| {
-                        crate::ai::providers::has_configured_auth(
+                        crate::ai::providers::has_configured_auth_in(
+                            agent_dir,
                             provider.id(),
                             &environment.api_keys,
                         )
@@ -958,6 +976,29 @@ pub async fn dispatch_project_trust(
     host: Option<&crate::plugins::PluginHost>,
     cwd_display: &str,
 ) -> crate::extensions::project_trust::ProjectTrustDecision {
+    dispatch_project_trust_in(
+        runtime,
+        host,
+        cwd_display,
+        &crate::coding_agent::context::agent_dir(),
+    )
+    .await
+}
+
+/// [`dispatch_project_trust`] against an EXPLICIT global agent dir: a
+/// `remember: true` decision is persisted under `agent_dir`, not under the
+/// process environment's.
+///
+/// The ambient form is only correct for the CLI startup path, whose agent dir
+/// IS the process one. Embedders and tests that own their directory (one
+/// scratch dir per scenario) must call this, or two concurrent scenarios
+/// resolve — and lock — each other's `trust.json`.
+pub async fn dispatch_project_trust_in(
+    runtime: Option<&ExtensionHandle>,
+    host: Option<&crate::plugins::PluginHost>,
+    cwd_display: &str,
+    agent_dir: &Path,
+) -> crate::extensions::project_trust::ProjectTrustDecision {
     use crate::extensions::project_trust::ProjectTrustDecision;
 
     let mut payload = serde_json::json!({ "type": "project_trust", "cwd": cwd_display });
@@ -1007,8 +1048,7 @@ pub async fn dispatch_project_trust(
         // `remember: true` grant stays "untrusted" for this run). Only the
         // pre-trust bootstrap pass is allowed to write the store.
         if remember && !pinned {
-            let agent_dir = crate::coding_agent::context::agent_dir();
-            let store = crate::config::trust::ProjectTrustStore::new(&agent_dir);
+            let store = crate::config::trust::ProjectTrustStore::new(agent_dir);
             if let Err(error) = store.set(Path::new(cwd_display), Some(trusted)) {
                 crate::ext_diag!("[ext] project_trust: cannot persist the decision: {error}");
             }

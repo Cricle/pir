@@ -952,6 +952,7 @@ fn nested_context(harness: &Harness) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 

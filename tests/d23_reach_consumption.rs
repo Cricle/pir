@@ -49,6 +49,9 @@ use pir::ai::types::{
     StreamOptions, TerminalReason, TextContent, ThinkingLevel, Usage,
 };
 use pir::config::mcp::{load_mcp_configs, parse_mcp_config_document, McpExposure, McpServerConfig};
+use pir::extensions::project_trust::{
+    clear_recorded_decision, record_decision, ProjectTrustDecision,
+};
 use pir::extensions::{ExtensionConfig, ExtensionHandle};
 use pir::mcp::manager::{DiscoveredTool, McpManager};
 use pir::mcp::protocol::McpTool;
@@ -356,6 +359,7 @@ fn test_config_at(cwd: &Path, label: &str) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -1167,48 +1171,23 @@ fn fake_model() -> Model {
     }
 }
 
-/// Serializes the tests that redirect process-global env vars.
-///
-/// Delegates to `crate::common::agent_dir_env_lock()`, the shared per-binary
-/// lock. A private `static` here (what this used to be) only serializes this
-/// file's tests against each other even though `PIR_AGENT_DIR` is process-wide:
-/// `EnvVars::set` below re-pointed it while `codemode_exposure`'s
-/// `/reload`-count test was running in the same `zz_merged_4` binary, so that
-/// test observed THIS file's temp agent dir and saw one settings read instead
-/// of two. Async so the guard can outlive the awaited shutdowns without
-/// holding a `std::sync` guard across an `.await`.
-async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    crate::common::agent_dir_env_lock().lock().await
-}
+/// Records this scenario's project-trust decision for `cwd` (and clears it on
+/// drop), so a test that needs the project scope open — the effect an operator
+/// `PIR_TRUST_PROJECT=1` would have — states it for ITS OWN directory instead
+/// of mutating the process environment.
+struct ScenarioTrust(std::path::PathBuf);
 
-/// Sets env vars for the guard's lifetime, restoring the previous values on
-/// drop.
-///
-/// The CALLER must already hold [`env_lock`] and keep it for the guard's
-/// lifetime — every call site does (`let _env = env_lock().await;` precedes
-/// it). Taking the lock here as well would self-deadlock: `tokio::sync::Mutex`
-/// is not reentrant.
-struct EnvVars(Vec<(&'static str, Option<std::ffi::OsString>)>);
-
-impl EnvVars {
-    fn set(pairs: &[(&'static str, &str)]) -> Self {
-        let mut previous = Vec::with_capacity(pairs.len());
-        for (key, value) in pairs {
-            previous.push((*key, std::env::var_os(key)));
-            std::env::set_var(key, value);
-        }
-        Self(previous)
+impl ScenarioTrust {
+    fn yes(cwd: &Path) -> Self {
+        clear_recorded_decision(cwd);
+        record_decision(cwd, ProjectTrustDecision::Yes);
+        Self(cwd.to_path_buf())
     }
 }
 
-impl Drop for EnvVars {
+impl Drop for ScenarioTrust {
     fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
+        clear_recorded_decision(&self.0);
     }
 }
 
@@ -1296,6 +1275,7 @@ impl Provider for CapturingProvider {
 /// `--tools` selection.
 fn session_with_plugins(
     cwd: &Path,
+    agent_dir: &Path,
     captured: &Arc<Mutex<Vec<Vec<String>>>>,
     core: &[&'static str],
     selection: Option<Vec<String>>,
@@ -1311,7 +1291,7 @@ fn session_with_plugins(
     for name in core {
         tools.register(Arc::new(CoreTool { name }));
     }
-    Arc::new(AgentSession::new_with_plugins(
+    Arc::new(AgentSession::new_with_plugins_and_agent_dir(
         AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::new(registry),
@@ -1332,8 +1312,10 @@ fn session_with_plugins(
                 // restore (upstream `usesDefaultTools` is false for it).
                 ..Default::default()
             }),
+            phone_child: None,
         },
         inline,
+        agent_dir,
     ))
 }
 
@@ -1453,7 +1435,6 @@ fn d23_auto_enable_codemode_parses_and_merges_project_over_global() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn d23_auto_enable_codemode_field_gates_the_plugin_activation() {
-    let _env = env_lock().await;
     let agent = TempDir::new("auto-plugin-agent");
     let cwd = TempDir::new("auto-plugin-cwd");
     std::fs::write(
@@ -1467,7 +1448,6 @@ async fn d23_auto_enable_codemode_field_gates_the_plugin_activation() {
         }"#,
     )
     .expect("write mcp.json");
-    let _vars = EnvVars::set(&[("PIR_AGENT_DIR", &agent.0.to_string_lossy())]);
 
     let plugin = Arc::new(McpPlugin::with_cwd(&agent.0, &cwd.0));
     let host = PluginHost::build(
@@ -1497,9 +1477,13 @@ async fn d23_auto_enable_codemode_field_gates_the_plugin_activation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn d23_auto_enable_codemode_project_value_wins() {
-    let _env = env_lock().await;
     let agent = TempDir::new("auto-project-agent");
     let cwd = TempDir::new("auto-project-cwd");
+    // The project scope opens through the extension decision (the
+    // `PIR_TRUST_PROJECT=1` layer's effect), recorded for THIS cwd only — the
+    // plugin resolves its trust against its explicit agent dir, so nothing
+    // here touches the process environment.
+    let _trust = ScenarioTrust::yes(&cwd.0);
     std::fs::write(
         agent.0.join("mcp.json"),
         r#"{ "mcpServers": {}, "autoEnableCodemode": false }"#,
@@ -1514,10 +1498,6 @@ async fn d23_auto_enable_codemode_project_value_wins() {
         }"#,
     )
     .expect("write project mcp.json");
-    let _vars = EnvVars::set(&[
-        ("PIR_AGENT_DIR", &agent.0.to_string_lossy()),
-        ("PIR_TRUST_PROJECT", "1"),
-    ]);
 
     let plugin = Arc::new(McpPlugin::with_cwd(&agent.0, &cwd.0));
     let host = PluginHost::build(
@@ -1721,16 +1701,15 @@ async fn d23_resource_tools_report_argument_and_no_resource_errors() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn d23_session_activation_keeps_core_tools_and_the_explicit_selection() {
-    let _env = env_lock().await;
     let agent = TempDir::new("session-activation-agent");
     let cwd = TempDir::new("session-activation-cwd");
-    let _vars = EnvVars::set(&[("PIR_AGENT_DIR", &agent.0.to_string_lossy())]);
 
     let mcp = Arc::new(McpPlugin::with_cwd(&agent.0, &cwd.0));
     register_unstartable_server(&mcp, "docs", McpExposure::Codemode);
     let captured = Arc::new(Mutex::new(Vec::new()));
     let session = session_with_plugins(
         &cwd.0,
+        &agent.0,
         &captured,
         &["noop", "second"],
         // `--tools noop,second`: the explicit selection must survive the
@@ -1767,15 +1746,14 @@ async fn d23_session_activation_keeps_core_tools_and_the_explicit_selection() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn d23_session_activation_is_a_noop_without_mcp_servers() {
-    let _env = env_lock().await;
     let agent = TempDir::new("session-noop-agent");
     let cwd = TempDir::new("session-noop-cwd");
-    let _vars = EnvVars::set(&[("PIR_AGENT_DIR", &agent.0.to_string_lossy())]);
 
     let mcp = Arc::new(McpPlugin::with_cwd(&agent.0, &cwd.0));
     let captured = Arc::new(Mutex::new(Vec::new()));
     let session = session_with_plugins(
         &cwd.0,
+        &agent.0,
         &captured,
         &["noop"],
         Some(vec!["noop".to_owned()]),
@@ -1931,10 +1909,8 @@ async fn d23_loop_awaits_the_wait_hook_before_executing_the_batch() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn d23_session_wires_the_wait_hook_to_the_mcp_plugin() {
-    let _env = env_lock().await;
     let agent = TempDir::new("session-wait-agent");
     let cwd = TempDir::new("session-wait-cwd");
-    let _vars = EnvVars::set(&[("PIR_AGENT_DIR", &agent.0.to_string_lossy())]);
 
     let mcp = Arc::new(McpPlugin::with_cwd(&agent.0, &cwd.0));
     register_bogus_server(&mcp, "docs");
@@ -1942,6 +1918,7 @@ async fn d23_session_wires_the_wait_hook_to_the_mcp_plugin() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let session = session_with_plugins(
         &cwd.0,
+        &agent.0,
         &captured,
         &["noop"],
         None,
@@ -1975,6 +1952,7 @@ async fn d23_session_wires_the_wait_hook_to_the_mcp_plugin() {
     // A session without the mcp builtin has no hook at all.
     let no_mcp = session_with_plugins(
         &cwd.0,
+        &agent.0,
         &Arc::new(Mutex::new(Vec::new())),
         &["noop"],
         None,
@@ -1990,11 +1968,9 @@ async fn d23_session_wires_the_wait_hook_to_the_mcp_plugin() {
 /// JS tool names, and the server's connection exists before the tool runs.
 #[tokio::test(flavor = "current_thread")]
 async fn d23_session_wait_hook_waits_for_a_js_tools_server() {
-    let _env = env_lock().await;
     let agent = TempDir::new("js-session-agent");
     let cwd = TempDir::new("js-session-cwd");
     let ext_dir = TempDir::new("js-session-ext");
-    let _vars = EnvVars::set(&[("PIR_AGENT_DIR", &agent.0.to_string_lossy())]);
     let runtime = load_runtime(&ext_dir, "js-session", JS_REACH_EXTENSION).await;
 
     let mcp = Arc::new(McpPlugin::with_cwd(&agent.0, &cwd.0));
@@ -2003,6 +1979,7 @@ async fn d23_session_wait_hook_waits_for_a_js_tools_server() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let session = session_with_plugins(
         &cwd.0,
+        &agent.0,
         &captured,
         &["noop"],
         None,

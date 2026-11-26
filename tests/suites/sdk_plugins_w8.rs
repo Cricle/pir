@@ -14,10 +14,9 @@
 //! - `SdkEvent` tool payload completeness (`args` on start/update, `result`
 //!   on end) and the terminal `AgentOutcome` event.
 //!
-//! The settings-default tests redirect `PIR_AGENT_DIR` at a scratch directory
-//! through `tests/common/mod.rs::AgentDirEnvGuard`, which holds the ONE
-//! binary-wide agent-dir env lock (a module-local lock cannot exclude the other
-//! suites of the merged `g_agent` binary).
+//! The settings-default tests give each build its own settings scope through
+//! `AgentBuilder::agent_dir`, so nothing here reads or mutates the
+//! process-wide `PIR_AGENT_DIR`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,13 +69,18 @@ impl Drop for TempDir {
     }
 }
 
-/// Pin `PIR_AGENT_DIR` at `dir` with `PI_OFFLINE=1` for the test's duration.
-/// `PIR_AGENT_DIR` is process-global while the merged `g_agent` binary runs
-/// tests in parallel threads, so this uses the binary-wide lock in
-/// `tests/common/mod.rs::AgentDirEnvGuard` — the same lock every other
-/// agent-dir suite takes. Restores both variables (panic included).
-async fn pin_agent_dir(dir: &Path) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::at(dir, &[("PI_OFFLINE", "1")]).await
+/// BUILD THE AGENT at `dir` instead of PINNING the process environment at it.
+///
+/// The builder's `.agent_dir(..)` gives this build its own settings scope,
+/// credentials and `models-store.json`; no `PIR_AGENT_DIR` write and no lock.
+/// `PI_OFFLINE` is not needed either: an explicit agent dir installs remote
+/// catalog overlays through [`install_remote_catalog_overlays_at`], whose first
+/// hop is one full refresh interval out, so nothing is fetched inside a test
+/// window.
+///
+/// [`install_remote_catalog_overlays_at`]: pir::ai::providers::install_remote_catalog_overlays_with
+fn pinned_builder_at(dir: &Path) -> pir::sdk::AgentBuilder {
+    pir::sdk::AgentBuilder::new().agent_dir(dir.to_path_buf())
 }
 
 fn fake_model() -> Model {
@@ -198,11 +202,10 @@ async fn builder_applies_settings_defaults_and_explicit_choices_win() {
     let agent_dir = TempDir::new("agent-defaults");
     let cwd = TempDir::new("cwd-defaults");
     write_default_settings(&agent_dir.0);
-    let _env = pin_agent_dir(&agent_dir.0).await;
 
     // No explicit model/tools: defaultProvider/defaultModel select the model,
     // settings defaultTools selects the declared tool set.
-    let agent = AgentBuilder::new()
+    let agent = pinned_builder_at(&agent_dir.0)
         .no_session()
         .no_compaction()
         .cwd(cwd.0.clone())
@@ -233,7 +236,7 @@ async fn builder_applies_settings_defaults_and_explicit_choices_win() {
     );
 
     // Explicit model + explicit tool list beat both settings defaults.
-    let explicit = AgentBuilder::new()
+    let explicit = pinned_builder_at(&agent_dir.0)
         .no_session()
         .no_compaction()
         .cwd(cwd.0.clone())

@@ -6,126 +6,96 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// The ONE process-wide lock every test that mutates `PIR_AGENT_DIR` (or
-/// its `PI_CODING_AGENT_DIR` alias) must take.
+/// Process-wide monotonic counter mixed into every scratch path name.
 ///
-/// The environment is process-global, while a merged test binary runs its
-/// test functions on parallel threads. A lock declared in a suite module only
-/// serializes that module's tests: two suites holding two different `static`
-/// mutexes do NOT exclude each other, so one suite can observe the scratch
-/// agent directory pinned by another (the `NoModel { "…/w8d-other" not found }`
-/// interleaving failure in `logs/w13/g_agent.log`).
+/// `SystemTime::now()` cannot make a temp name unique on its own: its
+/// granularity on Windows is the system tick (~15.6 ms), so two threads in the
+/// same merged test binary that read it inside one tick get *identical*
+/// nanoseconds. Combined with a shared literal label that is a real collision
+/// (`create_dir_all` is content to reuse an existing dir; `create_dir` and
+/// `File::create_new` are not, and a reused dir means two tests share state).
+/// A per-process atomic is the only thing that is unique without a syscall and
+/// without relying on the clock (audit finding TEST-4).
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A temp-dir path that is unique **within this process**, with no lock.
 ///
-/// `tests/common/mod.rs` is included exactly once per test binary (`mod
-/// common;` at the binary's crate root), so the static below is shared by
-/// every suite module inside that binary. The copy is duplicated per binary,
-/// which is correct: separate test binaries are separate processes with
-/// separate environments, so they can never race.
-///
-/// This is a **tokio** mutex rather than `std::sync::Mutex` because every
-/// guard here is held across `.await` points (the pinned directory must stay
-/// in place for the whole async test): the async lock keeps the test future
-/// `Send` and avoids `clippy::await_holding_lock`. The critical sections are
-/// instant env mutations, so contention costs nothing but scheduling.
-pub fn agent_dir_env_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+/// Use for any scratch directory or file a test creates. The name carries the
+/// label (so a leftover is traceable to its suite), the pid (so concurrent test
+/// *binaries* cannot collide) and a process-wide sequence number (so parallel
+/// tests *within* one merged binary cannot collide even in the same clock
+/// tick). Prefer this over hand-rolled `temp_dir().join(format!(...))`.
+pub fn unique_temp_path(label: &str) -> PathBuf {
+    let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    // Nanoseconds are kept as a tiebreaker for a reused pid across runs; they
+    // are not required for uniqueness, which the sequence number provides.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("pir-{label}-{}-{seq}-{stamp}", std::process::id()))
 }
 
-/// Set the process-wide `PI_OFFLINE=1` flag without taking the
-/// [`agent_dir_env_lock`] for the rest of the test.
-///
-/// This is the only env variable a large family of builder tests needs: they
-/// pass an explicit `.agent_dir()` and only want the remote-catalog refresh
-/// disabled. The value is constant and idempotent, so the mutation does not
-/// need to exclude `PIR_AGENT_DIR` pins (different variable), and the test no
-/// longer holds the binary-wide lock across its async builds — which was the
-/// dominant source of multi-second queueing inside `g_agent`.
-pub fn ensure_offline_mode() {
-    // Constant, idempotent value: re-set on every call so a preceding test's
-    // env restore cannot leave the flag unset.
-    std::env::set_var("PI_OFFLINE", "1");
-}
+/// The three spellings of the agent-dir environment variable, in precedence
+/// order (`PIR_AGENT_DIR` → `PIR_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR`).
+pub const AGENT_DIR_ENV_VARS: [&str; 3] = [
+    "PIR_AGENT_DIR",
+    "PIR_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_DIR",
+];
 
-/// RAII pin of the process-global `PIR_AGENT_DIR`, serialized by
-/// [`agent_dir_env_lock`]: restores the previous value (or absence) of the
-/// pinned variables on drop, panic included, so a failing test cannot leak a
-/// scratch agent directory into its neighbours.
-pub struct AgentDirEnvGuard {
-    /// `Drop::drop` (which restores the environment) runs before any field
-    /// is dropped, so the restore stays serialized with the pin: the lock is
-    /// still held while the previous values go back.
-    _lock: tokio::sync::MutexGuard<'static, ()>,
+/// A restore-on-drop pin of process environment variables, WITHOUT a lock.
+///
+/// Only for the tests whose property IS the process environment: variable
+/// precedence, a default-built session following the env, a child process
+/// inheriting it. Those cannot be expressed as an explicit argument, so they
+/// pin the variables instead — and each such test first calls
+/// [`skip_without_nextest`], so the pin is only ever applied while this
+/// process runs exactly one test. That is what makes the lock unnecessary
+/// rather than merely cheap.
+///
+/// `Drop` restores every saved name to its previous value (absence included),
+/// panic included, so a failing test cannot leak a scratch directory into the
+/// rest of its binary.
+pub struct ProcessEnvPin {
     saved: Vec<(&'static str, Option<OsString>)>,
-    owned_dir: Option<PathBuf>,
 }
 
-impl AgentDirEnvGuard {
-    /// Pin `PIR_AGENT_DIR` at a fresh scratch directory, removed on drop.
-    /// `settings_json`, when given, is written to `<dir>/settings.json`
-    /// before the pin is published.
-    pub async fn scratch(label: &str, settings_json: Option<&str>) -> Self {
-        Self::scratch_with(label, settings_json, &[]).await
-    }
-
-    /// [`Self::scratch`] plus extra environment variables pinned for the
-    /// guard's lifetime (restored on drop, like `PIR_AGENT_DIR`). Use this
-    /// instead of a bare `set_var` when a process-global setting must be
-    /// stable across an async test that builds sessions at several points.
-    pub async fn scratch_with(
-        label: &str,
-        settings_json: Option<&str>,
-        extra: &[(&'static str, &str)],
-    ) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "pir-test-agent-dir-{label}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("create pinned agent dir");
-        if let Some(settings) = settings_json {
-            std::fs::write(dir.join("settings.json"), settings).expect("write pinned settings");
+impl ProcessEnvPin {
+    /// Clear every name in `cleared`, then apply `pins`; all previous values
+    /// are restored on drop.
+    ///
+    /// The pin VALUES are consumed immediately (`set_var` copies them), so only
+    /// the NAMES have to outlive the call — a caller can pass a path borrowed
+    /// from a local `PathBuf`.
+    pub fn isolate(cleared: &[&'static str], pins: &[(&'static str, &str)]) -> Self {
+        let mut saved: Vec<(&'static str, Option<OsString>)> = Vec::new();
+        for key in cleared {
+            saved.push((key, std::env::var_os(key)));
+            std::env::remove_var(key);
         }
-        let mut guard = Self::acquire(&dir, extra).await;
-        guard.owned_dir = Some(dir);
-        guard
-    }
-
-    /// Pin `PIR_AGENT_DIR` at an existing directory (the caller owns its
-    /// cleanup) and set `extra` variables; everything is restored on drop.
-    pub async fn at(dir: impl AsRef<Path>, extra: &[(&'static str, &str)]) -> Self {
-        Self::acquire(dir.as_ref(), extra).await
-    }
-
-    /// The scratch directory this guard owns, when it created one.
-    pub fn dir(&self) -> Option<&Path> {
-        self.owned_dir.as_deref()
-    }
-
-    async fn acquire(dir: &Path, extra: &[(&'static str, &str)]) -> Self {
-        let lock = agent_dir_env_lock().lock().await;
-        let mut saved = Vec::with_capacity(1 + extra.len());
-        saved.push(("PIR_AGENT_DIR", std::env::var_os("PIR_AGENT_DIR")));
-        std::env::set_var("PIR_AGENT_DIR", dir);
-        for (key, value) in extra {
-            saved.push((*key, std::env::var_os(key)));
+        for (key, value) in pins {
+            if !saved.iter().any(|(saved_key, _)| saved_key == key) {
+                saved.push((key, std::env::var_os(key)));
+            }
             std::env::set_var(key, value);
         }
-        Self {
-            _lock: lock,
-            saved,
-            owned_dir: None,
-        }
+        Self { saved }
+    }
+
+    /// Pin `PIR_AGENT_DIR` at `dir` and clear the two lower-precedence aliases,
+    /// so the caller gets `dir` regardless of what the host exported.
+    pub fn agent_dir(dir: &Path) -> Self {
+        let value = dir.to_str().expect("temp paths are UTF-8");
+        Self::isolate(&AGENT_DIR_ENV_VARS, &[("PIR_AGENT_DIR", value)])
     }
 }
 
-impl Drop for AgentDirEnvGuard {
+impl Drop for ProcessEnvPin {
     fn drop(&mut self) {
         // Reverse order so a variable set twice unwinds to its original value.
         for (key, previous) in self.saved.drain(..).rev() {
@@ -134,10 +104,136 @@ impl Drop for AgentDirEnvGuard {
                 None => std::env::remove_var(key),
             }
         }
-        if let Some(dir) = self.owned_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
+}
+
+/// Whether this PROCESS may pin a process-global environment variable.
+///
+/// A few suites have a property that IS the environment: the precedence of
+/// `PIR_AGENT_DIR` / `PIR_CODING_AGENT_DIR` / `PI_CODING_AGENT_DIR`, a
+/// default-built session following the env, a child process inheriting it, a
+/// `HOME`-anchored skill scan, the crash hook's live-dir read. Those cannot be
+/// expressed as an explicit argument, so they pin the variables — and a
+/// process-global pin only makes sense when THIS process runs one test at a
+/// time.
+///
+/// `cargo nextest` runs one process per test, so `NEXTEST_RUN_ID` (nextest's
+/// documented per-run identifier — the `insta` snapshot crate keys on it too)
+/// is the proof that no sibling is concurrently reading the same variable.
+/// Under a plain `cargo test` the merged harness runs suites on parallel
+/// threads inside one process, where a pin is observable by everything else —
+/// there the test reports a SKIP instead of passing on a value it may have
+/// raced for.
+///
+/// `escape_var` is the explicit opt-in for a single-process run that knows
+/// what it is doing (e.g. filtering to exactly one such test with
+/// `--test-threads=1`). Each variable family has its own escape hatch so an
+/// operator can allow the cheap pin they trust without allowing every other
+/// one.
+fn exclusive_process_available(escape_var: &str) -> bool {
+    std::env::var_os("NEXTEST_RUN_ID").is_some() || std::env::var_os(escape_var).is_some()
+}
+
+/// The standard SKIP line for a test that pins `variable`, when the process is
+/// shared with other suites and `escape_var` is unset. Returns `true` when the
+/// caller should return early.
+///
+/// `what` names the ambient input in one clause ("re-points PIR_AGENT_DIR and
+/// would break every concurrently running suite"), so the operator sees why
+/// the test has to be alone rather than just which knob to turn.
+fn skip_unless_exclusive_process(test_name: &str, escape_var: &str, what: &str) -> bool {
+    if exclusive_process_available(escape_var) {
+        return false;
+    }
+    eprintln!(
+        "SKIP {test_name}: this test {what}. It runs under `cargo nextest` (CI); to run it \
+         under plain `cargo test`, filter to this test and set {escape_var}=1."
+    );
+    true
+}
+
+/// [`skip_unless_exclusive_process`] for the agent-dir variable family.
+pub fn skip_without_nextest(test_name: &str) -> bool {
+    skip_unless_exclusive_process(
+        test_name,
+        "PIR_ALLOW_SHARED_PROCESS_AGENT_DIR",
+        "re-points the process-wide agent-dir environment and would break every concurrently \
+         running suite",
+    )
+}
+
+/// [`skip_unless_exclusive_process`] for the `HOME` variable.
+pub fn skip_without_nextest_home(test_name: &str) -> bool {
+    skip_unless_exclusive_process(
+        test_name,
+        "PIR_ALLOW_SHARED_PROCESS_HOME",
+        "re-points the process-wide HOME and would break every concurrently running suite",
+    )
+}
+
+/// [`skip_unless_exclusive_process`] for the temporary-directory variables.
+pub fn skip_without_nextest_temp(test_name: &str) -> bool {
+    skip_unless_exclusive_process(
+        test_name,
+        "PIR_ALLOW_SHARED_PROCESS_TEMP",
+        "re-points the process-wide temporary directory and would break every concurrently \
+         running suite",
+    )
+}
+
+/// [`skip_unless_exclusive_process`] for `PI_PACKAGE_DIR`.
+pub fn skip_without_nextest_package(test_name: &str) -> bool {
+    skip_unless_exclusive_process(
+        test_name,
+        "PIR_ALLOW_SHARED_PROCESS_PACKAGE_DIR",
+        "re-points the process-wide package dir and would break every concurrently running \
+         suite",
+    )
+}
+
+/// Set the process-wide `PI_OFFLINE=1` flag.
+///
+/// This is the only env variable a large family of builder tests needs: they
+/// pass an explicit `.agent_dir()` and only want the remote-catalog refresh
+/// disabled. The value is constant and idempotent, so the mutation does not
+/// need to exclude `PIR_AGENT_DIR` pins (different variable) and nothing has
+/// to restore it afterwards.
+pub fn ensure_offline_mode() {
+    // Constant, idempotent value: re-set on every call so a preceding test's
+    // env restore cannot leave the flag unset.
+    std::env::set_var("PI_OFFLINE", "1");
+}
+
+/// An agent dir a test owns and passes explicitly (see
+/// [`scratch_agent_dir`]). Removed on drop, panic included.
+pub struct TempAgentDir(pub PathBuf);
+
+impl TempAgentDir {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempAgentDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Create a fresh scratch agent dir, optionally with a `settings.json`.
+///
+/// The directory is returned WITHOUT touching the process environment: the
+/// caller hands it to its session/builder explicitly (`.agent_dir(..)`,
+/// `new_with_agent_dir`, `PluginHost::build_with_agent_dir`). An explicit
+/// directory cannot race another test, so nothing here needs a lock and
+/// `PIR_AGENT_DIR` is left alone.
+pub fn scratch_agent_dir(label: &str, settings_json: Option<&str>) -> TempAgentDir {
+    let dir = unique_temp_path(&format!("test-agent-dir-{label}"));
+    std::fs::create_dir_all(&dir).expect("create scratch agent dir");
+    if let Some(settings) = settings_json {
+        std::fs::write(dir.join("settings.json"), settings).expect("write settings");
+    }
+    TempAgentDir(dir)
 }
 
 /// The ONE process-wide lock for tests that touch the **global Codex
@@ -159,8 +255,8 @@ impl Drop for AgentDirEnvGuard {
 /// too. Session-scoped closes deliberately do NOT take it — that keeps the
 /// lock off every test's path and serializes only the genuinely global case.
 ///
-/// This is a **tokio** mutex for the same reason as [`agent_dir_env_lock`]:
-/// every holder awaits inside the critical section.
+/// This is a **tokio** mutex because every holder awaits inside the critical
+/// section (the pooled socket is released by an async transport task).
 pub fn codex_ws_pool_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -186,7 +282,7 @@ pub async fn codex_ws_pool_guard() -> tokio::sync::MutexGuard<'static, ()> {
 /// (`tui_frame_reuse::user_bash_block_serves_its_whole_row_set_from_the_memo`
 /// failed exactly this way under `cargo test --test zz_merged_2`).
 ///
-/// As with [`agent_dir_env_lock`], a lock declared inside one suite module only
+/// As with [`codex_ws_pool_lock`], a lock declared inside one suite module only
 /// serializes that module: `tui_frame_reuse` and `tui_windowed_transcript`
 /// each had their own `static TEST_LOCK`, so they did not exclude each other.
 /// Declaring it here (once per test binary) makes every frame-measuring suite in
@@ -297,4 +393,66 @@ pub fn write_file_atomically(path: impl AsRef<Path>, contents: &str) {
     // `rename` replaces an existing destination on both platforms (Windows
     // `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` under `fs::rename`).
     let _ = std::fs::rename(&temp, path);
+}
+
+/// Wait for an external process to make `path` satisfy `check`, **without
+/// sleeping**.
+///
+/// Tests must not use `sleep` as a synchronisation primitive: a sleep is either
+/// too short (flaky under load) or too long (slow), and it hides the event the
+/// test actually depends on. This blocks on the same OS facility production
+/// uses — a filesystem watch over the *parent directory* (`notify`, the crate
+/// behind `fs.watch`) — and re-runs `check` on every relevant event.
+///
+/// `check` is evaluated once before waiting, so a producer that already
+/// finished cannot deadlock the waiter.
+///
+/// `timeout` is a *failure bound*, not a delay: it only fires when the producer
+/// never delivers, and the panic names the path that was being waited on.
+///
+/// Watching the parent (not the file) is deliberate: a producer that creates
+/// the file, or replaces it by rename (`write_file_atomically`), never emits an
+/// event addressed to a path that did not exist when the watch started — but a
+/// directory watch reports the creation/rename regardless.
+pub fn wait_for_file<T>(path: &Path, timeout: Duration, mut check: impl FnMut() -> Option<T>) -> T {
+    use notify::{RecursiveMode, Watcher};
+
+    if let Some(value) = check() {
+        return value;
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // A watched directory that does not exist yet cannot be watched; create it
+    // so a producer writing into it still wakes us. This is the only case where
+    // the test itself may create the parent.
+    let _ = std::fs::create_dir_all(dir);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        // A send failure means the waiter is gone; dropping the event is fine.
+        let _ = tx.send(event);
+    })
+    .expect("create fs watcher");
+    watcher
+        .watch(dir, RecursiveMode::NonRecursive)
+        .expect("watch the waiting directory");
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("timed out waiting for {}", path.display());
+        }
+        // Either an fs event or the deadline, whichever comes first: no sleep.
+        match rx.recv_timeout(remaining) {
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("timed out waiting for {}", path.display())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("fs watcher stopped while waiting for {}", path.display())
+            }
+        }
+    }
 }

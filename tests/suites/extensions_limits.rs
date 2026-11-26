@@ -85,6 +85,7 @@ fn injected_config(cwd: &Path, limits: ExtensionLimits) -> ExtensionConfig {
         is_idle: true,
         limits: Some(limits),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 

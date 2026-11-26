@@ -80,6 +80,7 @@ fn context(session_env: Option<Arc<ToolSessionEnv>>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -508,6 +509,7 @@ async fn session_host_exposes_and_aborts_a_background_call_through_the_tools() {
         event_stream: Some(scripted_stream(Arc::clone(&requests))),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     let handler: EventHandler = Arc::new(|_event: AgentEvent| {});
@@ -617,6 +619,7 @@ async fn each_session_reports_only_its_own_background_calls() {
             event_stream: Some(scripted_background_only(requests)),
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         })
     };
 

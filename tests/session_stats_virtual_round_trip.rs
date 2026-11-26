@@ -248,6 +248,7 @@ async fn stats_ignore_custom_entries_and_virtual_state_restores() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     // M10.4: the borrowed resident fold produces the same totals, and the

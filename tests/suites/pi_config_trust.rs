@@ -16,10 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
-use pir::ai::providers::load_pi_config_with;
+use pir::ai::providers::{load_pi_config_with_in, load_pi_config_with_in_and_override};
 use pir::config::trust::ProjectTrustStore;
 use pir::extensions::project_trust::{
-    clear_recorded_decisions, pin_decision, record_decision, ProjectTrustDecision,
+    clear_recorded_decision, pin_decision, record_decision, ProjectTrustDecision,
 };
 
 const PROJECT_THEME: &str = "project-config-theme";
@@ -59,36 +59,34 @@ fn fixture(label: &str) -> (PathBuf, PathBuf) {
     (project, agent)
 }
 
-/// Pin `PIR_AGENT_DIR` at the fixture agent dir and neutralize an ambient
-/// `PIR_TRUST_PROJECT` (only the literal `1` forces trust).
-async fn pin_agent_dir(agent: &Path) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::at(agent, &[("PIR_TRUST_PROJECT", "")]).await
-}
-
-/// Clear the process-wide extension decisions while the agent-dir lock is
-/// still held (declared after the env guard so it drops first).
-struct DecisionsGuard;
-
-impl DecisionsGuard {
-    fn new() -> Self {
-        clear_recorded_decisions();
-        Self
-    }
-}
-
-impl Drop for DecisionsGuard {
-    fn drop(&mut self) {
-        clear_recorded_decisions();
-    }
-}
-
-fn configured_theme(project: &Path) -> Option<String> {
-    load_pi_config_with(Some(project))
+/// The config resolver bound to `agent` — the explicit-dir form, so no test
+/// here relies on the process agent dir.
+fn configured_theme_at(agent: &Path, project: &Path) -> Option<String> {
+    load_pi_config_with_in(agent, Some(project))
         .expect("load pi config")
         .expect("models.json must produce a configured model")
         .settings
         .theme
         .clone()
+}
+
+/// Clears ONE scenario's recorded extension decision and pin, on entry and on
+/// drop. Scoped to the test's own project directory: the process-wide
+/// `clear_recorded_decisions()` would erase a concurrently running scenario's
+/// in-flight decision, which is contention the suite must not have.
+struct DecisionsGuard(std::path::PathBuf);
+
+impl DecisionsGuard {
+    fn new(project: &Path) -> Self {
+        clear_recorded_decision(project);
+        Self(project.to_path_buf())
+    }
+}
+
+impl Drop for DecisionsGuard {
+    fn drop(&mut self) {
+        clear_recorded_decision(&self.0);
+    }
 }
 
 /// An extension grant recorded before the config load opens the project
@@ -97,8 +95,7 @@ fn configured_theme(project: &Path) -> Option<String> {
 #[tokio::test(flavor = "current_thread")]
 async fn models_config_reads_project_scope_after_an_extension_grant() {
     let (project, agent) = fixture("grant");
-    let _env = pin_agent_dir(&agent).await;
-    let _decisions = DecisionsGuard::new();
+    let _decisions = DecisionsGuard::new(&project);
 
     record_decision(&project, ProjectTrustDecision::Yes);
     assert_eq!(
@@ -110,7 +107,7 @@ async fn models_config_reads_project_scope_after_an_extension_grant() {
     );
 
     assert_eq!(
-        configured_theme(&project).as_deref(),
+        configured_theme_at(&agent, &project).as_deref(),
         Some(PROJECT_THEME),
         "an extension grant must open the project settings scope for the config resolver"
     );
@@ -118,23 +115,29 @@ async fn models_config_reads_project_scope_after_an_extension_grant() {
 }
 
 /// The startup gate's pinned denial (`--no-approve` / an interactive "no")
-/// wins over both a recorded extension grant and `PIR_TRUST_PROJECT=1`; the
-/// config resolver must keep the project scope closed.
+/// wins over both a recorded extension grant and an operator override
+/// (`PIR_TRUST_PROJECT=1`); the config resolver must keep the project scope
+/// closed.
 #[tokio::test(flavor = "current_thread")]
 async fn models_config_honors_a_pinned_denial_over_an_extension_grant() {
     let (project, agent) = fixture("pinned-deny");
-    let _env = pin_agent_dir(&agent).await;
-    let _decisions = DecisionsGuard::new();
+    let _decisions = DecisionsGuard::new(&project);
 
     pin_decision(&project, false);
     // A later extension decision cannot change the pinned run decision.
     record_decision(&project, ProjectTrustDecision::Yes);
-    // The operator override outranks the extension decision but not the pin.
-    std::env::set_var("PIR_TRUST_PROJECT", "1");
 
+    // The operator override outranks the extension decision but not the pin.
+    // It is supplied explicitly — the value `PIR_TRUST_PROJECT=1` would carry —
+    // so this test needs no process-wide environment mutation.
+    let theme = load_pi_config_with_in_and_override(&agent, Some(&project), Some(true))
+        .expect("load pi config")
+        .expect("models.json must produce a configured model")
+        .settings
+        .theme
+        .clone();
     assert_eq!(
-        configured_theme(&project),
-        None,
+        theme, None,
         "a pinned no-approve must keep the config resolver off the project settings"
     );
     let _ = std::fs::remove_dir_all(project.parent().expect("fixture root"));
@@ -146,23 +149,22 @@ async fn models_config_honors_a_pinned_denial_over_an_extension_grant() {
 #[tokio::test(flavor = "current_thread")]
 async fn models_config_without_an_extension_decision_keeps_store_and_policy_fallback() {
     let (project, agent) = fixture("fallback");
-    let _env = pin_agent_dir(&agent).await;
-    let _decisions = DecisionsGuard::new();
+    let _decisions = DecisionsGuard::new(&project);
 
     // No decision anywhere + `ask` under a headless load => untrusted.
-    assert_eq!(configured_theme(&project), None);
+    assert_eq!(configured_theme_at(&agent, &project), None);
 
     let store = ProjectTrustStore::new(&agent);
     store.set(&project, Some(true)).expect("store yes");
     assert_eq!(
-        configured_theme(&project).as_deref(),
+        configured_theme_at(&agent, &project).as_deref(),
         Some(PROJECT_THEME),
         "no extension decision => a stored yes still opens the project scope"
     );
 
     store.set(&project, Some(false)).expect("store no");
     assert_eq!(
-        configured_theme(&project),
+        configured_theme_at(&agent, &project),
         None,
         "no extension decision => a stored no still closes the project scope"
     );
@@ -174,7 +176,7 @@ async fn models_config_without_an_extension_decision_keeps_store_and_policy_fall
     )
     .expect("agent settings");
     assert_eq!(
-        configured_theme(&project).as_deref(),
+        configured_theme_at(&agent, &project).as_deref(),
         Some(PROJECT_THEME),
         "defaultProjectTrust:always must still decide when no extension did"
     );

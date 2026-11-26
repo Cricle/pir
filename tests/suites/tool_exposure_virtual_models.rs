@@ -733,6 +733,7 @@ async fn virtual_model_routes_to_the_physical_model_and_persists_state() {
         event_stream: Some(event_stream),
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("hello", Arc::new(|_| {})).await.unwrap();
@@ -830,6 +831,7 @@ async fn virtual_model_routes_to_the_physical_model_and_persists_state() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
     assert!(resumed
         .virtual_models()
@@ -900,6 +902,7 @@ async fn virtual_selection_replays_signed_thinking() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("hello", Arc::new(|_| {})).await.unwrap();
@@ -1007,6 +1010,7 @@ async fn compaction_threshold_uses_the_routed_virtual_model() {
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent
@@ -1093,6 +1097,7 @@ async fn session_declares_only_the_active_direct_and_model_only_tools() {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![Arc::new(ExposurePlugin)],
     );
@@ -1124,6 +1129,7 @@ fn js_config(cwd: &std::path::Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -1322,6 +1328,7 @@ async fn js_virtual_model_syncs_into_the_session_and_persists() {
         event_stream: None,
         extensions: Some(handle),
         tool_selection: None,
+        phone_child: None,
     });
 
     agent.prompt("hello", Arc::new(|_| {})).await.unwrap();

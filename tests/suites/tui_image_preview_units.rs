@@ -92,7 +92,9 @@ fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
 
 #[test]
 fn renders_halfblocks_within_bounds() {
-    let dir = std::env::temp_dir().join("pir-image-preview-test");
+    // A private directory per run: the renderer reads whatever this test wrote,
+    // so a shared literal path would leak a previous run's file into this one.
+    let dir = crate::common::unique_temp_path("image-preview-test");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let path = dir.join("tiny.png");
     std::fs::write(&path, tiny_png(4, 4, [255u8, 0, 0, 255])).expect("write");
@@ -183,7 +185,7 @@ fn fallback_sniffs_dimensions_from_headers() {
 #[test]
 #[cfg_attr(target_os = "linux", ignore = "asserts Windows chord glyphs")]
 fn fallback_line_matches_upstream_shape() {
-    let dir = std::env::temp_dir().join("pir-image-fallback-test");
+    let dir = crate::common::unique_temp_path("image-fallback-test");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let path = dir.join("broken.png");
     // PNG magic + dimensions, but garbage after (undecodable).
@@ -361,7 +363,7 @@ fn image_preview_uses_the_configured_inline_protocol() {
         render_image_with_terminal, ImageSettings, DEFAULT_IMAGE_WIDTH_CELLS,
     };
 
-    let dir = std::env::temp_dir().join("pir-image-protocol-test");
+    let dir = crate::common::unique_temp_path("image-protocol-test");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let path = dir.join("inline.png");
     std::fs::write(&path, tiny_png(18, 18, [1u8, 2, 3, 255])).expect("write");

@@ -128,3 +128,26 @@ user should depend on.
 | `PIR_EXT_SKIP_PRELUDE` / `PIR_EXT_SKIP_NODE_BUILTINS` | Skip the JS host prelude / node builtin bootstrap at extension boot (test seam; breaks extensions that need them) |
 | `PIR_RESUME_ON_ERROR=1` | On resume, inject a synthetic continuation prompt when the leaf is a failed request (off by default) |
 | `PIR_FAIL_FAST` | Fail fast on the first error in a test/batch context |
+
+## Test-runner escape hatches
+
+The suites whose property IS the process environment (variable precedence, a
+default-built session following the env, a child process inheriting it, a
+`HOME`-anchored skill scan, the crash hook's live-dir read) pin that variable
+instead of passing a directory. A process-wide pin is only race-free when one
+test owns the process, so those tests call
+`tests/common/mod.rs::skip_without_nextest` and print a `SKIP` line unless they
+are running under `cargo nextest` (one process per test — the CI runner, see
+[`test-harness-map.md`](test-harness-map.md)). Each variable family has its own
+opt-in for a single-process run that knows what it is doing:
+
+| Variable | Meaning |
+|---|---|
+| `NEXTEST_RUN_ID` | Set by nextest itself; its presence is what the guards check |
+| `PIR_ALLOW_SHARED_PROCESS_AGENT_DIR=1` | Allow the `PIR_AGENT_DIR`-pinning tests in a shared process (run only that test, `--test-threads=1`) |
+| `PIR_ALLOW_SHARED_PROCESS_HOME=1` | Same for the `HOME`-pinning tests |
+| `PIR_ALLOW_SHARED_PROCESS_TEMP=1` | Same for the `TMP`/`TEMP`/`TMPDIR`-pinning test |
+| `PIR_ALLOW_SHARED_PROCESS_PACKAGE_DIR=1` | Same for the `PI_PACKAGE_DIR`-pinning tests |
+
+Setting any of them while other suites run in the same process reintroduces the
+races documented as TEST-2 in `.audit/review-2026-11-23/findings.jsonl`.

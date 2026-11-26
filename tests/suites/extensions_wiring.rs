@@ -323,6 +323,7 @@ async fn extension_tool_registered_in_session_start_is_callable() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("go", no_events()).await.expect("prompt");
@@ -393,6 +394,7 @@ async fn ctx_shutdown_requests_a_host_exit_without_aborting_the_run() {
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("go", no_events()).await.expect("prompt");
@@ -503,6 +505,7 @@ async fn tool_call_handler_blocks_bash_before_execution() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     let terminal = agent.prompt("go", no_events()).await.expect("prompt");
@@ -572,6 +575,7 @@ async fn input_handler_transform_replaces_prompt_text() {
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     });
 
     agent.prompt("hello", no_events()).await.expect("prompt");
@@ -670,6 +674,7 @@ async fn tool_call_handler_rewrites_tool_input() {
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     });
 
     agent.prompt("go", no_events()).await.expect("prompt");

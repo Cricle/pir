@@ -532,7 +532,7 @@ impl RemoteCatalogOverlay {
         config: RemoteCatalogOverlayConfig,
         registry: Arc<ProviderRegistry>,
     ) -> AiResult<Self> {
-        let personalize = personalize_for(&config.provider_id);
+        let personalize = personalize_for(&config.provider_id, &config.agent_dir);
         Self::new_personalized(config, registry, personalize)
     }
 
@@ -1147,14 +1147,23 @@ fn parse_remote_catalog(body: &str) -> AiResult<Vec<serde_json::Value>> {
 /// catalog is filtered to the models the stored key may use, with the key's
 /// context size, max output and prices, and the result is persisted as the
 /// offline cache.
-fn personalize_for(provider_id: &str) -> Option<Arc<PersonalizeCatalog>> {
+///
+/// The credential and the base URL are read from the overlay's explicit
+/// `agent_dir`, so two overlays built for different directories in one process
+/// each use their own `auth.json`/`models.json`.
+fn personalize_for(
+    provider_id: &str,
+    agent_dir: &std::path::Path,
+) -> Option<Arc<PersonalizeCatalog>> {
     if provider_id != "openrouter" {
         return None;
     }
-    Some(Arc::new(|catalog: Vec<Model>| {
+    let agent_dir = agent_dir.to_path_buf();
+    Some(Arc::new(move |catalog: Vec<Model>| {
+        let agent_dir = agent_dir.clone();
         Box::pin(async move {
-            let key = super::catalog::openrouter::openrouter_api_key();
-            let base_url = super::catalog::openrouter::configured_base_url();
+            let key = super::catalog::openrouter::openrouter_api_key_in(&agent_dir);
+            let base_url = super::catalog::openrouter::configured_base_url_in(&agent_dir);
             let models = super::catalog::openrouter::personalize_openrouter_catalog(
                 catalog,
                 &base_url,
@@ -1189,15 +1198,36 @@ fn personalize_for(provider_id: &str) -> Option<Arc<PersonalizeCatalog>> {
 /// already guards on `Handle::try_current`) are skipped silently. Returns the
 /// number of overlays successfully spawned.
 pub fn install_remote_catalog_overlays(registry: &Arc<ProviderRegistry>) -> usize {
-    if crate::config::env::is_offline() {
+    install_remote_catalog_overlays_with(
+        registry,
+        std::env::var("PI_CATALOG_BASE_URL")
+            .ok()
+            .as_deref()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty()),
+        &super::settings::agent_dir(),
+        crate::config::env::is_offline(),
+    )
+}
+
+/// [`install_remote_catalog_overlays`] with every process-level input supplied
+/// by the caller: the catalog base URL, the agent dir the overlays write their
+/// models-store cache into, and the offline gate.
+///
+/// An embedder or a test that owns these inputs states them here, so two
+/// installs in one process cannot redirect each other's catalog traffic or
+/// share one agent dir's cache.
+pub fn install_remote_catalog_overlays_with(
+    registry: &Arc<ProviderRegistry>,
+    catalog_base: Option<String>,
+    agent_dir: &std::path::Path,
+    offline: bool,
+) -> usize {
+    if offline {
         return 0;
     }
-    let base = std::env::var("PI_CATALOG_BASE_URL")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| REMOTE_CATALOG_DEFAULT_BASE_URL.to_string());
-    let agent_dir = super::settings::agent_dir();
+    let base = catalog_base.unwrap_or_else(|| REMOTE_CATALOG_DEFAULT_BASE_URL.to_string());
+    let agent_dir = agent_dir.to_path_buf();
     let mut spawned = 0usize;
     for (provider_id, _) in super::catalog::CATALOG_FILES {
         let config = RemoteCatalogOverlayConfig {

@@ -14,17 +14,17 @@ dispatch, tool execution, and the models/usage/tool/command snapshots cross as o
 guards with `typeof __pir_native?.x === "function"`, so a boot path without the native tier degrades to the
 string bridge unchanged. Extension source files are not modified by any of this.
 
-## Node builtins in Rust (`crates/pir-node`)
+## Node builtins in Rust (`crates/pir-core/src/pir_node`)
 
 The Node/npm surface an extension sees (`node:fs`, `node:crypto`, `child_process`, `zlib`, `http`/`net`,
 `worker_threads`, `node:sqlite`, `bcrypt`, `dns`, `path`, `os`, `process`, …) is implemented in Rust in the
-standalone `crates/pir-node` workspace crate. It has no dependency on rquickjs: its public entry point is
+`pir-core` engine crate, under the `pir_node` module. It has no dependency on rquickjs: its public entry point is
 `NodeRuntime::invoke(module, op, &serde_json::Value) -> Result<serde_json::Value, NodeError>`, and every module
-keeps the exact Node error shape (`{ok:false, code, message, syscall, path}` / libuv `errno`). The crate owns the
+keeps the exact Node error shape (`{ok:false, code, message, syscall, path}` / libuv `errno`). The module owns the
 whole implementation — there is no second op table in the host. `NodeRuntime::invoke` dispatches exactly these
-host-op modules (`crates/pir-node/src/lib.rs`): `os`, `process`, `path`, `crypto`, `zlib`, `sqlite`, `bcrypt`,
+host-op modules (`crates/pir-core/src/pir_node/mod.rs`): `os`, `process`, `path`, `crypto`, `zlib`, `sqlite`, `bcrypt`,
 `child`, `fs_watch`/`fsWatch`, `fs`, `dns`, `npm`, `http`, `worker`. The typed C-ABI fast paths (`__pirBufferCodec`,
-`__pirPath`, the `__pirFs*`/`__pirCrypto*` kernels) are additional entry points into the same crate, not a second
+`__pirPath`, the `__pirFs*`/`__pirCrypto*` kernels) are additional entry points into the same module, not a second
 implementation.
 
 The JS side reaches it through one C-ABI funnel: `globalThis.__pirNode.invoke(module, op, payload)` receives live
@@ -168,7 +168,7 @@ throughput.
 The two single-face rules are likewise always on because two copies would double-apply: `builtin:tool-repair`
 suppresses the JS `pi-tool-repair`, and `builtin:phone` suppresses `@malinamnam/pi-phone`. `PIR_PREFER_NATIVE=0`
 (also `false`/`off`) restores upstream first-wins behavior for the six full-port pairs, for a user who
-deliberately wants the JS package to win. See `src/plugins/loader.rs`'s `NATIVE_PRECEDENCE`.
+deliberately wants the JS package to win. See `crates/pir-core/src/plugins/loader.rs`'s `NATIVE_PRECEDENCE`.
 
 ## Default-disabled packages
 
@@ -287,14 +287,15 @@ export default function (pi) {
 `registerVirtualModel` ([custom-provider.md](custom-provider.md)), `registerShortcut`, `registerFlag`,
 `registerMCPServer`, `events.on/emit`. Tool parameter schemas are validated at load; `pi.on(event, handler)` is
 fail-closed against the known-event registry (an unknown name is a load-time `TypeError`; accepted set:
-`src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
+`crates/pir-core/src/plugins/coverage.rs::is_known_event`). CLI flags added with `registerFlag` are listed by
 `pir --help-extensions` (the upstream `Extension CLI Flags:` help section); `--help` itself never executes
 extension code.
 
 `pi.events` is a **JS-runtime-only** bus: `emit` synchronously invokes the prelude's `busSubs` subscribers
 (`prelude.js.txt:3075`). The native `EventService` (`PluginContext::events()`) is a separate Rust bus with no
 cross-face bridge — JS emissions do not reach native subscribers and vice versa
-(`src/agent_session/plugin_services.rs:178-182`, `:4161-4219`; `src/plugins/services/mod.rs:2112-2126`).
+(`crates/pir-core/src/agent_session/plugin_services.rs:178-182`, `:4161-4219`;
+`crates/pir-core/src/plugins/services/mod.rs:2112-2126`).
 
 ## The `ctx` surface
 
@@ -406,7 +407,8 @@ Every host↔JS queue is bounded and the bound is visible. **If the source can p
 backpressure: the OS pipe/socket/transport stops being read); only where Node coalesces or truncates (watcher
 notifications, blocking `spawnSync`) does the queue drop, and every drop is counted through `ext_diag!` (`[ext]
 …` / `[env-daemon] …` / `[env-client] …` / `[session] …`, repeat-collapsed by the logging router). The
-provider event stream (`src/ai/event_stream.rs`, capacity 32 + producer backpressure) uses the same pattern.
+provider event stream (`crates/pir-ai-types/src/event_stream.rs`, capacity 32 + producer
+backpressure) uses the same pattern.
 
 | Queue (source) | Bound | When full | Observation |
 |---|---|---|---|

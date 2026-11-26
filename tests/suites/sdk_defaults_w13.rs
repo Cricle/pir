@@ -15,10 +15,9 @@
 //!   a registry rebuild does not lose the record, and the SDK build refuses to
 //!   hand back an agent silently missing a plugin the caller attached.
 //!
-//! The end-to-end settings tests redirect the process-global `PIR_AGENT_DIR`
-//! through `tests/common/mod.rs::AgentDirEnvGuard`, which holds the ONE
-//! binary-wide agent-dir env lock shared with every other agent-dir suite in
-//! the merged `g_agent` binary (a module-local lock cannot exclude them).
+//! The end-to-end settings tests give each build its own settings scope through
+//! `AgentBuilder::agent_dir`, so nothing here reads or mutates the
+//! process-wide `PIR_AGENT_DIR`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,14 +69,15 @@ impl Drop for TempDir {
     }
 }
 
-/// Pin `PIR_AGENT_DIR` at `dir` with `PI_OFFLINE=1` for the test's duration,
-/// on the binary-wide lock (`tests/common/mod.rs::AgentDirEnvGuard`).
+/// BUILD THE AGENT at `dir` instead of PINNING the process environment at it.
 ///
-/// Offline keeps `install_remote_catalog_overlays` from spawning refresh tasks
-/// for a catalog this fixture does not need. The guard restores both variables
-/// on drop (panic included), so a sibling suite never observes the pin.
-async fn pin_agent_dir(dir: &Path) -> crate::common::AgentDirEnvGuard {
-    crate::common::AgentDirEnvGuard::at(dir, &[("PI_OFFLINE", "1")]).await
+/// The builder's `.agent_dir(..)` gives this build its own settings scope,
+/// credentials and `models-store.json`; no `PIR_AGENT_DIR` write and no lock.
+/// `PI_OFFLINE` is not needed either: an explicit agent dir installs remote
+/// catalog overlays whose first hop is one full refresh interval out, so
+/// nothing is fetched inside a test window.
+fn builder_at(dir: &Path) -> pir::sdk::AgentBuilder {
+    pir::sdk::AgentBuilder::new().agent_dir(dir.to_path_buf())
 }
 
 fn test_model(provider: &str, id: &str) -> Model {
@@ -435,11 +435,8 @@ async fn builder_applies_the_settings_model_defaults() {
     let agent_dir = TempDir::new("agent-defaults");
     let cwd = TempDir::new("cwd-defaults");
     write_settings_fixture(&agent_dir.0);
-    let _env = pin_agent_dir(&agent_dir.0).await;
 
-    // The guard holds the binary-wide agent-dir lock for the whole test, so no
-    // sibling suite can flip `PIR_AGENT_DIR` under this build.
-    let agent = AgentBuilder::new()
+    let agent = builder_at(&agent_dir.0)
         .no_session()
         .no_compaction()
         .cwd(cwd.0.clone())

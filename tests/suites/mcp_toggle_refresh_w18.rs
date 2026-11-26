@@ -60,8 +60,11 @@ fn write_mcp_json(dir: &Path) {
     .expect("write mcp.json");
 }
 
+/// Build the session around the caller's scratch TREE, which serves as both the
+/// project cwd and the agent dir: nothing session-scoped resolves through the
+/// process environment, so the caller needs no pin.
 fn build_session(cwd: &Path, plugin: Arc<McpPlugin>) -> Arc<AgentSession> {
-    AgentSession::new_arc_with_plugins(
+    AgentSession::new_arc_with_plugins_and_host_in(
         AgentSessionConfig {
             performance: Default::default(),
             provider_registry: Arc::new(ProviderRegistry::default()),
@@ -77,8 +80,11 @@ fn build_session(cwd: &Path, plugin: Arc<McpPlugin>) -> Arc<AgentSession> {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![plugin as Arc<dyn AgentPlugin>],
+        None,
+        Some(cwd.to_path_buf()),
     )
 }
 
@@ -110,7 +116,6 @@ fn bridge_exposure(host: &PluginHost, bridge: &str) -> Option<String> {
 fn disable_then_rebuild_then_enable_restores_the_bridge_without_a_manual_rebuild() {
     let tree = Tree::new("toggle-enable");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         write_mcp_json(&tree.0);
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         let session = build_session(&tree.0, Arc::clone(&plugin));
@@ -188,7 +193,6 @@ fn disable_then_rebuild_then_enable_restores_the_bridge_without_a_manual_rebuild
 fn remove_then_enable_restores_discovery_and_registration() {
     let tree = Tree::new("toggle-remove");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         write_mcp_json(&tree.0);
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         let session = build_session(&tree.0, Arc::clone(&plugin));
@@ -258,7 +262,6 @@ fn remove_then_enable_restores_discovery_and_registration() {
 fn exposure_change_takes_effect_on_the_next_native_command() {
     let tree = Tree::new("toggle-exposure");
     runtime().block_on(async {
-        let _guard = crate::common::AgentDirEnvGuard::at(&tree.0, &[]).await;
         write_mcp_json(&tree.0);
         let plugin = Arc::new(McpPlugin::with_cwd(&tree.0, &tree.0));
         let session = build_session(&tree.0, Arc::clone(&plugin));

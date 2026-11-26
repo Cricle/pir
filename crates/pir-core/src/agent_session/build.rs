@@ -86,7 +86,7 @@ impl AgentSession {
     /// once at build, so a fresh process and a fresh session behave exactly as
     /// before.
     pub fn new_with_agent_dir(config: AgentSessionConfig, agent_dir: impl Into<PathBuf>) -> Self {
-        Self::new_with_plugins_and_agent_dir(config, Vec::new(), Some(agent_dir.into()))
+        Self::build_plugins_at(config, Vec::new(), Some(agent_dir.into()))
     }
 
     /// Tear the session's plugin surface down: run every plugin's
@@ -123,12 +123,25 @@ impl AgentSession {
         config: AgentSessionConfig,
         inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
     ) -> Self {
-        Self::new_with_plugins_and_agent_dir(config, inline_plugins, None)
+        Self::build_plugins_at(config, inline_plugins, None)
     }
 
     /// [`Self::new_with_plugins`] with an explicit agent-directory override
     /// (see [`Self::new_with_agent_dir`]).
-    fn new_with_plugins_and_agent_dir(
+    ///
+    /// The by-value counterpart of [`Self::new_arc_with_plugins_and_host_in`]:
+    /// a caller that needs BOTH inline plugins and its own agent directory (a
+    /// test scratch dir, an embedder's own scope) uses this instead of pinning
+    /// `PIR_AGENT_DIR` in the process environment.
+    pub fn new_with_plugins_and_agent_dir(
+        config: AgentSessionConfig,
+        inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
+        agent_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self::build_plugins_at(config, inline_plugins, Some(agent_dir.into()))
+    }
+
+    fn build_plugins_at(
         config: AgentSessionConfig,
         inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
         agent_dir: Option<PathBuf>,
@@ -843,11 +856,14 @@ impl AgentSession {
             session_context_cache: Mutex::new(None),
             prompt_projection_cache: Mutex::new(None),
             projection_reuse_count: AtomicU64::new(0),
-            // Read the ambient child flag once here (the process was spawned
-            // by the phone pool with `PI_PHONE_CHILD=1`); every prompt then
-            // checks a bool. Only the RPC host reads it.
+            // The session's child flag: the config override when the caller stated
+            // one (an in-process child, an embedder), else the ambient value the
+            // phone pool spawns with. Read once; every prompt then checks a bool.
+            // Only the RPC host reads it.
             #[cfg(feature = "rpc")]
-            phone_child: phone_child::child_mode_from_env(),
+            phone_child: config
+                .phone_child
+                .unwrap_or_else(phone_child::child_mode_from_env),
             // Native plugin actions (`MessageService`) queue the same JSON
             // payloads the JS host functions produce; the next
             // `apply_extension_notifications` drain applies them.
@@ -1882,6 +1898,19 @@ impl AgentSession {
         agent_dir: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Self::new_arc_with_plugins_and_host_in(config, Vec::new(), None, Some(agent_dir.into()))
+    }
+
+    /// [`Self::new_arc_with_plugins`] bound to an explicit agent directory:
+    /// the `Arc`-valued counterpart of
+    /// [`Self::new_with_plugins_and_agent_dir`], and the form a host (or a
+    /// test) uses when its plugins need session-identity reads AND it owns its
+    /// agent directory — so nothing resolves through the process environment.
+    pub fn new_arc_with_plugins_and_agent_dir(
+        config: AgentSessionConfig,
+        inline_plugins: Vec<Arc<dyn crate::plugins::AgentPlugin>>,
+        agent_dir: impl Into<PathBuf>,
+    ) -> Arc<Self> {
+        Self::new_arc_with_plugins_and_host_in(config, inline_plugins, None, Some(agent_dir.into()))
     }
 
     /// [`Self::new_arc_with_plugins`] around a host the caller already built

@@ -1001,8 +1001,9 @@ fn theme_rejects_bad_name_and_bad_values() {
 fn theme_custom_themes_load_register_and_select() {
     // The process-global theme: serialize with the sibling suites' swaps.
     let _guard = super::tui_system_theme::lock();
-    let dir = std::env::temp_dir().join("pir-custom-themes");
-    let _ = std::fs::remove_dir_all(&dir);
+    // Unique per run: the fixture is removed then recreated, so a shared literal
+    // name would let another run delete it mid-test.
+    let dir = crate::common::unique_temp_path("custom-themes");
     std::fs::create_dir_all(&dir).expect("mkdir");
 
     // One valid theme (256-color index accent) and two invalid ones.

@@ -232,8 +232,9 @@ impl AgentTool for PowerShellTool {
         // Shell preferences: `tools.commandTimeoutMs` (the 120 s default
         // command timeout unless configured or disabled with 0). The
         // persistent-shell pool is bash-only: PowerShell always takes the
-        // one-shot spawn below (see the module docs).
-        let prefs = crate::config::settings::current_shell_prefs();
+        // one-shot spawn below (see the module docs). Read from the session's
+        // own agent directory, not the process environment.
+        let prefs = crate::config::settings::shell_prefs_in(&ctx.resolve_agent_dir());
         // A detached background call skips the settings default (only an
         // explicit per-call timeout caps it).
         let setting_timeout = if ctx.background {

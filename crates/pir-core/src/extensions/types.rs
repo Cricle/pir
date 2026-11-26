@@ -977,6 +977,16 @@ pub struct ExtensionConfig {
     /// sets this; extension/context/worker runtimes keep it false even when
     /// they use `mode = "script"` for stdio semantics.
     pub allow_process_exit: bool,
+    /// The global agent directory this runtime resolves against, when the host
+    /// already knows it (an SDK `.agent_dir(..)` agent, a test that owns its
+    /// scratch directory). The runtime's own agent-dir reads — the boot-time
+    /// host pi-package provisioning, whose failure is only a diagnostic — then
+    /// follow this directory instead of re-resolving `PIR_AGENT_DIR` from the
+    /// process environment.
+    ///
+    /// `None` (every CLI/host path) keeps the ambient resolution. Like
+    /// [`Self::limits`], this is an explicit injection seam, not a setting.
+    pub agent_dir: Option<PathBuf>,
 }
 
 impl Default for ExtensionConfig {
@@ -991,6 +1001,7 @@ impl Default for ExtensionConfig {
             is_idle: true,
             limits: None,
             allow_process_exit: false,
+            agent_dir: None,
         }
     }
 }

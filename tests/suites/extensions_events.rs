@@ -50,6 +50,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -534,6 +535,7 @@ async fn loop_events_reach_extensions() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1092,6 +1094,7 @@ async fn register_provider_records_defs_and_session_applies_them() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1309,6 +1312,7 @@ async fn ctx_facade_reports_session_model_and_thinking() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     agent.steer("queued message");
     let _ = agent
@@ -1472,6 +1476,7 @@ async fn set_model_and_thinking_level_apply_and_emit_events() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -1726,6 +1731,7 @@ async fn late_timer_registered_handler_is_not_gated_off() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -2111,6 +2117,7 @@ async fn provider_stream_events_are_dispatched_in_order_and_awaited() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -2289,6 +2296,7 @@ async fn provider_stream_events_after_abort_are_dropped() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     // The aborted run may surface as an error; the dispatch contract is what
     // this test pins.
@@ -2446,6 +2454,7 @@ async fn before_agent_start_system_prompt_options_are_mutable() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let _ = agent
         .prompt("hello", Arc::new(|_| {}))
@@ -2971,6 +2980,7 @@ async fn model_thinking_and_name_mutations_share_one_entry_and_source() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     let session_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3249,6 +3259,7 @@ async fn input_event_reports_source_and_handled_swallows_the_prompt() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
     let noop: pir::agent_session::EventHandler = Arc::new(|_| {});
 
@@ -3477,6 +3488,7 @@ async fn session_start_send_user_message_is_pumped_exactly_once() {
         event_stream: None,
         extensions: Some(runtime.clone()),
         tool_selection: None,
+        phone_child: None,
     });
 
     // The startup dispatch: the handler runs and its `pi.sendUserMessage`

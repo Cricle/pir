@@ -14,6 +14,29 @@ use super::session::{BridgeConfig, HostCommands, PoolConfig, SessionBridge, Sess
 pub const STATUS_KEY: &str = "pi-phone";
 pub const COMMAND_NAMES: [&str; 4] = ["phone-start", "phone-stop", "phone-status", "phone-token"];
 
+/// The environment variable a pool child reads its agent directory from.
+#[doc(hidden)]
+pub const AGENT_DIR_ENV: &str = "PIR_AGENT_DIR";
+/// The environment variable the pool reads its child executable from.
+#[doc(hidden)]
+pub const POOL_EXECUTABLE_ENV: &str = "PI_PHONE_SESSION_POOL_EXECUTABLE";
+
+/// Apply one owner-published environment entry to a pool config.
+///
+/// Two names are not plain child environment in `PoolConfig`: the executable
+/// lives in `executable`, and the agent dir is published to children as
+/// `PIR_AGENT_DIR` (which is also what this module reads from the process
+/// environment when the owner publishes nothing).
+fn command_env_override(config: &mut PoolConfig, key: &str, value: &str) {
+    if key == POOL_EXECUTABLE_ENV {
+        if !value.trim().is_empty() {
+            config.executable = value.into();
+        }
+        return;
+    }
+    config.env.push((key.to_owned(), value.to_owned()));
+}
+
 pub fn status_line(running: bool) -> String {
     if running {
         "📱 ● phone on".to_owned()
@@ -48,6 +71,9 @@ pub struct PhoneState {
     host_published: Arc<StdMutex<HostPublishedState>>,
     remote: StdMutex<Option<RemoteRuntime>>,
     pool: PhonePoolCell,
+    /// Child-process environment this phone owns, applied to every spawned
+    /// pool child (see [`PhoneState::set_pool_child_env`]).
+    pool_child_env: StdMutex<Vec<(String, String)>>,
 }
 
 impl PhoneState {
@@ -60,11 +86,36 @@ impl PhoneState {
             host_published: Arc::new(StdMutex::new(HostPublishedState::default())),
             remote: StdMutex::new(None),
             pool: Arc::new(StdMutex::new(None)),
+            pool_child_env: StdMutex::new(Vec::new()),
         }
     }
 
     pub fn pool_cell(&self) -> PhonePoolCell {
         Arc::clone(&self.pool)
+    }
+
+    /// Publish one environment entry for the pool child processes this phone
+    /// spawns.
+    ///
+    /// The pool children are separate processes, so their environment is the
+    /// only way to tell them which agent directory to use — and the process
+    /// environment cannot carry it: a phone embedded in another host (or a
+    /// test suite sharing one binary) would re-point every other session's
+    /// children too. Entries set here are applied ONLY to the children this
+    /// phone spawns, so each owner is isolated. Must be called before the pool
+    /// is created (`ensure_pool`), which happens on the first `phone-start`.
+    #[doc(hidden)]
+    pub fn set_pool_child_env(&self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        let mut entries = self
+            .pool_child_env
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match entries.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, slot)) => *slot = value,
+            None => entries.push((key, value)),
+        }
     }
 
     pub fn pool(&self) -> Option<Arc<SessionPool>> {
@@ -85,6 +136,19 @@ impl PhoneState {
             if !executable.trim().is_empty() {
                 pool_config.executable = executable.into();
             }
+        }
+        // A host (or a test) that published its child environment wins over
+        // the process-wide defaults: `env` entries are applied to every
+        // spawned child, which is how an owner passes its own
+        // `PIR_AGENT_DIR`/executable without touching the process
+        // environment that every other session in the process shares.
+        for (key, value) in self
+            .pool_child_env
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            command_env_override(&mut pool_config, key, value);
         }
         let (pool, mut events) = SessionPool::new(pool_config);
         let pool = Arc::new(pool);

@@ -497,13 +497,27 @@ async fn print_session_snapshot(
 pub fn print_plugin_host(
     extensions: Option<&crate::extensions::ExtensionHandle>,
 ) -> Option<Arc<PluginHost>> {
+    print_plugin_host_in(extensions, None)
+}
+
+/// [`print_plugin_host`] against an EXPLICIT agent directory for the
+/// settings-driven builtin gates (`None` resolves the process environment
+/// once, the historical behavior). A host that owns its agent directory — a
+/// test scratch dir, an embedder's scope — passes it here so the
+/// `disabledBuiltinExtensions` gate reads THAT directory's `settings.json`
+/// instead of the process-wide one.
+pub fn print_plugin_host_in(
+    extensions: Option<&crate::extensions::ExtensionHandle>,
+    agent_dir: Option<&std::path::Path>,
+) -> Option<Arc<PluginHost>> {
     let runtime = extensions?;
     let cwd = runtime.config().cwd;
-    let settings = crate::agent_session::AgentSession::host_settings(Some(&cwd));
+    let settings = crate::agent_session::AgentSession::host_settings_in(Some(&cwd), agent_dir);
     crate::agent_session::AgentSession::restrict_plan_for_builtins(runtime, &settings);
-    Some(Arc::new(PluginHost::build(
+    Some(Arc::new(PluginHost::build_with_agent_dir(
         Some(runtime.clone()),
         Vec::new(),
+        agent_dir,
     )))
 }
 
@@ -3535,6 +3549,7 @@ pub async fn run_print_with_environment(
             is_idle: true,
             limits: None,
             allow_process_exit: false,
+            agent_dir: None,
         },
         model_catalog.as_ref(),
     )

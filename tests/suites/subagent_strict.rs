@@ -348,6 +348,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>, signal: Option<AbortSignal
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 

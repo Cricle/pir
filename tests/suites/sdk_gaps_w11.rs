@@ -31,10 +31,9 @@
 //!   end, and the terminal `AgentOutcome` event (including its upstream
 //!   `agent_end.messages` slice).
 //!
-//! The settings-default tests redirect `PIR_AGENT_DIR` at a scratch directory
-//! through `tests/common/mod.rs::AgentDirEnvGuard`, which holds the ONE
-//! binary-wide agent-dir env lock (a module-local lock cannot exclude the other
-//! suites of the merged `g_agent` binary).
+//! The settings-default tests give each build its own settings scope through
+//! `AgentBuilder::agent_dir`, so nothing here reads or mutates the
+//! process-wide `PIR_AGENT_DIR`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

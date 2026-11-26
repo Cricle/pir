@@ -63,12 +63,12 @@ const KEEP: usize = 2 * 50 * 1024;
 /// fixture silently stopped forcing the failure while still passing its own
 /// preconditions.
 ///
-/// The suite is therefore gated on the runner giving it a private process.
-/// `cargo nextest` (the CI command, see `.config/nextest.toml`) runs one test
-/// per process, so the fixture is exercised there — that is its coverage home.
-/// A plain `cargo test` shares the process, so the test reports as skipped
-/// instead of poisoning its neighbours. Run it directly to exercise it
-/// locally:
+/// The suite is therefore gated on the runner giving it a private process
+/// (`tests/common/mod.rs::skip_without_nextest_temp`). `cargo nextest` (the CI
+/// command, see `.config/nextest.toml`) runs one test per process, so the
+/// fixture is exercised there — that is its coverage home. A plain
+/// `cargo test` shares the process, so the test reports as skipped instead of
+/// poisoning its neighbours. Run it directly to exercise it locally:
 ///
 /// ```text
 /// cargo test -p pir-sdk --test zz_merged_5 -- bash_eviction_utf8 --exact
@@ -76,30 +76,12 @@ const KEEP: usize = 2 * 50 * 1024;
 ///
 /// with `PIR_ALLOW_SHARED_PROCESS_TEMP=1` when the rest of the binary is
 /// filtered out.
-fn exclusive_process_available() -> bool {
-    // `NEXTEST_RUN_ID` is nextest's documented per-run identifier (the `insta`
-    // snapshot crate keys on it too, see its `snapshot.rs`), so it is the
-    // reliable "a process-per-test runner is driving me" signal. `NEXTEST`
-    // alone is NOT enough: nextest does not export it, so gating on it made the
-    // fixture depend on a variable the user had to pass by hand.
-    if std::env::var_os("NEXTEST_RUN_ID").is_some() {
-        return true;
-    }
-    std::env::var_os("PIR_ALLOW_SHARED_PROCESS_TEMP").is_some()
-}
-
 #[tokio::test]
 async fn eviction_cut_lands_on_a_utf8_boundary() {
     if !bash_available() {
         return;
     }
-    if !exclusive_process_available() {
-        eprintln!(
-            "[bash_eviction_utf8] SKIP: the spill-failure fixture repoints the process temp \
-             directory and would break every concurrently running suite. It runs under \
-             `cargo nextest` (CI); to run it under plain `cargo test --test`, filter to this \
-             test and set PIR_ALLOW_SHARED_PROCESS_TEMP=1."
-        );
+    if crate::common::skip_without_nextest_temp("bash_eviction_utf8") {
         return;
     }
     let root = temp_workspace();

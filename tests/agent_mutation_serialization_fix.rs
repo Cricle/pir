@@ -89,6 +89,7 @@ fn nested_batch_context(registry: Arc<ToolRegistry>, scheduler: ToolScheduler) -
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 

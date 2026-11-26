@@ -976,6 +976,14 @@ impl NestedToolExecutor {
             // The scheduler flips this when it adopts the child call as a
             // background execution (same seam as a model-issued call).
             background: false,
+            // Same session directory as the parent call: a nested shell call
+            // reads the settings the enclosing session was built with.
+            agent_dir: self
+                .shared
+                .session_env
+                .as_ref()
+                .and_then(|env| env.agent_dir.clone())
+                .map(Arc::new),
         };
         let outcome = run_tool_call(
             &tool_call,

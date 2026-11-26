@@ -373,6 +373,7 @@ fn agent_session_builder(
         event_stream: None,
         extensions: None,
         tool_selection: None,
+        phone_child: None,
     }
 }
 

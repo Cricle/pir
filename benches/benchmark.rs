@@ -732,6 +732,7 @@ fn extension_tool_bridge(c: &mut Criterion) {
             // A benchmark harness must never exit the process through the raw
             // host bridge.
             allow_process_exit: false,
+            agent_dir: None,
         })
         .await
         {

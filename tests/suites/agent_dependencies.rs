@@ -142,6 +142,7 @@ async fn nested_mutation_on_same_path_does_not_self_deadlock() {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     };
 
     let run = tokio::time::timeout(

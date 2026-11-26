@@ -2206,6 +2206,7 @@ impl AgentBuilder {
                 event_stream: None,
                 extensions,
                 tool_selection,
+                phone_child: None,
             },
             user_plugins,
             Some(plugin_host),

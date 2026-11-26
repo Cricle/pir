@@ -138,6 +138,7 @@ async fn load_runtime_with_command(dir: &TempDir, command_source: &str) -> Exten
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("extension runtime");
     let result = runtime

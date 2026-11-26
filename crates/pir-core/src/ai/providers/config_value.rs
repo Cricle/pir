@@ -299,7 +299,7 @@ fn execute_command_in(agent_dir: &Path, command: &str) -> Option<String> {
     // the command's full 10s timeout, or one slow command value would stall
     // every other config-value resolution.
     drop(guard);
-    let result = execute_command_with_timeout(command, COMMAND_TIMEOUT);
+    let result = execute_command_with_timeout_at(Some(agent_dir), command, COMMAND_TIMEOUT);
     // Cache only when no config edit landed while the command ran: a value
     // produced against the pre-edit config must not be stamped as current.
     if command_config_stamps(agent_dir) != stamps {
@@ -346,6 +346,22 @@ fn execute_command_in(agent_dir: &Path, command: &str) -> Option<String> {
 /// transport keeps the command as one `-c` argument, which is why upstream
 /// prefers it and why the rest of pir already resolves shells that way.
 pub fn execute_command_with_timeout(command: &str, timeout: Duration) -> Option<String> {
+    execute_command_with_timeout_at(None, command, timeout)
+}
+
+/// [`execute_command_with_timeout`] with the agent dir the value is being
+/// resolved FOR.
+///
+/// The child shell gets that directory as `PIR_AGENT_DIR`, so the
+/// documented `!cat "$PIR_AGENT_DIR/key.txt"` idiom reads the caller's
+/// directory instead of the process environment's. Without this a host bound
+/// to an explicit agent dir cached the command's output under (and
+/// invalidated it by) that dir while the command itself read a different one.
+pub fn execute_command_with_timeout_at(
+    agent_dir: Option<&Path>,
+    command: &str,
+    timeout: Duration,
+) -> Option<String> {
     // Upstream `executeWithConfiguredShell`: an explicit `shellPath` setting,
     // else the platform default (Git Bash on Windows, `/bin/bash` or `sh`
     // elsewhere). `Err` means "no configured shell could be resolved", which
@@ -354,13 +370,13 @@ pub fn execute_command_with_timeout(command: &str, timeout: Duration) -> Option<
     // missing) falls back to the default shell; a spawned shell that exits
     // non-zero does not.
     if let Ok(config) = crate::coding_agent::tools::resolve_shell_config(None) {
-        if let Some(result) = run_shell_command(&config, command, timeout) {
+        if let Some(result) = run_shell_command(&config, agent_dir, command, timeout) {
             return result;
         }
     }
     // `execSync`'s default shell: `cmd /C` on Windows, `sh -c` elsewhere.
     let fallback = fallback_shell_config();
-    run_shell_command(&fallback, command, timeout).unwrap_or(None)
+    run_shell_command(&fallback, agent_dir, command, timeout).unwrap_or(None)
 }
 
 /// The shell `execSync` uses when no shell was configured: `cmd /C` on
@@ -384,10 +400,11 @@ fn fallback_shell_config() -> crate::coding_agent::tools::ShellConfig {
 /// truncated value is never returned.
 fn run_shell_command(
     config: &crate::coding_agent::tools::ShellConfig,
+    agent_dir: Option<&Path>,
     command: &str,
     timeout: Duration,
 ) -> Option<Option<String>> {
-    let mut child = config.spawn(command).ok()?;
+    let mut child = config.spawn_with_agent_dir(command, agent_dir).ok()?;
     #[cfg(windows)]
     let child_pid = child.id();
     // A stdin-transport shell (legacy WSL bash) takes the command on stdin;

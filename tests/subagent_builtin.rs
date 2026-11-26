@@ -436,6 +436,7 @@ fn tool_context(cwd: &Path, env: Arc<ToolSessionEnv>, signal: Option<AbortSignal
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 
@@ -1025,10 +1026,18 @@ async fn bare_workspace_child_still_gets_the_default_preamble() {
     // to the agent body alone.
     let temp = TempDir::new("bare-sysprompt");
     // The skill scan also reads `~/.agents/skills` (home-anchored, NOT gated
-    // by the agent dir), so point `HOME` at an empty dir for this test —
+    // by the agent dir), so this test points `HOME` at an empty dir —
     // otherwise a developer machine's global skills make the workspace
-    // non-bare and the body-only arm below is never exercised. Restored on
-    // drop so the other tests keep their ambient environment.
+    // non-bare and the body-only arm below is never exercised.
+    //
+    // `HOME` is a PROCESS-level input, so under plain `cargo test` (one
+    // process, parallel threads) it would leak into every sibling suite. It
+    // therefore runs only when a process-per-test runner drives the binary
+    // (nextest: CI and the pre-push gate) or the operator opts in, exactly
+    // like `bash_eviction_utf8`'s temp-directory fixture.
+    if crate::common::skip_without_nextest_home("subagent_builtin::bare_workspace_child_prompt") {
+        return;
+    }
     struct HomeGuard(Option<std::ffi::OsString>);
     impl Drop for HomeGuard {
         fn drop(&mut self) {
@@ -1987,31 +1996,30 @@ fn subagent_runs_through_the_agent_loop_with_session_env() {
 
                 let mut tools = ToolRegistry::new();
                 tools.register(Arc::new(SubagentTool::default()));
-                // The loop-built session env resolves the user-agent directory
-                // from the process agent dir; point it at the fixture for this
-                // test. The SHARED per-binary lock keeps a sibling suite in the
-                // same merged harness from pinning `PIR_AGENT_DIR` at the same
-                // time (both would otherwise see the other's fixture, and a
-                // spawned child would then fail to resolve its catalog model).
-                let _agent_dir_guard = crate::common::agent_dir_env_lock().blocking_lock();
-                let previous_agent_dir = std::env::var("PIR_AGENT_DIR").ok();
-                std::env::set_var("PIR_AGENT_DIR", &temp.0);
-                let agent = Arc::new(AgentSession::new(AgentSessionConfig {
-                    performance: Default::default(),
-                    provider_registry: Arc::clone(&registry),
-                    model: fake_model(),
-                    api_key: None,
-                    thinking: ThinkingLevel::Off,
-                    tools,
-                    session: None,
-                    compaction: None,
-                    max_turns: 4,
-                    system_prompt: None,
-                    cwd: Some(temp.0.clone()),
-                    event_stream: None,
-                    extensions: None,
-                    tool_selection: None,
-                }));
+                // Explicit agent dir: the loop-built session env resolves the
+                // user-agent directory from THIS directory, so the fixture is
+                // an argument and the process environment stays untouched (no
+                // lock, and no sibling suite in the merged harness can see it).
+                let agent = Arc::new(AgentSession::new_with_agent_dir(
+                    AgentSessionConfig {
+                        performance: Default::default(),
+                        provider_registry: Arc::clone(&registry),
+                        model: fake_model(),
+                        api_key: None,
+                        thinking: ThinkingLevel::Off,
+                        tools,
+                        session: None,
+                        compaction: None,
+                        max_turns: 4,
+                        system_prompt: None,
+                        cwd: Some(temp.0.clone()),
+                        event_stream: None,
+                        extensions: None,
+                        tool_selection: None,
+                        phone_child: None,
+                    },
+                    &temp.0,
+                ));
 
                 let tool_results: Arc<Mutex<Vec<serde_json::Value>>> =
                     Arc::new(Mutex::new(Vec::new()));
@@ -2045,10 +2053,6 @@ fn subagent_runs_through_the_agent_loop_with_session_env() {
                     });
 
                 let terminal = agent.prompt("kick off", handler).await.expect("prompt");
-                match previous_agent_dir {
-                    Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-                    None => std::env::remove_var("PIR_AGENT_DIR"),
-                }
                 assert_eq!(
                     get_final_output(&[Message::Assistant(terminal)]).as_deref(),
                     Some("parent done")
@@ -2124,6 +2128,7 @@ fn session_env_propagates_the_explicit_credential_to_child_runs() {
                         event_stream: None,
                         extensions: None,
                         tool_selection: None,
+                        phone_child: None,
                     },
                     &temp.0,
                 ));
@@ -2264,6 +2269,7 @@ async fn child_executes_extension_tools_through_the_parent_handle() {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     })
     .expect("runtime start");
     let load = handle.load(&[ext_path]).await.expect("load extension");
@@ -2506,6 +2512,7 @@ mod tool_search_isolation {
                     modifiers: Vec::new(),
                     uses_default_tools: false,
                 }),
+                phone_child: None,
             },
             vec![Arc::new(ToolSearchPlugin::new()) as Arc<dyn pir::plugins::plugin::AgentPlugin>],
         );
@@ -2531,6 +2538,7 @@ mod tool_search_isolation {
             is_idle: true,
             limits: Some(Default::default()),
             allow_process_exit: false,
+            agent_dir: None,
         })
         .expect("extension runtime");
         let load = handle
@@ -2890,6 +2898,7 @@ mod tool_search_isolation {
                     modifiers: Vec::new(),
                     uses_default_tools: false,
                 }),
+                phone_child: None,
             },
             vec![Arc::new(ToolSearchPlugin::new()) as Arc<dyn pir::plugins::plugin::AgentPlugin>],
         );
@@ -2912,6 +2921,7 @@ mod tool_search_isolation {
             is_idle: true,
             limits: Some(Default::default()),
             allow_process_exit: false,
+            agent_dir: None,
         })
         .expect("extension runtime");
         let load = handle

@@ -115,6 +115,7 @@ fn tool_context(cwd: &Path, ledger: Arc<ReadLedger>) -> ToolContext {
         held_mutation_keys: None,
         on_update: None,
         background: false,
+        agent_dir: None,
     }
 }
 

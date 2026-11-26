@@ -717,6 +717,7 @@ async fn build_from_services(
             event_stream: None,
             extensions,
             tool_selection: None,
+            phone_child: None,
         },
         Vec::new(),
         Some(host),

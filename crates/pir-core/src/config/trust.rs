@@ -610,7 +610,27 @@ where
 /// ran the startup gate) still applies the environment override as its
 /// initial resolution input.
 pub fn resolve_cwd_trust(cwd: &Path, agent_dir: &Path) -> bool {
-    if let Some(trusted) = crate::extensions::project_trust::resolved_decision(cwd) {
+    resolve_cwd_trust_with(
+        cwd,
+        agent_dir,
+        crate::extensions::project_trust::env_override_decision(),
+    )
+}
+
+/// [`resolve_cwd_trust`] with the `PIR_TRUST_PROJECT` operator override
+/// supplied by the caller instead of read from the process environment. The
+/// ambient form is the only place that flag is read for this chain;
+/// everything below takes it as an argument, so a caller that owns its inputs
+/// (an embedder, a test with its own scratch directory) never races another
+/// consumer in the same process.
+pub fn resolve_cwd_trust_with(
+    cwd: &Path,
+    agent_dir: &Path,
+    operator_override: Option<bool>,
+) -> bool {
+    if let Some(trusted) =
+        crate::extensions::project_trust::resolved_decision_with(cwd, operator_override)
+    {
         return trusted;
     }
     // A pinned decision always carries a recorded boolean; treating a missing

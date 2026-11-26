@@ -779,6 +779,24 @@ pub struct McpPlugin {
     /// a changed directory takes effect: it re-roots the manager and stores
     /// the new resolution here, both from the same read.
     agent_dir: RwLock<std::path::PathBuf>,
+    /// Whether [`Self::agent_dir`] came from the PROCESS ENVIRONMENT
+    /// ([`Self::new`]) rather than from the caller ([`Self::with_cwd`]).
+    ///
+    /// It decides whether [`divergent_live_dir_line`] may fire at all: only an
+    /// environment-derived directory can drift away from the live variable.
+    /// An explicit directory is the caller's choice (a session cwd, an SDK
+    /// agent dir, a test scratch dir) and must never be reported as a
+    /// misconfiguration just because the process-level variable points
+    /// somewhere else. `on_reload` keeps it as constructed: a reload re-reads
+    /// the environment only for the environment-derived form.
+    env_scoped_agent_dir: bool,
+    /// A caller's explicit directory for the NEXT reload (see
+    /// [`Self::set_reload_agent_dir`]).
+    ///
+    /// `on_reload` resolves this first, then the process environment (only for
+    /// an environment-derived plugin), then the current directory. It is how a
+    /// host re-roots the plugin without touching shared process state.
+    reload_agent_dir: RwLock<Option<std::path::PathBuf>>,
     /// The JS runtime handle, attached by [`crate::plugins::PluginHost::build`]
     /// so registration changes flush as `mcp_servers_change` events.
     js: RwLock<Option<crate::extensions::ExtensionHandle>>,
@@ -869,7 +887,17 @@ fn overridden_line(name: &str, extension_path: Option<&str>, source: &McpServerS
 /// [`AgentPlugin::on_reload`]. Reporting it keeps the env audit's diagnostics
 /// contract — a split is surfaced, not silently honoured — with the same
 /// "rooted at" wording the manager's own divergence line uses.
-fn divergent_live_dir_line(resolved_root: &std::path::Path) -> Option<String> {
+///
+/// `env_scoped` says whether THIS plugin's directory came from the process
+/// environment ([`McpPlugin::new`], the CLI path) or was supplied by its
+/// caller ([`McpPlugin::with_cwd`]: the plugin host's session cwd, an SDK
+/// agent, a test). Only the environment-derived form can diverge: an explicit
+/// directory is chosen on purpose, so comparing it against the ambient one
+/// would report every embedder as misconfigured.
+fn divergent_live_dir_line(resolved_root: &std::path::Path, env_scoped: bool) -> Option<String> {
+    if !env_scoped {
+        return None;
+    }
     let live = crate::coding_agent::context::agent_dir();
     if crate::mcp::manager::same_dir(&live, resolved_root) {
         return None;
@@ -891,7 +919,11 @@ impl McpPlugin {
     pub fn new() -> Self {
         let agent_dir = crate::coding_agent::context::agent_dir();
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        Self::with_cwd(&agent_dir, &cwd)
+        let mut plugin = Self::with_cwd(&agent_dir, &cwd);
+        // This instance's directory IS the environment's, so it is the one
+        // form that can be observed drifting away from the live variable.
+        plugin.env_scoped_agent_dir = true;
+        plugin
     }
 
     /// Instantiate the plugin around a manager rooted at an explicit cwd
@@ -911,6 +943,10 @@ impl McpPlugin {
             info,
             manager,
             agent_dir: RwLock::new(agent_dir.to_path_buf()),
+            // An explicit directory is the caller's choice; only `new()` (the
+            // CLI's environment-derived form) flips this on.
+            env_scoped_agent_dir: false,
+            reload_agent_dir: RwLock::new(None),
             js: RwLock::new(None),
             extension_registered: RwLock::new(BTreeSet::new()),
             config_changed: RwLock::new(BTreeSet::new()),
@@ -928,6 +964,23 @@ impl McpPlugin {
     pub fn with_startup_budget(mut self, budget: std::time::Duration) -> Self {
         self.startup_budget = budget;
         self
+    }
+
+    /// The directory the NEXT [`AgentPlugin::on_reload`] re-roots to.
+    ///
+    /// A plugin built with an explicit directory ([`Self::with_cwd`]) keeps
+    /// that directory across reloads — the process environment cannot move it.
+    /// A host whose own agent dir changed (a session that was re-bound, an
+    /// embedder switching profiles) states the new directory here instead of
+    /// writing `PIR_AGENT_DIR`, which every other session in the process
+    /// shares. `None` restores the environment-derived default, which only
+    /// applies to a plugin built by [`Self::new`].
+    #[doc(hidden)]
+    pub fn set_reload_agent_dir(&self, agent_dir: Option<std::path::PathBuf>) {
+        *self
+            .reload_agent_dir
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = agent_dir;
     }
 
     /// The session-start discovery budget this plugin applies.
@@ -1105,7 +1158,7 @@ impl McpPlugin {
         // own diagnostics (a divergent request) come first, then this plugin's
         // live-env divergence line, then the per-file problems in file order.
         let mut config_errors: Vec<String> = diagnostics;
-        if let Some(line) = divergent_live_dir_line(&root) {
+        if let Some(line) = divergent_live_dir_line(&root, self.env_scoped_agent_dir) {
             self.manager.log().write_event("(config)", &line);
             config_errors.push(line);
         }
@@ -1639,12 +1692,18 @@ impl AgentPlugin for McpPlugin {
         // fresh environment value. A reload re-registers this command with the
         // re-rooted directory.
         let agent_dir = self.resolved_agent_dir();
+        // Captured OUTSIDE the closure: reading `self` inside it would tie the
+        // handler to `&self`'s lifetime, and a `CommandHandler` must be
+        // `'static`.
+        let env_scoped_agent_dir = self.env_scoped_agent_dir;
         let handler: crate::plugins::CommandHandler = Arc::new(move |args: &str| {
             let manager = Arc::clone(&manager);
             let state = Arc::clone(&state);
             let agent_dir = agent_dir.clone();
             let args = args.to_owned();
-            Box::pin(async move { run_mcp_command(&manager, &state, &agent_dir, &args).await })
+            Box::pin(async move {
+                run_mcp_command(&manager, &state, &agent_dir, env_scoped_agent_dir, &args).await
+            })
         });
         ctx.register_command(
             "mcp",
@@ -1861,7 +1920,33 @@ impl AgentPlugin for McpPlugin {
             // directory (read by the registry rebuild that follows this hook)
             // gets the same resolution. Neither face can be left on the old
             // directory while the other serves the new one.
-            let agent_dir = crate::coding_agent::context::agent_dir();
+            //
+            // Only an ENV-SCOPED plugin (built by `new()`) can MOVE its root
+            // just by reading the environment. A caller that named its
+            // directory (`McpPlugin::with_cwd`) keeps that directory unless it
+            // states a new one through `set_reload_agent_dir` —
+            // re-resolving would silently move an isolated session onto the
+            // ambient agent dir (and its `mcp.json`) on the first reload.
+            //
+            // Either way the reload keeps its historical teardown semantics:
+            // `re_root` shuts every drained connection down FIRST and leaves
+            // the log writer intact for a same-directory call, so the caller's
+            // config pass below re-discovers against the same root with no live
+            // transport pinning it.
+            let explicit = self
+                .reload_agent_dir
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let agent_dir = match explicit {
+                Some(dir) => dir,
+                None if self.env_scoped_agent_dir => crate::coding_agent::context::agent_dir(),
+                None => self
+                    .agent_dir
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            };
             self.manager.re_root(&agent_dir).await;
             *self
                 .agent_dir
@@ -2159,10 +2244,14 @@ impl McpPlugin {
 /// `PIR_AGENT_DIR` here would re-open the split-brain for the `/mcp enable`
 /// path; a live value that differs is diagnosed instead of followed, exactly
 /// like the config pass.
+///
+/// `env_scoped_agent_dir` is the plugin's own provenance flag (see
+/// [`McpPlugin::env_scoped_agent_dir`]): an explicit directory cannot diverge.
 fn restore_config_server(
     manager: &McpManager,
     state: &McpSessionState,
     agent_dir: &std::path::Path,
+    env_scoped_agent_dir: bool,
     name: &str,
 ) -> bool {
     let cwd = manager.cwd();
@@ -2179,7 +2268,7 @@ fn restore_config_server(
     // A live env move is reported here too (the config pass's line would not
     // run again before this restore): the plugin never follows it, and the
     // line names the directory the restored entry actually came from.
-    if let Some(line) = divergent_live_dir_line(&root) {
+    if let Some(line) = divergent_live_dir_line(&root, env_scoped_agent_dir) {
         manager.log().write_event("(config)", &line);
         diagnostics.push(line);
     }
@@ -2826,13 +2915,14 @@ async fn set_server_enabled(
     manager: &McpManager,
     state: &McpSessionState,
     agent_dir: &std::path::Path,
+    env_scoped_agent_dir: bool,
     name: &str,
     enabled: bool,
 ) -> Result<String, String> {
     let Some(entry) = manager.registry().get(name) else {
         if enabled {
             state.clear_override(name);
-            if restore_config_server(manager, state, agent_dir, name) {
+            if restore_config_server(manager, state, agent_dir, env_scoped_agent_dir, name) {
                 // The restored entry has no discovery snapshot (`/mcp remove`
                 // forgot it), so re-discover before the command's refresh
                 // rebuild registers the bridges. A failed discovery keeps the
@@ -3091,6 +3181,7 @@ async fn run_action(
     manager: &McpManager,
     state: &McpSessionState,
     agent_dir: &std::path::Path,
+    env_scoped_agent_dir: bool,
     action: McpAction,
     server: Option<&str>,
 ) -> Result<String, String> {
@@ -3107,10 +3198,12 @@ async fn run_action(
             };
             match action {
                 McpAction::Enable => {
-                    set_server_enabled(manager, state, agent_dir, name, true).await
+                    set_server_enabled(manager, state, agent_dir, env_scoped_agent_dir, name, true)
+                        .await
                 }
                 McpAction::Disable => {
-                    set_server_enabled(manager, state, agent_dir, name, false).await
+                    set_server_enabled(manager, state, agent_dir, env_scoped_agent_dir, name, false)
+                        .await
                 }
                 _ => remove_server(manager, state, name).await,
             }
@@ -3238,6 +3331,7 @@ async fn run_manager(
     manager: &McpManager,
     state: &McpSessionState,
     agent_dir: &std::path::Path,
+    env_scoped_agent_dir: bool,
     ui: &dyn crate::plugins::services::UiService,
 ) -> Result<Option<String>, String> {
     use crate::plugins::services::{DialogOptions, SelectOption};
@@ -3411,7 +3505,16 @@ async fn run_manager(
             let Some(action) = McpAction::parse(&choice) else {
                 continue;
             };
-            match run_action(manager, state, agent_dir, action, Some(&name)).await {
+            match run_action(
+                manager,
+                state,
+                agent_dir,
+                env_scoped_agent_dir,
+                action,
+                Some(&name),
+            )
+            .await
+            {
                 Ok(message) if message.is_empty() => {}
                 Ok(message) => {
                     ui.notify(crate::plugins::services::NotifyLevel::Info, &message);
@@ -3442,6 +3545,7 @@ async fn run_mcp_command(
     manager: &McpManager,
     state: &McpSessionState,
     agent_dir: &std::path::Path,
+    env_scoped_agent_dir: bool,
     args: &str,
 ) -> crate::extensions::CommandOutcome {
     let outcome = |ok: bool, text: String| crate::extensions::CommandOutcome {
@@ -3454,17 +3558,29 @@ async fn run_mcp_command(
         // warning is closer to the failure notice than to a success line.
         McpInvocation::Usage => Err(MCP_USAGE.to_owned()),
         McpInvocation::Status => match manager_ui(state) {
-            Some(ui) => match run_manager(manager, state, agent_dir, ui.as_ref()).await {
-                Ok(Some(text)) => Ok(text),
-                // Closed without a message: print the status so the terminal
-                // keeps a record.
-                Ok(None) => Ok(status_text(manager, state).await),
-                Err(text) => Err(text),
-            },
+            Some(ui) => {
+                match run_manager(manager, state, agent_dir, env_scoped_agent_dir, ui.as_ref())
+                    .await
+                {
+                    Ok(Some(text)) => Ok(text),
+                    // Closed without a message: print the status so the terminal
+                    // keeps a record.
+                    Ok(None) => Ok(status_text(manager, state).await),
+                    Err(text) => Err(text),
+                }
+            }
             None => Ok(status_text(manager, state).await),
         },
         McpInvocation::Action(action, server) => {
-            run_action(manager, state, agent_dir, action, server.as_deref()).await
+            run_action(
+                manager,
+                state,
+                agent_dir,
+                env_scoped_agent_dir,
+                action,
+                server.as_deref(),
+            )
+            .await
         }
     };
     match result {

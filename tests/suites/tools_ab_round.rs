@@ -131,13 +131,13 @@ fn truncated_shell_footer_uses_one_space_before_full_output() {
 /// capture, byte-identical to upstream `appendStatus(outputText, status)`.
 #[tokio::test]
 async fn bash_exit_status_keeps_the_capture_whitespace() {
-    let _agent_dir = crate::common::AgentDirEnvGuard::scratch("ab-status", None).await;
+    let agent_dir = crate::common::scratch_agent_dir("ab-status", None);
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     let registry = registry();
-    let context = ToolContext::new(root.clone());
+    let context = ToolContext::new(root.clone()).with_agent_dir(agent_dir.path());
 
     let result = run_tool(
         &registry,
@@ -247,13 +247,13 @@ async fn read_gate_refusal_does_not_leak_the_verbatim_prefix() {
 /// readable through `read`, exactly as the model would follow the footer.
 #[tokio::test]
 async fn advertised_spill_file_is_readable_through_read() {
-    let _agent_dir = crate::common::AgentDirEnvGuard::scratch("ab-spill", None).await;
+    let agent_dir = crate::common::scratch_agent_dir("ab-spill", None);
     if !bash_available() {
         return;
     }
     let root = temp_workspace();
     let registry = registry();
-    let context = ToolContext::new(root.clone());
+    let context = ToolContext::new(root.clone()).with_agent_dir(agent_dir.path());
 
     // >1 MiB so the capture evicts a prefix and must spill.
     let run = run_tool(

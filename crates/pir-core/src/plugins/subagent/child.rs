@@ -527,12 +527,13 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
                 // The parent's live catalog: `get_models` already merges
                 // dynamically registered providers and virtual models, so the
                 // child resolves exactly the models the parent can. Auth is
-                // resolved for the child cwd (the same inputs the child
-                // session's `authenticated_providers` reads), keeping
-                // `hasConfiguredAuth` exact even before the child session
-                // pushes its context.
-                let catalog = ModelCatalog::from_registry_with_authenticated_providers(
+                // resolved for the child cwd AND the child's own agent dir
+                // (the same inputs the child session's
+                // `authenticated_providers` reads), keeping `hasConfiguredAuth`
+                // exact even before the child session pushes its context.
+                let catalog = ModelCatalog::from_registry_with_authenticated_providers_at(
                     env.provider_registry.as_ref(),
+                    &agent_dir,
                     &cwd,
                 );
                 spawn_child_runtime(parent, &cwd, &catalog).await
@@ -609,6 +610,7 @@ pub(super) fn run_child(inputs: ChildRunInputs) -> BoxFuture<'static, SingleResu
             // registry): the selection becomes the child's active-tool override.
             // Built above, next to the prompt it also drives.
             tool_selection,
+            phone_child: None,
         };
         let child = Arc::new(AgentSession::new_with_agent_dir(config, &agent_dir));
         // Provider teardown (SNAP4 review P2-1 / SNAP6 P1-1): the child shares

@@ -46,6 +46,7 @@ fn test_config_at(cwd: &Path) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -56,6 +57,7 @@ fn test_config_default_prompt() -> ExtensionConfig {
         system_prompt: String::new(),
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
         ..test_config_at(&std::env::temp_dir())
     }
 }

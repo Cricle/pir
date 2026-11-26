@@ -269,15 +269,13 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "pir-sdk-extended-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&path);
+        // `unique_temp_path` mixes a process-wide counter into the name.
+        // `{label}-{pid}-{nanos}` is NOT unique: `SystemTime::now()` advances in
+        // ~15.6 ms system-tick steps on Windows, so two tests with the same
+        // label starting in one tick computed the SAME path — and the
+        // `remove_dir_all` below then deleted the other test's live directory
+        // (`PermissionDenied` from the survivor). Audit finding TEST-4.
+        let path = crate::common::unique_temp_path(&format!("sdk-extended-{label}"));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self(path)
     }
@@ -4995,6 +4993,17 @@ async fn only_builtin_ignores_extension_paths_and_still_registers_requested_buil
 /// same native commands, no on-disk JS in either path.
 #[tokio::test]
 async fn low_level_create_agent_session_matches_builder_only_builtin_plan() {
+    // This test builds a session through the full SDK entry point, which walks
+    // the resource/settings/skill discovery tree. Under one shared process the
+    // sibling suites' concurrent fixture churn makes that walk surface a bare
+    // `PermissionDenied` (Windows returns code 5 when a directory is being
+    // created/removed underneath a reader), so it needs a private process —
+    // which is exactly what `cargo nextest` gives every test.
+    if crate::common::skip_without_nextest(
+        "sdk_extended::low_level_create_agent_session_matches_builder_only_builtin_plan",
+    ) {
+        return;
+    }
     let temp = TempDir::new("sdk-only-builtin-parity");
     let js = temp.path().join("ignored_extension.js");
     std::fs::write(

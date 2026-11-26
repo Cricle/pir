@@ -817,6 +817,7 @@ async fn run_codemode_script(code: &str) -> pir::ai::types::ToolResultMessage {
             event_stream: None,
             extensions: None,
             tool_selection: None,
+            phone_child: None,
         },
         vec![
             pir::plugins::codemode::new_codemode_plugin(),

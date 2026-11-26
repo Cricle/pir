@@ -20,6 +20,90 @@ scripts/which_harness.sh <suite|module|tests/path.rs>   # harness + ready-to-pas
   process-global statics can interact. Run the full suite under **nextest**
   (process-per-test), not bare `cargo test`.
 
+## Isolating a test from the rest of the binary
+
+Prefer, in this order:
+
+1. **Pass the directory/path as an argument.** Almost every seam that reads
+   `PIR_AGENT_DIR`, `PI_PACKAGE_DIR` or a home directory also has an explicit
+   form (`*_in` / `*_with` / `*_at` / a `with_agent_dir` field). A test that
+   names its own directory cannot race anything: no lock, no guard.
+2. **Take a scratch directory and delete it.** `tests/common::scratch_agent_dir`
+   returns a `TempAgentDir` removed on drop. Every scratch path a test builds
+   by hand should come from `tests/common::unique_temp_path(label)`: the name
+   mixes the pid (concurrent test **binaries**) with a process-wide atomic
+   counter (parallel tests **inside one merged binary**). A
+   `{label}-{pid}-{nanos}` name is NOT unique — `SystemTime::now()` on Windows
+   advances in ~15.6 ms system-tick steps, so two threads reading it in the
+   same tick get identical nanoseconds, and a `remove_dir_all` +
+   `create_dir_all` fixture then deletes its sibling's live directory (audit
+   finding TEST-4).
+3. **If the property IS the process environment** (variable precedence, a
+   default-built session following the env, a child process inheriting it, a
+   `HOME`-anchored scan), gate the test on having a private process and pin the
+   variable with `tests/common::ProcessEnvPin`:
+
+   ```rust
+   if crate::common::skip_without_nextest("suite::test") { return; }
+   let _pin = crate::common::ProcessEnvPin::agent_dir(dir.path());
+   ```
+
+   `skip_without_nextest` (and its `_home` / `_temp` / `_package` twins) pass
+   when `NEXTEST_RUN_ID` — nextest's per-run identifier — is set, and print a
+   `SKIP` line naming the escape hatch (`PIR_ALLOW_SHARED_PROCESS_*`) otherwise.
+   `ProcessEnvPin` restores every touched variable on drop, panic included.
+
+   There is deliberately **no lock**: a lock can only serialize one file
+   against itself, while every other suite in the merged binary stays free to
+   re-point the same variable (audit finding TEST-2). The gate is the whole
+   mechanism — a test that cannot get a private process reports `SKIP` instead
+   of passing on a value it may have raced for.
+
+4. **If the test reads a process-global counter/registry or is timing-bound,
+   gate it the same way.** The gate is not only for environment variables: an
+   `AtomicUsize` test seam (`entry_appended_wire_builds`), the process-wide
+   worker/child tables, and assertions that a second call returns "immediately"
+   are equally shared. When the assertion cannot hold while a sibling suite is
+   running, it needs a private process — and `cargo nextest` gives every test
+   one. Do not paper over it with a lock or a retry loop:
+
+   ```rust
+   if crate::common::skip_without_nextest("suite::test") { return; }
+   ```
+
+   Gated so far: the six `session_context_snapshot_cache::model_catalog_push_*`
+   (credential fingerprint reads every provider key variable),
+   `rss_a_entry_append_materialization` (global wire-build counter),
+   `sdk_extended::low_level_create_agent_session_…`,
+   `mcp_integration::readiness_cache_backs_off_…`, plus the environment-pinning
+   suites listed above.
+
+## Never `sleep` to wait for something
+
+`sleep` is not synchronisation. A fixed delay is either too short (flaky on a
+loaded machine, and *more* likely to fail when the whole suite runs in
+parallel) or too long (slow). It also hides what the test actually depends on.
+Wait for the **event** instead:
+
+| Waiting for | Do this |
+|---|---|
+| a file a producer writes/replaces | `tests/common::wait_for_file(path, deadline, check)` — blocks on a `notify` directory watch (the crate behind `fs.watch`), re-running `check` per event. No polling. |
+| another tokio task (same runtime) | `tokio::task::yield_now().await` in a loop bounded by a deadline. Never `std::thread::yield_now` on a `current_thread` runtime: it parks the only driver and the task you are waiting for never runs. |
+| another **OS** thread (worker, dispatcher, process) | `std::thread::yield_now()` in a deadline-bounded loop, or a channel the producer signals. `tokio` yields do not help: the producer is not a tokio task. |
+| a process to disappear / a port to free | retry with `std::thread::yield_now()` under a deadline. The OS has no "pid gone" event; the deadline is the failure bound. |
+| an external process to observe something | have the producer signal it — write a marker file (`wait_for_file`), send on a channel, or set a counter the test polls under a deadline. |
+| a TTL/debounce to elapse | **reconfigure it to zero**, don't wait it out: `set_dialog_ttl(Duration::ZERO)` makes the next sweep expire the entry immediately. Only wait when the elapsed duration IS the contract, and then assert on the bound. |
+
+A deadline is a *failure bound*, not a delay — it only fires when the producer
+never delivers, and its panic message names what was being awaited. If you
+catch yourself writing `for _ in 0..N { sleep(..) }`, the loop is modelling an
+event: name the event and wait on it.
+
+Sleeping **inside a fixture** (a JS tool that must look slow, a handler that
+must not complete inline) is different: model it with a gate the test opens
+(a channel/semaphore) or a `yield`, so the ordering stays deterministic
+instead of depending on how fast the machine is.
+
 ## Why N harnesses costs N link steps
 
 Each `[[test]]` target (including each `zz_merged_N.rs`) is its own crate,

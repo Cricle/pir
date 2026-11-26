@@ -108,6 +108,7 @@ fn test_config_at(cwd: &Path, label: &str) -> ExtensionConfig {
         is_idle: true,
         limits: Some(Default::default()),
         allow_process_exit: false,
+        agent_dir: None,
     }
 }
 
@@ -310,6 +311,7 @@ fn session_with_extension_options(
         event_stream: None,
         extensions: Some(runtime),
         tool_selection: None,
+        phone_child: None,
     }));
     SessionFixture { session, captured }
 }

@@ -7,7 +7,6 @@
 //! descendants alive — see `background_tool_calls`). The sweep's shell config
 //! is cached, so the abort still returns well within the test's bound.
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,57 +14,6 @@ use pir::agent::tool_execution::{ToolContext, ToolRegistry};
 use pir::ai::types::AbortSignal;
 use pir::coding_agent::register_core_tools;
 use pir::coding_agent::tools::resolve_shell_config;
-
-/// Pin `PIR_AGENT_DIR` at a scratch directory with `shellPool: false`, so the
-/// bash tool takes its per-call spawn path (the `terminate` call under test)
-/// and no ambient `~/.pi/agent/settings.json` changes the shell.
-///
-/// The guard holds `crate::common::agent_dir_env_lock` — the SHARED per-binary
-/// lock, not a private `static` in this file. A private lock would exclude
-/// nothing outside this module even though the pin is process-wide:
-/// `codemode_exposure::settings_load_once_per_construction_and_once_more_on_reload`
-/// (same `zz_merged_4` binary) failed with `/reload` resolving settings once
-/// instead of twice precisely because a sibling suite re-pointed the variable
-/// mid-test.
-struct HermeticAgentDir {
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-    previous: Option<OsString>,
-    dir: PathBuf,
-}
-
-impl HermeticAgentDir {
-    async fn new(label: &str) -> Self {
-        let lock = crate::common::agent_dir_env_lock().lock().await;
-        let dir = std::env::temp_dir().join(format!(
-            "pir-bash-tree-kill-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("create pinned agent dir");
-        std::fs::write(dir.join("settings.json"), r#"{ "shellPool": false }"#)
-            .expect("write pinned settings");
-        let previous = std::env::var_os("PIR_AGENT_DIR");
-        std::env::set_var("PIR_AGENT_DIR", &dir);
-        Self {
-            _lock: lock,
-            previous,
-            dir,
-        }
-    }
-}
-
-impl Drop for HermeticAgentDir {
-    fn drop(&mut self) {
-        match self.previous.as_deref() {
-            Some(value) => std::env::set_var("PIR_AGENT_DIR", value),
-            None => std::env::remove_var("PIR_AGENT_DIR"),
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
 
 struct TempDir(PathBuf);
 
@@ -92,7 +40,14 @@ impl Drop for TempDir {
 
 #[tokio::test(flavor = "current_thread")]
 async fn bash_abort_returns_without_waiting_for_the_tree_kill_sweep() {
-    let _agent_dir = HermeticAgentDir::new("prompt").await;
+    // A scratch agent dir with `shellPool: false` makes the bash tool take its
+    // per-call spawn path (the `terminate` call under test) and keeps an
+    // ambient `~/.pi/agent/settings.json` from changing the shell. It is
+    // passed explicitly, so no test pins the process-wide `PIR_AGENT_DIR`.
+    let agent_dir = crate::common::scratch_agent_dir(
+        "bash-tree-kill-prompt",
+        Some(r#"{ "shellPool": false }"#),
+    );
     if resolve_shell_config(None).is_err() {
         return; // no shell on this host
     }
@@ -105,7 +60,7 @@ async fn bash_abort_returns_without_waiting_for_the_tree_kill_sweep() {
     let signal = AbortSignal::new();
     let context = ToolContext {
         signal: Some(signal.clone()),
-        ..ToolContext::new(cwd.0.clone())
+        ..ToolContext::new(cwd.0.clone()).with_agent_dir(agent_dir.path())
     };
 
     let marker = cwd.0.join("started");

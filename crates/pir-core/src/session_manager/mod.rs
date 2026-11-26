@@ -309,6 +309,73 @@ pub fn reset_session_list_file_reads() {
     SESSION_LIST_FILE_READS.store(0, Ordering::Relaxed);
 }
 
+/// Per-session-directory form of [`session_list_file_reads`]: files opened
+/// under `session_dir` since the last [`reset_session_list_file_reads_in`].
+///
+/// The counter above is PROCESS-GLOBAL, so two tests that list different
+/// directories in one binary cannot both assert exact counts (each keeps
+/// resetting the other's tally) — the reason the callers used to serialize
+/// themselves behind an env lock. Keying by directory makes each caller's
+/// count its own: a test that owns its scratch session dir gets an exact,
+/// repeatable number with no lock, and production pays one map entry per
+/// directory listed by the probe-enabled build only.
+static SESSION_LIST_FILE_READS_BY_DIR: std::sync::Mutex<std::collections::BTreeMap<PathBuf, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether anyone armed the per-directory counter. `reset_…_in` sets it and
+/// nothing clears it: an unarmed build pays ONE relaxed atomic load per
+/// listed file and touches no path or lock, so the production listing path
+/// is unchanged (the probe is only ever armed by tests).
+static SESSION_LIST_FILE_READS_BY_DIR_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of session files [`SessionManager::list_sessions`] has opened under
+/// `session_dir` (test/profiling probe; see
+/// [`session_list_file_reads_in`]).
+#[doc(hidden)]
+pub fn session_list_file_reads_in(session_dir: impl AsRef<Path>) -> u64 {
+    SESSION_LIST_FILE_READS_BY_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&normalize_session_dir_key(session_dir.as_ref()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Reset the per-directory counter for `session_dir` and arm the probe (test
+/// probe).
+#[doc(hidden)]
+pub fn reset_session_list_file_reads_in(session_dir: impl AsRef<Path>) {
+    SESSION_LIST_FILE_READS_BY_DIR_ARMED.store(true, Ordering::Relaxed);
+    let key = normalize_session_dir_key(session_dir.as_ref());
+    SESSION_LIST_FILE_READS_BY_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, 0);
+}
+
+/// Canonical key for the per-directory counter. Both forms of the same dir
+/// must map to ONE entry, so the counter follows the resolved directory when
+/// that is possible and falls back to the raw path when it is not (a dir the
+/// caller just created is resolvable; one that is gone still needs a stable
+/// key for the reset-then-assert pattern).
+fn normalize_session_dir_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// Bump the per-directory listing counter for `dir` (see
+/// [`session_list_file_reads_in`]).
+fn record_session_list_file_read_in(dir: &Path) {
+    if !SESSION_LIST_FILE_READS_BY_DIR_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    let key = normalize_session_dir_key(dir);
+    let mut counts = SESSION_LIST_FILE_READS_BY_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *counts.entry(key).or_insert(0) += 1;
+}
+
 /// Session files opened by [`SessionManager::list_session_headers`] since the
 /// last reset. Kept SEPARATE from [`session_list_file_reads`] so a consumer
 /// (the server registry) can prove it took the header-only path instead of
@@ -557,7 +624,15 @@ pub fn encode_cwd_dir_name(resolved_cwd: &str) -> String {
 /// The default session directory for a cwd (upstream
 /// `getDefaultSessionDirPath`): `<agent-dir>/sessions/<encoded-cwd>`.
 pub fn default_session_dir_path(cwd: &str) -> PathBuf {
-    sessions_dir().join(encode_cwd_dir_name(&resolve_path_str(cwd)))
+    default_session_dir_path_in(&agent_dir(), cwd)
+}
+
+/// [`default_session_dir_path`] against an EXPLICIT agent directory: the same
+/// layout under the caller's directory instead of the process-resolved one.
+/// A caller that owns its agent dir (the TUI's per-scenario seam, an embedder)
+/// compares paths without re-pointing the process environment.
+pub fn default_session_dir_path_in(agent_dir: &Path, cwd: &str) -> PathBuf {
+    sessions_dir_in(agent_dir).join(encode_cwd_dir_name(&resolve_path_str(cwd)))
 }
 
 /// Compute and create the default session directory for a cwd (upstream
@@ -1863,6 +1938,9 @@ fn read_session_listing(
     file_len: u64,
 ) -> Option<(SessionHeader, SessionInfoPeek)> {
     SESSION_LIST_FILE_READS.fetch_add(1, Ordering::Relaxed);
+    if let Some(parent) = path.parent() {
+        record_session_list_file_read_in(parent);
+    }
     let mut reader = std::io::BufReader::with_capacity(
         listing_read_buffer_size(file_len),
         std::fs::File::open(path).ok()?,

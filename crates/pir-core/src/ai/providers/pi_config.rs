@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::config::settings::Settings;
 
-use super::config_value::{resolve_config_value, resolve_headers_in};
+use super::config_value::{resolve_config_value, resolve_config_value_in, resolve_headers_in};
 use super::construction::{build_provider_from_models, model, ModelSpec};
 use super::settings;
 use crate::ai::error::AiResult;
@@ -1308,12 +1308,48 @@ pub fn load_pi_config() -> AiResult<Option<PiConfiguredModel>> {
 /// [`settings::load_settings`]), so a config typo never turns into an
 /// `authentication failure` that blocks a run (PIR-BIN-071).
 pub fn load_pi_config_with(project_dir: Option<&Path>) -> AiResult<Option<PiConfiguredModel>> {
-    let global_dir = settings::agent_dir();
+    load_pi_config_with_in(&settings::agent_dir(), project_dir)
+}
+
+/// [`load_pi_config_with`] against an EXPLICIT global agent dir.
+///
+/// Every input of the ambient form comes from the process environment
+/// (`$PIR_AGENT_DIR`), which makes it unusable for a caller that must not
+/// share global state: two such callers would resolve each other's settings
+/// and trust store. Embedders and tests that own their agent dir (one scratch
+/// directory per scenario) call this directly.
+pub fn load_pi_config_with_in(
+    agent_dir: &Path,
+    project_dir: Option<&Path>,
+) -> AiResult<Option<PiConfiguredModel>> {
+    load_pi_config_with_in_and_override(agent_dir, project_dir, None)
+}
+
+/// [`load_pi_config_with_in`] with the operator's project-trust override
+/// supplied by the caller instead of read from `$PIR_TRUST_PROJECT`.
+///
+/// `None` means "no operator override" — the same posture as the ambient
+/// form with the variable unset. The override still yields to a pinned
+/// startup decision, exactly as the ambient path does (the precedence lives in
+/// [`crate::extensions::project_trust::resolved_decision_with`], so the two
+/// forms cannot drift).
+pub fn load_pi_config_with_in_and_override(
+    agent_dir: &Path,
+    project_dir: Option<&Path>,
+    operator_override: Option<bool>,
+) -> AiResult<Option<PiConfiguredModel>> {
     let project_trusted = match project_dir {
-        Some(cwd) => crate::extensions::project_trust::resolve_project_trust(cwd, &global_dir),
+        Some(cwd) => crate::extensions::project_trust::resolve_project_trust_with(
+            cwd,
+            agent_dir,
+            operator_override,
+        ),
         None => false,
     };
-    load_pi_config_from(settings::load_settings(project_dir, project_trusted))
+    load_pi_config_from_in(
+        agent_dir,
+        settings::load_settings_in(agent_dir, project_dir, project_trusted),
+    )
 }
 
 /// [`load_pi_config_with`] on an ALREADY-loaded [`SettingsManager`] snapshot:
@@ -1326,7 +1362,9 @@ pub fn load_pi_config_with(project_dir: Option<&Path>) -> AiResult<Option<PiConf
 pub fn load_pi_config_with_settings(
     manager: &crate::config::settings::SettingsManager,
 ) -> AiResult<Option<PiConfiguredModel>> {
-    load_pi_config_from(manager.settings.clone())
+    // The manager carries the directory it was loaded from, so the caller's
+    // snapshot pins `models.json`/`auth.json`/key templates too.
+    load_pi_config_from_in(&manager.global_dir, manager.settings.clone())
 }
 
 /// The shared body of the loader variants: `models.json` + a resolved
@@ -1337,10 +1375,18 @@ pub fn load_pi_config_with_settings(
 /// is recorded for the CLI surfaces (`take_models_json_load_warning`, pi's
 /// `Warning: errors loading models.json:`) — PIR-BIN-098, mirroring the
 /// settings recovery of PIR-BIN-071.
-fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfiguredModel>> {
+///
+/// Every ambient input resolves against `agent_dir` (its callers name the
+/// directory: the settings snapshot's `global_dir`, or the explicit one a host
+/// passed), so an explicit-dir caller never reads a different
+/// `models.json`/`auth.json` than the one it named.
+fn load_pi_config_from_in(
+    agent_dir: &Path,
+    mut pi_settings: Settings,
+) -> AiResult<Option<PiConfiguredModel>> {
     // models.json is optional: the Claude Code environment can configure the
     // anthropic provider on its own.
-    let config = match read_pi_models_json() {
+    let config = match read_pi_models_json_from(&agent_dir.join("models.json")) {
         Some(contents) => {
             let (config, error) = parse_models_json_layer(&contents);
             record_models_json_load_error(error);
@@ -1351,7 +1397,7 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
             PiModelsConfig::default()
         }
     };
-    let mut registry = auth_backed_registry();
+    let mut registry = auth_backed_registry_at(agent_dir);
 
     // Per-provider keys resolved from models.json templates. Stored alongside
     // the selected model so hosts resolving a different `--model` can apply
@@ -1363,7 +1409,7 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
             provider_config
                 .api_key
                 .as_deref()
-                .and_then(|key| resolve_config_value(key, None))
+                .and_then(|key| resolve_config_value_in(agent_dir, key, None))
                 .map(|key| (provider_id.clone(), key))
         })
         .collect();
@@ -1371,11 +1417,10 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
     // Per-provider composed lists: built-in catalog seeded, entries upserted,
     // overrides applied (upstream `applyModelsJson`).
     let mut composed: Vec<(String, Vec<Model>)> = Vec::new();
-    let agent_dir = settings::agent_dir();
     for (provider_id, provider_config) in &config.providers {
         let builtin = super::catalog::load_provider_cached(provider_id)?;
         let (mut models, provider_headers) =
-            compose_provider_models(provider_id, provider_config, builtin.as_deref(), &agent_dir)?;
+            compose_provider_models(provider_id, provider_config, builtin.as_deref(), agent_dir)?;
         if models.is_empty() {
             // Legacy single-model provider entry (e.g. a local Ollama
             // endpoint) with no model list and no built-in entry: synthesize
@@ -1476,7 +1521,7 @@ fn load_pi_config_from(mut pi_settings: Settings) -> AiResult<Option<PiConfigure
         // Claude Code auth (ANTHROPIC_AUTH_TOKEN) is resolved by the adapter.
         api_key: provider_config
             .and_then(|config| config.api_key.as_deref())
-            .and_then(|key| resolve_config_value(key, None)),
+            .and_then(|key| resolve_config_value_in(agent_dir, key, None)),
         api_keys,
         settings: pi_settings,
     }))
@@ -1612,21 +1657,21 @@ fn read_pi_models_json_from(path: &Path) -> Option<String> {
     }
 }
 
-/// A provider registry backed by the session agent dir's `auth.json`, so a
+/// A provider registry backed by that agent dir's `auth.json`, so a
 /// credential written by `/login` (or the auth CLI) resolves for every request
-/// instead of only for status queries (`has_configured_auth`).
-fn auth_backed_registry() -> ProviderRegistry {
-    let agent_dir = settings::agent_dir();
+/// instead of only for status queries (`has_configured_auth`). The `auth.json`
+/// this registry reads and the install-telemetry decision follow `agent_dir`.
+fn auth_backed_registry_at(agent_dir: &Path) -> ProviderRegistry {
     // Upstream `getClientIdentity(settingsManager)` (client-identity.ts:10-16)
     // wired into every request (sdk.ts:346-350): the host registry carries the
     // detailed pi User-Agent and install-telemetry attribution. PIR-BIN-059:
     // the `with_identity` seam existed but no host installed it.
     let identity = crate::ai::provider::pi_client_identity(
-        crate::ai::provider::install_telemetry_enabled_in(&agent_dir),
+        crate::ai::provider::install_telemetry_enabled_in(agent_dir),
     );
     ProviderRegistry::default()
         .with_auth_storage(std::sync::Arc::new(
-            crate::ai::auth::FileAuthStorage::in_agent_dir(&agent_dir),
+            crate::ai::auth::FileAuthStorage::in_agent_dir(agent_dir),
         ))
         .with_identity(identity)
 }
@@ -1926,12 +1971,50 @@ pub struct PiEnvironment {
 /// file degrades to that scope's defaults with a recorded diagnostic instead
 /// of failing: the run proceeds (PIR-BIN-071).
 pub fn load_pi_environment(project_dir: Option<&Path>) -> AiResult<PiEnvironment> {
-    let global_dir = settings::agent_dir();
+    load_pi_environment_in(&settings::agent_dir(), project_dir)
+}
+
+/// [`load_pi_environment`] against an EXPLICIT global agent dir.
+///
+/// Every input of the ambient form comes from the process environment
+/// (`$PIR_AGENT_DIR` etc.), which makes it unusable for a caller that must not
+/// share global state: two such callers would resolve each other's trust store
+/// and settings. Embedders and tests that own their agent dir (one scratch
+/// directory per scenario) call this directly; the trust store, settings scope
+/// and credential sources all follow `agent_dir`, so nothing is read from the
+/// environment behind the caller's back.
+pub fn load_pi_environment_in(
+    agent_dir: &Path,
+    project_dir: Option<&Path>,
+) -> AiResult<PiEnvironment> {
+    load_pi_environment_in_with(
+        agent_dir,
+        project_dir,
+        crate::extensions::project_trust::env_override_decision(),
+    )
+}
+
+/// [`load_pi_environment_in`] with the `PIR_TRUST_PROJECT` operator override
+/// supplied by the caller. This is the fully explicit form: the agent dir, the
+/// project dir and the operator flag are all arguments, so the load touches no
+/// process-level state at all.
+pub fn load_pi_environment_in_with(
+    agent_dir: &Path,
+    project_dir: Option<&Path>,
+    operator_override: Option<bool>,
+) -> AiResult<PiEnvironment> {
     let project_trusted = match project_dir {
-        Some(cwd) => crate::extensions::project_trust::resolve_project_trust(cwd, &global_dir),
+        Some(cwd) => crate::extensions::project_trust::resolve_project_trust_with(
+            cwd,
+            agent_dir,
+            operator_override,
+        ),
         None => false,
     };
-    load_pi_environment_from(settings::load_settings(project_dir, project_trusted))
+    load_pi_environment_at(
+        settings::load_settings_in(agent_dir, project_dir, project_trusted),
+        agent_dir,
+    )
 }
 
 /// [`load_pi_environment`] against an ALREADY-loaded settings snapshot: the
@@ -1944,6 +2027,21 @@ pub fn load_pi_environment_with_settings(
     manager: &crate::config::settings::SettingsManager,
 ) -> AiResult<PiEnvironment> {
     load_pi_environment_from(manager.settings.clone())
+}
+
+/// The shared body of the explicit-environment variants: the `models.json`
+/// layer is read from `agent_dir` (the SAME directory the settings snapshot
+/// came from), so an embedder or a test that owns its agent dir never picks up
+/// the process environment's `models.json`.
+fn load_pi_environment_at(
+    settings_snapshot: Settings,
+    agent_dir: &Path,
+) -> AiResult<PiEnvironment> {
+    load_pi_environment_from_paths_at(
+        settings_snapshot,
+        Some(agent_dir.join("models.json")),
+        Some(agent_dir),
+    )
 }
 
 /// Register the built-in catalog except the providers immediately composed
@@ -1972,16 +2070,48 @@ fn register_builtin_catalog_excluding(
     Ok(())
 }
 
-fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvironment> {
+fn load_pi_environment_from(settings_snapshot: Settings) -> AiResult<PiEnvironment> {
+    load_pi_environment_from_paths(settings_snapshot, None)
+}
+
+/// The one implementation both environment forms funnel through.
+///
+/// `models_json_path` names the file to read: `Some(path)` for an explicit
+/// agent directory, `None` for the process environment's
+/// ([`pi_models_path`]). Everything else — the degradation on a malformed
+/// file, the default provider/model seeding, the catalog registration — is
+/// shared, so the two faces cannot diverge.
+fn load_pi_environment_from_paths(
+    settings_snapshot: Settings,
+    models_json_path: Option<PathBuf>,
+) -> AiResult<PiEnvironment> {
+    load_pi_environment_from_paths_at(settings_snapshot, models_json_path, None)
+}
+
+/// [`load_pi_environment_from_paths`] with the agent directory the
+/// `!command` / `$ENV` key templates resolve against.
+///
+/// `models_json_path` already names the file, so the templates are the
+/// remaining ambient input: without `agent_dir` a `!cat "$PIR_AGENT_DIR/…"`
+/// key ran against the process directory while the layer came from the
+/// caller's. `None` keeps the process resolution (the historical behavior of
+/// the ambient wrapper).
+fn load_pi_environment_from_paths_at(
+    mut settings_snapshot: Settings,
+    models_json_path: Option<PathBuf>,
+    agent_dir: Option<&Path>,
+) -> AiResult<PiEnvironment> {
     // Malformed `models.json` degrades exactly like in [`load_pi_config_from`]
     // (PIR-BIN-098): empty layer + recorded warning, catalog intact.
-    let (models_json, models_json_error) = match read_pi_models_json() {
-        Some(contents) => {
-            let (config, error) = parse_models_json_layer(&contents);
-            (Some(config), error)
-        }
-        None => (None, None),
-    };
+    let (models_json, models_json_error) = match models_json_path {
+        Some(ref path) => read_pi_models_json_from(path),
+        None => read_pi_models_json(),
+    }
+    .map(|contents| {
+        let (config, error) = parse_models_json_layer(&contents);
+        (Some(config), error)
+    })
+    .unwrap_or((None, None));
     record_models_json_load_error(models_json_error);
 
     // Seed the default provider/model from models.json when settings.json does
@@ -2012,7 +2142,10 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
             if let Some(key) = provider_config
                 .api_key
                 .as_deref()
-                .and_then(|key| resolve_config_value(key, None))
+                .and_then(|key| match agent_dir {
+                    Some(agent_dir) => resolve_config_value_in(agent_dir, key, None),
+                    None => resolve_config_value(key, None),
+                })
             {
                 api_keys.insert(provider_id.clone(), key);
             }
@@ -2032,14 +2165,23 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
     // whole model list and construct its adapters only to be overwritten.
     // `claude_env` bootstraps the anthropic provider the same way.
     let claude_env = ClaudeCodeEnvConfig::from_process_env();
-    let mut registry = auth_backed_registry();
+    // The SAME directory the settings and `models.json` came from: credential
+    // templates, per-provider composition and the auth-backed registry all
+    // follow it, so an explicit scope never reaches the process environment.
+    let agent_dir = match &models_json_path {
+        Some(path) => path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(settings::agent_dir),
+        None => settings::agent_dir(),
+    };
+    let mut registry = auth_backed_registry_at(&agent_dir);
     register_builtin_catalog_excluding(&mut registry, |provider_id| {
         (claude_env.is_some() && provider_id == "anthropic")
             || models_json
                 .as_ref()
                 .is_some_and(|config| config.providers.contains_key(provider_id))
     })?;
-    let agent_dir = settings::agent_dir();
     if let Some(config) = &models_json {
         for (provider_id, provider_config) in &config.providers {
             let builtin = super::catalog::load_provider_cached(provider_id)?;
@@ -2102,6 +2244,24 @@ fn load_pi_environment_from(mut settings_snapshot: Settings) -> AiResult<PiEnvir
 /// environment variable, or a stored `auth.json` credential (upstream
 /// `hasConfiguredAuth`).
 pub fn has_configured_auth(provider_id: &str, api_keys: &BTreeMap<String, String>) -> bool {
+    has_configured_auth_in(&settings::agent_dir(), provider_id, api_keys)
+}
+
+/// [`has_configured_auth`] with the stored-credential read rooted at an
+/// EXPLICIT agent directory.
+///
+/// The ambient form consults
+/// [`crate::ai::auth::storage::FileAuthStorage::default_storage`], which
+/// re-resolves the process environment, so a session, an SDK agent or a test
+/// that owns its agent directory would otherwise see another directory's
+/// `auth.json`. The API-key half needs no directory: `api_keys` is the
+/// caller's already-resolved map, and the provider environment variables are
+/// process-level by nature.
+pub fn has_configured_auth_in(
+    agent_dir: &Path,
+    provider_id: &str,
+    api_keys: &BTreeMap<String, String>,
+) -> bool {
     if api_keys.contains_key(provider_id) {
         return true;
     }
@@ -2111,7 +2271,7 @@ pub fn has_configured_auth(provider_id: &str, api_keys: &BTreeMap<String, String
     {
         return true;
     }
-    crate::ai::auth::storage::FileAuthStorage::default_storage()
+    crate::ai::auth::storage::FileAuthStorage::in_agent_dir(agent_dir)
         .read_stored(provider_id)
         .map(|stored| stored.is_some())
         .unwrap_or(false)

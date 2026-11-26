@@ -3113,6 +3113,7 @@ fn default_session_factory(
         event_stream: None,
         extensions,
         tool_selection,
+        phone_child: None,
     });
     if !selection.scoped_models.is_empty() {
         agent_session.set_scoped_models(selection.scoped_models);

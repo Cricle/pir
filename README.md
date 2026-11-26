@@ -44,7 +44,16 @@ providers, sessions, config, prompt/skills and the plugin framework.
 The workspace splits the engine (`pir-core`, no terminal dependency), the
 terminal front end (`pir-tui`), and this single-crate facade (`pir-sdk`).
 Consumers keep depending on one crate and `use pir::...`; another UI is another
-crate that depends on `pir-core`. The builtins are published support crates too
+crate that depends on `pir-core`.
+
+Four engine layers are their own published crates, each re-exported by
+`pir-core` under its historical module path so no downstream `use` changes:
+`pir-protocol` (CBOR wire protocol and framing, `crate::protocol`),
+`pir-telemetry` (`crate::telemetry`), `pir-ai-types` (the provider-neutral
+message/event types, `crate::ai::{types,error,event_stream,util}`) and
+`pir-durable` (checkpoint/persistence, `crate::durable`).
+
+The builtins are published support crates too
 (`pir-plugin-api` for the engine-free protocol, one `pir-builtin-*` per builtin,
 `pir-builtins` for the catalog), so the engine consumes one implementation
 instead of carrying duplicates while embedders still see the same historical
@@ -161,7 +170,7 @@ and routes messages without retaining transcripts or images. Details:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-powershell -NoProfile -File scripts/test_select.ps1 -Files src/ai/api/openai/mod.rs  # changed-area loop
+powershell -NoProfile -File scripts/test_select.ps1 -Files crates/pir-core/src/ai/api/openai/mod.rs  # changed-area loop
 powershell -NoProfile -File scripts/test_fast.ps1 -UseNextest   # full suite, nextest runner
 # Full merged-harness builds disable Cargo incremental state to avoid low-value
 # multi-gigabyte caches; targeted test_select/test_fast -Tests loops keep the

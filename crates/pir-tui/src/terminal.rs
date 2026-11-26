@@ -25267,6 +25267,7 @@ fn build_agent_session(
             // shortcuts: one extension runtime for the whole interactive run.
             extensions: extensions.cloned(),
             tool_selection,
+            phone_child: None,
         },
     );
     if let Some(scoped_models) = scoped_models {

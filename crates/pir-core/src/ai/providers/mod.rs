@@ -26,11 +26,11 @@ mod settings;
 
 pub use construction::CatalogProviderEntry;
 pub use dynamic::{
-    install_remote_catalog_overlays, remote_catalog_initial_delay, remote_catalog_is_newer,
-    DynamicProviderConfig, PersonalizeCatalog, RefreshFn, RegisterDynamicProvider,
-    RegisterDynamicProviderShared, RemoteCatalogOverlay, RemoteCatalogOverlayConfig,
-    REMOTE_CATALOG_DEFAULT_BASE_URL, REMOTE_CATALOG_MAX_BODY_BYTES,
-    REMOTE_CATALOG_REFRESH_INTERVAL, REMOTE_CATALOG_REQUEST_TIMEOUT,
+    install_remote_catalog_overlays, install_remote_catalog_overlays_with,
+    remote_catalog_initial_delay, remote_catalog_is_newer, DynamicProviderConfig,
+    PersonalizeCatalog, RefreshFn, RegisterDynamicProvider, RegisterDynamicProviderShared,
+    RemoteCatalogOverlay, RemoteCatalogOverlayConfig, REMOTE_CATALOG_DEFAULT_BASE_URL,
+    REMOTE_CATALOG_MAX_BODY_BYTES, REMOTE_CATALOG_REFRESH_INTERVAL, REMOTE_CATALOG_REQUEST_TIMEOUT,
 };
 pub use js_stream::{
     js_virtual_route_callback, JsStreamProvider, RegisterJsStreamProviderShared,
@@ -41,9 +41,11 @@ pub use models_store::{
     ModelsStore, ModelsStoreEntry,
 };
 pub use pi_config::{
-    has_configured_auth, load_pi_config, load_pi_config_with, load_pi_config_with_settings,
-    load_pi_environment, load_pi_environment_with_settings, merge_pi_config, merge_pi_config_in,
-    models_json_load_error, models_json_load_failures, parse_models_json_layer_at, parse_pi_config,
+    has_configured_auth, has_configured_auth_in, load_pi_config, load_pi_config_with,
+    load_pi_config_with_in, load_pi_config_with_in_and_override, load_pi_config_with_settings,
+    load_pi_environment, load_pi_environment_in, load_pi_environment_in_with,
+    load_pi_environment_with_settings, merge_pi_config, merge_pi_config_in, models_json_load_error,
+    models_json_load_failures, parse_models_json_layer_at, parse_pi_config,
     record_models_json_load_error, strip_jsonc, take_models_json_load_error,
     take_models_json_load_warning, PiConfiguredModel, PiCostRates, PiEnvironment, PiModelConfig,
     PiModelsConfig, PiModelsJsonError, PiProviderConfig,
@@ -53,7 +55,7 @@ pub use resolution::{
     default_model_per_provider, find_initial_model, resolve_cli_model, resolve_model_scope,
     ScopedModel,
 };
-pub use settings::{agent_dir, load_settings, load_settings_in};
+pub use settings::{agent_dir, load_settings, load_settings_in, resolve_agent_dir_at};
 
 /// Register every built-in catalog provider into the registry (upstream
 /// `builtinModels()`). Returns the number of registered providers. models.json
