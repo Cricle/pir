@@ -2637,6 +2637,37 @@ impl ShellPool {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Test seam: release the cached member, if any.
+    ///
+    /// A pool keeps its member alive by design (that is what makes the second
+    /// call cheap), and the member is only reaped when the `Arc<ShellPool>`
+    /// that holds it drops. A test that builds its own pool therefore leaves a
+    /// live shell process for the rest of the test binary's life, and under
+    /// nextest the *harness* process then has to be waited on: whichever test
+    /// happens to be scheduled last inherits that wait and can hold the shard
+    /// to its timeout even though its own body finished. Calling this at the
+    /// end of such a test hands the slot back deterministically instead of
+    /// relying on where the scheduler put it.
+    ///
+    /// Production never calls this: the process-wide pool is meant to outlive
+    /// every call.
+    ///
+    /// Synchronous on purpose, so a `Drop` guard can call it: the slot lock is
+    /// only ever held for the duration of one command, so by the time a test's
+    /// body returns it is free. A contended lock means a call is still in
+    /// flight, and killing its member out from under it would turn a test bug
+    /// into a confusing "lost member" failure — this leaves it alone instead.
+    #[doc(hidden)]
+    pub fn release_member_for_tests(&self) {
+        let Ok(mut slot) = self.bash.try_lock() else {
+            return;
+        };
+        if let Some(entry) = slot.as_mut() {
+            entry.member.terminate();
+        }
+        *slot = None;
+    }
+
     fn slot(&self, protocol: ShellProtocol) -> &tokio::sync::Mutex<Option<Entry>> {
         match protocol {
             ShellProtocol::Bash => &self.bash,
