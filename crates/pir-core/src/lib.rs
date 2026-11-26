@@ -62,11 +62,11 @@
 //! - **client** — the remote TCP protocol client (`pir_core::client`). Off: the
 //!   module is not compiled (no stub); the command reports the
 //!   missing feature at runtime.
-//! - **minimal** — not a gate but the zero-optional profile: `pir_core::minimal`
-//!   and the `pir-minimal` binary are core, so
-//!   `--no-default-features` still yields a runnable agent (one
-//!   OpenAI-compatible provider, one `read_file` tool, in-memory
-//!   session).
+//! - **minimal** — not a gate but the zero-optional profile: [`minimal`] is
+//!   compiled unconditionally, so `--no-default-features` still yields a
+//!   runnable agent (one OpenAI-compatible provider, one `read_file` tool,
+//!   in-memory session). The `pir-minimal` binary that drives it belongs to
+//!   the root `pir-sdk` package, not this crate.
 //! - **image-resize** — the `image` codec used by the model-facing resize pipeline
 //!   (implied by `image-tools`; a UI can enable it alone).
 //! - **ui-support** — the edit-preview engine and confinement helpers a front end

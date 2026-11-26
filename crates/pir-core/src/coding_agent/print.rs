@@ -6042,64 +6042,16 @@ pub fn should_replay_background(
         && settle_iterations < AGENT_BEFORE_SETTLE_CONTINUATION_CAP
 }
 
-/// The model compaction thresholds are checked against (agent_session
-/// `threshold_model_for`): a virtual selection checks the ROUTED physical
-/// model's context window (with its limit overrides applied); an unrouted
-/// virtual model falls back to its catalog entry (context window 0 disables
-/// threshold compaction, like upstream).
-pub fn threshold_model_for(
-    registry: &ProviderRegistry,
-    model: &crate::ai::types::Model,
-) -> crate::ai::types::Model {
-    if crate::ai::virtual_::is_virtual_model(model) {
-        if let Some(registration) = registry
-            .virtual_model_registry()
-            .get(&model.provider, &model.id)
-        {
-            let physical = registry
-                .get_physical_model(&registration.physical.provider, &registration.physical.id);
-            return registration.catalog_model(physical.as_ref());
-        }
-    }
-    model.clone()
-}
+/// The model compaction thresholds are checked against. The implementation
+/// lives in [`crate::compaction`] because every `AgentSession` host needs it
+/// (rpc / TUI / server as well as print); re-exported here so the historical
+/// `coding_agent::print::threshold_model_for` path keeps working.
+pub use crate::compaction::threshold_model_for;
 
-/// The session hosts' compaction config from the settings `compaction` block
-/// (upstream `SETTINGS_DEFAULTS.compaction` + the per-model override, the same
-/// resolution SettingsManager's `compactionToken` applies). Shared by every
-/// `AgentSession` host (print / rpc / TUI / server): PIR-BIN-028 — the RPC,
-/// TUI and server factories used to hard-code `CompactionConfig::default()`
-/// here and silently ignore `settings.compaction`.
-pub fn settings_compaction_config(
-    settings: &crate::config::settings::Settings,
-    model: &crate::ai::types::Model,
-) -> Option<CompactionConfig> {
-    use crate::config::defaults::settings_defaults;
-    let compaction = settings.compaction.as_ref();
-    let enabled = compaction
-        .and_then(|compaction| compaction.enabled)
-        .unwrap_or(settings_defaults::COMPACTION_ENABLED);
-    if !enabled {
-        return None;
-    }
-    let key = format!("{}/{}", model.provider, model.id);
-    let override_settings = compaction
-        .and_then(|compaction| compaction.model_overrides.as_ref())
-        .and_then(|overrides| overrides.get(&key));
-    let reserve_tokens = override_settings
-        .and_then(|over| over.reserve_tokens)
-        .or_else(|| compaction.and_then(|compaction| compaction.reserve_tokens))
-        .unwrap_or(settings_defaults::COMPACTION_RESERVE_TOKENS);
-    let keep_recent_tokens = override_settings
-        .and_then(|over| over.keep_recent_tokens)
-        .or_else(|| compaction.and_then(|compaction| compaction.keep_recent_tokens))
-        .unwrap_or(settings_defaults::COMPACTION_KEEP_RECENT_TOKENS);
-    Some(CompactionConfig {
-        enabled: true,
-        reserve_tokens,
-        keep_recent_tokens,
-    })
-}
+/// The session hosts' compaction config from the settings `compaction` block.
+/// Re-exported from [`crate::compaction`] for the same reason: it is not
+/// print-specific, and an `rpc`-only build has no `print` module at all.
+pub use crate::compaction::settings_compaction_config;
 
 /// The print host's out-of-loop session-event sink: every compaction
 /// lifecycle frame (`compaction_start` / `compaction_end`) is written through

@@ -78,7 +78,11 @@ pub const MAIN_FILE: &str = "main.jsonl";
 /// not a commit point; recovery only reads it to seed the watermark.
 const IDS_FILE: &str = "ids.jsonl";
 /// The suffix of a sidecar rewrite in progress.
-const RECLAIM_SUFFIX: &str = ".reclaim";
+///
+/// Public only so `tests/jsonl_sidecar_rewrite.rs` can assert the guard leaves
+/// no temporary behind; not part of the crate's supported surface.
+#[doc(hidden)]
+pub const RECLAIM_SUFFIX: &str = ".reclaim";
 
 /// A live task's sidecar is rewritten to its newest record once appending
 /// another record would grow it past this many bytes.
@@ -1121,7 +1125,12 @@ async fn reclaim_recovered_sidecars(
 /// to (or past) EOF and copying zero bytes would otherwise silently replace
 /// the sidecar with an empty file, discarding records that were never proven
 /// reclaimable. The next recovery recomputes the plan from a fresh scan.
-async fn replace_sidecar_suffix(directory: &Path, fsync: bool, file: &str, offset: u64) {
+///
+/// Public only so `tests/jsonl_sidecar_rewrite.rs` can drive it directly (the
+/// guard is about the file, not about any caller's state); not part of the
+/// crate's supported surface.
+#[doc(hidden)]
+pub async fn replace_sidecar_suffix(directory: &Path, fsync: bool, file: &str, offset: u64) {
     let path = directory.join(file);
     let length = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata.len(),
@@ -1898,75 +1907,4 @@ pub async fn sidecar_files(directory: &Path) -> std::io::Result<Vec<String>> {
     }
     names.sort();
     Ok(names)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{replace_sidecar_suffix, RECLAIM_SUFFIX};
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_directory(tag: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("pir-jsonl-{tag}-{}-{stamp}", std::process::id()))
-    }
-
-    /// `KeepFrom` offsets always point at a retained line start, so anything
-    /// at or past EOF is a corrupted/raced state. Rewriting then would truncate
-    /// the sidecar to an empty file; the guard must leave it untouched instead.
-    #[tokio::test]
-    async fn replace_sidecar_suffix_preserves_the_file_when_offset_reaches_eof() {
-        let dir = temp_directory("suffix-eof");
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .expect("create fixture directory");
-        let file = "task-20.jsonl";
-        let original = b"{\"format\":1,\"type\":\"record\",\"seq\":1}\n\
-                         {\"format\":1,\"type\":\"record\",\"seq\":2}\n";
-        tokio::fs::write(dir.join(file), original)
-            .await
-            .expect("write sidecar");
-
-        for offset in [original.len() as u64, original.len() as u64 + 4096] {
-            replace_sidecar_suffix(&dir, false, file, offset).await;
-            assert_eq!(
-                tokio::fs::read(dir.join(file)).await.expect("read sidecar"),
-                original,
-                "an out-of-range offset ({offset}) must not truncate the sidecar"
-            );
-        }
-        assert!(
-            !dir.join(format!("{file}{RECLAIM_SUFFIX}")).exists(),
-            "the guard must not leave a rewrite temporary behind"
-        );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    /// The normal path still copies exactly the bytes from a valid line-start
-    /// offset to EOF.
-    #[tokio::test]
-    async fn replace_sidecar_suffix_keeps_the_retained_tail() {
-        let dir = temp_directory("suffix-tail");
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .expect("create fixture directory");
-        let file = "task-20.jsonl";
-        let first = b"{\"format\":1,\"type\":\"record\",\"seq\":1}\n";
-        let second = b"{\"format\":1,\"type\":\"record\",\"seq\":2}\n";
-        let original = [first.as_slice(), second.as_slice()].concat();
-        tokio::fs::write(dir.join(file), &original)
-            .await
-            .expect("write sidecar");
-
-        replace_sidecar_suffix(&dir, false, file, first.len() as u64).await;
-        assert_eq!(
-            tokio::fs::read(dir.join(file)).await.expect("read sidecar"),
-            second,
-            "the retained suffix must be copied verbatim"
-        );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
 }

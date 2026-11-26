@@ -434,7 +434,11 @@ fn strip_windows_drive_separator(path: &str) -> &str {
 /// `%XX` byte decoder for URL path components (UTF-8 decoded at the end; an
 /// invalid escape is kept verbatim, which is what Node's URL parser does for
 /// stray `%`).
-fn percent_decode(input: &str) -> String {
+///
+/// Public under `#[doc(hidden)]` so `tests/loader_percent_decode.rs` can drive
+/// it directly; not part of the crate's supported surface.
+#[doc(hidden)]
+pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -2050,28 +2054,4 @@ fn module_file_url(path: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::percent_decode;
-
-    #[test]
-    fn malformed_percent_escapes_stay_literal_without_panicking() {
-        // `%` followed by a multi-byte character: `str` slice boundaries used
-        // to land inside the character and panic inside the QuickJS loader
-        // callback, aborting the host.
-        assert_eq!(percent_decode("file:///%€"), "file:///%€");
-        assert_eq!(percent_decode("file:///%中"), "file:///%中");
-        // Truncated escapes are kept verbatim, like Node's URL parser.
-        assert_eq!(percent_decode("%"), "%");
-        assert_eq!(percent_decode("%2"), "%2");
-        assert_eq!(percent_decode("100%"), "100%");
-    }
-
-    #[test]
-    fn valid_percent_escapes_decode() {
-        assert_eq!(percent_decode("a%20b"), "a b");
-        assert_eq!(percent_decode("file:///%E4%B8%AD"), "file:///中");
-    }
 }

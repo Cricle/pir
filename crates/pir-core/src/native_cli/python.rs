@@ -1,16 +1,34 @@
-//! `pir python`: the embedded RustPython 3 interpreter.
+//! `pir python`: run a program on the embedded interpreter.
 //!
 //! Native forms: `-c CMD`, a script path followed by its arguments, and code
-//! read from stdin (no arguments, or `-`). The script's path becomes
-//! `sys.argv[0]`, `__name__` is `__main__`, and a script's directory is
-//! prepended to `sys.path`, matching CPython. Anything else (`-m`, `-u`,
-//! `-X`, `-W`, `-O`, `-I`, `-S`, `-B`, `-E`, `-V`, `-h`, `-i`, …) falls back
-//! to the system `python3`/`python`.
+//! read from stdin (no arguments, or `-`). Anything else (`-m`, `-u`, `-X`,
+//! `-W`, `-O`, `-I`, `-S`, `-B`, `-E`, `-V`, `-h`, `-i`, …) falls back to the
+//! system `python3`/`python`.
 //!
-//! stdout and stderr are written straight to the process streams; the exit
-//! code is 0 on success, N for `sys.exit(N)`, 1 for an uncaught exception or
-//! a non-integer `sys.exit` argument, and 2 when the script file cannot be
-//! opened.
+//! ## The embedded interpreter is QuickJS, not Python
+//!
+//! The command name, the flag surface and the arg resolution are CPython's,
+//! but the program itself runs as **JavaScript** on the extension host's
+//! QuickJS runtime ([`crate::plugins::builtin::js_vm`]). This used to be an
+//! embedded RustPython 3 interpreter; that stack was several megabytes of the
+//! shipped binary and a large share of the release build time, so the engine
+//! behind the name changed while the CLI surface stayed for compatibility.
+//!
+//! Consequences a caller must know:
+//!
+//! - Python source does **not** run here. `pir python -c 'print(1)'` is
+//!   evaluated as JS; only syntax valid in both languages behaves. There is no
+//!   `sys`, no `__name__` and no `sys.path` machinery: the source is passed
+//!   through verbatim ([`build_source`] adds no preamble) and the script
+//!   directory is not put on any import path.
+//! - stdout and stderr come from the runtime's print bindings; the exit code
+//!   keeps the old shape (0 on success, N for an explicit exit, 1 for an
+//!   uncaught error, 2 when the script file cannot be opened).
+//! - A flag the embedded path cannot honor, or a non-UTF-8 program, is handed
+//!   to the system `python3`/`python` instead of failing.
+//!
+//! The CPython preamble/future helpers kept below are dead (`allow` scoped for
+//! them); they stay only until the arg parsing is simplified.
 
 // QuickJS runtime: the Python preamble/future helpers are retained for
 // arg parsing but no longer feed the interpreter.

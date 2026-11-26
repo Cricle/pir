@@ -253,24 +253,27 @@ approval_id 授权面、审批消费持久化等门禁修复）。
 
 - **context-mode**：冷启动 18ms，warm 0.03ms；2M 次循环 380ms；索引
   38–72MB/s；64MB 文本生成 493MB DB（7.3×）；选择性检索 p50
-  0.06–0.11ms；36.5k chunks 的 common-term 检索 120ms。非协作正则可持有
-  进程级 `PY_VM_EXEC_LOCK` 超过 timeout。
+  0.06–0.11ms；36.5k chunks 的 common-term 检索 120ms。QuickJS 的
+  interrupt handler 在边界检查 deadline，所以不协作的循环能被 timeout
+  中断（旧 RustPython 实现做不到，那条历史结论已不适用）。
 - **turn/session**：live 5000 轮 221s（44ms/轮、18MB 常驻）；full 2000 轮
   144s、122MB，每轮成本 34→112ms；100MB session paged open 0.67ms、
   full 80ms、fork 282ms、listing 229ms、append 54µs；64MB 单行 paged
   93ms（慢于 full 48ms）；100MB recovery 1.6s/143MB。
 - **plugin/notification**：native 服务纳秒级；JS extension 启动 45ms、
   +10–25MB；command/event/tool/renderer 单次跨边界 27–57µs；所有 JS 工作
-  串行在一个 QuickJS actor。通知 push 0.4–0.8µs，1024 上限；500 个 widget
-  入队 1.5ms、renderer refresh 13.5ms。
+  串行在一个 QuickJS actor。通知 push 0.4–0.8µs；两套队列各有上限——
+  JS extension 通知队列 1024（`extensions/runtime/state.rs`），native
+  presentation 队列 512（`agent_session/notifications.rs`），上文 1024
+  指的是前者；500 个 widget 入队 1.5ms、renderer refresh 13.5ms。
 - 证据：`.play/evidence/context-mode-ceiling/`、
   `.play/evidence/turn-session-ceiling/`、
   `.play/evidence/plugin-notification-ceiling/`。
 
 ## 剩余边界
 
-- context-mode 的 RustPython 不协作代码无法被 timeout 抢占；WAL/FTS5
-  外部内容索引仍是下一步结构性优化。
+- context-mode 的 LLM 调用本身不在 timeout 覆盖范围内（deadline 只作用于
+  本地代码执行）；WAL/FTS5 外部内容索引仍是下一步结构性优化。
 - session listing 仍是全目录扫描 + 每文件窗口读；超大单行 paged 打开比
   full 更慢；没有 sidecar 索引/分段 session。
 - 带 JS 扩展的 TUI 峰值约 97.5MB（JS runtime floor ~25MB）；native-only

@@ -360,9 +360,8 @@ fn register_theme_file(path: &Path, loaded: &mut LoadedThemes) {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let result = std::fs::read_to_string(path)
-        .map_err(|error| error.to_string())
-        .and_then(|text| parse_theme_json(&text));
+    let result = super::theme_json::read_theme_file(path)
+        .and_then(|text| parse_theme_json(&text).map_err(|error| error.to_string()));
     match result {
         Ok(theme) => {
             let name = theme.name.clone();

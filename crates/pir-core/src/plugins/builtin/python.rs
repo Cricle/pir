@@ -1,49 +1,66 @@
-//! The `python` builtin plugin —an embedded RustPython 3 interpreter
-//! (pir-only differentiation from upstream pi, where Python is reached by
-//! spawning the user's native `python3` through the bash tool).
+//! The `python` builtin plugin —a lazily-started QuickJS JavaScript session
+//! exposed under a stable `python` tool name. The tool name is the only thing
+//! left of the original Python surface: model code is JavaScript.
 //!
-//! ## What this gives over the upstream bash+python3 path
+//! ## History
 //!
-//! - **Pure Rust, no system Python**: the interpreter (and the pure-Python
-//!   half of the stdlib, frozen into the binary via `rustpython-pylib`'s
-//!   `freeze-stdlib`) ships inside pir itself. Nothing is spawned, nothing is
-//!   looked up on PATH, and the tool works offline.
-//! - **Persistent session**: one RustPython VM per plugin instance, shared by
-//!   every tool object the instance registers (a registry rebuild replaces
+//! This tool used to host an embedded RustPython 3 interpreter (VM, frozen
+//! stdlib, `!Send` worker thread, user-signal interrupts). That stack was
+//! several megabytes of the shipped binary and a large share of the release
+//! build time, so the engine behind the name was replaced by the extension
+//! host's QuickJS runtime (see [`super::js_vm`]). The call contract is
+//! unchanged — a persistent session, a per-call deadline, captured
+//! stdout/stderr and an optional eval result — and the tool name is kept for
+//! settings and tool-selection compatibility.
+//!
+//! ## What it gives over the upstream bash+python3 path
+//!
+//! - **Nothing is spawned**: the interpreter ships inside pir, so no `python3`
+//!   or `node` is looked up on PATH and the tool works offline.
+//! - **Persistent session**: one QuickJS context per plugin instance, shared
+//!   by every tool object the instance registers (a registry rebuild replaces
 //!   the tool, not the session). Globals (functions, variables, imports)
 //!   defined in one call are visible in every later call —the agent can
-//!   iterate (define, then use) without re-sending setup code. The VM lives on
-//!   a dedicated worker thread (RustPython's `VirtualMachine` is `!Send`); the
-//!   thread exits with the session (plugin shutdown or a reset).
-//! - **Bounded execution**: a host-side watchdog turns the deadline (default
-//!   30s, `timeout_ms` up to 120s) into a KeyboardInterrupt-style interrupt
-//!   delivered through RustPython's user-signal channel —the eval loop polls
-//!   it (`vm.check_signals()` per bytecode), so runaway loops stop
-//!   cooperatively. Captured output is capped at 1 MiB.
+//!   iterate (define, then use) without re-sending setup code.
+//! - **Bounded execution**: a host-side watchdog installs a QuickJS interrupt
+//!   handler that compares the deadline per interrupt check, so a runaway
+//!   loop stops cooperatively rather than running to completion. Captured
+//!   stdout and stderr are each capped at 1 MiB.
 //!
-//! The worker/interpreter machinery itself lives in
-//! [`super::js_vm`] and is shared with the `context-mode` builtin (whose
-//! executor runs each job in a fresh namespace over the same interpreter).
+//! The session machinery itself lives in [`super::js_vm`] and is shared with
+//! the `context-mode` builtin (whose executor runs each job in a fresh
+//! namespace over the same runtime).
 //!
 //! ## Execution semantics
 //!
-//! `code` is compiled in `eval` mode first: a single expression's repr is
-//! appended to the captured stdout as the tool's result (REPL-style echo).
-//! Anything that is not a single expression compiles in `exec` mode and only
-//! captured stdout is returned (the minimal-correct contract: print/stdout +
-//! an explicit result, no implicit echo of intermediate expression
-//! statements). Uncaught exceptions return `isError: true` with the Python
-//! traceback (captured `sys.stderr`, which `print_exception` writes through);
-//! partially printed stdout is kept on the error result.
+//! `code` is evaluated as a single expression first: its string form is
+//! echoed as the tool's result (REPL-style). Anything that is not a single
+//! expression runs as a program and only captured output is returned (the
+//! minimal-correct contract: explicit output plus an explicit result, no
+//! implicit echo of intermediate statements). Uncaught errors return
+//! `isError: true` with the captured stderr (the JS error text and stack);
+//! partially produced stdout is kept on the error result.
 //!
 //! ## Capability boundary (stated in the tool description)
 //!
-//! The embedded stdlib is RustPython's: pure-Python modules (json, re,
-//! asyncio, csv, ...) plus its Rust-implemented modules (math, io, os, ...).
-//! CPython C extensions (numpy/pandas/...) are not available, and the
-//! `threading`/`ssl` feature flags are deliberately disabled (no native
-//! thread module, no TLS backends). RustPython 0.4 has no VM memory-limit
-//! knob —the output cap and the deadline are the containment surface.
+//! The runtime is QuickJS: ECMAScript plus the host bindings that
+//! [`super::js_vm`] installs (no native Node addons, no Web APIs beyond those
+//! bound). Imports resolve against the working directory. No network by
+//! default, no native threads, and no VM memory-limit knob —the output cap
+//! and the deadline are the containment surface.
+//!
+//! ## Timeout / abort behavior (session reset)
+//!
+//! A deadline that fires while the call is still QUEUED behind another job
+//! only abandons that call: the worker skips it, so the job actually running
+//! (and the session's globals) survive. A deadline that fires on the job the
+//! VM is running trips the interrupt handler and resets the session.
+//!
+//! On deadline or abort the host drops the worker handle after tripping the
+//! abort flag: if the interrupt lands (the common case —nearly every JS loop
+//! reaches an interrupt check), the worker finishes the interrupted job,
+//! finds the job channel closed, and exits cleanly; the next call spins a
+//! fresh worker with a fresh context.
 //!
 //! ## Timeout / abort behavior (session reset)
 //!
@@ -127,11 +144,11 @@ impl AgentTool for PythonTool {
     }
 
     fn description(&self) -> &'static str {
-        "Embedded RustPython 3 —pure-Python stdlib subset; C extensions (numpy/pandas) not available; state persists across calls in this session. \
-Executes JavaScript `code` in a persistent interpreter: variables, functions and imports defined in one call remain available in later calls. \
-A single expression's repr is returned after captured output; print/stdout and stderr are captured, and uncaught exceptions return the Python traceback as an error. \
+        "Executes JavaScript `code` in a persistent embedded interpreter (the tool is still named `python` for settings compatibility); state persists across calls in this session. \
+Variables, functions and imports defined in one call remain available in later calls. \
+A single expression's value is returned as its string form; stdout and stderr are captured, and an uncaught error returns isError with the captured error text. \
 The default 30s deadline can be raised with timeout_ms (max 120000); a timed-out or aborted call resets the session (globals are lost). \
-Imports resolve against the frozen stdlib and the working directory; no network, no native threads, no SSL, and no memory cap (output is capped at 1 MiB per call)."
+Imports resolve against the working directory; no network, no native threads, and no memory cap (output is capped at 1 MiB per call)."
     }
 
     fn parameters(&self) -> Option<serde_json::Value> {

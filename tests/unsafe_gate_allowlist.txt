@@ -45,7 +45,7 @@ crates/pir-core/src/file_identity.rs 4 0 0  # Win32 FILE_ID_INFO identity probe 
 crates/pir-core/src/jobs.rs 16 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes + macOS proc_pidinfo(PROC_PIDTBSDINFO) start token (all with SAFETY notes)
 crates/pir-core/src/mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
 crates/pir-core/src/pir_node/modules/buffer.rs 5 0 0  # QuickJS typed-array bytes -> String::from_utf8_unchecked (validated first)
-crates/pir-core/src/pir_node/modules/fs.rs 4 0 0  # Win32 GetDiskFreeSpaceW out-pointers + reparse-point-aware path FFI
+crates/pir-core/src/pir_node/modules/fs.rs 7 0 0  # Win32 GetDiskFreeSpaceW out-pointers + reparse-point-aware path FFI, plus the Unix arms: libc::statvfs for statfs and libc::utimensat(AT_SYMLINK_NOFOLLOW) for lutimes (every block carries a SAFETY note)
 crates/pir-core/src/plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
 crates/pir-core/src/plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
 crates/pir-core/src/session_manager/retention.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes (the start-token probe is now delegated to jobs.rs instead of duplicated)

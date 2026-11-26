@@ -641,15 +641,23 @@ pub fn stat_parts(
 ) -> Result<StatParts, NodeError> {
     let path = resolve_fs_path(runtime, raw);
     let syscall = if symlink { "lstat" } else { "stat" };
+    // Same ordering rule as the JSON `stat`/`lstat` arm: the metadata must be
+    // read BEFORE the `:pir_symlink` marker probe, because that probe is a read
+    // of this file and a read refreshes the last-access time on Windows.
+    #[cfg(windows)]
+    if symlink {
+        let meta =
+            std::fs::symlink_metadata(&path).map_err(|error| fs_io(&error, syscall, &path))?;
+        let emulated = emulated_link_text(&path).is_some();
+        return Ok(stat_parts_of(
+            &meta,
+            emulated || meta.file_type().is_symlink(),
+        ));
+    }
     #[cfg(windows)]
     if let Some(target) = emulated_link_target(&path) {
-        let meta = if symlink {
-            std::fs::symlink_metadata(&path)
-        } else {
-            std::fs::metadata(&target)
-        }
-        .map_err(|error| fs_io(&error, syscall, &path))?;
-        return Ok(stat_parts_of(&meta, symlink));
+        let meta = std::fs::metadata(&target).map_err(|error| fs_io(&error, syscall, &path))?;
+        return Ok(stat_parts_of(&meta, false));
     }
     let meta = if symlink {
         std::fs::symlink_metadata(&path)
@@ -787,29 +795,25 @@ pub(crate) fn fs_op(
         }
         "statfs" => {
             let path = read_path(runtime, payload, "path")?;
+            // `(bsize, blocks, bfree, files, ffree)`. Windows passes zero inode
+            // counts because libuv leaves them unset there; Unix reads them
+            // from the same `statvfs` call.
             #[cfg(windows)]
-            {
-                let (bsize, blocks, free) =
-                    windows_disk_space(&path).map_err(|error| fs_io(&error, "statfs", &path))?;
-                Ok(serde_json::json!({
-                    "type": 0u64,
-                    "bsize": bsize,
-                    "frsize": bsize,
-                    "blocks": blocks,
-                    "bfree": free,
-                    "bavail": free,
-                    // libuv leaves the inode counts zero on Windows.
-                    "files": 0u64,
-                    "ffree": 0u64,
-                }))
-            }
+            let (bsize, blocks, free, files, ffree) =
+                windows_disk_space(&path).map_err(|error| fs_io(&error, "statfs", &path))?;
             #[cfg(not(windows))]
-            {
-                Err(NodeError::new(
-                    "ENOSYS",
-                    "statfs is not implemented on this platform",
-                ))
-            }
+            let (bsize, blocks, free, files, ffree) =
+                unix_disk_space(&path).map_err(|error| fs_io(&error, "statfs", &path))?;
+            Ok(serde_json::json!({
+                "type": 0u64,
+                "bsize": bsize,
+                "frsize": bsize,
+                "blocks": blocks,
+                "bfree": free,
+                "bavail": free,
+                "files": files,
+                "ffree": ffree,
+            }))
         }
         "stat" | "lstat" => {
             let symlink = op == "lstat";
@@ -817,15 +821,28 @@ pub(crate) fn fs_op(
             let path = read_path(runtime, payload, "path")?;
             // Unprivileged file-symlink emulation: lstat is the marker file
             // itself, stat follows the recorded target.
+            //
+            // The `lstat` arm must take the metadata BEFORE consulting the
+            // `:pir_symlink` marker: that probe is a read of this same file,
+            // and Windows refreshes the last-access time on read, so probing
+            // first makes `lstat` report the probe's atime instead of the one
+            // `lutimes` just set.
+            #[cfg(windows)]
+            if symlink {
+                let meta = std::fs::symlink_metadata(&path)
+                    .map_err(|error| fs_io(&error, syscall, &path))?;
+                let emulated = emulated_link_text(&path).is_some();
+                return Ok(metadata_value(
+                    &meta,
+                    emulated || meta.file_type().is_symlink(),
+                ));
+            }
             #[cfg(windows)]
             if let Some(target) = emulated_link_target(&path) {
-                let meta = if symlink {
-                    std::fs::symlink_metadata(&path)
-                } else {
-                    std::fs::metadata(&target)
-                }
-                .map_err(|error| fs_io(&error, syscall, &path))?;
-                return Ok(metadata_value(&meta, symlink));
+                let meta =
+                    std::fs::metadata(&target).map_err(|error| fs_io(&error, syscall, &path))?;
+                // `stat` follows the link, so the answer describes the target.
+                return Ok(metadata_value(&meta, false));
             }
             let meta = if symlink {
                 std::fs::symlink_metadata(&path)
@@ -889,9 +906,14 @@ pub(crate) fn fs_op(
             let path = check_write_entry(runtime, payload, "path", "unlink")?;
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(JsonValue::Null),
-                // A junction is a directory object; removing the directory
-                // entry is Node's `unlink` of a directory symlink.
-                Err(error) if cfg!(windows) && is_directory_symlink(&path) => {
+                // A directory symlink (a junction included) is a directory
+                // object, so `remove_file` fails on it and Node's `unlink`
+                // removes the directory entry instead. The check is portable:
+                // `symlink_metadata` flags the link itself, `metadata` follows
+                // it to say whether the target is a directory. Unix never
+                // reaches this arm (`remove_file` unlinks either kind), so the
+                // guard only decides on Windows without naming the platform.
+                Err(error) if is_directory_symlink(&path) => {
                     std::fs::remove_dir(&path).map_err(|_| fs_io(&error, "unlink", &path))?;
                     Ok(JsonValue::Null)
                 }
@@ -1820,22 +1842,86 @@ fn lutimes_path(
     file.set_times(times)
 }
 
-#[cfg(not(windows))]
+/// Set the link's own timestamps without following it (`lutimes`), Unix arm.
+///
+/// `std::fs::File::set_times` always follows the link, so this needs
+/// `utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW)` — the one syscall
+/// that names the link itself. POSIX on every Unix target, so one
+/// implementation covers Linux and the BSDs; the `AT_SYMLINK_NOFOLLOW` value
+/// differs per OS and libc supplies the right one.
+#[cfg(unix)]
+#[allow(unsafe_code)]
 fn lutimes_path(
-    _path: &Path,
-    _atime: std::time::SystemTime,
-    _mtime: std::time::SystemTime,
+    path: &Path,
+    atime: std::time::SystemTime,
+    mtime: std::time::SystemTime,
 ) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "lutimes is not implemented on this platform",
-    ))
+    use std::os::unix::ffi::OsStrExt;
+
+    /// `SystemTime` to a `timespec` the way `utimensat` wants it: ns since the
+    /// epoch, with negatives (a pre-1970 timestamp) left to `tv_sec`/`tv_nsec`
+    /// normalisation below.
+    fn to_timespec(time: std::time::SystemTime) -> std::io::Result<libc::timespec> {
+        match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(since) => Ok(libc::timespec {
+                tv_sec: since.as_secs() as libc::time_t,
+                tv_nsec: since.subsec_nanos() as libc::c_long,
+            }),
+            // Before the epoch: `utimensat` takes a negative seconds value.
+            Err(before) => {
+                let behind = before.duration();
+                let secs = -(behind.as_secs() as libc::time_t);
+                let nanos = behind.subsec_nanos() as libc::c_long;
+                // A duration of exactly N seconds has nanos 0; anything else
+                // borrows one second so `tv_nsec` stays in [0, 1e9).
+                if nanos == 0 {
+                    Ok(libc::timespec {
+                        tv_sec: secs,
+                        tv_nsec: 0,
+                    })
+                } else {
+                    Ok(libc::timespec {
+                        tv_sec: secs - 1,
+                        tv_nsec: 1_000_000_000 - nanos,
+                    })
+                }
+            }
+        }
+    }
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL",
+        ));
+    };
+    let times = [to_timespec(atime)?, to_timespec(mtime)?];
+    // SAFETY: `c_path` is NUL-terminated and outlives the call; `times` is a
+    // two-element array of the exact `struct timespec[2]` the syscall reads
+    // (atime, mtime). `AT_FDCWD` keeps the path relative to the process cwd,
+    // matching Node's `lutimes`, and `AT_SYMLINK_NOFOLLOW` is what makes this
+    // the link's own timestamps rather than its target's.
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
-/// Free/total space of the volume holding `path` (libuv's `uv_fs_statfs`):/// `(bsize, blocks, bfree)`. Clusters are the unit; `bsize` is cluster bytes.
+/// Free/total space of the volume holding `path` (libuv's `uv_fs_statfs`):
+/// `(bsize, blocks, bfree, files, ffree)`. Clusters are the unit; `bsize` is
+/// cluster bytes. The inode counts stay 0 — libuv does not fill them on
+/// Windows.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn windows_disk_space(path: &Path) -> std::io::Result<(u64, u64, u64)> {
+fn windows_disk_space(path: &Path) -> std::io::Result<(u64, u64, u64, u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
 
     extern "system" {
@@ -1874,17 +1960,70 @@ fn windows_disk_space(path: &Path) -> std::io::Result<(u64, u64, u64)> {
         return Err(std::io::Error::last_os_error());
     }
     let bsize = (bytes as u64).saturating_mul(sectors as u64);
-    Ok((bsize, total as u64, free as u64))
+    // libuv leaves the inode counts unset on Windows.
+    Ok((bsize, total as u64, free as u64, 0, 0))
 }
 
-#[cfg(windows)]
-#[cfg(windows)]
+/// Free/total space of the volume holding `path`, Unix arm (libuv's
+/// `uv_fs_statfs` is `statvfs` there).
+///
+/// `f_frsize` is the fragment size libuv reports as `bsize`/`frsize`; the block
+/// counts are the filesystem's own units (`f_blocks`, `f_bfree`). `statvfs` is
+/// POSIX, so this is one implementation for every Unix target rather than a
+/// per-OS `statfs`/`statvfs`/`statfs64` split.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn unix_disk_space(path: &Path) -> std::io::Result<(u64, u64, u64, u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // A path with an interior NUL cannot be handed to the syscall; report it
+    // the way the rest of the fs surface does.
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL",
+        ));
+    };
+    // SAFETY: `statvfs` writes into the whole `statvfs` struct it is handed and
+    // reads only the NUL-terminated `c_path` that outlives the call. The
+    // initialised value is overwritten on success and ignored on failure.
+    let mut raw: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `raw` is a valid, exclusively borrowed out-parameter of the exact
+    // type the syscall expects, and `c_path` is NUL-terminated.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut raw) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // `f_frsize` may be 0 on filesystems that only fill `f_bsize`; libuv falls
+    // back to the block size there.
+    let bsize = if raw.f_frsize == 0 {
+        raw.f_bsize as u64
+    } else {
+        raw.f_frsize as u64
+    };
+    Ok((
+        bsize,
+        raw.f_blocks as u64,
+        raw.f_bfree as u64,
+        raw.f_files as u64,
+        raw.f_ffree as u64,
+    ))
+}
+
+/// Whether `path` is a symlink whose *target* is a directory (so `remove_file`
+/// cannot unlink it and `remove_dir` must). `symlink_metadata` inspects the
+/// link itself; `metadata` follows it. Portable — no platform gate needed.
 fn is_directory_symlink(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    is_link
+        && std::fs::metadata(path)
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
 }
 
+#[cfg(windows)]
 fn symlink_impl(target: &str, path: &Path, kind: &str) -> std::io::Result<()> {
     // Junctions use FSCTL_SET_REPARSE_POINT (no SeCreateSymbolicLinkPrivilege
     // needed); `dir`/`file` go through the normal API and fall back on an
@@ -2086,12 +2225,6 @@ fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
         0o666
     };
     kind | perm
-}
-
-#[cfg(unix)]
-fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
-    meta.permissions().mode()
 }
 
 /// Node-parity stat fields shared by `stat`/`lstat` (both the JSON op and the

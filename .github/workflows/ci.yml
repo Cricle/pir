@@ -189,7 +189,18 @@ jobs:
       #   * `sdk_extended::low_level_create_agent_session_…` — full SDK build
       #     whose discovery walk cannot survive a sibling's fixture churn;
       #   * `mcp_integration::readiness_cache_backs_off_…` — asserts a second
-      #     call returns immediately after a 1 s connect timeout.
+      #     call returns immediately after a 1 s connect timeout;
+      #   * `node_shims::child_process_blocking_timeout_maxbuffer_and_signal`
+      #     and `node_shims::child_process_kill_stops_a_long_running_child` —
+      #     both assert wall-clock deadlines (a spawnSync timeout must fire, an
+      #     exit event must land within 4 s of kill()), which a sibling suite's
+      #     CPU churn in the same binary can stretch;
+      #   * `tui_dirty_refresh::{streaming_deltas_only_touch_the_tail_dirty_rows,
+      #     frame_row_budget_defers_without_losing_tokens,
+      #     idle_decorator_keeps_dirty_fast_path}` — the frame cache folds the
+      #     PROCESS-GLOBAL `Theme::generation()` into each slot's cache key, so
+      #     a sibling suite installing a theme invalidates every slot and turns
+      #     an incremental frame into a full repaint.
       # Keep the `--test zz_merged_*` groups on nextest for that reason; running
       # them with plain `cargo test` reintroduces the shared-process races
       # documented in TEST-2 (`.audit/review-2026-11-23/findings.jsonl`).
@@ -247,17 +258,37 @@ jobs:
           # zz_merged_N harnesses, not cargo test targets. Enumerate the real
           # targets from cargo metadata (jq ships on the hosted runners); fall
           # back to the generated harness names when jq is unavailable.
+          #
+          # `rpc_export_off` is subtracted here and run on its own below. Its
+          # `required-features = ["rpc"]` and `rpc` is deliberately outside
+          # `full` (it is the one profile that must be exercisable with the
+          # feature OFF), so a default-feature `--test rpc_export_off` is a
+          # configuration error — "target requires the features" — not a red
+          # test. Listing the exclusion by name rather than deriving it from the
+          # feature graph keeps this readable: it is the only such target, and
+          # a new one shows up as a loud error in the groups instead of being
+          # silently filtered by a rule that guesses at the default set.
+          NON_DEFAULT_TARGETS=" rpc_export_off "
           if command -v jq >/dev/null 2>&1; then
             mapfile -t targets < <(cargo metadata --no-deps --format-version 1 \
-              | jq -r '.packages[] | select(.name == "pir-sdk") | .targets[] | select(.kind[] == "test") | .name' \
+              | jq -r '.packages[] | select(.name == "pir-sdk") | .targets[]
+                       | select(.kind[] == "test") | .name' \
               | tr -d '\r')
+            filtered=()
+            for name in "${targets[@]}"; do
+              case "$NON_DEFAULT_TARGETS" in
+                *" $name "*) ;;
+                *) filtered+=("$name") ;;
+              esac
+            done
+            targets=("${filtered[@]}")
           else
             targets=(
               zz_merged_1 zz_merged_2 zz_merged_3 zz_merged_4
               zz_merged_5 zz_merged_6 zz_merged_7 zz_merged_8
               worker_threads_real g_durable_integration
               print_native_session resume_on_error
-              feature_off_surface sdk_consumer_surface sdk_consumer_embed rpc_export_off
+              feature_off_surface sdk_consumer_surface sdk_consumer_embed
             )
           fi
           if [ "${#targets[@]}" -eq 0 ]; then
@@ -322,6 +353,28 @@ jobs:
               i=$((i + 1))
             done
           done
+          # The out-of-default target, run with the feature set it requires.
+          # `--no-default-features` is load-bearing, not tidiness: `default =
+          # ["full"]`, and `full` includes `tui`, which pulls `export-html`.
+          # The suite is `#![cfg(all(feature = "rpc", not(feature =
+          # "export-html")))]`, so enabling defaults would compile it down to
+          # zero tests and silently pass. Same invocation as the
+          # `off(rpc,export-html)` row in scripts/feature_matrix.sh.
+          rpc_log=/tmp/nextest-rpc-export-off.log
+          cargo nextest run --locked --profile ci --no-default-features \
+            --features rpc --test rpc_export_off 2>&1 | tee "$rpc_log"
+          rpc_exit=${PIPESTATUS[0]}
+          echo "::notice title=Nextest rpc_export_off::exit=${rpc_exit}"
+          if [ "$rpc_exit" -ne 0 ]; then
+            status=1
+            sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' "$rpc_log" > "$rpc_log.clean" || cp "$rpc_log" "$rpc_log.clean"
+            grep -E "^\s*(FAIL|TIMEOUT)" "$rpc_log.clean" | head -20 | while IFS= read -r line; do
+              [ -n "$line" ] && echo "::error title=rpc_export_off::$line"
+            done
+            tail -c 4000 "$rpc_log.clean" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' \
+              | awk '{printf "%s%%0A", $0}' | cut -c1-40000 > /tmp/nextest-rpc-tail.txt
+            echo "::error title=rpc_export_off log tail::$(cat /tmp/nextest-rpc-tail.txt)"
+          fi
           exit "$status"
 
   test-linux-subset:

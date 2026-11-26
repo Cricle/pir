@@ -1180,6 +1180,50 @@ export default (pi: any) => {
     fs.writeFileSync(enc, "42", "hex");
     eq("writeFile string option is encoding", fs.readFileSync(enc, "utf8"), "B");
 
+    // --- statfs / lutimes against the host's own volume ---------------------
+    // Both are platform-backed now (GetDiskFreeSpaceW on Windows, statvfs on
+    // Unix; reparse-point handles vs utimensat(AT_SYMLINK_NOFOLLOW)), so the
+    // assertions target VALUES, which holds both arms to one contract. This
+    // used to be untested: the parity fixture only checked that the names
+    // exist, and the Unix arms answered ENOSYS/Unsupported.
+    const space = fs.statfsSync(cwd);
+    eq("statfs reports a positive block size",
+      typeof space.bsize === "number" && space.bsize > 0, true);
+    eq("statfs reports a positive block count",
+      typeof space.blocks === "number" && space.blocks > 0, true);
+    eq("statfs free never exceeds total", space.bfree <= space.blocks, true);
+    eq("statfs frsize mirrors bsize", space.frsize, space.bsize);
+    const spaceBig = fs.statfsSync(cwd, { bigint: true });
+    eq("statfs bigint bsize is a bigint", typeof spaceBig.bsize, "bigint");
+    eq("statfs bigint matches the number form",
+      spaceBig.bsize === BigInt(space.bsize), true);
+
+    // `lutimes` must retime the LINK, not its target: set a symlink's times,
+    // then check lstat moved while stat did not.
+    const linkTarget = reset("lt-target.txt", "target body");
+    const linkPath = abs("lt-link.txt");
+    const stamp = new Date(Date.UTC(2001, 1, 2, 3, 4, 5));
+    try { fs.unlinkSync(linkPath); } catch (e: any) { if (e.code !== "ENOENT") throw e; }
+    try {
+      fs.symlinkSync(linkTarget, linkPath);
+      const targetMtime = fs.statSync(linkTarget).mtimeMs;
+      fs.lutimesSync(linkPath, stamp, stamp);
+      eq("lutimes sets the link own atime",
+        fs.lstatSync(linkPath).atimeMs, stamp.getTime());
+      eq("lutimes sets the link own mtime",
+        fs.lstatSync(linkPath).mtimeMs, stamp.getTime());
+      eq("lutimes leaves the target mtime alone",
+        fs.statSync(linkTarget).mtimeMs, targetMtime);
+      fs.unlinkSync(linkPath);
+    } catch (error: any) {
+      // Creating a symlink needs a privilege on Windows; when that is refused
+      // the retiming contract is still covered on a plain file.
+      if (error.code !== "EPERM") throw error;
+      const plain = reset("lt-plain.txt", "body");
+      fs.utimesSync(plain, stamp, stamp);
+      eq("utimes fallback sets atime", fs.statSync(plain).atimeMs, stamp.getTime());
+    }
+
     globalThis.__fsParity = { checked, failures };
   });
 };

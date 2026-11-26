@@ -846,8 +846,12 @@ pub fn push_cached_node(
     tail.push_str(",\"id\":");
     tail.push_str(&json_text_or_null(&id));
     tail.push('}');
-    let index = u32::try_from(tree.arena.len())
-        .expect("a session tree beyond u32::MAX nodes is not a real fixture");
+    // A session tree cannot reach 4.29e9 nodes (each carries a rendered
+    // transcript excerpt), but this is a library entry point, so the conversion
+    // saturates instead of panicking. `NONE` is `u32::MAX`, which the index must
+    // never collide with, hence one below. Everything past the cap shares that
+    // slot: the tree renders as a truncated one rather than aborting the host.
+    let index = u32::try_from(tree.arena.len()).unwrap_or(u32::MAX - 1);
     tree.arena.push(CachedTreeNode {
         head,
         tail,

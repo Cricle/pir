@@ -69,6 +69,41 @@ const OPTIONAL_COLOR_KEYS: [&str; 5] = [
     "thinkingMax",
 ];
 
+/// Ceiling on a theme document read from disk.
+///
+/// A theme is a flat map of color keys plus a handful of `vars`: real files are
+/// a few kilobytes (the largest bundled palettes are ~8 KiB). The startup
+/// loader and the file watcher both used a bare `read_to_string`, so a
+/// mis-pointed path (a log, a session transcript, a device file) would be read
+/// whole into memory before JSON parsing could reject it — and on the watcher
+/// path that repeats on every change event. 1 MiB is two orders of magnitude
+/// above any real theme and still bounds the allocation.
+pub const MAX_THEME_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a theme document, refusing anything past [`MAX_THEME_FILE_BYTES`].
+///
+/// The size is checked against the file metadata BEFORE reading, so an
+/// oversized file costs one `stat` rather than a full read. A file that grows
+/// between the check and the read is still bounded by the post-read length
+/// check.
+pub fn read_theme_file(path: &std::path::Path) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_THEME_FILE_BYTES {
+        return Err(format!(
+            "theme file is {} bytes, over the {MAX_THEME_FILE_BYTES}-byte limit",
+            metadata.len()
+        ));
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    if text.len() as u64 > MAX_THEME_FILE_BYTES {
+        return Err(format!(
+            "theme file grew to {} bytes while reading it, over the {MAX_THEME_FILE_BYTES}-byte limit",
+            text.len()
+        ));
+    }
+    Ok(text)
+}
+
 /// Every color key the port consumes (`ThemeColor::key` outputs).
 pub(super) fn all_color_keys() -> Vec<&'static str> {
     super::all_theme_colors()

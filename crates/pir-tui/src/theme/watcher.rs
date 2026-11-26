@@ -218,7 +218,11 @@ pub fn notify_theme_change() {
 ///
 /// Returns the registered theme's name on success.
 pub fn reload_theme_file(path: &Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    // Bounded read: an oversized file is rejected here rather than read whole.
+    // The watcher keeps the last good theme on any error (see the module doc),
+    // so a file left permanently oversized does not hot-loop — each change
+    // event costs one `stat` and an early return.
+    let text = crate::theme::theme_json::read_theme_file(path)?;
     let theme = parse_theme_json(&text)?;
     let name = theme.name.clone();
     // Upstream `registeredThemes.set(watchedThemeName, reloadedTheme)`: the
