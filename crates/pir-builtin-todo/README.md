@@ -12,8 +12,6 @@ session wiring) lives in `pir-core`; this crate never depends on it, nor on
 
 | Item | Kind |
 |---|---|
-| Item | Kind |
-|---|---|
 | task state machine | pure, host-free |
 | dependency graph | pure, host-free |
 | reducer | pure, host-free |
