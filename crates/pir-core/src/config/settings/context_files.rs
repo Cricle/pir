@@ -17,6 +17,24 @@ pub const CONTEXT_FILE_CANDIDATES: [&str; 5] = [
 /// `loadContextFileFromDir` reads without a cap).
 pub const MAX_CONTEXT_FILE_BYTES: u64 = 1024 * 1024;
 
+/// Whether `path` is a regular file, following a symlink to its target.
+///
+/// Following the link is what upstream does: `loadProjectContextFiles` and its
+/// system-prompt twin read the path, so the decision has to be about the target,
+/// not the link. Deciding on `symlink_metadata`'s own type (which is
+/// `is_symlink`, never `is_file`) silently drops every linked context file —
+/// exactly the shape a worktree or a dotfiles setup uses to point at one shared
+/// copy, so the link would never shadow the file it replaces.
+fn is_regular_file_following_links(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::metadata(path)
+            .map(|target| target.file_type().is_file())
+            .unwrap_or(false),
+        Ok(metadata) => metadata.file_type().is_file(),
+        Err(_) => false,
+    }
+}
+
 /// Load the first existing context file in `dir` (candidates in upstream order).
 ///
 /// Upstream `loadContextFileFromDir`
@@ -53,10 +71,7 @@ fn load_context_file_from_dir(
     let mut visited: Vec<PathBuf> = Vec::with_capacity(CONTEXT_FILE_CANDIDATES.len());
     for filename in CONTEXT_FILE_CANDIDATES {
         let path = dir.join(filename);
-        let Ok(file_type) = fs::symlink_metadata(&path).map(|metadata| metadata.file_type()) else {
-            continue;
-        };
-        if file_type.is_symlink() || !file_type.is_file() {
+        if !is_regular_file_following_links(&path) {
             continue;
         }
         let identity = canonicalize_lossy(&path);
@@ -266,12 +281,7 @@ pub fn discover_system_md(
         dirs.push(global_dir);
         for dir in dirs {
             let path = dir.join(filename);
-            if let Ok(file_type) = fs::symlink_metadata(&path).map(|metadata| metadata.file_type())
-            {
-                if file_type.is_symlink() || !file_type.is_file() {
-                    continue;
-                }
-            } else {
+            if !is_regular_file_following_links(&path) {
                 continue;
             }
             // pir hardening (FIX-C17): skip oversized files before reading
