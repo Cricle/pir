@@ -22,6 +22,33 @@ pub const REDACTED: &str = "<redacted>";
 /// The `pi.bug-report` custom entry type (upstream core/bug-report.ts:17).
 pub const BUG_REPORT_CUSTOM_ENTRY_TYPE: &str = "pi.bug-report";
 
+/// Ceiling on the assembled upload body.
+///
+/// The bundle is built as one in-memory `Vec<u8>` (the shared reqwest feature
+/// set has no streaming multipart), and `session.jsonl` is the whole
+/// transcript, so a long session made the upload allocate on the order of the
+/// transcript — the session `String`, its clone in [`bug_report_files`], and
+/// the multipart copy. Nothing bounded it: a 100 MB session peaked at hundreds
+/// of MB and the server would have rejected it anyway. 32 MiB is well past any
+/// report that has ever been useful (a transcript that size is not reviewable
+/// by hand) and keeps the peak allocation fixed.
+pub const BUG_REPORT_MAX_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Total bytes the bundle would put in the upload body, without building it.
+///
+/// Counts the file data plus the multipart framing overhead (`--boundary`,
+/// headers, CRLFs) so the check happens before any allocation for the body.
+pub fn bug_report_body_len(bundle: &BugReportBundle) -> usize {
+    // 76 bytes covers the longest plausible framing per part (boundary line,
+    // Content-Disposition, Content-Type, blank line, trailing CRLF); the
+    // boundary itself is a 32-char uuid, so this is a generous constant.
+    const FRAMING_PER_PART: usize = 200;
+    bug_report_files(bundle)
+        .iter()
+        .map(|file| file.data.len() + FRAMING_PER_PART)
+        .sum()
+}
+
 /// Keys whose values never leave the machine (upstream `SENSITIVE_KEY`,
 /// core/bug-report.ts:20 — the case-insensitive regex
 /// `api[-_]key|secret|token|password|passwd|credential|authorization|cookie`).
@@ -329,6 +356,16 @@ fn radius_token() -> Option<String> {
 /// Returns the created report id; a missing Radius credential is the
 /// caller's fallback signal (`Ok(None)`).
 pub async fn upload_bug_report(bundle: &BugReportBundle) -> Result<Option<String>, String> {
+    // Refuse before building the body: the multipart assembly below copies
+    // every file's data into one `Vec<u8>`, and an unbounded transcript made
+    // that allocation unbounded too.
+    let body_len = bug_report_body_len(bundle);
+    if body_len > BUG_REPORT_MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "bug report is {body_len} bytes, over the {BUG_REPORT_MAX_UPLOAD_BYTES}-byte upload limit; \
+             retry with the transcript excluded, or attach it manually"
+        ));
+    }
     let token = radius_token();
     // Hand-rolled multipart/form-data body (the shared reqwest feature set
     // has no `multipart`); the boundary is random per request.

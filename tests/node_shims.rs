@@ -1663,6 +1663,14 @@ export default (pi: any) => {
 
 #[tokio::test(flavor = "current_thread")]
 async fn child_process_blocking_timeout_maxbuffer_and_signal() {
+    // Timing-bound: the fixture asserts a spawnSync deadline fires, and the
+    // deadline is wall-clock — a sibling suite's CPU churn inside this 800-test
+    // binary can stretch it past the point the script expects.
+    if crate::common::skip_without_nextest(
+        "node_shims::child_process_blocking_timeout_maxbuffer_and_signal",
+    ) {
+        return;
+    }
     let rt = new_runtime().await;
     let v = run_phase3_fixture(&rt, "limits", PHASE3_LIMITS_TS).await;
 
@@ -1734,6 +1742,14 @@ export default (pi: any) => {
 
 #[tokio::test(flavor = "current_thread")]
 async fn child_process_kill_stops_a_long_running_child() {
+    // Timing-bound: asserts the exit event lands within 4s of kill(), which is
+    // wall-clock and can be stretched by a sibling suite's CPU churn in the
+    // same binary.
+    if crate::common::skip_without_nextest(
+        "node_shims::child_process_kill_stops_a_long_running_child",
+    ) {
+        return;
+    }
     let rt = new_runtime().await;
     let v = run_phase3_fixture(&rt, "kill", PHASE3_KILL_TS).await;
 

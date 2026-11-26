@@ -306,6 +306,13 @@ pub fn shorten_path(path: &str, home: Option<&str>) -> String {
 
 /// Delete a session file, trying the `trash` CLI first and falling back to a
 /// permanent unlink (upstream `deleteSessionFile`).
+///
+/// The fallback is **irreversible** — no recycle bin, no undo — so it must only
+/// ever be reached from a path the user explicitly confirmed. It is: the
+/// sessions overlay intercepts every key while `confirm_delete` is set and only
+/// Enter reaches `apply_delete` → `delete_session` → here
+/// (`terminal.rs::handle_sessions_overlay_key`, upstream
+/// session-selector.ts:543-557). Do not call this from an unconfirmed path.
 pub fn delete_session_file(path: &PathBuf) -> Result<&'static str, String> {
     // Upstream prefixes `--` when the path starts with `-` so a leading-dash
     // filename is not parsed as a flag by the trash CLI.
@@ -328,6 +335,8 @@ pub fn delete_session_file(path: &PathBuf) -> Result<&'static str, String> {
     if trashed || !path.exists() {
         return Ok("trash");
     }
+    // Irreversible: the `trash` CLI is unavailable or refused, so this is a
+    // permanent unlink. See the doc comment for the confirmation contract.
     std::fs::remove_file(path).map_err(|error| error.to_string())?;
     Ok("unlink")
 }

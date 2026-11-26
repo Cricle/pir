@@ -2054,7 +2054,11 @@ fn source_label(source: &McpServerSource) -> &'static str {
 /// accessor and a TUI panel cannot drift. The upstream-shaped plain text is
 /// [`McpStatusSnapshot::format_status`]; this list form adds the source and
 /// the always-visible tool count the `/mcp` menu shows.
-fn servers_report(status: &McpStatusSnapshot) -> String {
+///
+/// Public under `#[doc(hidden)]` so `tests/mcp_servers_report.rs` can render
+/// the same rows the `/mcp` command shows; not part of the supported surface.
+#[doc(hidden)]
+pub fn servers_report(status: &McpStatusSnapshot) -> String {
     if status.servers.is_empty() {
         return status.format_status();
     }
@@ -5661,83 +5665,4 @@ async fn read_mcp_resource(manager: &McpManager, args: &JsonValue) -> ToolResult
         "contents": result.contents,
     });
     resource_tool_result(tool, Some(&name), text, payload)
-}
-
-#[cfg(test)]
-mod servers_report_tests {
-    use super::*;
-    use crate::mcp::manager::{ConnectionState, McpServerStatus};
-    use std::path::PathBuf;
-
-    fn server(state: ConnectionState, tools: Vec<String>) -> McpServerStatus {
-        McpServerStatus {
-            name: "docs".to_owned(),
-            config: serde_json::from_value(serde_json::json!({ "command": "true" }))
-                .expect("valid server config"),
-            builtin_tools: false,
-            exposure: McpExposure::Direct,
-            enabled: true,
-            state,
-            tools,
-            transport: "stdio".to_owned(),
-            source: McpServerSource::GlobalConfig(PathBuf::from("mcp.json")),
-        }
-    }
-
-    fn report(state: ConnectionState, tools: Vec<String>) -> String {
-        servers_report(&McpStatusSnapshot {
-            servers: vec![server(state, tools)],
-            config_errors: Vec::new(),
-            overridden: Vec::new(),
-            agent_dir: PathBuf::from("."),
-        })
-    }
-
-    /// A server that never published a discovery must not claim `0 tools`:
-    /// the state word on the same row already distinguishes configured,
-    /// connecting and failed.
-    #[test]
-    fn unconnected_zero_tools_is_not_reported_as_zero() {
-        let states = [
-            ConnectionState::Idle,
-            ConnectionState::Connecting,
-            ConnectionState::Failed {
-                error: "boom".to_owned(),
-            },
-            ConnectionState::Disconnected { error: None },
-            ConnectionState::Closed,
-        ];
-        for state in states {
-            let text = report(state.clone(), Vec::new());
-            assert!(
-                !text.contains("0 tools"),
-                "{state:?} must not read as an empty server: {text}"
-            );
-            assert!(
-                text.contains("tools not discovered yet"),
-                "{state:?} names the missing discovery: {text}"
-            );
-        }
-    }
-
-    /// A connected server's count is authoritative: zero means it really
-    /// exposes no tools.
-    #[test]
-    fn connected_zero_tools_stays_zero() {
-        let text = report(ConnectionState::Connected, Vec::new());
-        assert!(text.contains("0 tools"), "{text}");
-        assert!(!text.contains("not discovered"), "{text}");
-    }
-
-    /// A dropped connection keeps the last discovered count instead of
-    /// claiming nothing was ever discovered.
-    #[test]
-    fn unconnected_last_known_count_is_kept() {
-        let text = report(
-            ConnectionState::Disconnected { error: None },
-            vec!["echo".to_owned()],
-        );
-        assert!(text.contains("1 tool"), "{text}");
-        assert!(!text.contains("not discovered"), "{text}");
-    }
 }

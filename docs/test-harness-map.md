@@ -136,7 +136,7 @@ extra name multiplies the link phase.
 | `feature_off_surface` | `tests/feature_off_surface.rs` | standalone, `cli` | 0 |
 | `sdk_consumer_surface` | `tests/sdk_consumer_surface.rs` | standalone, `sdk` | 0 |
 | `sdk_consumer_embed` | `tests/sdk_consumer_embed.rs` | standalone, `sdk` | 0 |
-| `rpc_export_off` | `tests/rpc_export_off.rs` | standalone, `rpc` | 0 |
+| `rpc_export_off` | `tests/rpc_export_off.rs` | standalone; needs `rpc` **and not** `export-html`, so run it as `--no-default-features --features rpc` (default features pull `tui` → `export-html` and the suite compiles to zero tests) | 0 |
 
 `tests/suites/*.rs` are not targets: each is included by a
 `tests/*.rs` wrapper, which is in turn included by a merged harness or named as

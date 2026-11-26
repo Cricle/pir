@@ -167,18 +167,20 @@ const FORBIDDEN_MARKERS: [&str; 3] = ["#[test]", "#[tokio::test]", "#[cfg(test)]
 /// `fork_seed_tests` → `tui_surface_units.rs`. What remains is the original
 /// 2026-11-01 grandfathered set only; every entry still has inline tests and
 /// is tracked as migration debt, not a permanent exemption.
-const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 10] = [
-    "crates/pir-core/src/ai/api/bedrock/credentials.rs",
-    "crates/pir-ai-types/src/partial_mirror.rs",
-    "crates/pir-durable/src/storage/jsonl.rs",
-    "crates/pir-core/src/env_client/selection.rs",
-    "crates/pir-core/src/extensions/loader.rs",
-    "src/main_cli/cli_preprocess.rs",
-    "crates/pir-core/src/plugins/builtin/mcp.rs",
-    "crates/pir-core/src/session_manager/search.rs",
-    "crates/pir-tui/src/fuzzy.rs",
-    "crates/pir-tui/src/terminal.rs",
-];
+/// 2026-11-26 final sweep: the ten remaining entries were moved out too, each
+/// with the `#[doc(hidden)] pub` (or opaque-wrapper `test_api`) seam the repo
+/// already sanctions — `ai/api/bedrock/credentials.rs` and
+/// `session_manager/search.rs` → their `*_test_api.rs` harness modules (opaque
+/// wrappers, so no private type name is published);
+/// `ai-types/partial_mirror.rs`, `env_client/selection.rs`,
+/// `extensions/loader.rs`, `plugins/builtin/mcp.rs`, `durable/storage/jsonl.rs`,
+/// `tui/fuzzy.rs` and `tui/terminal.rs` → crate-level `tests/` files
+/// (`findings.jsonl` TEST-6-1). One entry is left, and it is not debt to
+/// migrate but a structural limit: `cli_preprocess` is declared by the `pir`
+/// binary, so its items are bin-private and no crate-level `tests/` file can
+/// name them. Making it testable would mean moving the CLI parse types into the
+/// library — a restructure, recorded as TEST-6-2.
+const PREEXISTING_INLINE_TEST_ALLOWLIST: [&str; 1] = ["src/main_cli/cli_preprocess.rs"];
 
 #[test]
 fn src_tree_contains_no_inline_test_modules() {
@@ -278,7 +280,7 @@ fn src_tree_contains_only_expected_file_kinds() {
 // programming error surfaced immediately rather than a runtime condition.
 // The serde sites serialize the crate's own derive-only message/checkpoint
 // types into memory.
-const EXPECT_SITE_ALLOWLIST: [(&str, u32); 25] = [
+const EXPECT_SITE_ALLOWLIST: [(&str, u32); 24] = [
     // The repair pipeline moved from `pir-core/src/plugins/tool_repair/` into
     // the engine-free crate. The `Regex::new` site is the same literal-pattern
     // invariant documented above; the `types.rs` site serializes the crate's
@@ -354,7 +356,12 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 25] = [
     // site, same invariant), then 841 -> 845 by the Arc<str> cache-text
     // fields, then 845 -> 850 by the projection-sentinel rewrite above it
     // (same site).
-    ("crates/pir-core/src/agent_session/session_ctx.rs", 850),
+    //
+    // Removed 2026-11-26: the site is gone. The production `expect` on the
+    // u32 node-index conversion was replaced with a saturating
+    // `u32::try_from(..).unwrap_or(u32::MAX - 1)` (findings.jsonl CORE-1-3),
+    // and the file now has no `.expect(` at all, so keeping an allowlist line
+    // for it would hide a future site at that line number.
     // `reuse` is computed two lines above as
     // `old.as_ref().is_some_and(|slot| ..)`, so `Some` is proven when this
     // branch runs; the `take` cannot observe `None`. Shifted 8398 -> 8458 by
@@ -363,8 +370,11 @@ const EXPECT_SITE_ALLOWLIST: [(&str, u32); 25] = [
     // 8509 -> 8507 by the abort-retry/streaming edits, then 8507 -> 8530 by
     // the background-completion notice helper above it, then 8530 -> 8545 by
     // the native-shortcut snapshot and live-overlay edits above it, then
-    // 8545 -> 8538 by the header content-revision cache (same site).
-    ("crates/pir-tui/src/terminal.rs", 8625),
+    // 8545 -> 8538 by the header content-revision cache (same site), then
+    // 8538 -> 8642 by the `#[doc(hidden)] blocked_status()` accessor plus the
+    // docs on `custom_overlay_blocked`/`autocomplete_popup_frame` that replaced
+    // the inline test modules (same site, same invariant).
+    ("crates/pir-tui/src/terminal.rs", 8642),
     // `guard.sender.is_none()` returns above, so the `as_ref()` in the same
     // locked scope is `Some`: the sender is read and used under one sink lock
     // with no intervening mutation. (This site surfaced when the file's

@@ -785,7 +785,15 @@ pub fn run(id: u32, json: &Value, output: &Output, control: &Control) -> Result<
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => unreachable!("the watcher holds a sender"),
+            Err(RecvTimeoutError::Disconnected) => {
+                // The sender lives inside `watcher`, which this loop owns and
+                // never replaces, so this arm should not be reachable. Treat it
+                // as end-of-stream rather than a hard panic: a dropped channel
+                // means there is nothing left to watch, and an env-daemon
+                // command should answer instead of aborting on a teardown
+                // ordering it cannot observe.
+                return Ok(json!({}));
+            }
         }
         let now = Instant::now();
         let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);

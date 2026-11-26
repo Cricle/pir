@@ -198,6 +198,7 @@ async fn pooled_shell_sentinel_is_not_learnable_from_inside_a_command() {
         }
         other => panic!("follow-up command did not complete: {other:?}"),
     }
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -230,6 +231,7 @@ async fn pooled_shell_ignores_a_well_formed_but_wrong_nonce() {
         }
         other => panic!("command did not complete: {other:?}"),
     }
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -263,6 +265,9 @@ async fn pooled_shell_nonce_changes_between_invocations() {
             other => panic!("command did not complete: {other:?}"),
         }
     }
+    // Hand the member back before the test returns: this pool is local to the
+    // test, and a cached member outlives it until the harness process exits.
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -519,6 +524,9 @@ async fn member_death_after_dispatch_is_terminal_and_the_next_call_respawns() {
         2,
         "the dead member must be discarded and exactly one fresh member spawned"
     );
+    // The respawned member is cached in this test-local pool, so release it
+    // rather than leaving a live shell for the rest of the harness process.
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -597,6 +605,7 @@ async fn background_output_from_a_previous_call_does_not_bleed_into_the_next_cal
         }
         other => panic!("call 2 did not complete: {other:?}"),
     }
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -763,6 +772,7 @@ async fn pooled_call_cannot_inject_into_a_later_calls_channel_by_enumeration() {
         "no private channel directory was visible at all: the probe did not exercise \
          the new layout — report:\n{report}"
     );
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -890,6 +900,9 @@ async fn a_pre_existing_permissive_channel_directory_is_not_adopted() {
         "the pool must record that it refused the suspicious path"
     );
 
+    // This pool is test-local: its cached member would otherwise outlive the
+    // test and hold the harness process open (see the seam's doc).
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
@@ -995,6 +1008,9 @@ async fn a_channel_directory_whose_deny_ace_was_lifted_is_rejected() {
             "a directory whose deny ACE was lifted was used as a channel directory: \
              {observed_channel_files:?}"
         );
+        // Test-local pool: hand the cached member back instead of letting it
+        // hold the harness process open.
+        pool.release_member_for_tests();
         let entries: Vec<_> = std::fs::read_dir(&channel)
             .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
             .unwrap_or_default();
@@ -1132,7 +1148,10 @@ async fn a_channel_directory_tampered_mid_call_fails_closed() {
                     "echo canary; sleep 0.3",
                     Some(30.0),
                 )
-                .await
+                .await;
+            // The canary pool only exists to force the shared runtime to make
+            // progress; release its member so it cannot outlive the test.
+            canary_pool.release_member_for_tests();
         });
         let _ = tokio::time::timeout(Duration::from_secs(15), canary).await;
         let _ = std::fs::remove_dir_all(&canary_cleanup);
@@ -1178,6 +1197,7 @@ async fn a_channel_directory_tampered_mid_call_fails_closed() {
         }
     }
     assert!(pool.channel_directory_rejections_for_tests() > 0);
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 

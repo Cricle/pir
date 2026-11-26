@@ -18,9 +18,11 @@
 //!   shows the core graph (tokio/reqwest/serde...), but no `cli`, `tui`,
 //!   `extensions`, `mcp` or `session` surface.
 //!
-//! The executable front end is `src/bin/pir-minimal.rs` (`pir-minimal`): it
-//! parses the handful of flags/environment variables in [`MinimalConfig`] and
-//! runs a one-shot prompt or a stdin REPL.
+//! The executable front end is the `pir-minimal` binary, which lives in the
+//! root `pir-sdk` package (`src/bin/pir-minimal.rs`) rather than in this crate:
+//! the binary parses the handful of flags/environment variables in
+//! [`MinimalConfig`] and runs a one-shot prompt or a stdin REPL over the
+//! profile defined here.
 //!
 //! ```text
 //! cargo run --no-default-features --bin pir-minimal -- --prompt "hello"

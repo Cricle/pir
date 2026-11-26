@@ -4,12 +4,13 @@ name = "pir-core"
 # depend on the `pir-sdk` facade instead (library name `pir`), which re-exports
 # this crate under the historical `pir::...` paths.
 version.workspace = true
-edition = "2021"
-rust-version = "1.97"
+edition.workspace = true
+rust-version.workspace = true
 description = "UI-agnostic engine for the pi coding agent (agent loop, providers, sessions, tools, runtime)"
-license = "MIT OR Apache-2.0"
-authors = ["Earendil Works <team@earendil.works>"]
-repository = "https://github.com/Cricle/pir"
+readme = "README.md"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 # Embedded JS shims / agent presets are compile-time `include_bytes!`/
 # `include_str!` inputs under `assets/`; the crate cannot build without them.

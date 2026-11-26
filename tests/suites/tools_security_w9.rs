@@ -292,6 +292,9 @@ async fn pooled_shell_rejects_a_well_formed_forged_sentinel() {
         }
         other => panic!("the command did not complete through the pool: {other:?}"),
     }
+    // Test-local pool: hand the cached member back so it cannot hold the
+    // harness process open (see `release_member_for_tests`).
+    pool.release_member_for_tests();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -75,10 +75,21 @@ struct Worker {
     context: Context,
 }
 
-fn spawn_worker() -> Arc<Mutex<Worker>> {
-    let runtime = Runtime::new().unwrap_or_else(|e| panic!("create QuickJS runtime: {e}"));
-    let context = Context::full(&runtime).unwrap_or_else(|e| panic!("create QuickJS context: {e}"));
-    Arc::new(Mutex::new(Worker { runtime, context }))
+/// Create the QuickJS runtime/context pair.
+///
+/// `None` when the runtime cannot be created (allocation failure or a broken
+/// QuickJS build). This is the same condition the fresh-context path in
+/// [`PythonSession::exec`] reports as an error, so it takes the same shape
+/// here instead of panicking: the caller turns `None` into a failed outcome for
+/// the tool call, which a model can see and retry, rather than unwinding out of
+/// a blocking task where the reason is lost behind "task panicked".
+fn spawn_worker() -> Option<Arc<Mutex<Worker>>> {
+    let runtime = Runtime::new().ok()?;
+    let context = match Context::full(&runtime) {
+        Ok(context) => context,
+        Err(_) => return None,
+    };
+    Some(Arc::new(Mutex::new(Worker { runtime, context })))
 }
 
 /// A lazily started QuickJS session. A persistent session reuses its context
@@ -147,8 +158,10 @@ impl PythonSession {
                 Err(p) => p.into_inner(),
             };
             if guard.is_none() {
-                *guard = Some(spawn_worker());
-                self.spawns.fetch_add(1, Ordering::AcqRel);
+                *guard = spawn_worker();
+                if guard.is_some() {
+                    self.spawns.fetch_add(1, Ordering::AcqRel);
+                }
             }
             match guard.as_ref() {
                 Some(w) => Arc::clone(w),

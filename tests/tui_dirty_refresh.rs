@@ -102,8 +102,21 @@ impl Component for StreamingMarkdownBlock {
 
 /// N deltas only repaint the streaming tail: the block grows past 200 rows,
 /// yet every measured frame's dirty set and rerendered rows stay a few rows.
+///
+/// Gated: the frame cache folds `Theme::generation()` — a PROCESS-GLOBAL
+/// counter — into every slot's cache key, so a sibling test in the same binary
+/// that installs a theme (or reloads the theme file) moves the generation
+/// between this test's frames. Every slot then misses, the frame degrades to a
+/// full repaint, and `dirty_rows` is the whole block instead of the tail (the
+/// observed failure: dirty 314 = cached 311 + rerendered 3). Passes alone, eight
+/// runs out of eight; fails intermittently in the merged harness.
 #[test]
 fn streaming_deltas_only_touch_the_tail_dirty_rows() {
+    if crate::common::skip_without_nextest(
+        "tui_dirty_refresh::streaming_deltas_only_touch_the_tail_dirty_rows",
+    ) {
+        return;
+    }
     let mut core = test_core(100, 40);
     let markdown = Arc::new(Markdown::new("", 0, 0));
     let revision = Arc::new(AtomicU64::new(0));
@@ -239,6 +252,15 @@ fn resize_and_scroll_fall_back_to_full_frame_dirty_rows() {
 /// render of the latest state.
 #[test]
 fn frame_row_budget_defers_without_losing_tokens() {
+    // Gated for the same reason as the streaming-tail test: a sibling suite's
+    // theme install moves the process-global `Theme::generation()`, every slot
+    // misses, and a budgeted frame that is allowed one block past its budget
+    // re-renders the whole frame (48 rows) instead of <= 24.
+    if crate::common::skip_without_nextest(
+        "tui_dirty_refresh::frame_row_budget_defers_without_losing_tokens",
+    ) {
+        return;
+    }
     let revisions = Arc::new((0..12).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
     let mut core = test_core(80, 20);
     core.push_content(Box::new(BlockList {
@@ -352,6 +374,15 @@ fn app_dirty_blocks_and_inbox_keep_latest_state_only() {
 /// scans only its dirty rows (not the whole 48-row frame).
 #[test]
 fn idle_decorator_keeps_dirty_fast_path() {
+    // Gated: asserts an exact `rerendered_rows == 4` and that the dirty markers
+    // skip the rest. A sibling suite's theme install bumps the process-global
+    // `Theme::generation()`, invalidating every slot's cache key and turning
+    // the one-block edit into a whole-frame rebuild.
+    if crate::common::skip_without_nextest(
+        "tui_dirty_refresh::idle_decorator_keeps_dirty_fast_path",
+    ) {
+        return;
+    }
     let revisions = Arc::new((0..12).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
     let mut core = test_core(80, 20);
     core.push_content(Box::new(BlockList {

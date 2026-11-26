@@ -179,7 +179,16 @@ pub fn json_to_js<'js>(ctx: &Ctx<'js>, value: &JsonValue) -> JsResult<Value<'js>
             }
             Some((slot, child)) => {
                 let (js_value, child_frame) = make_child(ctx, &child)?;
-                install(stack.last_mut().unwrap(), slot, js_value)?;
+                // `top` held the frame this iteration, so the stack is
+                // non-empty here. `if let` instead of `.unwrap()` documents
+                // that and keeps a future edit to the `None` arm from becoming
+                // a panic; the unreachable arm still has to return an error
+                // rather than break, because a half-built tree must not be
+                // handed back as a value.
+                let Some(frame) = stack.last_mut() else {
+                    return Err(js_err("JSON build frame"));
+                };
+                install(frame, slot, js_value)?;
                 if let Some(frame) = child_frame {
                     stack.push(frame);
                 }
@@ -248,7 +257,13 @@ pub fn json_to_js_owned<'js>(ctx: &Ctx<'js>, value: JsonValue) -> JsResult<Value
             }
             Some((slot, child)) => {
                 let (js_value, child_frame) = make_child_owned(ctx, child)?;
-                install(stack.last_mut().unwrap(), slot, js_value)?;
+                // Same invariant as `json_to_js`: the loop head took `top`
+                // from this stack, so it is non-empty. Spelled as a `let`-else
+                // so the arm has to say what it would do instead of panicking.
+                let Some(frame) = stack.last_mut() else {
+                    return Err(js_err("JSON build frame"));
+                };
+                install(frame, slot, js_value)?;
                 if let Some(frame) = child_frame {
                     stack.push(frame);
                 }

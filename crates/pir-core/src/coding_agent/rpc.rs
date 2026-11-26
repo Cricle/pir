@@ -3085,9 +3085,9 @@ fn default_session_factory(
     // `settings.compaction`, so a keep-recent window that covered the whole
     // transcript rejected a manual `/compact` with "nothing to compact
     // (session too small)" where upstream compacts.
-    let compaction_config = crate::coding_agent::print::settings_compaction_config(
+    let compaction_config = crate::compaction::settings_compaction_config(
         &environment.settings,
-        &crate::coding_agent::print::threshold_model_for(&provider_registry, &selection.model),
+        &crate::compaction::threshold_model_for(&provider_registry, &selection.model),
     );
     let agent_session = AgentSession::new_arc(crate::agent_session::AgentSessionConfig {
         provider_registry,

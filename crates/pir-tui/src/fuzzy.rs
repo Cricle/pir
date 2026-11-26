@@ -278,7 +278,12 @@ fn fuzzy_match_ascii(query_lower: &str, text: &str) -> FuzzyMatch {
 }
 
 /// Unicode path: both inputs are already lowercase.
-fn fuzzy_match_unicode(query_lower: &str, text_lower: &str) -> FuzzyMatch {
+///
+/// Public under `#[doc(hidden)]` so `tests/fuzzy_parity.rs` can assert the
+/// ASCII byte fast path is bit-for-bit equivalent to this reference path; not
+/// part of the supported surface.
+#[doc(hidden)]
+pub fn fuzzy_match_unicode(query_lower: &str, text_lower: &str) -> FuzzyMatch {
     let query_chars: Vec<char> = query_lower.chars().collect();
     let text_chars: Vec<char> = text_lower.chars().collect();
 
@@ -324,7 +329,11 @@ pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
 /// stores its filter key lowercased). The text is still normalized here; this
 /// only skips re-lowercasing the query for every scored item. Callers must pass
 /// the result of `str::to_lowercase`.
-pub(crate) fn fuzzy_match_prelowered(query_lower: &str, text: &str) -> FuzzyMatch {
+///
+/// Public under `#[doc(hidden)]` so `tests/fuzzy_parity.rs` can hold the
+/// pre-lowered form to the full API; not part of the supported surface.
+#[doc(hidden)]
+pub fn fuzzy_match_prelowered(query_lower: &str, text: &str) -> FuzzyMatch {
     debug_assert_eq!(query_lower, query_lower.to_lowercase());
     if query_lower.is_ascii() && text.is_ascii() {
         fuzzy_match_ascii(query_lower, text)
@@ -371,94 +380,4 @@ pub fn fuzzy_filter<T: Clone>(items: &[T], query: &str, get_text: impl Fn(&T) ->
 
     results.sort_by(|a, b| a.1.total_cmp(&b.1));
     results.into_iter().map(|(item, _)| item).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The ASCII byte fast path must be bit-for-bit equivalent to the original
-    /// char path (`to_lowercase` + `match_query`); non-ASCII input keeps the
-    /// Unicode path and stays correct.
-    #[test]
-    fn ascii_fast_path_matches_unicode_path_scores() {
-        let cases = [
-            ("", "anything"),
-            ("abc", "abc"),
-            ("ABC", "abc"),
-            ("abc", "xxabcxx"),
-            ("fb", "foobar"),
-            ("fz", "foobar"),
-            ("f", "foo_bar"),
-            ("_", "foo_bar"),
-            ("ab", "abc"),
-            ("ac", "abc"),
-            ("foo", "foo"),
-            ("foo", "foobar"),
-            ("FOO", "foobar"),
-            ("ab12", "foobar 12ab"),
-            ("12ab", "foobar 12ab"),
-            ("rpln", "Release Planning"),
-            ("WRSP", "C:\\Work\\Rust_Projects"),
-            ("abcdef", "abc"),
-            ("z", "abc"),
-            ("a-b", "a-b-c"),
-            // Vertical tab is ASCII whitespace for `char::is_whitespace` but
-            // not for `u8::is_ascii_whitespace`; the fast path must not drift.
-            ("f", "\x0Bfoo"),
-            ("a", "foo\x0Bbar"),
-            ("a b", "a\x0Bb"),
-            ("über", "Ärger Über"),
-            ("ÜB", "ärger über"),
-            ("ärger", "ÄRGER"),
-            ("é", "café"),
-            ("cafe", "café"),
-            ("日本語", "これは日本語のテキスト"),
-            ("本語", "日本語"),
-        ];
-        for (query, text) in cases {
-            let expected = fuzzy_match_unicode(&query.to_lowercase(), &text.to_lowercase());
-            let actual = fuzzy_match(query, text);
-            assert_eq!(
-                actual.matches, expected.matches,
-                "match parity for {query:?} against {text:?}"
-            );
-            assert_eq!(
-                actual.score, expected.score,
-                "score parity for {query:?} against {text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn prelowered_query_matches_full_api_scores() {
-        let cases = [
-            ("abc", "ABC"),
-            ("ü", "Ärger Über"),
-            ("über", "ÄRGER ÜBER"),
-            ("é", "CAFÉ"),
-            ("ab12", "FOOBAR 12AB"),
-            ("f", "FOO\x0BBAR"),
-            ("x", "日本語"),
-        ];
-        for (query_lower, text) in cases {
-            assert_eq!(
-                fuzzy_match_prelowered(query_lower, text),
-                fuzzy_match(query_lower, text),
-                "prelowered parity for {query_lower:?} against {text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn ascii_fast_path_keeps_rank_order() {
-        // Same assertions as the public API tests, exercised through the byte
-        // path (all-ASCII inputs).
-        assert!(fuzzy_match("abc", "abc").score < fuzzy_match("abc", "xabcx").score);
-        assert!(fuzzy_match("fb", "foobar").score < fuzzy_match("fz", "foobar").score);
-        let swapped = fuzzy_match("ab12", "foobar 12ab");
-        let direct = fuzzy_match("12ab", "foobar 12ab");
-        assert!(swapped.matches && direct.matches);
-        assert!(swapped.score > direct.score);
-    }
 }

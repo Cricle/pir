@@ -1465,6 +1465,75 @@ fn oversized_system_md_files_are_skipped() {
     assert_eq!(append, None);
 }
 
+/// Create a symlink, returning `false` where the platform/account cannot.
+///
+/// Windows needs SeCreateSymbolicLinkPrivilege for `symlink_file` (an
+/// unprivileged account gets ERROR_PRIVILEGE_NOT_HELD), so this test skips
+/// there rather than failing on the environment.
+fn try_symlink(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        } else {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+/// A `SYSTEM.md` that is a symlink to a real file must still be discovered.
+///
+/// The discovery decision has to be about the target, not the link: dotfiles
+/// setups and worktrees point one shared copy at many checkouts through a
+/// symlink. Deciding on `symlink_metadata`'s own type (always `is_symlink`,
+/// never `is_file`) silently drops the file, so the project override would be
+/// ignored and the global copy would win instead.
+#[test]
+fn symlinked_system_md_is_still_discovered() {
+    let root = TempDir::new("system-md-symlink");
+    let global_dir = root.child("agent");
+    let cwd = root.child("work");
+    let shared = root.child("shared");
+
+    fs::create_dir_all(&global_dir).unwrap();
+    fs::create_dir_all(cwd.join(".pi")).unwrap();
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("SYSTEM.md"), "shared preamble").unwrap();
+    fs::write(shared.join("APPEND_SYSTEM.md"), "shared append").unwrap();
+
+    let system_link = cwd.join(".pi").join("SYSTEM.md");
+    let append_link = cwd.join(".pi").join("APPEND_SYSTEM.md");
+    if !try_symlink(&shared.join("SYSTEM.md"), &system_link)
+        || !try_symlink(&shared.join("APPEND_SYSTEM.md"), &append_link)
+    {
+        eprintln!("skipping: symlink creation unavailable on this platform");
+        return;
+    }
+    // The links are followed only if they are recognised as files at all.
+    assert!(
+        system_link.is_file(),
+        "the fixture link must resolve to a file"
+    );
+
+    let (preamble, append) = discover_system_md(&cwd, &global_dir, true);
+    assert_eq!(preamble.as_deref(), Some("shared preamble"));
+    assert_eq!(append.as_deref(), Some("shared append"));
+
+    // The global copy is only the fallback: the (linked) project file wins.
+    fs::write(global_dir.join("SYSTEM.md"), "global preamble").unwrap();
+    let (preamble, _) = discover_system_md(&cwd, &global_dir, true);
+    assert_eq!(preamble.as_deref(), Some("shared preamble"));
+}
+
 #[test]
 fn settings_manager_helpers_round_trip() {
     let root = TempDir::new("manager-helpers");

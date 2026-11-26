@@ -2342,3 +2342,71 @@ pub fn recover_from_overflow(
         }
     })
 }
+
+/// The model compaction thresholds are checked against (agent_session
+/// `threshold_model_for`): a virtual selection checks the ROUTED physical
+/// model's context window (with its limit overrides applied); an unrouted
+/// virtual model falls back to its catalog entry (context window 0 disables
+/// threshold compaction, like upstream).
+///
+/// Lives here rather than in `coding_agent::print` because every
+/// `AgentSession` host resolves it — print, `rpc`, the TUI and the server —
+/// and `print` is behind its own feature, so an `rpc`-only build had no copy
+/// at all. `coding_agent::print` re-exports it under the historical name.
+pub fn threshold_model_for(
+    registry: &crate::ai::provider::ProviderRegistry,
+    model: &crate::ai::types::Model,
+) -> crate::ai::types::Model {
+    if crate::ai::virtual_::is_virtual_model(model) {
+        if let Some(registration) = registry
+            .virtual_model_registry()
+            .get(&model.provider, &model.id)
+        {
+            let physical = registry
+                .get_physical_model(&registration.physical.provider, &registration.physical.id);
+            return registration.catalog_model(physical.as_ref());
+        }
+    }
+    model.clone()
+}
+
+/// The session hosts' compaction config from the settings `compaction` block
+/// (upstream `SETTINGS_DEFAULTS.compaction` + the per-model override, the same
+/// resolution SettingsManager's `compactionToken` applies). Shared by every
+/// `AgentSession` host (rpc / TUI / server / print): PIR-BIN-028 — those
+/// factories used to hard-code `CompactionConfig::default()` and silently
+/// ignore `settings.compaction`.
+///
+/// Lives here rather than in `coding_agent::print` for the same reason as
+/// [`threshold_model_for`]: the two callers that need it most are the ones
+/// that do not compile `print`.
+pub fn settings_compaction_config(
+    settings: &crate::config::settings::Settings,
+    model: &crate::ai::types::Model,
+) -> Option<CompactionConfig> {
+    use crate::config::defaults::settings_defaults;
+    let compaction = settings.compaction.as_ref();
+    let enabled = compaction
+        .and_then(|compaction| compaction.enabled)
+        .unwrap_or(settings_defaults::COMPACTION_ENABLED);
+    if !enabled {
+        return None;
+    }
+    let key = format!("{}/{}", model.provider, model.id);
+    let override_settings = compaction
+        .and_then(|compaction| compaction.model_overrides.as_ref())
+        .and_then(|overrides| overrides.get(&key));
+    let reserve_tokens = override_settings
+        .and_then(|over| over.reserve_tokens)
+        .or_else(|| compaction.and_then(|compaction| compaction.reserve_tokens))
+        .unwrap_or(settings_defaults::COMPACTION_RESERVE_TOKENS);
+    let keep_recent_tokens = override_settings
+        .and_then(|over| over.keep_recent_tokens)
+        .or_else(|| compaction.and_then(|compaction| compaction.keep_recent_tokens))
+        .unwrap_or(settings_defaults::COMPACTION_KEEP_RECENT_TOKENS);
+    Some(CompactionConfig {
+        enabled: true,
+        reserve_tokens,
+        keep_recent_tokens,
+    })
+}
