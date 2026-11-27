@@ -1406,7 +1406,23 @@ fn finish_loaded_session(
 
 /// Attempts, and the pause between them, for a session read that observed a
 /// ZERO-BYTE file (see [`load_entries_retrying_transient_empties`]).
-const EMPTY_SESSION_READ_ATTEMPTS: usize = 10;
+///
+/// The budget is `ATTEMPTS * DELAY` = ~500 ms, and it has to cover the whole
+/// competing-writer window, not just one observation: a CI runner is far
+/// slower than a developer's disk (Windows runners add antivirus/filter-driver
+/// latency to every open+read, and each retry re-reads the full transcript).
+/// The previous 10 x 5 ms = 50 ms budget lost that race on CI: the W13 test
+/// `open_retries_a_transient_zero_byte_file_instead_of_reinitializing` timed
+/// out and reported "a zero-byte transient must not be read as a new empty
+/// session", while passing locally in 0.05 s.
+///
+/// Widening it stays safe in the other direction: the only caller-visible
+/// difference is that `open` over a GENUINELY empty file (the documented
+/// `open`/`--session` empty-file case) now waits ~500 ms instead of ~50 ms
+/// before initializing it as a new session. That is a one-time cost on an
+/// empty session file, and it buys the guarantee this retry exists for: never
+/// overwrite another writer's transcript with a fresh header.
+const EMPTY_SESSION_READ_ATTEMPTS: usize = 100;
 const EMPTY_SESSION_READ_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// [`load_entries_from_file`] with a bounded retry while the file is observed
