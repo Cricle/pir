@@ -120,10 +120,10 @@ mod tui_session_reset;
 mod upstream_d3_strict_tool_fallback;
 #[path = "v8_diagnostics.rs"]
 mod v8_diagnostics;
-#[path = "version_consistency.rs"]
-mod version_consistency;
 #[path = "verification_floor_normal.rs"]
 mod verification_floor_normal;
+#[path = "version_consistency.rs"]
+mod version_consistency;
 #[path = "w1_d7_tilde_patterns.rs"]
 mod w1_d7_tilde_patterns;
 #[path = "web_globals.rs"]

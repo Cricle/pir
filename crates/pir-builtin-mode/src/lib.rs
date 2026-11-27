@@ -16,6 +16,7 @@ pub mod delegation;
 pub mod journal;
 pub mod mode;
 pub mod settings;
+pub mod size;
 
 pub use approvals::{ApprovalKind, ApprovalRecord, ApprovalState};
 pub use delegation::{
@@ -31,6 +32,7 @@ pub use journal::{
 };
 pub use mode::{Mode, Phase};
 pub use settings::{ApprovalMode, ModeSettings, RouterMode};
+pub use size::{size_task, PromptShape, TaskInputs, TaskSize};
 
 use pir_plugin_api::{BuiltinPlugin, PluginInfo};
 
