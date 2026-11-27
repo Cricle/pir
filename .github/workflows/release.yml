@@ -8,10 +8,24 @@ on:
   push:
     tags:
       - "v*"
+  # Manual dispatch exists to RESUME a release whose crates.io publication ran
+  # into the registry's rate limit (see `publish` below). It cannot be a tag
+  # re-push: that would move a tag whose GitHub Release and binaries already
+  # exist. Dispatching runs this workflow file from the default branch (so it
+  # carries the current script) while checking out `tag` for the tree to
+  # publish, and skips the gate jobs whose success is already recorded.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish crates for (e.g. v0.3.3)"
+        required: true
+      skip_gates:
+        description: "Skip CI/build/GitHub Release: they already succeeded for this tag"
+        type: boolean
+        default: true
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 # Least privilege: only the `release` job needs write access to publish the
@@ -86,13 +100,35 @@ jobs:
       version: ${{ steps.derive.outputs.version }}
       tag: ${{ steps.derive.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      # A tag push resolves `ref_name` to the tag; a manual dispatch runs this
+      # file from the default branch (so the script being executed is the
+      # current one), and names the tag it publishes in `inputs.tag`. Resolve
+      # once here and let every later job take the resolved ref, so a resume
+      # publishes the SAME tree the tag points at, never the branch tip.
+      - name: Resolve release tag
+        id: ref
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          if [ -z "$tag" ]; then
+            echo "::error title=Missing tag::no `inputs.tag` and no ref name to derive one from"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved release tag: $tag"
 
-      - name: Validate ${{ github.ref_name }} as semver
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.tag }}
+
+      - name: Validate ${{ steps.ref.outputs.tag }} as semver
         id: derive
         shell: bash
         env:
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ steps.ref.outputs.tag }}
         run: |
           tag="$TAG_NAME"
           case "$tag" in
@@ -176,10 +212,16 @@ jobs:
   ci:
     name: CI (reusable)
     uses: ./.github/workflows/ci.yml
+    # A resume dispatch carries `skip_gates`: the CI/build/Release for this tag
+    # already happened and re-running them would only delay the crates.
+    # A tag push always runs the gates; a resume dispatch can skip them.
+    if: ${{ github.event_name == 'push' || inputs.skip_gates != true }}
 
   build:
     name: Build (${{ matrix.name }})
     needs: [version, ci]
+    # A tag push always runs the gates; a resume dispatch can skip them.
+    if: ${{ github.event_name == 'push' || inputs.skip_gates != true }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -206,6 +248,8 @@ jobs:
       OPENSSL_STATIC: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -321,6 +365,8 @@ jobs:
     name: Publish GitHub Release
     # CI runs first as a reusable workflow; release never repeats lint/test/doctest.
     needs: [version, ci, build]
+    # A tag push always runs the gates; a resume dispatch can skip them.
+    if: ${{ github.event_name == 'push' || inputs.skip_gates != true }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -341,19 +387,53 @@ jobs:
           files: artifacts/*
           fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(needs.version.outputs.tag, '-') }}
 
   # Runs last and on its own: publishing to crates.io is irreversible, so it
   # waits for the build, the test gate AND the GitHub Release to exist.
+  #
+  # crates.io rate-limits PUBLISHING ITSELF (`rust-lang/crates.io`
+  # `src/rate_limiter.rs`, `LimitedAction`): a first-time crate costs a token
+  # from a bucket of 5 that refills one token per 10 minutes, while a new
+  # version of an existing crate costs one from a bucket of 30 that refills
+  # every minute. A release of this workspace is ~18 first-time crates, so a
+  # straight loop is throttled at the 6th crate and the remaining 13 need
+  # ~130 minutes of refill. That is why this job retries instead of failing:
+  # it reads the retry instant from the 429 body, waits, and continues.
   publish:
     name: Publish to crates.io
     needs: [version, ci, build, release]
+    # A job whose `needs` were SKIPPED is itself skipped unless the condition
+    # uses a status function, so `always()` is required for a resume dispatch
+    # (where ci/build/release are skipped but publishing must still happen).
+    # `always()` alone would also survive a FAILED gate, so every result is
+    # named explicitly: `version` must have succeeded (it always runs), and no
+    # gate may have failed. The step below re-checks VERSION for the case where
+    # `version` succeeded but produced nothing.
+    if: >-
+      ${{
+        always()
+        && !cancelled()
+        && needs.version.result == 'success'
+        && needs.ci.result != 'failure'
+        && needs.build.result != 'failure'
+        && needs.release.result != 'failure'
+      }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 13 crates * 10 min of NEW-crate refill + 30 s of index polling each, plus
+    # one `cargo publish` verification build per crate. 240 min covers a full
+    # first-time workspace release with headroom; the default 90 was less than
+    # the refill time alone.
+    timeout-minutes: 240
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
     steps:
+      # The tree published must be the one the tag points at, not the branch a
+      # resume dispatch was launched from.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       # No rust-cache here: `cargo publish`'s verification build happens in
       # `target/package/<crate>-<version>/`, a fresh target dir that the
@@ -367,6 +447,16 @@ jobs:
       # `crates.io` accepts an upload only once the index has served the
       # previous crate's version, so after each successful publish the loop
       # polls the index for the crate it just uploaded before moving on.
+      #
+      # RATE LIMITING IS PART OF THE CONTRACT, not an error path. A publish is
+      # charged against a per-user token bucket (`rust-lang/crates.io`
+      # `src/rate_limiter.rs`): a FIRST-TIME crate takes from a bucket of 5
+      # that refills one token every 10 minutes, a new version of an existing
+      # crate from a bucket of 30 that refills every minute. This workspace
+      # release has ~18 first-time crates, so crates 6..18 are published one
+      # per 10 minutes; the 429 body carries the exact instant the next token
+      # exists ("Please try again after ..."), so the loop sleeps until then
+      # instead of failing. Only a 429 that names no instant is fatal.
       - name: Publish crates in dependency order
         shell: bash
         env:
@@ -377,7 +467,20 @@ jobs:
             echo "::error title=Missing token::the CARGO_REGISTRY_TOKEN secret is not set"
             exit 1
           fi
+          # `always()` above keeps this job alive when the gate jobs were
+          # SKIPPED (a resume dispatch), but it also survives a FAILED
+          # `version` job — where VERSION would be empty and every probe would
+          # ask crates.io for `/<crate>/` and get a 404 it reads as "safe to
+          # publish". Fail before that can happen.
+          if [ -z "${VERSION}" ]; then
+            echo "::error title=No version::the version job did not produce a version; nothing to publish"
+            exit 1
+          fi
           user_agent="${GITHUB_REPOSITORY} release workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})"
+          # The longest a single rate-limit wait may ask for. Refill for a new
+          # crate is 10 minutes; anything far beyond that means the response
+          # was not a plain rate limit and should not be slept through.
+          max_wait_seconds=1800
 
           # 200 = published already, 404 = safe to publish, anything else aborts
           # (a 5xx must not be mistaken for "not published yet").
@@ -393,6 +496,66 @@ jobs:
                 return 2
                 ;;
             esac
+          }
+
+          # Seconds to sleep before retrying, when a publish was rate-limited.
+          # Prints nothing and returns 1 when the text carries no retry instant.
+          #
+          # The server's message is
+          #   You have published too many new crates in a short period of time.
+          #   Please try again after Fri, 27 Nov 2026 11:26:33 GMT and see ...
+          # and there is no Retry-After header, so the instant is parsed from
+          # the body. `date -d` understands that exact RFC-1123 form.
+          rate_limit_delay() {
+            local text="$1" stamp target now
+            stamp="$(printf '%s' "$text" \
+              | grep -oE 'try again after [^.]*GMT' \
+              | sed 's/^try again after //' | head -n 1)"
+            [ -n "$stamp" ] || return 1
+            target="$(date -u -d "$stamp" +%s 2>/dev/null)" || return 1
+            now="$(date -u +%s)"
+            # +5s of slack: the server's clock and this runner's are not the
+            # same clock, and an early retry costs a whole extra 10 minutes.
+            echo $(( target - now + 5 ))
+          }
+
+          # Publish one crate, waiting out a rate limit. `cargo publish` is the
+          # only thing that talks to the registry's write endpoint; its stderr
+          # is captured so a 429 can be told apart from a real failure.
+          publish_with_retry() {
+            local name="$1" attempt=1 output ready delay
+            while : ; do
+              set +e
+              output="$(cargo publish -p "$name" --locked --allow-dirty \
+                --token "$CARGO_REGISTRY_TOKEN" 2>&1)"
+              ready=$?
+              set -e
+              if [ "$ready" -eq 0 ]; then
+                printf '%s\n' "$output"
+                return 0
+              fi
+              if ! printf '%s' "$output" | grep -qi 'too many.*\(crates\|requests\)'; then
+                printf '%s\n' "$output"
+                echo "::error title=Publish failed::${name} ${VERSION} failed for a reason other than rate limiting"
+                return 1
+              fi
+              if ! delay="$(rate_limit_delay "$output")"; then
+                printf '%s\n' "$output"
+                echo "::error title=Rate limited::${name} ${VERSION} was rate-limited and the response named no retry instant"
+                return 1
+              fi
+              if [ "$delay" -gt "$max_wait_seconds" ]; then
+                printf '%s\n' "$output"
+                echo "::error title=Rate limited::${name} ${VERSION} needs ${delay}s, more than the ${max_wait_seconds}s this job will wait"
+                return 1
+              fi
+              if [ "$delay" -lt 0 ]; then delay=1; fi
+              echo "::warning title=crates.io rate limit::${name} ${VERSION} attempt ${attempt} was throttled; retrying in ${delay}s"
+              # `date` above is UTC so the log states the wake-up explicitly.
+              echo "  sleeping until $(date -u -d "@$(( $(date -u +%s) + delay ))" '+%H:%M:%S UTC')"
+              sleep "$delay"
+              attempt=$(( attempt + 1 ))
+            done
           }
 
           # crates.io rejects a .crate at or above 10,000,000 bytes; package the
@@ -438,10 +601,7 @@ jobs:
               echo "::notice title=Already published::${crate} ${VERSION} is already on crates.io; skipping."
             elif [ "$status" -eq 1 ]; then
               size_guard "$crate"
-              # `--token` is required by the task contract; GitHub masks secret
-              # values in logs, and the value is never written to a file.
-              # `--locked` publishes against the checked-in Cargo.lock.
-              cargo publish -p "$crate" --locked --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
+              publish_with_retry "$crate"
               wait_for_index "$crate"
             else
               exit 1
