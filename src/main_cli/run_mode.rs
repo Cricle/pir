@@ -247,6 +247,13 @@ pub(super) async fn run() -> Result<()> {
         // Process-local only; the settings file is never rewritten.
         std::env::set_var("PIR_PERF_PROFILE", profile);
     }
+    if !cli.check.is_empty() {
+        // Same process-local handoff as `--perf-profile`: the mode plugin
+        // reads it when it arms the verification floor. Newline-joined so a
+        // command containing spaces survives the trip without a second
+        // encoding; commands cannot contain a newline.
+        std::env::set_var("PIR_CHECK", cli.check.join("\n"));
+    }
 
     // Upstream main.ts post-parse validation: every failure prints
     // `Error: …` and exits 1 before any mode work starts. (The provider rule

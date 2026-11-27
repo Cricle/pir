@@ -64,6 +64,7 @@ the archived baseline audit, which stay Chinese.
 | [FEATURES.md](FEATURES.md) | Feature graph, profiles, off-error contract, tool loadout |
 | [durable-spec.md](durable-spec.md) | Durable kernel: records, storage, harness (pinned to upstream 1.4.0) |
 | [performance-profiles.md](performance-profiles.md) | `performance.profile` presets and measurement method |
+| [verification-floor.md](verification-floor.md) | `--check`: the declared-check correctness floor for `normal` runs |
 | [test-harness-map.md](test-harness-map.md) | How `tests/*.rs` maps to merged harnesses; how to run one suite |
 | [node-test-suite-audit.md](node-test-suite-audit.md) | The `node:*` shim test suite: coverage and gaps |
 | [runtime-support-matrix.md](runtime-support-matrix.md) | Which host/runtime combinations are supported |

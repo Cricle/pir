@@ -908,6 +908,13 @@ pub struct Cli {
     )]
     pub perf_profile: Option<String>,
 
+    /// A verification command that must succeed before the run may report
+    /// done (repeatable). It is matched verbatim: the model has to run this
+    /// exact string. Persisted with the session, so a resumed task keeps its
+    /// check. Without this, a `normal` run has no correctness floor at all.
+    #[arg(long = "check", value_name = "CMD", global = true)]
+    pub check: Vec<String>,
+
     // Upstream `--no-extensions, -ne`.
     /// `-ne`: Disable settings/default extension discovery and built-in extensions; explicit `-e`
     /// paths (including `builtin:<name>`) still load
@@ -3477,6 +3484,7 @@ const KNOWN_LONG_FLAGS: &[&str] = &[
     "tools",
     "exclude-tools",
     "perf-profile",
+    "check",
     "no-extensions",
     "only-builtin",
     "no-mcp",

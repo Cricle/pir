@@ -70,6 +70,7 @@ Accepted by every subcommand (`global = true`).
 | `--thinking <LEVEL>` | Thinking level |
 | `--system-prompt <TEXT>` / `--append-system-prompt <TEXT>` | Override/append the prompt |
 | `--perf-profile <name>` | `balanced` (default) or `efficient` ([performance-profiles.md](performance-profiles.md)) |
+| `--check <CMD>` | A verification command the run must actually execute (exit 0, after the last edit) before it may report done. Repeatable; matched verbatim. Persisted with the session, so a resumed task keeps it. See [verification-floor.md](verification-floor.md) |
 
 ### Tools and extensions
 

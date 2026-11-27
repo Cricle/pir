@@ -156,6 +156,66 @@ fn preprocess_args_keeps_clap_defined_long_flags() {
 }
 
 #[test]
+fn every_clap_long_flag_survives_preprocess_args() {
+    // The hand-written list in the test below is the regression that was
+    // actually seen. This is the general form: enumerate the flags clap itself
+    // defines and require every one of them to pass `preprocess_args`
+    // untouched. Adding a flag to `Cli` without adding it to
+    // `KNOWN_LONG_FLAGS` used to drop the flag AND a following value before
+    // clap could parse either — silent, and only reproducible through that
+    // flag. `--check` was the second instance of exactly that bug.
+    let command = <Cli as clap::CommandFactory>::command();
+    let mut checked = 0usize;
+    for arg in command.get_arguments() {
+        let Some(long) = arg.get_long() else {
+            continue;
+        };
+        if matches!(long, "help" | "version") {
+            continue;
+        }
+        checked += 1;
+        let flag = format!("--{long}");
+        // A flag that takes a value is also given one, so the "value attached
+        // to the collected unknown flag" half of the bug is covered too.
+        // `preprocess_args` validates `--mode` and exits the process on a bad
+        // value, so that one gets a legal one.
+        let takes_value = arg
+            .get_num_args()
+            .map(|range| range.min_values() > 0)
+            .unwrap_or_else(|| arg.get_action().takes_values());
+        let mut argv = vec!["pir".to_string(), flag.clone()];
+        if takes_value {
+            let value = if long == "mode" { "text" } else { "value" };
+            argv.push(value.to_string());
+        }
+        let expected = argv.clone();
+        let (cleaned, unknown) = preprocess_args(argv);
+        // Only `preprocess_args` is under test here: a value-validated flag
+        // (`--mode`) legitimately rejects "value" later, in clap. What must
+        // hold is that the flag and its detached value are not swallowed.
+        // Two flags are intentionally rewritten by `preprocess_args` itself
+        // (`--models` is hoisted, `update --extension` becomes
+        // `--update-extension`), so the assertion is "nothing was lost", not
+        // "byte-identical argv".
+        let nothing_lost =
+            expected.iter().all(|token| cleaned.contains(token)) && cleaned.len() == expected.len();
+        assert!(
+            nothing_lost,
+            "{flag} must reach clap untouched (add it to KNOWN_LONG_FLAGS): \
+             expected {expected:?}, got {cleaned:?}"
+        );
+        assert!(
+            unknown.is_empty(),
+            "{flag} was collected as an unknown extension flag: {unknown:?}"
+        );
+    }
+    assert!(
+        checked >= 40,
+        "the enumeration should see every global flag, saw {checked}"
+    );
+}
+
+#[test]
 fn preprocess_args_keeps_print_flag_with_its_message() {
     // The concrete regression: `pir --print "msg"` lost the flag and the
     // message (the value attached to the collected extension flag), so the

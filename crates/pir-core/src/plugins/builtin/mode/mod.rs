@@ -298,6 +298,11 @@ struct ModeState {
     /// probabilistic model must be told the rules changed; swapping the
     /// system-prompt section alone leaves the old instructions in history.
     pending_transition: RwLock<Option<String>>,
+    /// Declared verification commands for this session (`--check`, or the task
+    /// record's checks once B lands). Separate from `settings` because
+    /// `ModeSettings` is `Copy` and travels through the foreman routing paths;
+    /// this is per-session data, not a mode preference.
+    declared_checks: RwLock<Vec<String>>,
     journal: RwLock<Option<journal::ForemanJournal>>,
 }
 
@@ -322,6 +327,7 @@ impl ModeState {
             verification_passed_id: RwLock::new(None),
             verified_call: RwLock::new(None),
             pending_transition: RwLock::new(None),
+            declared_checks: RwLock::new(Vec::new()),
             journal: RwLock::new(None),
         }
     }
@@ -619,6 +625,82 @@ impl ModeState {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn declared_checks(&self) -> Vec<String> {
+        self.declared_checks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the session's declared checks. Empty clears the floor.
+    fn set_declared_checks(&self, checks: Vec<String>) {
+        *self
+            .declared_checks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = checks;
+    }
+
+    /// Arm the declared-check verification floor for one task boundary.
+    ///
+    /// Called once per prompt, not once per session: `complete_contract`
+    /// retires a satisfied contract, so a session that runs several prompts
+    /// would otherwise lose its floor after the first success. The baseline is
+    /// recomputed every time for the same reason — carrying it forward would
+    /// let task 1's evidence satisfy task 2's check.
+    ///
+    /// Returns `true` when a contract was installed.
+    fn arm_declared_check_floor(&self, context: &PluginContext) -> bool {
+        if self.mode() != Mode::Normal {
+            // Foreman and plan have their own gates; plan installs the real
+            // contract on approval. Only plain Normal needs this floor.
+            return false;
+        }
+        // An approved plan's contract is strictly stronger: it carries the
+        // plan the model must follow. Never let a `--check` line replace it.
+        if self
+            .active_contract()
+            .is_some_and(|contract| !contract.plan.trim().is_empty())
+        {
+            return false;
+        }
+        let checks = self.declared_checks();
+        if checks.is_empty() {
+            return false;
+        }
+        // `set_active_contract` clears the pass markers, so a fresh prompt
+        // starts a fresh gate. Re-arming mid-run would reset a satisfied
+        // contract, which is why this is called at the prompt boundary only.
+        self.set_active_contract(ExecutionContract {
+            // A declared-check floor has no plan. The prompt-injection arm
+            // tolerates that (see the `verification`-only branch).
+            plan: String::new(),
+            verification: Some(journal::Verification(checks)),
+            approval_id: None,
+            evidence_baseline: shell_call_baseline(context),
+        });
+        true
+    }
+
+    /// Take `--check` from the process environment, once.
+    ///
+    /// The CLI sets `PIR_CHECK` at startup (one process, one invocation),
+    /// mirroring `PIR_PERF_PROFILE`. It is **consumed** here rather than read:
+    /// a foreman worker is a child session in the same process, and it must
+    /// not inherit the parent's check — a worker has its own job and gating it
+    /// on the parent's command would stall it three nudges for nothing.
+    fn take_declared_checks_from_env() -> Vec<String> {
+        let Ok(raw) = std::env::var("PIR_CHECK") else {
+            return Vec::new();
+        };
+        // Consume: later sessions in this process must not see it.
+        std::env::remove_var("PIR_CHECK");
+        raw.split('\n')
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
     }
 
     fn verification_passed_id(&self) -> Option<String> {
@@ -1548,16 +1630,9 @@ impl AgentPlugin for ModePlugin {
                     // has no sidecar and starts normal; a resumed/reloaded
                     // session restores foreman/plan and reconstructs the gate
                     // from its transcript.
-                    if let Some(context) = self.state.context() {
-                        if context.is_active() {
-                            self.state.restore_from_context(&context);
-                        } else {
-                            self.state.close_journal();
-                            self.state.set_mode(Mode::Normal);
-                            self.state.reset_gate();
-                            self.state.clear_approvals();
-                            self.state.set_phase(Phase::Idle);
-                        }
+                    let context = self.state.context();
+                    if let Some(context) = context.as_ref().filter(|context| context.is_active()) {
+                        self.state.restore_from_context(context);
                     } else {
                         self.state.close_journal();
                         self.state.set_mode(Mode::Normal);
@@ -1565,10 +1640,36 @@ impl AgentPlugin for ModePlugin {
                         self.state.clear_approvals();
                         self.state.set_phase(Phase::Idle);
                     }
+                    // Declared checks: `--check` on this invocation wins, else the session's
+                    // own persisted list. A resumed task keeps the check it was
+                    // started with, which is the whole point of persisting it.
+                    let from_env = ModeState::take_declared_checks_from_env();
+                    if !from_env.is_empty() {
+                        self.state.set_declared_checks(from_env.clone());
+                        if let Some(context) =
+                            context.as_ref().filter(|context| context.is_active())
+                        {
+                            persist_declared_checks(context, &from_env);
+                        }
+                    } else if let Some(context) =
+                        context.as_ref().filter(|context| context.is_active())
+                    {
+                        self.state
+                            .set_declared_checks(persisted_declared_checks(context));
+                    }
                     self.state.refresh_status();
                     PluginEventOutcome::None
                 }
                 "before_agent_start" => {
+                    // Every prompt is a task boundary for the declared-check
+                    // floor: `complete_contract` retires a satisfied contract,
+                    // so a multi-prompt session would lose the floor after the
+                    // first success without re-arming here.
+                    if let Some(context) = self.state.context() {
+                        if context.is_active() {
+                            self.state.arm_declared_check_floor(&context);
+                        }
+                    }
                     let transition = self.state.take_pending_transition();
                     let outcome = match self.state.mode() {
                         Mode::Foreman => {
@@ -1580,7 +1681,26 @@ impl AgentPlugin for ModePlugin {
                         }
                         Mode::Plan => mode_prompt(event, PLAN_SECTION, PLAN_PROMPT),
                         Mode::Normal => match self.state.active_contract() {
-                            Some(contract) if !contract.plan.trim().is_empty() => {
+                            // A declared-check floor has an empty plan. The
+                            // model still has to be told which command
+                            // satisfies the gate (matching is verbatim), so
+                            // the verification list is injected on its own.
+                            Some(contract) if contract.plan.trim().is_empty() => {
+                                match contract.verification.as_ref() {
+                                    Some(verification) if !verification.display().is_empty() => {
+                                        let mut prompt = String::from(DECLARED_CHECK_PROMPT_HEAD);
+                                        prompt.push_str(
+                                            "Verification criteria: run one of these \
+                                                         commands EXACTLY (no rewriting):\n",
+                                        );
+                                        prompt.push_str(verification.display().trim());
+                                        prompt.push_str(DECLARED_CHECK_PROMPT_TAIL);
+                                        mode_prompt(event, EXECUTION_CONTRACT_SECTION, &prompt)
+                                    }
+                                    _ => PluginEventOutcome::None,
+                                }
+                            }
+                            Some(contract) => {
                                 let mut prompt = String::from(EXECUTION_CONTRACT_PROMPT_HEAD);
                                 prompt.push_str("Approval: ");
                                 prompt.push_str(
@@ -2134,6 +2254,64 @@ pub fn persist_mode(context: &PluginContext, mode: Mode, settings: ModeSettings)
         return;
     };
     persist_mode_path(&path, mode, settings);
+}
+
+/// Sidecar for the declared verification checks (`--check`).
+///
+/// Deliberately a separate file from `<session>.mode.json`: the mode sidecar
+/// is rewritten wholesale by every mode transition, so a field stored there
+/// would be lost the first time the user switches mode. Two files, two
+/// owners, no read-modify-write dance.
+const DECLARED_CHECKS_SUFFIX: &str = ".checks.json";
+
+fn declared_checks_path_for(session_path: &Path) -> PathBuf {
+    let mut os = session_path.as_os_str().to_owned();
+    os.push(DECLARED_CHECKS_SUFFIX);
+    PathBuf::from(os)
+}
+
+fn persisted_declared_checks(context: &PluginContext) -> Vec<String> {
+    let Some(path) = context
+        .session()
+        .and_then(|session| session.session_path())
+        .map(|path| declared_checks_path_for(path.as_ref()))
+    else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("checks")
+        .and_then(Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn persist_declared_checks(context: &PluginContext, checks: &[String]) {
+    let Some(path) = context
+        .session()
+        .and_then(|session| session.session_path())
+        .map(|path| declared_checks_path_for(path.as_ref()))
+    else {
+        return;
+    };
+    let value = serde_json::json!({ "version": 1, "checks": checks });
+    if let Err(error) = journal::write_atomic_json(&path, &value) {
+        crate::ext_diag!(
+            "[mode] failed to persist declared checks to {}: {error}",
+            path.display()
+        );
+    }
 }
 
 pub fn persist_mode_path(path: &Path, mode: Mode, settings: ModeSettings) {
@@ -2886,6 +3064,21 @@ available tools and observe a successful result. Saying "verified" or reasoning
 about correctness is not verification: a real tool result with a zero exit
 status is required. If verification fails, fix the cause and run it again.
 </execution_contract>"#;
+
+/// Head of the declared-check prompt. This is the plan-free variant of the
+/// execution contract: there is no approved plan to restate, only a check the
+/// user declared up front, so the prompt says that and nothing more. Without
+/// this arm a `--check` contract would gate every settle while never telling
+/// the model the exact string it must run.
+const DECLARED_CHECK_PROMPT_HEAD: &str = r#"<declared_verification>
+This session declares a verification check. The run is not complete until one
+of the commands below has actually been executed and succeeded.
+"#;
+const DECLARED_CHECK_PROMPT_TAIL: &str = r#"
+A tool result with a zero exit status is required. Saying "verified" or
+reasoning about correctness does not count. If the check fails, fix the cause
+and run the exact command again.
+</declared_verification>"#;
 
 /// Apply an approval decision's side effects: send the follow-up message and,
 /// for an approved plan, switch the session to normal mode so the follow-up
