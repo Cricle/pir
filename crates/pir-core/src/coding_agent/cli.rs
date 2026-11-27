@@ -1100,6 +1100,7 @@ pub enum Command {
         command: SessionsCommand,
     },
     /// Persistent background job management
+    #[cfg(feature = "jobs")]
     Jobs {
         #[command(subcommand)]
         command: JobsCommand,
@@ -1111,6 +1112,7 @@ pub enum Command {
         command: ForemanCommand,
     },
     /// File checkpoint inspection / restore
+    #[cfg(feature = "checkpoint-cli")]
     Checkpoint {
         #[command(subcommand)]
         command: CheckpointCommand,
@@ -1227,18 +1229,6 @@ pub enum Command {
     /// system `sed` with the original argv
     Sed {
         /// Arguments forwarded verbatim (GNU sed syntax)
-        #[arg(
-            trailing_var_arg = true,
-            allow_hyphen_values = true,
-            value_name = "ARGS"
-        )]
-        args: Vec<String>,
-    },
-    /// Native `python` (the embedded QuickJS runtime; the name is kept for
-    /// Settings/tool-selection compatibility); unsupported flags exec the
-    /// system `python3` with the original argv
-    Python {
-        /// Arguments forwarded verbatim
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
@@ -1401,7 +1391,7 @@ pub enum ModelsCommand {
 
 /// `pir checkpoint` — per-session file checkpoint inspection / restore
 /// (pir extension).
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "checkpoint-cli"))]
 #[derive(Debug, Clone, Subcommand)]
 pub enum CheckpointCommand {
     /// List recent checkpoints for a session (default: this project's newest)
@@ -1518,7 +1508,7 @@ pub enum ForemanCommand {
 }
 
 /// `pir jobs` — persistent cross-process background jobs.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "jobs"))]
 #[derive(Debug, Clone, Subcommand)]
 pub enum JobsCommand {
     /// Start a detached command and print its job id

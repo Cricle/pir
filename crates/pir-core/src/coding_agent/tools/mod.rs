@@ -1,6 +1,7 @@
 //! Core coding-agent tools: read, bash, powershell, edit, write, grep, find,
-//! ls, plus the model-facing background-call controls (`background_status`,
-//! `background_abort`).
+//! ls, plus the model-facing background-call controls (`bg_status`,
+//! `bg_abort`; formerly `background_status`, `background_abort`, still
+//! accepted wherever a tool name is written by hand).
 //!
 //! Every built-in tool is its own leaf feature (`tool-read`, `tool-bash`,
 //! `tool-powershell`, `tool-edit`, `tool-write`, `tool-ls`,
@@ -16,7 +17,7 @@
 //! TUI's live edit preview.
 
 #[cfg(feature = "tool-background")]
-mod background;
+pub mod background;
 mod bash;
 // Handle-relative (descriptor-anchored) resolution shared by the file tools
 // (`read`, `write`, `edit`). The TUI's edit preview (`compute_edits_diff`)
@@ -215,9 +216,9 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     #[cfg(feature = "tool-ls")]
     "ls",
     #[cfg(feature = "tool-background")]
-    "background_status",
+    "bg_status",
     #[cfg(feature = "tool-background")]
-    "background_abort",
+    "bg_abort",
 ];
 
 // Pluggable per-tool backends (upstream `*Operations` options): a host can

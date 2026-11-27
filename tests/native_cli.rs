@@ -1,5 +1,5 @@
 //! Integration tests for the standalone native commands: `pir grep`,
-//! `pir sed`, `pir python` (native paths, exit codes, and the
+//! `pir sed` (native paths, exit codes, and the
 //! `--no-fallback` / `PIR_NATIVE_FALLBACK` switch).
 //!
 //! The commands are spawned as real processes (`CARGO_BIN_EXE_pir`) because
@@ -485,18 +485,4 @@ fn sed_non_utf8_stdin_preserves_bytes_through_fallback() {
         "fallback must preserve the raw stdin bytes"
     );
     assert_eq!(output.stdout, b"\xff\xfeb\n".as_slice());
-}
-
-// ---------------------------------------------------------------------------
-// python
-// ---------------------------------------------------------------------------
-
-#[test]
-fn python_native_command_outputs_result() {
-    if skip_without_binary() {
-        return;
-    }
-    let output = run(&["python", "-c", "print(1+1)", "--no-fallback"]);
-    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
-    assert_eq!(stdout(&output), "2\n");
 }

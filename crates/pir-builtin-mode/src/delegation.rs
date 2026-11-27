@@ -24,8 +24,8 @@ pub const MODE_ALLOWED_TOOLS: &[&str] = &[
     "ls",
     "tool_search",
     "todo",
-    "background_status",
-    "background_abort",
+    "bg_status",
+    "bg_abort",
 ];
 
 /// Hard read-only tool set for plan-mode subagents.

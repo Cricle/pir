@@ -820,7 +820,7 @@ pub struct BackgroundCallInfo {
 }
 
 /// The host's background-call control surface, exposed to the model-facing
-/// `background_status` / `background_abort` tools.
+/// `bg_status` / `bg_abort` tools.
 ///
 /// Implemented by the session host (`AgentSession`'s registry) and by print
 /// mode (`PrintBackground`), so both hosts give the model the same view of
@@ -947,8 +947,8 @@ pub struct ToolSessionEnv {
     /// `setActiveTools`): writing it re-drives the loadout precedence chain
     /// on the next rebuild, which is how `tool_search` loads matches.
     pub active_override: Option<Arc<RwLock<Option<Vec<String>>>>>,
-    /// The host's in-flight background calls (the `background_status` /
-    /// `background_abort` tools). `None` for hosts that run no background
+    /// The host's in-flight background calls (the `bg_status` /
+    /// `bg_abort` tools). `None` for hosts that run no background
     /// registry; the tools then report that instead of an empty list.
     pub background: Option<Arc<dyn BackgroundControl>>,
     /// Session-scoped read ledger for the read-before-edit constraint (the
@@ -1241,8 +1241,35 @@ impl ToolRegistry {
     }
 
     /// Look up a tool by name.
+    ///
+    /// A miss retries against the LEGACY spellings of the one pair of tools
+    /// that were renamed (`background_status`/`background_abort` →
+    /// `bg_status`/`bg_abort`). Renaming a model-facing tool is not free: a
+    /// resumed transcript records the names its loadout declared, a settings
+    /// `defaultTools` list is written by hand, and a plugin may name the tool
+    /// in a handler. Resolving the old spelling here keeps every one of those
+    /// working without re-declaring the long name (which would be paid in
+    /// every request's tool array and prompt listing).
     pub fn get(&self, name: &str) -> Option<Arc<dyn AgentTool>> {
-        self.inner.get(name).cloned()
+        if let Some(tool) = self.inner.get(name).cloned() {
+            return Some(tool);
+        }
+        // Only a build that carries the background controls can have been
+        // renamed; every other name is a plain miss.
+        #[cfg(feature = "tool-background")]
+        {
+            let renamed = if crate::coding_agent::tools::background::is_status_name(name) {
+                crate::coding_agent::tools::background::STATUS_TOOL_NAME
+            } else if crate::coding_agent::tools::background::is_abort_name(name) {
+                crate::coding_agent::tools::background::ABORT_TOOL_NAME
+            } else {
+                return None;
+            };
+            if renamed != name {
+                return self.inner.get(renamed).cloned();
+            }
+        }
+        None
     }
 
     /// Names of all registered tools, sorted by name.
@@ -1365,7 +1392,25 @@ impl ToolRegistry {
                     })
                     .map(|(name, _)| name.clone())
                     .collect();
-                names.sort();
+                // Upstream's default order is `DEFAULT_TOOL_NAMES = read, bash,
+                // edit, write`; the rest of pir's larger default set is
+                // alphabetical after them. A pure `sort()` put `read` at
+                // position 21 of 23 once the `ctx_*`/`bg_*` tools were declared,
+                // while upstream lists it first — the model then reached for
+                // `bash` + `sed` for file inspection and never called `read` in
+                // two measured runs on the same task. Leading with the core
+                // four restores upstream's ordering cue without shrinking the
+                // loadout. An explicit `--tools` list still keeps its own order
+                // (the `Some` arm above).
+                let core = crate::config::settings::DEFAULT_TOOL_NAMES;
+                names.sort_by_key(|name| {
+                    (
+                        core.iter()
+                            .position(|core| core == name)
+                            .unwrap_or(core.len()),
+                        name.clone(),
+                    )
+                });
                 names
             }
         }
@@ -1471,6 +1516,12 @@ pub fn declared_tool_definitions_for_profile(
 /// itself never sees it. A non-object schema (a malformed declaration) is
 /// returned unchanged. `inject` is false on the efficient profile for tools
 /// that cannot run in the background.
+///
+/// The description is deliberately one short line. This key is copied into
+/// EVERY declared tool (~165 bytes each, ~1.5 KB across the default loadout)
+/// and it is the same sentence in all of them, so a longer wording is paid
+/// once per tool per request. `bg` is the short name the result and the
+/// status tools use for the same concept.
 fn with_background_argument(mut parameters: serde_json::Value, inject: bool) -> serde_json::Value {
     if !inject {
         return parameters;
@@ -1486,7 +1537,7 @@ fn with_background_argument(mut parameters: serde_json::Value, inject: bool) -> 
             "background".to_owned(),
             serde_json::json!({
                 "type": "boolean",
-                "description": "Run this call in the background: it returns immediately and the real result is delivered as a separate message once it finishes.",
+                "description": "Run in bg; the result arrives later as a message.",
             }),
         );
     }

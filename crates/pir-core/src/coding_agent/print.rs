@@ -4683,7 +4683,7 @@ pub async fn run_print_with_environment(
 
         // The print host's session environment: print drives the loop without
         // an `AgentSession`, so without this env the model-facing
-        // `background_status` / `background_abort` tools (registered by
+        // `bg_status` / `bg_abort` tools (registered by
         // `register_core_tools`) would report "no registry" even though this
         // host owns one. The env carries the same handles the session env
         // does, with the background control adapter over THIS invocation's

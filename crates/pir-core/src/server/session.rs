@@ -1593,7 +1593,7 @@ fn prepare_persisted_session(
 /// full core registry every CLI host builds
 /// ([`register_core_tools`](crate::coding_agent::tools::register_core_tools) —
 /// `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls`, and
-/// the model-facing `background_status`/`background_abort` controls), with
+/// the model-facing `bg_status`/`bg_abort` controls), with
 /// the fail-closed remote-execution policy applied on top.
 ///
 /// With `allow_remote_bash` off (the default) both shell-execution tools

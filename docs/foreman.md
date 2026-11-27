@@ -44,7 +44,7 @@ session may call:
 
 ```text
 submit_plan, subagent, read, grep, find, ls, tool_search, todo,
-background_status, background_abort
+bg_status, bg_abort
 ```
 
 `submit_plan` is visible only in plan mode. Everything else is blocked, so the

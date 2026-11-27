@@ -16,6 +16,7 @@ pir -p "<prompt>"            # --print shorthand; `-p a -p b` runs a then b
 
 | Command | Purpose |
 |---|---|
+| `interactive` | The interactive TUI agent, spelled explicitly. `pir` with no subcommand enters the same mode when stdin/stdout is a TTY; the subcommand exists for callers that cannot rely on that inference. Requires the `tui` feature |
 | `print` | Non-interactive run. Positional prompts each run as their own turn; `@file` is read as a file reference; stdin is read when the prompt is omitted or `-`. `--mode json` switches to the JSONL event stream. |
 | `rpc` | JSON Lines RPC over stdin/stdout ([rpc.md](rpc.md)) |
 | `server` | Remote session server. Requires `PIR_SERVER_AUTH_TOKEN`; `--unix <path>` binds a Unix socket; `--allow-unauthenticated` is a local-dev escape hatch only ([security.md](security.md)) |

@@ -2070,10 +2070,17 @@ impl AgentTool for BashTool {
         "bash"
     }
     fn description(&self) -> &'static str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB by default (1000 lines or 24KB in the efficient profile; whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds; when omitted, the tools.commandTimeoutMs setting applies (120 seconds by default; 30 seconds in the efficient profile). When PIR_BIN is set, prefer `\"$PIR_BIN\" grep|sed …` over the system grep/sed; use the plain commands only when PIR_BIN is unavailable or pir rejects the usage."
+        // No `prefer $PIR_BIN grep|sed` hint here. It contradicted this
+        // build's own `Use read to examine files instead of cat or sed`
+        // guideline, and the model resolved the conflict in favour of sed:
+        // a measured 20-turn task read files through 11 separate
+        // `sed -n A,Bp` calls (one turn each) instead of `read`. The
+        // native grep/sed binaries still exist; they are simply not
+        // advertised as the way to examine a file.
+        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first); a truncated result is saved to a temp file. Optional timeout in seconds, defaulting to the tools.commandTimeoutMs setting (120)."
     }
     fn prompt_snippet(&self) -> Option<String> {
-        Some("Execute bash commands; prefer pir grep|sed ($PIR_BIN) when available".to_owned())
+        Some("Execute bash commands (ls, grep, find, etc.)".to_owned())
     }
     fn prompt_guidelines(&self) -> Vec<String> {
         vec![
@@ -2330,7 +2337,19 @@ impl AgentTool for BashTool {
             if shell.stdin_transport() {
                 if let Some(mut stdin) = child.stdin.take() {
                     use tokio::io::AsyncWriteExt;
-                    let _ = stdin.write_all(command.as_bytes()).await;
+                    // The command IS the stdin payload on this transport
+                    // (`bash -s`, the legacy WSL path). A failed write means
+                    // it never ran: a `bash -s` that hits EOF before any
+                    // command exits 0 with no output, so ignoring the error
+                    // would report a successful empty run for a command that
+                    // never executed. Fail the call instead.
+                    if let Err(error) = stdin.write_all(command.as_bytes()).await {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return ToolResult::error(format!(
+                            "Command failed: could not deliver the command to the shell's stdin: {error}"
+                        ));
+                    }
                     drop(stdin);
                 }
             }

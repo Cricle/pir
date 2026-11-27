@@ -582,8 +582,8 @@ fn assert_core_declared(names: &[String]) {
         "edit",
         "write",
         "ls",
-        "background_status",
-        "background_abort",
+        "bg_status",
+        "bg_abort",
     ] {
         assert_declares(names, core);
     }
@@ -593,27 +593,32 @@ fn assert_core_declared(names: &[String]) {
     }
 }
 
-/// The builtin-plugin tools the task names as the minimum end-to-end set,
-/// each gated on the cargo feature that compiles it in.
+/// The builtin-plugin tools a DEFAULT run declares, each gated on the cargo
+/// feature that compiles it in.
+///
+/// `context-mode` used to be in this list. It is now default-off (see the
+/// `pir-builtins` crate docs), so a default `pir print` declares no `ctx_*`
+/// tool; the explicit-`-e` case below covers them instead.
 fn assert_plugin_tools_declared(names: &[String]) {
-    #[cfg(feature = "context-mode")]
-    for tool in [
-        "ctx_execute",
-        "ctx_execute_file",
-        "ctx_batch_execute",
-        "ctx_index",
-        "ctx_search",
-        "ctx_fetch_and_index",
-        "ctx_stats",
-        "ctx_purge",
-        "ctx_doctor",
-    ] {
-        assert_declares(names, tool);
-    }
     #[cfg(feature = "todo")]
     assert_declares(names, "todo");
     #[cfg(feature = "subagent")]
     assert_declares(names, "subagent");
+    #[cfg(feature = "mode")]
+    assert_declares(names, "submit_plan");
+    // The default-off builtins must NOT be on the default wire surface.
+    for absent in [
+        "ctx_execute",
+        "ctx_search",
+        "codemode",
+        "tool_search",
+        "memory",
+    ] {
+        assert!(
+            !names.iter().any(|name| name == absent),
+            "`{absent}` belongs to a default-off builtin and must not be default-declared: {names:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,18 +637,20 @@ fn default_print_declares_core_and_builtin_plugin_tools() {
     assert_plugin_tools_declared(&names);
 
     // The pre-fix body was exactly the nine core names; a run that never merged
-    // the plugin host can never reach this count.
+    // the plugin host can never reach this count. Only the default-ON builtins
+    // contribute here — `context-mode`'s twelve tools no longer count toward a
+    // default run.
     let plugin_count = {
         let mut count = 0;
-        #[cfg(feature = "context-mode")]
-        {
-            count += 11;
-        }
         #[cfg(feature = "todo")]
         {
             count += 1;
         }
         #[cfg(feature = "subagent")]
+        {
+            count += 1;
+        }
+        #[cfg(feature = "mode")]
         {
             count += 1;
         }
@@ -697,8 +704,8 @@ fn no_builtin_tools_keeps_plugin_tools_and_drops_core() {
         "write",
         "ls",
         "powershell",
-        "background_status",
-        "background_abort",
+        "bg_status",
+        "bg_abort",
     ] {
         assert!(
             !names.iter().any(|name| name == core),

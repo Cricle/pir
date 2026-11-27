@@ -1,8 +1,12 @@
-# cargo-deny configuration. CI runs this via EmbarkStudios/cargo-deny-action
-# (see .github/workflows/ci.yml, job `deny`). Kept deliberately
+# cargo-deny configuration. Kept deliberately
 # permissive-but-explicit: the list below is the allow-list that makes the
 # current tree pass; anything not justified by the tree stays commented rather
 # than pre-enabled.
+#
+# NOT run by CI today: `.github/workflows/ci.yml` has no `deny` job. This is a
+# local gate, run via `scripts/gate_resources.ps1` (the `deny` row) or directly
+# with `cargo deny check`. Wiring it into CI takes a workflow job plus a green
+# `cargo deny check` run; do that before treating this file as enforced.
 
 [graph]
 # All targets are only needed if we ever lint cross-platform deps in CI; the

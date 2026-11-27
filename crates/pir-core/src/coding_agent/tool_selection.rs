@@ -577,6 +577,11 @@ const TOOL_SURFACE_FEATURES: &[(&str, &str)] = &[
     ("edit", "tool-edit"),
     ("write", "tool-write"),
     ("ls", "tool-ls"),
+    ("bg_status", "tool-background"),
+    ("bg_abort", "tool-background"),
+    // The pre-rename spellings are still resolved by `ToolRegistry::get`, so a
+    // build with `tool-background` compiled out must diagnose them too instead
+    // of treating them as unknown names.
     ("background_status", "tool-background"),
     ("background_abort", "tool-background"),
     ("grep", "grep-find"),
@@ -597,6 +602,67 @@ const TOOL_SURFACE_FEATURES: &[(&str, &str)] = &[
     ("ctx_purge", "context-mode"),
     ("ctx_doctor", "context-mode"),
 ];
+
+/// The `builtin:<name>` a tool name lives in, when that tool is registered by a
+/// builtin rather than by the core registry.
+///
+/// Only the builtins that are NOT default-on need this: a default-on builtin is
+/// already on the plan, so naming its tool changes nothing. `todo`,
+/// `subagent` and `mode` are therefore absent, and so are the `memory` /
+/// `phone` / `tool-repair` builtins, which register tools under names this
+/// table cannot map back (`memory` does register `memory`, but that name is
+/// also a plain tool name the core registry can hold, and the others register
+/// no tool, a server-derived name, or an internal seam).
+const TOOL_TO_BUILTIN: &[(&str, &str)] = &[
+    ("codemode", "codemode"),
+    ("tool_search", "tool-search"),
+    ("ctx_execute", "context-mode"),
+    ("ctx_execute_file", "context-mode"),
+    ("ctx_batch_execute", "context-mode"),
+    ("ctx_batch", "context-mode"),
+    ("ctx_index", "context-mode"),
+    ("ctx_search", "context-mode"),
+    ("ctx_resume", "context-mode"),
+    ("ctx_fetch_and_index", "context-mode"),
+    ("ctx_stats", "context-mode"),
+    ("ctx_purge", "context-mode"),
+    ("ctx_doctor", "context-mode"),
+];
+
+/// The `builtin:<name>` entries a tool selection requires to actually resolve.
+///
+/// The default plan is deliberately small (`todo`, `subagent`, `mode`), so
+/// `--tools codemode` on its own names a tool nothing registered: the run then
+/// starts with an empty declared surface and the request silently loses the
+/// tool the user asked for. This maps an explicitly requested tool name back to
+/// the builtin that registers it, so the plan can enable exactly that builtin
+/// instead of loading the whole set again.
+///
+/// A glob (`--tools 'ctx_*'`) and the modifier form (`+name`) are expanded by
+/// the caller before this runs; this function only matches plain names.
+pub fn builtin_paths_for_selected_tools(names: &[String]) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        let plain = name.trim();
+        // A pattern's expansion is the caller's job; skipping it here keeps a
+        // `*` from silently enabling a builtin the user never named.
+        if plain.contains('*') || plain.starts_with('+') || plain.starts_with('-') {
+            continue;
+        }
+        let Some((_, builtin)) = TOOL_TO_BUILTIN.iter().find(|(tool, _)| *tool == plain) else {
+            continue;
+        };
+        if seen.insert(*builtin) {
+            paths.push(std::path::PathBuf::from(format!(
+                "{}{}",
+                crate::plugins::BUILTIN_PATH_PREFIX,
+                builtin
+            )));
+        }
+    }
+    paths
+}
 
 /// Whether `feature` is compiled into this build (a compile-time constant per
 /// [`TOOL_SURFACE_FEATURES`] row).

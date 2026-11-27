@@ -68,14 +68,14 @@ date/platform/model/permissions.
 | # | Deviation | Why it stays | Regression |
 |---|---|---|---|
 | B1 | `<docs>` section is omitted unless the package dir really has `README.md` + `docs/` + `examples/` (PIR-BIN-061 runtime probe; `PI_PACKAGE_DIR` wins, else the executable's directory is probed) | Upstream always prints its package path. pir's contract is stronger: `<docs>` never names a path this install lacks — a release archive ships only `README.md`, `cargo install` ships no assets. | `prompt_loadout_w22::docs_section_*`, `package_dir_*` |
-| B19 | Four pir-only `<rules>` bullets | Each encodes an enforced gate upstream lacks: the read-before-edit gate (`PIR_READ_BEFORE_EDIT`, default `edit-partial`; partial read may edit with a warning, never-read/stale and `write` stay strict), literal-path validation, `tools.broadSearchGuard` (default true), and the finish self-check. Removing them hides constraints the model will actually hit. Cost ≈ +709 chars per request, only when the tool is declared. **`efficient` profile exception**: it drops only the advisory finish self-check; the three gated rules stay in both profiles (`PromptRuleOptions { self_check: false }`). | `prompt_loadout_w22::pir_only_rules_*`, `efficient_profile_omits_only_the_advisory_finish_rule` |
+| B19 | Three pir-only `<rules>` bullets | Each encodes an enforced gate upstream lacks: literal-path validation, `tools.broadSearchGuard` (default true), and the finish self-check. Removing them hides constraints the model will actually hit. **`efficient` profile exception**: it drops only the advisory finish self-check; the two gated rules stay in both profiles (`PromptRuleOptions { self_check: false }`). A fourth bullet (`read it completely, no offset/limit, before overwriting with write`) was **removed**: upstream has no such bullet, and a measured bug hunt obeyed it literally, pulling whole 48 KB / 35 KB files into context and driving repeated compaction. The constraint it described is enforced in code (`PIR_READ_BEFORE_EDIT`, default `edit-partial`: `write` to a never-read file is refused, a partial read warns). | `prompt_loadout_w22::pir_only_rules_*`, `no_read_before_write_bullet_is_rendered`, `efficient_profile_omits_only_the_advisory_finish_rule` |
 | — | Default tool set is a superset of upstream's four | Product capability, decided 2026-11-14 (Option B: keep the loadout, fix the docs). Canonical list and cost measurement: [`FEATURES.md`](FEATURES.md) §3.1. `efficient` or `--tools read,bash,edit,write` selects the upstream four; `--no-extensions` leaves the core nine; the registry is never filtered by the selection. | `FEATURES.md` §3.1 |
 
 ### Open deviations
 
 | # | Deviation | pir location | Upstream behavior | Effect |
 |---|---|---|---|---|
-| B2 | Default tool order is alphabetical; an explicit `--tools` keeps the active order | `crates/pir-core/src/agent/tool_execution.rs` (`active_names`); `definitions`/`print_active_definitions` build the declared array from the active set | `DEFAULT_TOOL_NAMES = read, bash, edit, write` | Explicit selection is aligned; the no-`--tools` path still differs. Pinned by `declared_tool_array_order_matches_the_tools_section_order` |
+| B2 | **Resolved**: the default tool order now leads with upstream's core four | `crates/pir-core/src/agent/tool_execution.rs` (`active_names_after`); `definitions`/`print_active_definitions` build the declared array from the active set | `DEFAULT_TOOL_NAMES = read, bash, edit, write` | The no-`--tools` path used to be a plain `sort()`, which put `read` at position 21 of 23 once the `ctx_*`/`bg_*` tools were declared. It now sorts by `(index in DEFAULT_TOOL_NAMES, name)`, so the first four lines match upstream and everything else stays alphabetical. An explicit `--tools` keeps its own order either way. Pinned by `declared_tool_array_order_matches_the_tools_section_order`; the order cue is the reason `read` is used at all — see `docs/system-prompt-audit.md` §4 measurement notes |
 | B3 | bash/powershell snippets point at `PIR_BIN` | `coding_agent/tools/bash.rs`, `powershell.rs` | `Execute bash commands (ls, grep, find, etc.)` | Changes tool-selection behavior; no byte parity possible |
 | B4 | MCP section lists every enabled server plus `failed: <reason>` | `system_prompt.rs` (`render_mcp_section`) | Only indirect servers, description/instructions, no status errors | Redundant lines; error text can echo URL/token fragments |
 | B5 | A custom section sharing a built-in name emits a duplicate tag (`Custom("tools") != Tools`) | `system_prompt.rs` (section insert + custom loop) | Same-named key overwrites | Two `<tools>` blocks, unpredictable for the model |
@@ -101,6 +101,52 @@ Fixed since the baseline audit: B14 (RPC prompt cwd), M1 (print/RPC/TUI
 `SYSTEM.md`/`APPEND_SYSTEM.md`), M4-RPC (`--skill`/`--no-skills`), and M5
 (subagent base prompt). SDK still needs an explicit
 `.discover_system_prompt(true)`.
+
+### Measurement notes: what decided B2
+
+B2 is the only deviation here that was changed on measured evidence rather than
+by design preference, so the evidence is recorded. The task was a single
+reproducible bug hunt (`packages/durable/test/harness-inbox.test.ts`, 6 failing
+of 37), run through both CLIs with `--mode json`, the same provider/model, 240 s
+ceiling, clean session dirs, and a fixture in which the bug is the committed
+state (no `git diff`, no reachable fix commit, no build artifact holding the
+answer — `git diff`/`git show` had been handing the model the patch outright
+before that).
+
+Hypotheses that measurement falsified:
+
+- *"bash's snippet advertises ls/grep/find, so the model never calls `read`."*
+  Upstream pi's first six calls on this task were **all** bash (`cat`, `grep`,
+  `sed`, `ls`), exactly like pir's. The snippet wording does not decide this.
+- *"Narrowing the bash snippet to non-inspection work steers the model to
+  `read`."* Two runs with the narrowed snippet came out **worse** than the
+  widened one (read 8→3 and 2→1, tool output 224 KB / 184 KB → 393 KB / 389 KB).
+  Reverted.
+- *"Listing the 12 `ctx_*` tools in `<tools>` makes the model use them."* Six
+  runs across four configurations produced **zero** `ctx_*` calls, with or
+  without their `prompt_snippet`. Those snippets are still present only because
+  they cost nothing measurable and the loadout is unchanged either way.
+
+What the runs did show:
+
+- `read` and `bash` order matters. Upstream lists `read` first and `bash`
+  second; pir's `sort()` put `bash` first and `read` **21st of 23** once the
+  `ctx_*`/`bg_*` tools were declared. Every run that ever called `read` at all
+  was one where the `<tools>` section had grown; the two runs on the plain
+  alphabetical 11-tool section called it zero times.
+- Leading with the core four is the only change that moved the FIRST tool call.
+  Opening six calls per run (most recent config last):
+  `base [bash×6]`, `base [bash×9]`, `ctx [bash×5,read,…]`,
+  `narrow [bash×6,read,…]`, then with the core four first
+  `order [read,ls,bash,bash,bash,read,…]` and `order [bash,read,bash,bash,bash,read,…]`.
+  Both ordering runs call `read` within the first two calls; no earlier
+  configuration ever did. Total counts moved the same way (13/4 `read` against
+  0/0 on the alphabetical baseline, and `bash` fell to 11 in one run).
+- The effect is noisy, not deterministic. Upstream pi itself, unchanged across
+  two runs of the same task, produced 8 `read` calls and 1 — and pir's ordering
+  runs gave 13 and 4. Direction is consistent; magnitude is not. This section
+  therefore reports counts rather than claiming a fixed improvement, and B2 is
+  the only deviation here changed on this evidence.
 
 ## 5. Remaining work
 

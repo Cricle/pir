@@ -294,7 +294,6 @@ full = [
     "extensions",
     "context-mode",
     "mcp",
-    "python",
     "env",
     "env-daemon",
     "server",
@@ -310,6 +309,8 @@ full = [
     "provider-bedrock",
     "provider-mistral",
     "cli",
+    "jobs",
+    "checkpoint-cli",
     "tools",
     "grep-find",
     "image-tools",
@@ -343,7 +344,17 @@ image-tools = ["pir-core/image-tools", "image-resize"]
 # `image-tools`; exposed separately for an embed that wants only the resize
 # helpers (the TUI also enables the engine-side feature directly).
 image-resize = ["pir-core/image-resize"]
-cli = ["pir-core/cli", "dep:clap"]
+# `jobs` and `checkpoint-cli` are listed explicitly: `pir-core/cli` implies
+# both, so those `Command` variants exist in any `cli` build. The facade must
+# mirror that, or its own `#[cfg(feature = "...")]` arms are compiled out while
+# the enum member remains — a non-exhaustive match on the `pir` binary.
+cli = ["pir-core/cli", "dep:clap", "jobs", "checkpoint-cli"]
+# `pir jobs` + the detached supervisor. Forwarded so an embed can enable it
+# through the facade without the full `cli` argv surface.
+jobs = ["pir-core/jobs"]
+# The `pir checkpoint` CLI surface only (the checkpoint engine that `edit` /
+# `write` snapshot through is always compiled).
+checkpoint-cli = ["pir-core/checkpoint-cli"]
 print = ["pir-core/print"]
 rpc = ["pir-core/rpc"]
 export-html = ["pir-core/export-html"]
@@ -372,9 +383,6 @@ grep-find = ["pir-core/grep-find"]
 extensions = ["pir-core/extensions", "pir-tui?/extensions", "dep:rquickjs"]
 brush = ["pir-core/brush"]
 context-mode = ["pir-core/context-mode"]
-# The `python` tool name is kept for Settings/tool-selection compatibility; the
-# tool now runs JavaScript on the embedded QuickJS runtime.
-python = ["pir-core/python"]
 # Allocator A/B switch for the `pir` binary only (`src/main.rs`). OFF by
 # default: enabling it swaps the process-wide allocator, which is what the
 # perf harness compares against the default.

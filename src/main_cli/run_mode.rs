@@ -53,6 +53,7 @@ pub(super) async fn run() -> Result<()> {
     // `JobStore::spawn`. Intercepted on the RAW argv before settings/tracing
     // setup: it owns the job's log and must not contend for the parent's
     // terminal or config locks.
+    #[cfg(feature = "jobs")]
     if raw_args.first().map(String::as_str) == Some("__jobs-supervise") {
         std::process::exit(pir::jobs::run_supervisor(&raw_args[1..]));
     }
@@ -164,7 +165,7 @@ pub(super) async fn run() -> Result<()> {
     if raw_args.first().map(String::as_str) == Some("__brush") {
         return Err(missing_feature("pir __brush", "brush"));
     }
-    // Native `grep`/`sed`/`python`: standalone commands that own their argv
+    // Native `grep`/`sed`: standalone commands that own their argv
     // and stdio (see `native_cli`). Intercept them on the RAW argv — like
     // `js`/`env-daemon` — so a grep invocation neither parses the 60+ flag
     // CLI surface nor runs migrations/settings/trust/package discovery before
@@ -174,7 +175,6 @@ pub(super) async fn run() -> Result<()> {
         let native = match command {
             "grep" => Some(pir::native_cli::run_grep as fn(&[String]) -> pir::Result<()>),
             "sed" => Some(pir::native_cli::run_sed as fn(&[String]) -> pir::Result<()>),
-            "python" => Some(pir::native_cli::run_python as fn(&[String]) -> pir::Result<()>),
             _ => None,
         };
         if let Some(run) = native {
@@ -1394,7 +1394,6 @@ pub(super) async fn run() -> Result<()> {
         },
         Some(Command::Grep { args }) => pir::native_cli::run_grep(&args),
         Some(Command::Sed { args }) => pir::native_cli::run_sed(&args),
-        Some(Command::Python { args }) => pir::native_cli::run_python(&args),
         Some(Command::Session) => {
             let path = std::path::Path::new(&config.session_dir);
             let exists = path.is_dir();
@@ -1413,9 +1412,11 @@ pub(super) async fn run() -> Result<()> {
         Some(Command::Sessions { command }) => {
             run_sessions_command(command, &config, &settings_manager)
         }
+        #[cfg(feature = "jobs")]
         Some(Command::Jobs { command }) => run_jobs_command(command),
         #[cfg(feature = "subagent")]
         Some(Command::Foreman { command }) => foreman_mode::run(command, &config).await,
+        #[cfg(feature = "checkpoint-cli")]
         Some(Command::Checkpoint { command }) => run_checkpoint_command(command, &config),
         None => {
             // Upstream entry shapes (no subcommand given): print / json / rpc
@@ -1567,19 +1568,14 @@ pub(super) async fn run() -> Result<()> {
 /// the agent-dir files (`auth.json` / `models-store.json`).
 ///
 /// `--export` exits before the upstream runtime (`main.ts:640-652`), and the
-/// native helper subcommands (`version`, `grep`, `sed`, `python`) are pir-only
+/// native helper subcommands (`version`, `grep`, `sed`) are pir-only
 /// surfaces that never read the pi config. `--version`/`-v` exit in clap
 /// before this module runs at all.
 fn bootstraps_agent_dir(cli: &Cli) -> bool {
     cli.export.is_none()
         && !matches!(
             cli.command,
-            Some(
-                Command::Version
-                    | Command::Grep { .. }
-                    | Command::Sed { .. }
-                    | Command::Python { .. }
-            )
+            Some(Command::Version | Command::Grep { .. } | Command::Sed { .. })
         )
 }
 
@@ -1704,6 +1700,7 @@ fn maybe_prune_sessions_on_startup(
 /// Restore requires an explicit `--root <dir>`: the session header `cwd` is
 /// untrusted and is only reported as a diagnostic, never used as a security
 /// root (F2c).
+#[cfg(feature = "checkpoint-cli")]
 fn run_checkpoint_command(
     command: pir::coding_agent::cli::CheckpointCommand,
     config: &pir::config::Config,
@@ -1799,6 +1796,7 @@ fn run_checkpoint_command(
 }
 
 /// `pir jobs ...`: persistent background job management.
+#[cfg(feature = "jobs")]
 fn run_jobs_command(command: pir::coding_agent::cli::JobsCommand) -> Result<()> {
     use pir::coding_agent::cli::JobsCommand;
     use pir::jobs::{JobSpec, JobStore, DEFAULT_CLEAN_AGE_DAYS};

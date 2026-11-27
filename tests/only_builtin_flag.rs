@@ -154,9 +154,14 @@ fn plan_keeps_only_builtins_and_reports_on_disk_paths() {
         "the explicit builtin entry is deduped into its CLI position"
     );
     assert_eq!(plan.first(), Some(&explicit), "CLI builtins keep order");
-    // Every default-enabled builtin is present (phone stays default-off).
+    // Every DEFAULT-ON builtin is present. The default plan is `subagent`,
+    // `mode`, `todo`; everything else (including `phone`) joins only when
+    // named, see the `pir-builtins` crate docs.
     for name in &names {
-        if *name == "phone" {
+        let default_on = pir::plugins::builtin::KNOWN_BUILTINS
+            .iter()
+            .any(|row| row.name == *name && row.default_enabled);
+        if !default_on {
             continue;
         }
         assert!(
@@ -225,8 +230,12 @@ async fn plan_only_handle_registers_native_builtins() {
         .map(|plugin| plugin.info().path.clone())
         .collect();
     for name in &names {
-        // `phone` is default-off: only its explicit `-e builtin:phone` adds it.
-        if *name == "phone" {
+        // Only default-ON builtins are on a `--only-builtin` plan; a
+        // default-off one is added by naming it (`-e builtin:<name>`).
+        let default_on = pir::plugins::builtin::KNOWN_BUILTINS
+            .iter()
+            .any(|row| row.name == *name && row.default_enabled);
+        if !default_on {
             continue;
         }
         assert!(
@@ -242,13 +251,11 @@ async fn plan_only_handle_registers_native_builtins() {
         .iter()
         .map(|entry| entry.0.name.clone())
         .collect();
-    for (builtin, tool) in [
-        ("subagent", "subagent"),
-        ("todo", "todo"),
-        ("memory", "memory"),
-        ("tool-search", "tool_search"),
-    ] {
-        if names.contains(&builtin) {
+    for (builtin, tool) in [("subagent", "subagent"), ("todo", "todo")] {
+        let default_on = pir::plugins::builtin::KNOWN_BUILTINS
+            .iter()
+            .any(|row| row.name == builtin && row.default_enabled);
+        if default_on && names.contains(&builtin) {
             assert!(
                 tools.iter().any(|name| name == tool),
                 "native tool `{tool}` missing from {tools:?}"

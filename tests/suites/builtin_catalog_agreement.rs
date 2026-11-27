@@ -58,11 +58,13 @@ fn default_plan_flags_match_the_catalog() {
         .filter(|def| def.default_enabled)
         .map(|def| def.name)
         .collect();
-    assert!(
-        !default_on.contains("phone"),
-        "phone binds a port; default off"
+    assert_eq!(
+        default_on,
+        BTreeSet::from(["subagent", "mode", "todo"]),
+        "the default plan is todo, subagent and mode only: every other builtin \
+         must be named by a flag, a setting or a tool selection, because its \
+         schema is paid for on every request"
     );
-    assert_eq!(default_on.len(), BUILTIN_EXTENSION_FACTORIES.len() - 1);
 }
 
 #[test]

@@ -556,7 +556,7 @@ impl BackgroundRegistry {
 }
 
 /// The session host's [`BackgroundControl`] adapter: the model-facing
-/// `background_status` / `background_abort` tools read and abort through it.
+/// `bg_status` / `bg_abort` tools read and abort through it.
 ///
 /// One adapter is built per prompt iteration over the session's own registry
 /// (`prompt_loop.rs`), so the model sees exactly the calls this session owns.

@@ -40,7 +40,7 @@ fn tool_feature(name: &str) -> &'static str {
         "write" => "tool-write",
         "ls" => "tool-ls",
         "grep" | "find" => "grep-find",
-        "background_status" | "background_abort" => "tool-background",
+        "bg_status" | "bg_abort" | "background_status" | "background_abort" => "tool-background",
         _ => "tools",
     }
 }

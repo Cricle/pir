@@ -71,6 +71,21 @@ fn names(entries: &[&str]) -> Vec<String> {
     entries.iter().map(|name| (*name).to_string()).collect()
 }
 
+/// Every builtin path this build compiles in, as explicit CLI `-e` paths.
+///
+/// These parity tests ask "which builtin tools can a selection reach", so their
+/// fixture has to carry every ENABLED builtin. They used to pass `&[]` and lean
+/// on the default plan; the default plan is now `todo`, `subagent`, `mode`, so
+/// the rest has to be named here. This changes nothing these tests assert: they
+/// are about the selection/registry plumbing, not about which builtins a bare
+/// run loads.
+fn all_builtin_paths() -> Vec<PathBuf> {
+    pir::plugins::builtin_names()
+        .into_iter()
+        .map(|name| PathBuf::from(format!("builtin:{name}")))
+        .collect()
+}
+
 /// The core registration as a [`ToolRegistry`] (the interactive host's base).
 fn core_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -181,7 +196,7 @@ async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
     // The host is built with an explicit agent dir below, so this suite needs
     // no process pin and no lock.
     let dir = TempDir::new("host");
-    let plan = pir::plugins::order_extension_paths(&[], &[], false);
+    let plan = pir::plugins::order_extension_paths(&all_builtin_paths(), &[], false);
     if plan.is_empty() {
         // A minimal build compiles no builtin factories.
         return;
@@ -211,7 +226,7 @@ async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
     host_names.sort();
     host_names.dedup();
 
-    let mut enumerated = builtin_plan_tool_names(&[], false, &Default::default());
+    let mut enumerated = builtin_plan_tool_names(&all_builtin_paths(), false, &Default::default());
     enumerated.sort();
     enumerated.dedup();
 
@@ -245,7 +260,7 @@ async fn builtin_plan_tool_names_equals_the_plugin_host_registry() {
             )
         })
         .collect();
-    let plan_tools = builtin_plan_available_tools(&[], false, &Default::default());
+    let plan_tools = builtin_plan_available_tools(&all_builtin_paths(), false, &Default::default());
     assert_eq!(
         plan_tools.len(),
         enumerated.len(),
@@ -336,7 +351,7 @@ fn registration_of(tools: &[AvailableTool], name: &str) -> Option<(ToolExposure,
 
 #[test]
 fn default_plan_offers_every_enabled_builtin_tool() {
-    let enumerated = builtin_plan_tool_names(&[], false, &Default::default());
+    let enumerated = builtin_plan_tool_names(&all_builtin_paths(), false, &Default::default());
     // A minimal build compiles none of the gated builtins, so the `mut` and
     // the pushes below disappear.
     #[allow(unused_mut)]
@@ -373,7 +388,7 @@ fn unknown_builtin_names_contribute_nothing() {
 #[cfg(feature = "context-mode")]
 #[test]
 fn allowlist_selects_a_builtin_plugin_tool() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     assert_eq!(
         resolve(&names(&[CTX_EXECUTE]), &[], false, false, &available),
         names(&[CTX_EXECUTE]),
@@ -393,7 +408,7 @@ fn allowlist_selects_a_builtin_plugin_tool() {
 #[cfg(feature = "context-mode")]
 #[test]
 fn glob_allowlist_expands_over_builtin_plugin_tools() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let enabled = resolve(&names(&["ctx_*"]), &[], false, false, &available);
     assert!(
         enabled.iter().any(|name| name == CTX_EXECUTE),
@@ -412,7 +427,7 @@ fn glob_allowlist_expands_over_builtin_plugin_tools() {
 #[cfg(feature = "context-mode")]
 #[test]
 fn allowlist_and_exclude_compose_over_builtin_plugin_tools() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let enabled = resolve(
         &names(&["read", CTX_EXECUTE, CTX_SEARCH]),
         &names(&[CTX_SEARCH]),
@@ -432,7 +447,7 @@ fn allowlist_and_exclude_compose_over_builtin_plugin_tools() {
 #[cfg(feature = "context-mode")]
 #[test]
 fn exclude_only_drops_exactly_the_named_tool() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     // A denylist entry matching nothing yields the exclude-only base itself.
     let base = resolve(&[], &names(&["ghost_tool"]), false, false, &available);
     let enabled = resolve(&[], &names(&[CTX_EXECUTE]), false, false, &available);
@@ -481,7 +496,7 @@ fn exclude_only_drops_exactly_the_named_tool() {
 #[cfg(feature = "context-mode")]
 #[test]
 fn no_builtin_tools_keeps_plugin_tools_and_drops_core_tools() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let enabled = resolve(&[], &[], false, true, &available);
 
     assert!(
@@ -583,7 +598,7 @@ fn no_builtin_tools_keeps_plugin_tools_and_drops_core_tools() {
 /// wildcard, `?` is literal, matching is case-sensitive.
 #[test]
 fn patterns_are_star_only_and_case_sensitive() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     // Sanity: the same shape resolves when it is the plain name, so the empty
     // results below are the matcher's doing, not a missing tool.
     assert_eq!(
@@ -628,7 +643,7 @@ fn patterns_are_star_only_and_case_sensitive() {
 
 #[test]
 fn unknown_names_are_still_dropped_silently() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let enabled = resolve(&names(&["ghost_tool"]), &[], false, false, &available);
     assert!(
         enabled.is_empty(),
@@ -638,7 +653,7 @@ fn unknown_names_are_still_dropped_silently() {
 
 #[test]
 fn tool_list_shape_errors_keep_their_text() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let error = resolve_tool_selection(
         None,
         &names(&["read", "-write"]),
@@ -672,7 +687,7 @@ fn tool_list_shape_errors_keep_their_text() {
 
 #[test]
 fn no_tools_disables_every_name_known_or_plugin() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let enabled = resolve(&[], &[], true, false, &available);
     assert!(
         enabled.is_empty(),
@@ -682,7 +697,7 @@ fn no_tools_disables_every_name_known_or_plugin() {
 
 #[test]
 fn no_flags_resolve_to_no_selection() {
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     assert!(
         resolve_tool_selection(
             None,
@@ -704,7 +719,7 @@ fn the_request_gate_matches_the_resolver_unchanged_return() {
     // The interactive host skips the (non-free) plugin enumeration behind
     // this gate, so it must agree exactly with the resolver's own
     // unchanged-selection return for every input shape.
-    let available = interactive_available(&[], false);
+    let available = interactive_available(&all_builtin_paths(), false);
     let read_selection = names(&["read"]);
     let mine: &[String] = &read_selection;
     let none: &[String] = &[];
@@ -781,8 +796,8 @@ fn no_mcp_drops_the_aggregate_mcp_resource_tools() {
     let disabled: std::collections::BTreeSet<String> = pir::plugins::disabled_from_flags(true)
         .into_iter()
         .collect();
-    let with_mcp = builtin_plan_tool_names(&[], false, &Default::default());
-    let without_mcp = builtin_plan_tool_names(&[], false, &disabled);
+    let with_mcp = builtin_plan_tool_names(&all_builtin_paths(), false, &Default::default());
+    let without_mcp = builtin_plan_tool_names(&all_builtin_paths(), false, &disabled);
     let resource_tools = pir::mcp::registry::MCP_RESOURCE_TOOLS;
     // Server tools (`mcp__<server>__<tool>`) exist only after discovery, so
     // the aggregate resource tools are the mcp builtin's static tool names.
@@ -831,7 +846,7 @@ fn builtin_tool_names_are_not_core_names() {
         registry.remove_exposure(ToolExposure::Hidden);
         registry
     };
-    for name in builtin_plan_tool_names(&[], false, &Default::default()) {
+    for name in builtin_plan_tool_names(&all_builtin_paths(), false, &Default::default()) {
         assert!(
             registry.get(&name).is_none(),
             "`{name}` is a plugin tool, not a core tool"

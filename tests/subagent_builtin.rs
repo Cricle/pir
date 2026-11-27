@@ -2207,16 +2207,19 @@ fn subagent_builtin_is_registered_and_replaceable() {
 fn loader_enables_builtins_by_default_with_settings_exclusion() {
     // Default: every factory builtin is on the path plan without -e.
     let ordered = pir::plugins::order_extension_paths(&[], &[], false);
+    // The default plan is `subagent`, `mode`, `todo`; `mcp` is default-off now
+    // (see the `pir-builtins` crate docs), so this fixture uses `todo` as the
+    // second default-on builtin instead.
     assert!(ordered.contains(&PathBuf::from("builtin:subagent")));
-    assert!(ordered.contains(&PathBuf::from("builtin:mcp")));
+    assert!(ordered.contains(&PathBuf::from("builtin:todo")));
 
-    // Exclusion: disabledBuiltinExtensions (the --no-mcp pattern) removes it
-    // even when the default enablement added it.
+    // Exclusion: disabledBuiltinExtensions removes a builtin even when the
+    // default enablement added it.
     let mut disabled = std::collections::BTreeSet::new();
     disabled.insert("subagent".to_owned());
     let filtered = pir::plugins::filter_disabled_builtins(&ordered, &disabled);
     assert!(!filtered.contains(&PathBuf::from("builtin:subagent")));
-    assert!(filtered.contains(&PathBuf::from("builtin:mcp")));
+    assert!(filtered.contains(&PathBuf::from("builtin:todo")));
 
     // --no-extensions keeps only CLI paths (an explicit -e still loads).
     let cli_only =

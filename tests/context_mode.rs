@@ -257,7 +257,14 @@ fn builtin_factory_list_carries_context_mode() {
     );
     let definition =
         pir::plugins::builtin::builtin_extension_def("context-mode").expect("definition");
-    assert!(definition.default_enabled);
+    // `context-mode` is compiled in and instantiable, but NOT default-on: its
+    // twelve `ctx_*` tools were 48% of the `tools[]` schema and produced zero
+    // calls in six measured runs. A session opts in with `-e
+    // builtin:context-mode`, a settings entry, or a `--tools ctx_*` selection.
+    assert!(
+        !definition.default_enabled,
+        "context-mode is default-off; the factory list still carries it"
+    );
     assert!(definition.replaceable);
 }
 

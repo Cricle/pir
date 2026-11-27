@@ -630,7 +630,23 @@ async fn run_shell_command(
     if shell.stdin_transport() {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            let _ = stdin.write_all(command.as_bytes()).await;
+            // The command is the stdin payload on this transport (`bash -s`,
+            // the legacy WSL path). A failed write means it never ran; a
+            // `bash -s` that hits EOF first exits 0 silently, which must not
+            // be reported as a successful empty run.
+            if let Err(error) = stdin.write_all(command.as_bytes()).await {
+                // `ShellTreeKill`'s `Drop` terminates the tree when this early
+                // return leaves the function.
+                return BashResult {
+                    output: format!(
+                        "Command failed: could not deliver the command to the shell's stdin: {error}"
+                    ),
+                    exit_code: None,
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                };
+            }
             let _ = stdin.shutdown().await;
         }
     }

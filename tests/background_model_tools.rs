@@ -1,19 +1,19 @@
-//! Model-facing background-call control tools (`background_status` /
-//! `background_abort`): the provider-visible surface over a host's background
+//! Model-facing background-call control tools (`bg_status` /
+//! `bg_abort`): the provider-visible surface over a host's background
 //! registry.
 //!
 //! Coverage:
 //! 1. A bare `ToolContext` (`session_env: None`): the tools answer the
 //!    registry-less text (a legal host shape, never an error), and
-//!    `background_abort` still enforces its argument contract.
+//!    `bg_abort` still enforces its argument contract.
 //! 2. An injected [`BackgroundControl`]: the status JSON shape
 //!    (`callId`/`toolName`/`parentToolCallId`/`count`) and the abort
 //!    semantics (single id, unknown id as a successful no-op, `all: true`).
 //! 3. Registration/visibility: both tools are registered, model-visible
 //!    (`Direct` exposure), default-active, and listed in `CORE_TOOL_NAMES`.
 //! 4. A real `AgentSession` with a scripted provider: a `background: true`
-//!    bash-shaped call is visible through `background_status` and is actually
-//!    cancelled through `background_abort` (the session adapter is wired).
+//!    bash-shaped call is visible through `bg_status` and is actually
+//!    cancelled through `bg_abort` (the session adapter is wired).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -115,12 +115,12 @@ fn registry() -> ToolRegistry {
 }
 
 async fn run_status(ctx: &ToolContext) -> ToolResult {
-    let tool = registry().get("background_status").expect("registered");
+    let tool = registry().get("bg_status").expect("registered");
     tool.run(&json!({}), ctx).await
 }
 
 async fn run_abort(args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-    let tool = registry().get("background_abort").expect("registered");
+    let tool = registry().get("bg_abort").expect("registered");
     tool.run(&args, ctx).await
 }
 
@@ -183,11 +183,11 @@ async fn bare_context_reports_no_registry_and_keeps_the_argument_contract() {
     let missing_selector = run_abort(json!({}), &ctx).await;
     assert!(
         missing_selector.is_error,
-        "background_abort without a selector must be an argument error"
+        "bg_abort without a selector must be an argument error"
     );
     assert_eq!(
         missing_selector.content,
-        "background_abort requires either \"callId\" or \"all\": true"
+        "bg_abort requires either \"callId\" or \"all\": true"
     );
 
     let by_id = run_abort(json!({ "callId": "call-1" }), &ctx).await;
@@ -300,7 +300,7 @@ async fn abort_all_reports_the_cancelled_count() {
 #[test]
 fn both_tools_are_registered_model_visible_and_default_active() {
     let registry = registry();
-    for name in ["background_status", "background_abort"] {
+    for name in ["bg_status", "bg_abort"] {
         assert!(
             registry.get(name).is_some(),
             "{name} must be registered by register_core_tools"
@@ -316,7 +316,7 @@ fn both_tools_are_registered_model_visible_and_default_active() {
         );
     }
     let active = registry.active_names(None);
-    for name in ["background_status", "background_abort"] {
+    for name in ["bg_status", "bg_abort"] {
         assert!(
             active.iter().any(|active| active == name),
             "{name} must be active by default: {active:?}"
@@ -326,12 +326,47 @@ fn both_tools_are_registered_model_visible_and_default_active() {
         .into_iter()
         .map(|tool| tool.name)
         .collect();
-    for name in ["background_status", "background_abort"] {
+    for name in ["bg_status", "bg_abort"] {
         assert!(
             declared.iter().any(|declared| declared == name),
             "{name} must appear in the model-facing tool definitions: {declared:?}"
         );
     }
+}
+
+/// The pre-rename `background_*` spelling still resolves.
+///
+/// Renaming a model-facing tool is not free: a settings `defaultTools` list,
+/// a `--tools` argument, a plugin handler, or a resumed transcript may all
+/// still spell the old name. Only the DECLARED name is short — the long one
+/// must keep working wherever a name is written by hand, without being
+/// re-declared (which would put it back in every request's tool array).
+#[test]
+fn legacy_background_names_still_resolve_but_are_not_declared() {
+    let registry = registry();
+    for (legacy, current) in [
+        ("background_status", "bg_status"),
+        ("background_abort", "bg_abort"),
+    ] {
+        let resolved = registry
+            .get(legacy)
+            .unwrap_or_else(|| panic!("{legacy} must still resolve to {current}"));
+        assert_eq!(resolved.name(), current);
+    }
+    // The long spelling is not part of the declared set: resolving it must not
+    // put it back into the prompt or the provider tool array.
+    let declared: Vec<String> = tool_definitions(&registry)
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    for legacy in ["background_status", "background_abort"] {
+        assert!(
+            !declared.iter().any(|name| name == legacy),
+            "{legacy} must not be re-declared: {declared:?}"
+        );
+    }
+    // An unknown name is still a plain miss.
+    assert!(registry.get("background_status_typo").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +452,7 @@ fn text_turn(text: &str) -> AssistantMessage {
 }
 
 /// Four scripted turns: start a background call, inspect it with
-/// `background_status`, cancel it with `background_abort`, then finish.
+/// `bg_status`, cancel it with `bg_abort`, then finish.
 fn scripted_stream(requests: Arc<Mutex<Vec<Vec<Message>>>>) -> SharedEventStreamFn {
     let turns = Arc::new(vec![
         assistant(
@@ -429,13 +464,13 @@ fn scripted_stream(requests: Arc<Mutex<Vec<Vec<Message>>>>) -> SharedEventStream
             StopReason::ToolUse,
         ),
         assistant(
-            vec![tool_call("call-status", "background_status", json!({}))],
+            vec![tool_call("call-status", "bg_status", json!({}))],
             StopReason::ToolUse,
         ),
         assistant(
             vec![tool_call(
                 "call-abort",
-                "background_abort",
+                "bg_abort",
                 json!({ "callId": "call-bg" }),
             )],
             StopReason::ToolUse,
@@ -521,7 +556,7 @@ async fn session_host_exposes_and_aborts_a_background_call_through_the_tools() {
     let captured = requests.lock().unwrap().clone();
     assert_eq!(captured.len(), 4, "one request per scripted turn");
 
-    // `background_status` saw the detached call: the JSON projection carries
+    // `bg_status` saw the detached call: the JSON projection carries
     // the id, the tool name and a count of one.
     let status_text = tool_result_text(&captured, "call-status");
     let status: serde_json::Value =
@@ -531,7 +566,7 @@ async fn session_host_exposes_and_aborts_a_background_call_through_the_tools() {
     assert_eq!(status["calls"][0]["toolName"], json!("parking-probe"));
     assert!(status["calls"][0]["parentToolCallId"].is_null());
 
-    // `background_abort` actually cancelled it (not merely reported zero).
+    // `bg_abort` actually cancelled it (not merely reported zero).
     let abort_text = tool_result_text(&captured, "call-abort");
     let abort: serde_json::Value =
         serde_json::from_str(&abort_text).expect("background_abort must return JSON");

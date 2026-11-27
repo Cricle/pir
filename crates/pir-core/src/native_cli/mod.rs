@@ -1,4 +1,4 @@
-//! `pir grep` / `pir sed` / `pir python` — the standalone native command
+//! `pir grep` / `pir sed` — the standalone native command
 //! surface (no agent, session, model or config load).
 //!
 //! Each command forwards its argv verbatim. The native implementation handles
@@ -17,7 +17,6 @@
 
 mod fallback;
 mod grep;
-mod python;
 mod sed;
 
 /// What a native command implementation decided.
@@ -77,39 +76,6 @@ pub fn run_sed(args: &[String]) -> crate::Result<()> {
                 fallback::exit_with(1);
             }
             fallback::exit_with(fallback::exec_with_stdin(&["sed"], &args, &bytes));
-        }
-    }
-}
-
-/// Run `pir python <args…>`.
-///
-/// The name is kept for CLI compatibility; the interpreter behind it is the
-/// embedded QuickJS runtime (`plugins/builtin/js_vm`), the same one the
-/// `python` tool and `context-mode` use. Model/script code is JavaScript.
-pub fn run_python(args: &[String]) -> crate::Result<()> {
-    let (args, disabled) = fallback::strip_control(&command_args("python", args));
-    match python::run(&args) {
-        RunOutcome::Exit(code) => fallback::exit_with(code),
-        RunOutcome::Unsupported => {
-            if disabled {
-                fallback::report_unsupported("python");
-                fallback::exit_with(2);
-            }
-            // Windows/macOS commonly ship `python3`, some installs only
-            // `python`; try both in that order (CPython's own launcher
-            // convention).
-            fallback::exit_with(fallback::exec(&["python3", "python"], &args));
-        }
-        RunOutcome::UnsupportedWithStdin(bytes) => {
-            if disabled {
-                fallback::report_unsupported("python");
-                fallback::exit_with(2);
-            }
-            fallback::exit_with(fallback::exec_with_stdin(
-                &["python3", "python"],
-                &args,
-                &bytes,
-            ));
         }
     }
 }

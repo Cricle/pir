@@ -408,11 +408,17 @@ fn run_shell_command(
     #[cfg(windows)]
     let child_pid = child.id();
     // A stdin-transport shell (legacy WSL bash) takes the command on stdin;
-    // close it so the shell sees EOF and starts.
+    // close it so the shell sees EOF and starts. A failed write means the
+    // command never reached the shell, so report "no value" instead of
+    // reading a silent-EOF exit 0 as a successful empty result.
     if config.stdin_transport() {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            let _ = stdin.write_all(command.as_bytes());
+            if stdin.write_all(command.as_bytes()).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
             drop(stdin);
         }
     }

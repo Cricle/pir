@@ -585,9 +585,15 @@ pub fn win32_relative(from: &str, to: &str, cwd: &str) -> String {
         return String::new();
     }
 
-    if from_orig.chars().count() != from_lower.chars().count()
-        || to_orig.chars().count() != to_lower.chars().count()
-    {
+    // Byte lengths, not char counts: the fast path below indexes `to_orig` with
+    // byte offsets computed on `to_lower`, so it is only sound when lowercasing
+    // preserved the byte layout. A char-count comparison misses a mapping that
+    // keeps the char count and changes the byte count — U+023A `Ⱥ` (2 bytes)
+    // lowercases to U+2C65 `ⱥ` (3 bytes), and every later byte offset then lands
+    // one byte early, slicing `to_orig` mid-codepoint and panicking. A byte
+    // comparison routes that case (and the `İ`-style length-changing cases) to
+    // the segment-based fallback below, which splits on `\` and is byte-safe.
+    if from_orig.len() != from_lower.len() || to_orig.len() != to_lower.len() {
         let mut from_split: Vec<&str> = from_orig.split('\\').collect();
         let mut to_split: Vec<&str> = to_orig.split('\\').collect();
         if from_split.last().is_some_and(|s| s.is_empty()) {

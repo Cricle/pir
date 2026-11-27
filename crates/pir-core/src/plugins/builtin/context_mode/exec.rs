@@ -343,6 +343,14 @@ Pass intent when the output may be large: stdout over 5 KiB is indexed into the 
 Use this when you intend to derive an answer FROM data and the output shape is not known before execution. Not for file editing, navigation, or short observational commands whose entire output you will read anyway."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Run JavaScript in the embedded sandbox to derive an answer from large output; \
+only stdout enters context, so filter/count/aggregate in code instead of paging files"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",
@@ -504,6 +512,14 @@ This is for analysis, not editing: use Read when you intend to edit the file or 
 Each call runs as a fresh module; an uncaught exception or nonzero exit returns the error stack. stdout/stderr are each capped at 1 MiB; default deadline 30s, max 120s. \
 Use this to know something ABOUT a file (line counts, matches, parsed structure, aggregates) without reading all of it. \
 Pass intent for a large derivation: stdout over 5 KiB is indexed and only matching section titles + snippets are returned; retrieve more with ctx_search."
+    }
+
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Analyze one file in the sandbox and print only the derivation (line counts, \
+matches, parsed structure) instead of reading the whole file into context"
+                .to_owned(),
+        )
     }
 
     fn parameters(&self) -> Option<serde_json::Value> {
@@ -1131,6 +1147,14 @@ impl AgentTool for CtxBatchExecuteTool {
 Batch related analyses in one call instead of running ctx_execute repeatedly: multi-file scans, several parses, or gather-and-query in one round trip. Only matched sections (title/source/snippet/line hints) and a one-line preview of failing scripts enter context; raw output stays in the sandbox and the database and is never echoed in full. \
 Scripts run sequentially, 1-16 per call; a failing script (uncaught exception, nonzero exit or per-script timeout) does not abort the batch — its error stack is summarized as errorPreview and the next script still runs. stdout/stderr are each capped at 1 MiB, the default per-script deadline is 30s (max 120s). `queries` is optional: at most 32, each up to 512 bytes. Each script indexes under `<source>#<label>` (or `<source>` for a single-script batch), so `ctx_search(source: ...)` can address one script; `source` defaults to a stable `batch:<hash>` label. \
 Use this when you have several analyses that would otherwise be sequential tool calls, or when you want to gather and query in one round trip. Use ctx_execute for a single script; do not use this for short observational commands whose entire output you will read anyway."
+    }
+
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Run several sandbox analyses in one call and return only the matched sections; \
+use instead of many sequential bash calls over large files"
+                .to_owned(),
+        )
     }
 
     fn parameters(&self) -> Option<serde_json::Value> {

@@ -872,7 +872,7 @@ fn declared_tool_schemas_expose_the_background_argument() {
     let definitions = declared_tool_definitions(&declared, &BTreeMap::new(), &BTreeSet::new());
     let expected = json!({
         "type": "boolean",
-        "description": "Run this call in the background: it returns immediately and the real result is delivered as a separate message once it finishes.",
+        "description": "Run in bg; the result arrives later as a message.",
     });
     assert_eq!(definitions.len(), 2);
     assert_eq!(

@@ -510,12 +510,13 @@ pub fn process_is_alive(_pid: u32) -> bool {
 
 /// Platform start token used to detect pid reuse.
 ///
-/// Delegates to [`crate::jobs::process_start_token`] rather than repeating the
-/// probe: the two used to be copies, and the copy is why macOS (no `/proc`)
-/// silently degraded to pid-only identity in *both* places. One implementation
-/// means a platform fix lands everywhere it is used.
+/// Delegates to [`crate::process_probe::process_start_token`] rather than
+/// repeating the probe: the two used to be copies, and the copy is why macOS
+/// (no `/proc`) silently degraded to pid-only identity in *both* places. One
+/// implementation means a platform fix lands everywhere it is used, and it is
+/// shared with the `jobs` supervisor without depending on that feature.
 pub fn process_start_token(pid: u32) -> Option<u64> {
-    crate::jobs::process_start_token(pid)
+    crate::process_probe::process_start_token(pid)
 }
 
 /// Why a session is scheduled for deletion.

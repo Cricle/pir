@@ -214,8 +214,8 @@ async fn provider_registry_runs_real_multi_turn_tool_workflow() {
         assert_eq!(requests.len(), 3);
         let schema = requests[0]["tools"].as_array().unwrap();
         // Core tools: read/bash/edit/write/grep/find/ls + powershell, plus the
-        // two model-facing background-call controls (background_status /
-        // background_abort) registered by `register_core_tools`.
+        // two model-facing background-call controls (bg_status / bg_abort)
+        // registered by `register_core_tools`.
         let mut names: Vec<&str> = schema
             .iter()
             .filter_map(|tool| tool["function"]["name"].as_str())
@@ -224,9 +224,9 @@ async fn provider_registry_runs_real_multi_turn_tool_workflow() {
         assert_eq!(
             names,
             [
-                "background_abort",
-                "background_status",
                 "bash",
+                "bg_abort",
+                "bg_status",
                 "edit",
                 "find",
                 "grep",

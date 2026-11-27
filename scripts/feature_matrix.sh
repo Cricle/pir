@@ -3,7 +3,7 @@
 # bin profiles must run.
 #
 # Rows (count is asserted below so this comment cannot drift):
-#   core   59 library rows: the boundary cases `docs/FEATURES.md` promises first
+#   core   61 library rows: the boundary cases `docs/FEATURES.md` promises first
 #          (bare minimal core, minimal + CLI, tui/extensions/...), then each
 #          non-provider feature alone — every selectable feature in Cargo.toml
 #          except `default`/`full` has its own row (including the seven
@@ -77,7 +77,7 @@
 #          pulls sibling suites that need `tui`/`extensions`.
 #          `smoke(cli,tool-read)` pins the partial build: `read` is available
 #          while every other leaf reports its own missing feature.
-#   TOTAL 123 cargo invocations (87 root-package rows + 36 support-crate rows).
+#   TOTAL 125 cargo invocations (89 root-package rows + 36 support-crate rows).
 #
 # It runs in the cargo target dir the caller selects (`CARGO_TARGET_DIR`,
 # default `target-alt`); lanes run it in their own `target-lane-*` dir so an
@@ -132,6 +132,8 @@ CONFIGS=(
   "export-html|--features export-html"
   "session|--features session"
   "skills|--features skills"
+  "jobs|--features jobs"
+  "checkpoint-cli|--features checkpoint-cli"
   "sdk|--features sdk"
   "provider-openai|--features provider-openai"
   "provider-anthropic|--features provider-anthropic"
@@ -198,7 +200,7 @@ SMOKE_CONFIGS=(
 # a row added without updating the header (or a stale header) fails the gate
 # before it spends any time compiling. The consumer count is asserted in the
 # consumer phase below (its glob is only known there).
-EXPECTED_LIB_ROWS=59
+EXPECTED_LIB_ROWS=61
 EXPECTED_BIN_ROWS=18
 EXPECTED_CONSUMER_ROWS=2
 EXPECTED_SMOKE_ROWS=8

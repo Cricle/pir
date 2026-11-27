@@ -5,13 +5,15 @@ keeps the historical tool loadout, unlimited tool-result text, compaction
 thresholds, and turn limits unchanged.
 
 > **The balanced default tool loadout is a documented SUPERSET of upstream pi.**
-> With no `--tools` / `settings.defaultTools`, a full build declares **24
-> tools** (nine registration-active core tools plus 15 default-active builtin
-> tools), where upstream pi's implicit set is four (`read`, `bash`, `edit`,
-> `write`). The extra five core tools are pir capabilities (in-process
-> grep/find, `ls`, the scheduler-owned background controls) and the builtins
-> are the default-on extension layer; the declaration costs ~+33 KB of
-> `tools[]` JSON (~+8.3k tokens) on the first request.
+> With no `--tools` / `settings.defaultTools`, a full build declares the
+> registration-active core nine plus the default-active builtin tools (the 15
+> listed in [`FEATURES.md`](FEATURES.md) §3.1; the former `python` builtin was
+> removed, so the pre-removal "24 tools / ~+33 KB / ~+8.3k tokens" figures are
+> one tool higher than the current build), where upstream pi's implicit set is
+> four (`read`, `bash`, `edit`, `write`). The extra five core tools are pir
+> capabilities (in-process grep/find, `ls`, the scheduler-owned background
+> controls) and the builtins are the default-on extension layer; the recorded
+> cost is ~+33 KB of `tools[]` JSON (~+8.3k tokens) on the first request.
 > [`FEATURES.md`](FEATURES.md) §3.1 is the canonical list, rationale and
 > measurement. `efficient` (below) and `--tools read,bash,edit,write` both
 > select the upstream four; `--no-extensions` leaves the core nine; no tool

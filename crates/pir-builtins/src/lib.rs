@@ -7,7 +7,21 @@
 //!
 //! The order matches the historical in-core table: `subagent, mode, mcp,
 //! codemode, context-mode, tool-search, tool-repair, todo, memory, phone`.
-//! `phone` is default-off (it binds a local port and holds a server task).
+//!
+//! ## The default plan is deliberately small
+//!
+//! Only `todo`, `subagent` and `mode` are default-on. Everything else —
+//! `mcp`, `codemode`, `context-mode`, `tool-search`, `tool-repair`, `memory`,
+//! `phone` — is default-off and joins a session only when something names it
+//! (`-e builtin:<name>`, `settings.extensions`, `+builtin:<name>`, or the
+//! `--tools` selection for a tool it registers). The reason is a measured one:
+//! the full plan declared 25 tools at 39,530 bytes of `tools[]` schema against
+//! upstream's 4 tools / 2,527 bytes, and 48% of that payload was the twelve
+//! `ctx_*` tools, which produced **zero** calls across six measured runs of a
+//! read-and-edit task. Paying for that much schema on every request to expose
+//! tools the model declines is the cost this default avoids. `phone` was
+//! already default-off for its own reason (it binds a local port and holds a
+//! server task).
 //!
 //! ## Two projections of one table
 //!
@@ -46,7 +60,7 @@ pub struct KnownBuiltin {
 
 /// Every builtin this workspace knows about, in registration order, regardless
 /// of which features are enabled.
-pub const KNOWN_BUILTINS: [KnownBuiltin; 11] = [
+pub const KNOWN_BUILTINS: [KnownBuiltin; 10] = [
     KnownBuiltin {
         name: "subagent",
         host_feature: "subagent",
@@ -62,40 +76,31 @@ pub const KNOWN_BUILTINS: [KnownBuiltin; 11] = [
     KnownBuiltin {
         name: "mcp",
         host_feature: "mcp",
-        default_enabled: true,
+        default_enabled: false,
         feature: "mcp",
     },
     KnownBuiltin {
         name: "codemode",
         host_feature: "extensions",
-        default_enabled: true,
+        default_enabled: false,
         feature: "codemode",
-    },
-    // The `python` builtin keeps its Settings/tool-selection name, but the
-    // interpreter behind it is the embedded QuickJS runtime (the RustPython
-    // surface was removed), so it rides the engine's `python` feature.
-    KnownBuiltin {
-        name: "python",
-        host_feature: "python",
-        default_enabled: true,
-        feature: "python",
     },
     KnownBuiltin {
         name: "context-mode",
         host_feature: "context-mode",
-        default_enabled: true,
+        default_enabled: false,
         feature: "context-mode",
     },
     KnownBuiltin {
         name: "tool-search",
         host_feature: "tool-search",
-        default_enabled: true,
+        default_enabled: false,
         feature: "tool-search",
     },
     KnownBuiltin {
         name: "tool-repair",
         host_feature: "tool-repair",
-        default_enabled: true,
+        default_enabled: false,
         feature: "tool-repair",
     },
     KnownBuiltin {
@@ -107,7 +112,7 @@ pub const KNOWN_BUILTINS: [KnownBuiltin; 11] = [
     KnownBuiltin {
         name: "memory",
         host_feature: "memory",
-        default_enabled: true,
+        default_enabled: false,
         feature: "memory",
     },
     KnownBuiltin {
@@ -126,13 +131,6 @@ pub fn known(name: &str) -> Option<KnownBuiltin> {
 /// The factory for one builtin, or `None` when this build disabled its
 /// feature. The match is exhaustive on purpose: a row added to
 /// [`KNOWN_BUILTINS`] without a factory (or vice versa) fails to compile.
-///
-/// `python` is the one row with no factory here: its implementation
-/// (`pir-core`'s `plugins::builtin::python`) depends on the engine's agent and
-/// plugin traits, which this crate cannot reach. `pir-core` owns that factory
-/// and its `BUILTIN_EXTENSION_FACTORIES` table; this catalog keeps the row so
-/// `known()` can still explain a build that left the feature off, and
-/// `descriptors()` simply omits it (it has no factory to project).
 fn factory_for(name: &str) -> Option<pir_plugin_api::BuiltinPluginFactory> {
     match name {
         #[cfg(feature = "subagent")]
@@ -163,9 +161,8 @@ fn factory_for(name: &str) -> Option<pir_plugin_api::BuiltinPluginFactory> {
 ///
 /// The descriptor's order, `replaceable` flag, default-enable flag and host
 /// feature all come from [`KNOWN_BUILTINS`]; only the factory is decided by the
-/// feature gates. A row this crate owns no factory for (`python`, see
-/// [`factory_for`]) is skipped: its factory lives in `pir-core`, which keeps
-/// the authoritative table for the engine's own builtins.
+/// feature gates. A row with no factory here is skipped; `pir-core` keeps the
+/// authoritative factory table for the engine's own builtins.
 pub fn descriptors() -> Vec<BuiltinDescriptor> {
     KNOWN_BUILTINS
         .iter()
@@ -187,7 +184,8 @@ pub fn names() -> Vec<&'static str> {
     descriptors().iter().map(|entry| entry.name).collect()
 }
 
-/// Names the default plan enables (everything except `phone`).
+/// Names the default plan enables: `todo`, `subagent`, `mode`. Every other
+/// builtin joins a session only when something names it explicitly.
 pub fn default_names() -> Vec<&'static str> {
     descriptors()
         .into_iter()
