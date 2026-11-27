@@ -1416,14 +1416,34 @@ fn finish_loaded_session(
 /// out and reported "a zero-byte transient must not be read as a new empty
 /// session", while passing locally in 0.05 s.
 ///
-/// Widening it stays safe in the other direction: the only caller-visible
-/// difference is that `open` over a GENUINELY empty file (the documented
-/// `open`/`--session` empty-file case) now waits ~500 ms instead of ~50 ms
-/// before initializing it as a new session. That is a one-time cost on an
-/// empty session file, and it buys the guarantee this retry exists for: never
-/// overwrite another writer's transcript with a fresh header.
+/// Spending the whole budget on every zero-byte file is not acceptable: an
+/// `open` over a GENUINELY empty session file measured 596 ms with a flat
+/// 100-attempt loop, a 12x startup regression on the `open`/`--session`
+/// empty-file case. The retry therefore only waits while the file still looks
+/// like it is being written (see `TRANSIENT_EMPTY_MTIME_GRACE`); a zero-byte
+/// file whose mtime is already older than that is returned as the documented
+/// empty session on the FIRST observation.
 const EMPTY_SESSION_READ_ATTEMPTS: usize = 100;
 const EMPTY_SESSION_READ_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How recently a zero-byte session file must have been modified for the
+/// reader to treat it as a transient rather than a genuinely empty file.
+///
+/// This is the only thing that keeps the widened retry budget from costing
+/// every empty-file `open` the full ~500 ms. A competing writer that has just
+/// created the name (the `create_new`-then-write path) or a filesystem that
+/// has just exposed a rename target leaves an mtime within this window, so the
+/// retry runs. A file untouched for longer than this cannot still be mid-write
+/// by a writer that has been observed doing nothing for that long, so the
+/// reader stops immediately.
+///
+/// 2 s is deliberately generous: mtime granularity on FAT/NTFS is coarse
+/// (2 s in the worst FAT case) and a container clock can lag, so a tighter
+/// window would misclassify a real transient on exactly the filesystems this
+/// guard exists for. The cost of being generous is only that an empty file
+/// created less than 2 s ago pays the retry once; the cost of being tight is
+/// the data-loss bug this whole function prevents.
+const TRANSIENT_EMPTY_MTIME_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`load_entries_from_file`] with a bounded retry while the file is observed
 /// as ZERO BYTES.
@@ -1457,10 +1477,41 @@ fn load_entries_retrying_transient_empties(path: &Path) -> crate::Result<LoadedS
         if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0) {
             return load_entries_from_file(path);
         }
+        // Only a file that still looks ACTIVE is worth waiting for. Without
+        // this check a genuinely empty session file pays the whole budget
+        // (measured: 596 ms), which is a 12x regression on the documented
+        // empty-file `open`. `metadata` errors fall through to the retry: an
+        // unreadable path is not evidence that the file is settled.
+        if !looks_like_a_write_in_progress(path) {
+            return Ok(loaded);
+        }
         std::thread::sleep(EMPTY_SESSION_READ_DELAY);
         loaded = load_entries_from_file(path)?;
     }
     Ok(loaded)
+}
+
+/// Whether a zero-byte session file was modified recently enough that a
+/// competing writer could still be filling it.
+///
+/// `false` means the file has been sitting at zero bytes for longer than
+/// [`TRANSIENT_EMPTY_MTIME_GRACE`], which no mid-write path produces; the
+/// caller then treats it as the documented empty session instead of waiting
+/// out the full retry budget.
+///
+/// A missing/unreadable mtime returns `true` (keep retrying): the whole point
+/// of the retry is to not misjudge a file it cannot observe, and the retry is
+/// still bounded, so the failure mode stays "one bounded delay", never a hang.
+fn looks_like_a_write_in_progress(path: &Path) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return true;
+    };
+    match std::time::SystemTime::now().duration_since(modified) {
+        // A future mtime (clock skew, a container sharing the host volume)
+        // is not evidence of inactivity.
+        Ok(age) => age <= TRANSIENT_EMPTY_MTIME_GRACE,
+        Err(_) => true,
+    }
 }
 
 /// Read and validate only the first parseable line of a session file

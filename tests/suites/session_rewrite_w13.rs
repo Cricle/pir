@@ -362,14 +362,22 @@ fn open_retries_a_transient_zero_byte_file_instead_of_reinitializing() {
             //
             // The 10 ms is NOT a synchronization primitive and must not be
             // read as one: it only has to be long enough for `open` to observe
-            // the zero-byte name at least once. What actually makes the test
-            // deterministic is `EMPTY_SESSION_READ_ATTEMPTS` in
-            // `session_manager`: its ~500 ms budget is what absorbs this
-            // delay, so a slow runner that takes 300 ms to read the path still
-            // lands on the transcript. Measured before that budget was
-            // widened: 10 x 5 ms = 50 ms lost the race on CI (this exact
-            // assertion failed) while passing locally in 0.05 s, and a
-            // 300 ms writer delay reproduces the CI failure on demand.
+            // the zero-byte name at least once. Two things in
+            // `session_manager` make the outcome deterministic:
+            //
+            // - the file was written by THIS thread microseconds ago, so
+            //   `looks_like_a_write_in_progress` reports `true` and the retry
+            //   actually runs (an empty file older than the mtime grace is
+            //   returned at once, which is why the empty-file `open` costs
+            //   ~26 ms instead of the full budget);
+            // - `EMPTY_SESSION_READ_ATTEMPTS` gives that retry ~500 ms, so a
+            //   slow runner that takes 300 ms to publish still lands on the
+            //   transcript.
+            //
+            // Measured before the budget was widened: 10 x 5 ms = 50 ms lost
+            // the race on CI (this exact assertion failed) while passing
+            // locally in 0.05 s, and a 300 ms writer delay reproduces the CI
+            // failure on demand.
             let _ = wait.recv();
             std::thread::sleep(Duration::from_millis(10));
             std::fs::rename(&payload_path, &path).expect("publish transcript");
