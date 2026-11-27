@@ -14,17 +14,17 @@ include = ["/Cargo.toml", "/README.md", "/src/**", "/tests/**"]
 unsafe_code = "deny"
 
 [dependencies]
-pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
-pir-builtin-subagent = { path = "../pir-builtin-subagent", version = "0.3.2", optional = true }
-pir-builtin-mode = { path = "../pir-builtin-mode", version = "0.3.2", optional = true }
-pir-builtin-mcp = { path = "../pir-builtin-mcp", version = "0.3.2", optional = true }
-pir-builtin-codemode = { path = "../pir-builtin-codemode", version = "0.3.2", optional = true }
-pir-builtin-context-mode = { path = "../pir-builtin-context-mode", version = "0.3.2", optional = true }
-pir-builtin-tool-search = { path = "../pir-builtin-tool-search", version = "0.3.2", optional = true }
-pir-builtin-tool-repair = { path = "../pir-builtin-tool-repair", version = "0.3.2", optional = true }
-pir-builtin-todo = { path = "../pir-builtin-todo", version = "0.3.2", optional = true }
-pir-builtin-memory = { path = "../pir-builtin-memory", version = "0.3.2", optional = true }
-pir-builtin-phone = { path = "../pir-builtin-phone", version = "0.3.2", optional = true }
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.3" }
+pir-builtin-subagent = { path = "../pir-builtin-subagent", version = "0.3.3", optional = true }
+pir-builtin-mode = { path = "../pir-builtin-mode", version = "0.3.3", optional = true }
+pir-builtin-mcp = { path = "../pir-builtin-mcp", version = "0.3.3", optional = true }
+pir-builtin-codemode = { path = "../pir-builtin-codemode", version = "0.3.3", optional = true }
+pir-builtin-context-mode = { path = "../pir-builtin-context-mode", version = "0.3.3", optional = true }
+pir-builtin-tool-search = { path = "../pir-builtin-tool-search", version = "0.3.3", optional = true }
+pir-builtin-tool-repair = { path = "../pir-builtin-tool-repair", version = "0.3.3", optional = true }
+pir-builtin-todo = { path = "../pir-builtin-todo", version = "0.3.3", optional = true }
+pir-builtin-memory = { path = "../pir-builtin-memory", version = "0.3.3", optional = true }
+pir-builtin-phone = { path = "../pir-builtin-phone", version = "0.3.3", optional = true }
 
 [features]
 default = ["full"]

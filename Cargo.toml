@@ -257,8 +257,8 @@ required-features = ["sdk"]
 # The facade proper: the engine plus (optionally) the terminal front end.
 # Every feature below forwards to these crates; the facade adds no
 # dependencies of its own beyond what the `pir` binary needs to bootstrap.
-pir-core = { path = "crates/pir-core", version = "0.3.2", default-features = false }
-pir-tui = { path = "crates/pir-tui", version = "0.3.2", optional = true }
+pir-core = { path = "crates/pir-core", version = "0.3.3", default-features = false }
+pir-tui = { path = "crates/pir-tui", version = "0.3.3", optional = true }
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "fs", "process", "signal"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }
@@ -727,7 +727,7 @@ resolver = "2"
 # Keep the spelling exactly `version = "x.y.z[-PRERELEASE]"` on one line: the
 # release workflow parses this section (prereleases like `0.3.2-rc.1` are valid).
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 # Language/toolchain contract for the whole workspace. Every member inherits
 # these via `edition.workspace = true` / `rust-version.workspace = true`, so a
 # bump is one edit here instead of twenty.

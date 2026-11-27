@@ -7027,7 +7027,7 @@ dependencies = [
 
 [[package]]
 name = "pir-ai-types"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -7045,14 +7045,14 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-codemode"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
 ]
 
 [[package]]
 name = "pir-builtin-context-mode"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "serde_json",
@@ -7060,21 +7060,21 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-mcp"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
 ]
 
 [[package]]
 name = "pir-builtin-memory"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
 ]
 
 [[package]]
 name = "pir-builtin-mode"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "serde",
@@ -7083,7 +7083,7 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-phone"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "serde",
@@ -7092,7 +7092,7 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-subagent"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "serde_json",
@@ -7101,7 +7101,7 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-todo"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "serde",
@@ -7110,7 +7110,7 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-tool-repair"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "regex",
@@ -7120,7 +7120,7 @@ dependencies = [
 
 [[package]]
 name = "pir-builtin-tool-search"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-plugin-api",
  "serde_json",
@@ -7130,7 +7130,7 @@ dependencies = [
 
 [[package]]
 name = "pir-builtins"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-builtin-codemode",
  "pir-builtin-context-mode",
@@ -7147,7 +7147,7 @@ dependencies = [
 
 [[package]]
 name = "pir-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -7228,7 +7228,7 @@ dependencies = [
 
 [[package]]
 name = "pir-durable"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "futures-util",
  "memchr",
@@ -7247,7 +7247,7 @@ dependencies = [
 
 [[package]]
 name = "pir-native-shell"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -7264,7 +7264,7 @@ dependencies = [
 
 [[package]]
 name = "pir-phone-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -7291,7 +7291,7 @@ dependencies = [
 
 [[package]]
 name = "pir-plugin-api"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -7299,7 +7299,7 @@ dependencies = [
 
 [[package]]
 name = "pir-protocol"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ciborium",
  "serde",
@@ -7309,7 +7309,7 @@ dependencies = [
 
 [[package]]
 name = "pir-sdk"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -7387,7 +7387,7 @@ dependencies = [
 
 [[package]]
 name = "pir-telemetry"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "pir-telemetry",
  "serde_json",
@@ -7396,7 +7396,7 @@ dependencies = [
 
 [[package]]
 name = "pir-tui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arboard",

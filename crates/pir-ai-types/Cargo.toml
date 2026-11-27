@@ -16,7 +16,7 @@ unsafe_code = "deny"
 [dependencies]
 anyhow = "1"
 futures-util = "0.3"
-pir-telemetry = { path = "../pir-telemetry", version = "0.3.2" }
+pir-telemetry = { path = "../pir-telemetry", version = "0.3.3" }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form"] }
 serde = { version = "1", features = ["derive", "rc"] }
