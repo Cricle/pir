@@ -164,8 +164,16 @@ pub mod env_client;
 // the one question `std` cannot answer portably, shared by the session append
 // cache's staleness check and the spill-file exception in the coding agent.
 pub mod file_identity;
+// Cross-platform process identity probes (start token + liveness). Shared by
+// the session lock and the `jobs` supervisor, so it stays in the always-on
+// core: a recycled pid must never be signalled, and the session lock needs
+// that guarantee even when the `jobs` feature is off.
+pub mod process_probe;
 // Persistent cross-process background jobs (P0-2): a detached supervisor
 // records command/status/pid/exit-code under `<agent-dir>/jobs/<job-id>/`.
+// Feature-gated: `pir jobs` and the supervisor half go away without it, while
+// the shared start-token probe above keeps the session lock intact.
+#[cfg(feature = "jobs")]
 pub mod jobs;
 // The structured Node/npm runtime surface (C-ABI bridge host ops). It used to
 // be a separate `pir-node` workspace crate, but an unpublished path dependency

@@ -1,6 +1,13 @@
-//! Model-facing background tool-call control: `background_status` and
-//! `background_abort` (the user-approved provider-visible surface; see
+//! Model-facing background tool-call control: `bg_status` and `bg_abort`
+//! (the user-approved provider-visible surface; see
 //! `TOOL-BACKGROUND-SCOPE.md` §"边界与开放项").
+//!
+//! The names are short on purpose. Every declared tool name is echoed twice
+//! per request — in the `<tools>` prompt listing and in the provider's tool
+//! array — and the long `background_*` prefix bought nothing the tool's own
+//! description does not say. [`LEGACY_STATUS_NAME`] / [`LEGACY_ABORT_NAME`]
+//! are still recognized as arguments and in `--tools` lists so an existing
+//! settings file or a resumed transcript keeps working.
 //!
 //! Both tools read and act through [`ToolContext::session_env`]'s
 //! `background` handle, so the same implementations serve the session host
@@ -11,15 +18,35 @@
 use crate::agent::tool_batch::ToolResult;
 use crate::agent::tool_execution::{AgentTool, BoxFuture, ToolContext};
 
+/// The status tool's model-facing name.
+pub const STATUS_TOOL_NAME: &str = "bg_status";
+/// The abort tool's model-facing name.
+pub const ABORT_TOOL_NAME: &str = "bg_abort";
+/// The pre-rename name of the status tool, still accepted where a tool name
+/// is written by hand (a settings `defaultTools` list, `--tools`, a resumed
+/// transcript).
+pub const LEGACY_STATUS_NAME: &str = "background_status";
+/// The pre-rename name of the abort tool (same reason).
+pub const LEGACY_ABORT_NAME: &str = "background_abort";
+
+/// Whether `name` names the status tool under either spelling.
+pub fn is_status_name(name: &str) -> bool {
+    name == STATUS_TOOL_NAME || name == LEGACY_STATUS_NAME
+}
+
+/// Whether `name` names the abort tool under either spelling.
+pub fn is_abort_name(name: &str) -> bool {
+    name == ABORT_TOOL_NAME || name == LEGACY_ABORT_NAME
+}
+
 /// The exact answer for a host without a background registry (session-less
 /// tool execution, a bare embedder). A legal host shape, never an error: the
 /// model learns the surface is absent instead of seeing a fabricated empty
 /// list.
 pub const NO_BACKGROUND_REGISTRY: &str = "No background call registry in this host.";
 
-/// The argument error of `background_abort` when neither selector is given.
-const ABORT_REQUIRES_SELECTOR: &str =
-    "background_abort requires either \"callId\" or \"all\": true";
+/// The argument error of `bg_abort` when neither selector is given.
+const ABORT_REQUIRES_SELECTOR: &str = "bg_abort requires either \"callId\" or \"all\": true";
 
 /// The model-facing status tool.
 pub struct BackgroundStatusTool;
@@ -29,7 +56,7 @@ pub struct BackgroundAbortTool;
 
 impl AgentTool for BackgroundStatusTool {
     fn name(&self) -> &'static str {
-        "background_status"
+        STATUS_TOOL_NAME
     }
 
     fn description(&self) -> &'static str {
@@ -81,7 +108,7 @@ impl AgentTool for BackgroundStatusTool {
 
 impl AgentTool for BackgroundAbortTool {
     fn name(&self) -> &'static str {
-        "background_abort"
+        ABORT_TOOL_NAME
     }
 
     fn description(&self) -> &'static str {
@@ -96,7 +123,7 @@ impl AgentTool for BackgroundAbortTool {
         Some(serde_json::json!({
             "type": "object",
             "properties": {
-                "callId": { "type": "string", "description": "Provider tool-call id to abort (from background_status)" },
+                "callId": { "type": "string", "description": "Provider tool-call id to abort (from bg_status)" },
                 "all": { "type": "boolean", "description": "Abort every in-flight background call (default: false)" }
             }
         }))

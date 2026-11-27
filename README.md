@@ -29,6 +29,12 @@ skipped) and 33 doctests (0 failed, 7 ignored); both grow as tests are added.
 Evidence: `.play/evidence/release-v032/` (`summary.txt`, `gates.log`; local
 working material, not tracked).
 
+> The 7501/33 figures are a **snapshot of that release commit**, not a live
+> count of the current tree. They go stale the moment a test lands, and they are
+> deliberately not re-measured on every edit — the release gate re-measures them
+> on the tag. For a rough current size, `cargo nextest list` (or `cargo test
+> -- --list` per harness) is the authority; anything quoted here is historical.
+
 ## Building
 
 ```bash

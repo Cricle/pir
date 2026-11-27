@@ -285,10 +285,16 @@ fn render_rules_section(tools: &[ToolInfo], rule_options: PromptRuleOptions) -> 
         }
     }
     if has_read && has_edit_or_write {
-        add_rule(
-            "Read an existing file before editing it, and read it completely (no offset/limit) before overwriting it with write; after your own successful write/edit you do not need to re-read it unless the tool reports an external change",
-            &mut rules,
-        );
+        // There is deliberately NO read-before-write rule here. Upstream pi has
+        // none: its `read` guidance is just "Use read to examine files instead
+        // of cat or sed", and the model chooses offset/limit itself. A pir-only
+        // "read it completely (no offset/limit) before overwriting" bullet made
+        // a measured bug hunt read whole files (a 48 KB test file and a 35 KB
+        // source file) and pushed 202 KB of tool output into the transcript,
+        // crossing the compaction threshold repeatedly. The safety the bullet
+        // was meant to give is already enforced in code, not prose:
+        // `ReadBeforeEditMode` (default `edit-partial`) refuses writes to a file
+        // the model never read, and warns when the read was partial.
         add_rule(
             "Pass literal filesystem paths to read/edit/write; never use shell substitutions such as $(pwd) or backticks in path arguments",
             &mut rules,

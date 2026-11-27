@@ -312,7 +312,17 @@ pub fn run(
     let mut child = spawn(&request, &program, &args, stdin_command.is_some())
         .map_err(|error| Failure::new("spawn_error", error.to_string()))?;
     if let (Some(command), Some(mut stdin)) = (stdin_command, child.stdin.take()) {
-        let _ = stdin.write_all(command.as_bytes());
+        // The command is the stdin payload on a `-s` shell; a failed write
+        // means it never ran, so report the spawn failure instead of letting
+        // a silent-EOF shell exit 0 for a command that never executed.
+        if let Err(error) = stdin.write_all(command.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Failure::new(
+                "spawn_error",
+                format!("could not deliver the command to the shell's stdin: {error}"),
+            ));
+        }
     }
     let pid = child.id();
     groups

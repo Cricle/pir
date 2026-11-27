@@ -40,12 +40,17 @@ Out-of-range or malformed values keep the default rather than failing open.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PIR_ALLOW_REMOTE_AGENT` | off | `false`/unset disables remote agent execution |
-| `PIR_ALLOW_REMOTE_BASH` | off | Remote bash is off by default |
+| `PIR_ALLOW_REMOTE_AGENT` | **on** | Gates whether a remote client may send a prompt at all. On by default to preserve the historical `Server::bind` behavior; set it to `false` or `0` to refuse prompt execution from remote clients |
+| `PIR_ALLOW_REMOTE_BASH` | off | When off, the bash tool is **excluded from every session's registry**, so a remote prompt can never run a shell command even if the model asks |
 | `PIR_ALLOW_PARALLEL_SIDE_EFFECTS` | off | Gates parallel side-effecting tool calls |
 
-An authenticated client that cannot execute the agent can still read and write
-session state; the gates control *execution*, not authentication.
+`PIR_ALLOW_REMOTE_AGENT` and `PIR_ALLOW_REMOTE_BASH` accept exactly `true` or `1`
+to enable; `PIR_ALLOW_PARALLEL_SIDE_EFFECTS` accepts exactly `true` or `1` too.
+Anything else (including `yes`, `on`, `2`) leaves the value off — except that
+`PIR_ALLOW_REMOTE_AGENT`'s unset default is on, so a typo there *disables*
+execution rather than enabling it. Authentication is a separate axis: an
+authenticated client that cannot execute the agent can still read and write
+session state.
 
 ## Project trust
 
@@ -67,14 +72,17 @@ projects skip project-scope discovery; user-scope resources are never gated.
 
 - `read`, `write`, and `edit` re-establish confinement against open handles so
   a rename between check and use cannot escape the workspace.
-- Spill files are owner-only and swept. The outside-workspace exemption for an
-  advertised spill path (`Full output: <path>`) is bound to the file's OS
-  **identity at creation**, not to its name: re-creating a file at a registered
-  spill path does not inherit the exemption. Identity is `(dev, ino)` on Unix
-  and the 128-bit `FILE_ID_INFO` id on Windows — the latter because both
-  `Metadata::created()` and the older 64-bit file index were measured identical
-  after a delete-then-recreate on NTFS. When no identity can be read, the path
-  is refused.
+- Spill files are created `create_new` (never following a symlink or
+  overwriting a pre-planted file in the shared temp directory) with mode `0600`
+  on Unix, and are swept. On Windows the mode flag does not apply, so a spill
+  file is only as private as the temp directory it lands in.
+- The outside-workspace exemption for an advertised spill path (`Full output:
+  <path>`) is bound to the file's OS **identity at creation**, not to its name:
+  re-creating a file at a registered spill path does not inherit the exemption.
+  Identity is `(dev, ino)` on Unix and the 128-bit `FILE_ID_INFO` id on Windows —
+  the latter because both `Metadata::created()` and the older 64-bit file index
+  were measured identical after a delete-then-recreate on NTFS. When no identity
+  can be read, the path is refused.
 - Remote `write`/`edit` are atomic.
 - An out-of-loop bash command arms `ShellTreeKill` so a killed command cannot
   leave orphaned children.
@@ -84,9 +92,13 @@ projects skip project-scope discovery; user-scope resources are never gated.
 
 ## Credentials
 
-Stored at `~/.pi/agent/auth.json` (owner-only). Precedence: stored OAuth > stored
-API key > environment. Tokens are never written to session transcripts and never
-logged; `pir auth print-api-key` is the only command that prints one.
+Stored at `~/.pi/agent/auth.json`. On Unix the file is created `0o600` and its
+directory `0o700`; **Windows applies no equivalent ACL**, so there the file
+inherits the ordinary per-user profile permissions (`%USERPROFILE%` is
+per-user readable by default, but the file is not explicitly restricted).
+Precedence: stored OAuth > stored API key > environment. Tokens are never
+written to session transcripts and never logged; `pir auth print-api-key` is the
+only command that prints one.
 
 ## Subagents and the process executor
 

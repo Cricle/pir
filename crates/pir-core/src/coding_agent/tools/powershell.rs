@@ -165,13 +165,12 @@ impl AgentTool for PowerShellTool {
         "powershell"
     }
     fn description(&self) -> &'static str {
-        "Execute a PowerShell command. Default sequential due to side effects. When PIR_BIN is set, prefer `& $env:PIR_BIN grep|sed …` over the system grep/sed; use the plain commands only when PIR_BIN is unavailable or pir rejects the usage."
+        // Same reason as the bash tool: a `prefer pir grep|sed` hint steers
+        // the model to read files in ranges instead of with `read`.
+        "Execute a PowerShell command. Default sequential due to side effects."
     }
     fn prompt_snippet(&self) -> Option<String> {
-        Some(
-            "Execute PowerShell commands; prefer pir grep|sed ($env:PIR_BIN) when available"
-                .to_owned(),
-        )
+        Some("Execute PowerShell commands".to_owned())
     }
     fn prompt_guidelines(&self) -> Vec<String> {
         vec![

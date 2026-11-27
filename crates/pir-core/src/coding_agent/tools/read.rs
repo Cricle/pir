@@ -72,12 +72,17 @@ type ImageSupport = ();
 /// returns image content, so it must not claim to).
 #[cfg(feature = "image-tools")]
 fn read_description() -> &'static str {
-    "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB by default (1000 lines or 24KB in the efficient profile; whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+    // One truncation budget in the text, not one per performance profile:
+    // the pre-baked "1000 lines or 24KB in the efficient profile" clause
+    // doubled the sentence, and the actual limits are reported by the tool
+    // when it truncates. The model only needs to know that `offset`/`limit`
+    // exist for a file that comes back short.
+    "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
 }
 
 #[cfg(not(feature = "image-tools"))]
 fn read_description() -> &'static str {
-    "Read the contents of a file. Supports text files. Images (jpg, png, gif, webp, bmp) are recognized but not attached: this build was compiled without the `image-tools` feature, so reading an image reports its type and size only. For text files, output is truncated to 2000 lines or 50KB by default (1000 lines or 24KB in the efficient profile; whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+    "Read the contents of a file. Supports text files. Images (jpg, png, gif, webp, bmp) are recognized but not attached: this build was compiled without the `image-tools` feature, so reading an image reports its type and size only. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
 }
 
 /// Upstream `readOutputSchema`: the structured output for programmatic

@@ -1405,11 +1405,57 @@ impl ProviderRegistry {
         }
     }
 
+    /// Run a provider forwarding body on a spawned task, turning a panic into a
+    /// terminal `Error` event on `producer`.
+    ///
+    /// Every `stream*` entry point below bridges the provider's inner stream to
+    /// the outer `AssistantMessageEventStream` the agent loop consumes, and does
+    /// it from a detached `tokio::spawn`. Two things make a bare spawn unsafe:
+    ///
+    /// - The `JoinHandle` is dropped, so a panic is unobserved.
+    /// - Abandonment is signalled only by dropping the last CONSUMER handle
+    ///   (`AssistantMessageEventStream`'s `Drop`). A panicking producer never
+    ///   drops a consumer and never calls `end`, so a consumer parked in
+    ///   `next()` waits forever: `request_timeout` is `None` here and the
+    ///   agent loop's `while let Some(event) = stream.next().await` has no
+    ///   deadline of its own.
+    ///
+    /// Catching the unwind and pushing an error event before `end` guarantees the
+    /// consumer observes a terminal event exactly like a provider setup failure
+    /// does.
+    fn spawn_isolated_forwarder<F>(
+        producer: AssistantMessageEventStream,
+        panic_model: Model,
+        body: F,
+    ) where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            use futures_util::FutureExt;
+            if let Err(payload) = std::panic::AssertUnwindSafe(body).catch_unwind().await {
+                let message = crate::agent::tool_execution::panic_payload_message(payload.as_ref());
+                tracing::error!(panic = %message, "provider forwarding task panicked; ending the stream");
+                producer.push(AssistantMessageEventStream::error_event(
+                    ErrorReason::Error,
+                    error_message(
+                        &panic_model,
+                        &format!("Provider stream task panicked: {message}"),
+                    ),
+                ));
+                producer.end(None);
+            }
+        });
+    }
+
     /// Stream a model request through its provider.
     ///
     /// Auth is resolved asynchronously before dispatch; auth or provider
     /// failures are encoded as an `Error` event on the returned stream so
     /// callers never see a thrown error from this method.
+    ///
+    /// The forwarding task runs through [`Self::spawn_isolated_forwarder`], so a
+    /// panic inside it becomes a terminal error event instead of leaving the
+    /// consumer parked in `stream.next()` forever.
     pub fn stream(
         &self,
         model: Model,
@@ -1437,59 +1483,64 @@ impl ProviderRegistry {
             .as_ref()
             .map(|observer| observer.span.trace_context().clone());
 
-        tokio::spawn(async move {
-            match self_
-                .resolve_and_dispatch(model, context, options, trace_context.as_ref())
-                .await
-            {
-                Ok(inner) => {
-                    let cost_model = dispatch_model.clone();
-                    let mut inner = std::pin::pin!(inner);
-                    // Accumulate the deltas, so the terminal message of a
-                    // failed/aborted stream keeps the content the provider had
-                    // already streamed (see [`StreamedContent`]).
-                    let mut streamed = StreamedContent::default();
-                    while let Some(event) = inner.next().await {
-                        streamed.observe(&event);
-                        let event = apply_model_cost(&cost_model, streamed.finalize(event));
+        Self::spawn_isolated_forwarder(
+            outer_events.producer(),
+            dispatch_model.clone(),
+            async move {
+                match self_
+                    .resolve_and_dispatch(model, context, options, trace_context.as_ref())
+                    .await
+                {
+                    Ok(inner) => {
+                        let cost_model = dispatch_model.clone();
+                        let mut inner = std::pin::pin!(inner);
+                        // Accumulate the deltas, so the terminal message of a
+                        // failed/aborted stream keeps the content the provider had
+                        // already streamed (see [`StreamedContent`]).
+                        let mut streamed = StreamedContent::default();
+                        while let Some(event) = inner.next().await {
+                            streamed.observe(&event);
+                            let event = apply_model_cost(&cost_model, streamed.finalize(event));
+                            if let Some(observer) = observer.as_mut() {
+                                observer.observe(&event);
+                            }
+                            // Producer backpressure: a slow consumer parks this
+                            // forwarding task (and, through the provider's body
+                            // read loop, the network) instead of letting the outer
+                            // queue retain frozen snapshots without bound.
+                            // `false` means every consumer handle is gone: stop
+                            // forwarding instead of parking forever, and terminate
+                            // the inner stream so ITS producer (the transport body
+                            // read loop) is released too rather than left parked on
+                            // a queue nobody drains any more.
+                            if !outer_events.push_await(event).await {
+                                inner.as_mut().end(None);
+                                break;
+                            }
+                        }
+                        // A stream that ended without a terminal event still ends
+                        // its span (upstream `observeResult(undefined)`).
+                        if let Some(observer) = observer.as_mut() {
+                            observer.finish();
+                        }
+                        outer_events.end(None);
+                    }
+                    Err(boxed) => {
+                        let (message, reason) = *boxed;
+                        let event =
+                            AssistantMessageEventStream::error_event(reason, message.clone());
+                        // Setup failures are part of the logical request: observe
+                        // the terminal error like upstream's lazyStream catch path.
                         if let Some(observer) = observer.as_mut() {
                             observer.observe(&event);
+                            observer.finish();
                         }
-                        // Producer backpressure: a slow consumer parks this
-                        // forwarding task (and, through the provider's body
-                        // read loop, the network) instead of letting the outer
-                        // queue retain frozen snapshots without bound.
-                        // `false` means every consumer handle is gone: stop
-                        // forwarding instead of parking forever, and terminate
-                        // the inner stream so ITS producer (the transport body
-                        // read loop) is released too rather than left parked on
-                        // a queue nobody drains any more.
-                        if !outer_events.push_await(event).await {
-                            inner.as_mut().end(None);
-                            break;
-                        }
+                        outer_events.push(event);
+                        outer_events.end(Some(Arc::new(message)));
                     }
-                    // A stream that ended without a terminal event still ends
-                    // its span (upstream `observeResult(undefined)`).
-                    if let Some(observer) = observer.as_mut() {
-                        observer.finish();
-                    }
-                    outer_events.end(None);
                 }
-                Err(boxed) => {
-                    let (message, reason) = *boxed;
-                    let event = AssistantMessageEventStream::error_event(reason, message.clone());
-                    // Setup failures are part of the logical request: observe
-                    // the terminal error like upstream's lazyStream catch path.
-                    if let Some(observer) = observer.as_mut() {
-                        observer.observe(&event);
-                        observer.finish();
-                    }
-                    outer_events.push(event);
-                    outer_events.end(Some(Arc::new(message)));
-                }
-            }
-        });
+            },
+        );
 
         outer
     }
@@ -1527,7 +1578,7 @@ impl ProviderRegistry {
             return outer;
         };
         let self_ = self.clone();
-        tokio::spawn(async move {
+        Self::spawn_isolated_forwarder(output.producer(), model.clone(), async move {
             let mut options = options;
             match self_
                 .assemble_dispatch_headers(provider.as_ref(), &model, &options, None)
@@ -1642,7 +1693,7 @@ impl ProviderRegistry {
             return outer;
         };
         let self_ = self.clone();
-        tokio::spawn(async move {
+        Self::spawn_isolated_forwarder(output.producer(), model.clone(), async move {
             let (request_model, options) = match self_
                 .resolve_auth_for(session.as_ref(), &model, options.api_key.as_deref())
                 .await
@@ -2552,7 +2603,7 @@ impl ProviderRegistry {
             .as_ref()
             .map(|observer| observer.span.trace_context().clone());
         let self_ = self.clone();
-        tokio::spawn(async move {
+        Self::spawn_isolated_forwarder(output.producer(), model.clone(), async move {
             match self_
                 .resolve_deferred_dispatch(model.clone(), handle, options, trace_context.as_ref())
                 .await

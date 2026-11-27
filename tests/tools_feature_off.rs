@@ -89,8 +89,8 @@ fn expected_core_tool_names() -> Vec<&'static str> {
         names.push("ls");
     }
     if cfg!(feature = "tool-background") {
-        names.push("background_status");
-        names.push("background_abort");
+        names.push("bg_status");
+        names.push("bg_abort");
     }
     names
 }
@@ -139,12 +139,12 @@ fn diagnostics_name_the_leaf_feature_for_each_disabled_tool() {
         ("write", "tool-write", cfg!(feature = "tool-write")),
         ("ls", "tool-ls", cfg!(feature = "tool-ls")),
         (
-            "background_status",
+            "bg_status",
             "tool-background",
             cfg!(feature = "tool-background"),
         ),
         (
-            "background_abort",
+            "bg_abort",
             "tool-background",
             cfg!(feature = "tool-background"),
         ),

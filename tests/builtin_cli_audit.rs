@@ -89,32 +89,33 @@ fn every_builtin_loads_explicitly_and_exposes_its_surface() {
 }
 
 #[test]
-fn default_plan_is_all_default_enabled_builtins_but_phone() {
+fn default_plan_is_todo_subagent_and_mode_only() {
     let plan = pir::plugins::order_extension_paths(&[], &[], false);
     let host = host_for(&plan);
     let (plugins, tools, _) = names(&host);
+    // The default plan used to carry every builtin but `phone`. It is now
+    // deliberately small: their tools cost more `tools[]` schema on every
+    // request than the model recovers by having them (see the `pir-builtins`
+    // crate docs and `docs/system-prompt-audit.md` §4). Each still loads on
+    // demand — `-e builtin:<name>`, `settings.extensions`, or a `--tools`
+    // entry naming one of its tools.
     assert_eq!(
         plugins,
-        vec![
-            "builtin:subagent",
-            "builtin:mode",
-            "builtin:mcp",
-            "builtin:codemode",
-            "builtin:python",
-            "builtin:context-mode",
-            "builtin:tool-search",
-            "builtin:tool-repair",
-            "builtin:todo",
-            "builtin:memory",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>()
+        vec!["builtin:subagent", "builtin:mode", "builtin:todo"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
     );
-    for tool in ["subagent", "ctx_execute", "todo"] {
+    for tool in ["subagent", "submit_plan", "todo"] {
         assert!(tools.iter().any(|t| t == tool), "missing {tool}: {tools:?}");
     }
-    assert!(!plugins.iter().any(|p| p == "builtin:phone"));
+    // Nothing default-off may quietly reappear through the default plan.
+    for tool in ["ctx_execute", "codemode", "tool_search", "memory"] {
+        assert!(
+            !tools.iter().any(|t| t == tool),
+            "{tool} must not be on the default plan: {tools:?}"
+        );
+    }
 }
 
 #[test]
@@ -266,20 +267,27 @@ fn wire_tools(
 }
 
 #[test]
-fn print_default_and_selected_wire_surface() {
+fn print_default_wire_surface_is_the_small_default_plan() {
     let (port, bodies) = spawn_mock();
     let dir = std::env::temp_dir().join(format!("pir-zz-builtin-a-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     write_agent(&dir, port, "{}");
     let tools = wire_tools(&dir, &bodies, &[]);
-    for expected in ["subagent", "ctx_execute", "ctx_search", "todo"] {
+    // The core four plus the default-on builtins' tools.
+    for expected in ["read", "bash", "edit", "write", "todo", "subagent"] {
         assert!(
             tools.iter().any(|t| t == expected),
             "missing {expected}: {tools:?}"
         );
     }
+    // Every default-off builtin stays off the wire until something names it.
+    for expected in ["ctx_execute", "ctx_search", "tool_search"] {
+        assert!(
+            !tools.iter().any(|t| t == expected),
+            "{expected} must not be default-declared: {tools:?}"
+        );
+    }
     assert!(!tools.iter().any(|t| t == "codemode"), "{tools:?}");
-    assert!(!tools.iter().any(|t| t == "tool_search"), "{tools:?}");
     assert!(!tools.iter().any(|t| t.starts_with("phone")), "{tools:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

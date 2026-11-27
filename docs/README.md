@@ -65,6 +65,10 @@ the archived baseline audit, which stay Chinese.
 | [durable-spec.md](durable-spec.md) | Durable kernel: records, storage, harness (pinned to upstream 1.4.0) |
 | [performance-profiles.md](performance-profiles.md) | `performance.profile` presets and measurement method |
 | [test-harness-map.md](test-harness-map.md) | How `tests/*.rs` maps to merged harnesses; how to run one suite |
+| [node-test-suite-audit.md](node-test-suite-audit.md) | The `node:*` shim test suite: coverage and gaps |
+| [runtime-support-matrix.md](runtime-support-matrix.md) | Which host/runtime combinations are supported |
+| [rustdoc.md](rustdoc.md) | Rustdoc gates: the intra-doc link lint, why it is `warn` today |
+| [pgo.md](pgo.md) | Profile-guided optimization build recipe and measurements |
 | [phone-server.md](phone-server.md) | Multi-user pi-phone relay: accounts, `/agent` + `/ws`, deployment |
 | [phone-server-performance.md](phone-server-performance.md) | Repeatable release-profile load test |
 

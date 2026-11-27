@@ -96,7 +96,6 @@ fn unknown_builtins_are_absent() {
             "mode",
             "mcp",
             "codemode",
-            "python",
             "context-mode",
             "tool-search",
             "tool-repair",
@@ -260,10 +259,9 @@ fn cli_paths_come_first_then_project_then_global() {
     // paths (upstream package-manager.ts:986-1001): `builtin:subagent` dedups
     // into its CLI position, the default paths follow, then the remaining
     // builtins in factory order; `phone` is compiled but default-disabled, so
-    // it is not inserted. `python` keeps its Settings/tool-selection name and
-    // is default-enabled, so it lands right after `codemode`.
+    // it is not inserted.
 
-    assert_eq!(ordered.len(), 13);
+    assert_eq!(ordered.len(), 12);
     assert_eq!(ordered[0], PathBuf::from("cli.ts"));
     assert_eq!(ordered[1], builtin("subagent"));
     assert_eq!(ordered[2], PathBuf::from("D:/proj/.pi/extensions"));
@@ -272,12 +270,11 @@ fn cli_paths_come_first_then_project_then_global() {
     assert_eq!(ordered[4], builtin("mode"));
     assert_eq!(ordered[5], builtin("mcp"));
     assert_eq!(ordered[6], builtin("codemode"));
-    assert_eq!(ordered[7], builtin("python"));
-    assert_eq!(ordered[8], builtin("context-mode"));
-    assert_eq!(ordered[9], builtin("tool-search"));
-    assert_eq!(ordered[10], builtin("tool-repair"));
-    assert_eq!(ordered[11], builtin("todo"));
-    assert_eq!(ordered[12], builtin("memory"));
+    assert_eq!(ordered[7], builtin("context-mode"));
+    assert_eq!(ordered[8], builtin("tool-search"));
+    assert_eq!(ordered[9], builtin("tool-repair"));
+    assert_eq!(ordered[10], builtin("todo"));
+    assert_eq!(ordered[11], builtin("memory"));
 
     let cli_only = order_extension_paths(&cli, &defaults, true);
     assert_eq!(cli_only, cli);

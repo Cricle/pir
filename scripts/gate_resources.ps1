@@ -1,10 +1,14 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the Rust/resource gates that CI enforces in .github/workflows/ci.yml.
+    Runs the Rust/resource gates (msrv, deny, audit, bench-smoke) locally.
 
 .DESCRIPTION
-    Mirrors the four independent CI resource jobs locally:
+    Runs the four independent resource gates that `.github/workflows/ci.yml`
+    does NOT currently define jobs for. They are local/manual gates: CI covers
+    fmt, clippy, the SDK no-default matrix, doctests, examples and the test
+    suites, but has no msrv, deny, audit or bench-smoke job (see the same note
+    in `rust-toolchain.toml` for msrv and in `deny.toml` for deny).
 
         msrv         cargo +<MsrvToolchain> check --all-targets --locked
         deny         cargo deny check                     (repository deny.toml)

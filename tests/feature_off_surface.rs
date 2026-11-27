@@ -341,12 +341,12 @@ fn explicit_core_tools_name_their_leaf_feature() {
         ("write", "tool-write", cfg!(feature = "tool-write")),
         ("ls", "tool-ls", cfg!(feature = "tool-ls")),
         (
-            "background_status",
+            "bg_status",
             "tool-background",
             cfg!(feature = "tool-background"),
         ),
         (
-            "background_abort",
+            "bg_abort",
             "tool-background",
             cfg!(feature = "tool-background"),
         ),

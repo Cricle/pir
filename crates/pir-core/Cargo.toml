@@ -175,7 +175,6 @@ full = [
     "durable",
     "extensions",
     "context-mode",
-    "python",
     "mcp",
     "env",
     "env-daemon",
@@ -192,6 +191,8 @@ full = [
     "provider-bedrock",
     "provider-mistral",
     "cli",
+    "jobs",
+    "checkpoint-cli",
     "tools",
     "grep-find",
     "image-tools",
@@ -217,10 +218,20 @@ provider-bedrock = ["dep:hmac"]
 provider-mistral = []
 image-resize = ["dep:image"]
 image-tools = ["image-resize"]
-cli = ["dep:clap", "print", "rpc", "export-html"]
+cli = ["dep:clap", "print", "rpc", "export-html", "jobs", "checkpoint-cli"]
 print = []
 rpc = []
 export-html = []
+# `pir jobs` + the detached supervisor. `cli` and `subagent` imply it, but an
+# SDK embed that wants background jobs without the full CLI argv surface can
+# ask for it alone. The shared start-token probe the session lock needs is NOT
+# behind this feature; it lives in `pir_core::process_probe` (always compiled).
+jobs = []
+# The `pir checkpoint` CLI surface only. The checkpoint ENGINE
+# (`checkpoints::CheckpointStore`) is NOT behind this feature: the `edit` and
+# `write` tools snapshot a file before every mutation, so gating the module
+# would fork their undo behavior. This feature removes the argv surface only.
+checkpoint-cli = []
 tool-read = []
 tool-bash = []
 tool-powershell = []
@@ -278,11 +289,6 @@ brush = ["dep:brush-core", "dep:brush-builtins"]
 # helpers a front end renders without registering the edit tool itself.
 ui-support = ["dep:similar"]
 context-mode = ["extensions", "dep:rusqlite", "dep:pir-builtin-context-mode", "pir-builtins/context-mode"]
-# The `python` builtin tool. The name is kept for Settings/tool-selection
-# compatibility; the tool now runs JavaScript on the embedded QuickJS runtime
-# (`plugins/builtin/js_vm.rs`), so this pulls the same engine as context-mode
-# without the Python interpreter that used to back it.
-python = ["extensions"]
 mcp = ["dep:rmcp", "extensions", "dep:pir-builtin-mcp", "pir-builtins/mcp"]
 mcp-sd = ["mcp", "dep:ignore"]
 env = ["dep:notify", "dep:ignore"]
@@ -292,7 +298,7 @@ env-daemon = ["env"]
 # that compile the server.
 server = ["pir-protocol/server"]
 client = []
-subagent = ["dep:pir-builtin-subagent", "dep:pir-builtin-mode", "pir-builtins/subagent", "pir-builtins/mode"]
+subagent = ["dep:pir-builtin-subagent", "dep:pir-builtin-mode", "pir-builtins/subagent", "pir-builtins/mode", "jobs"]
 # `mode` (the foreman/plan session modes) is only meaningful on top of the
 # `subagent` tool it delegates through, so enabling it implies `subagent`. The
 # alias exists so every builtin has a feature of its own name: a consumer can

@@ -1340,14 +1340,11 @@ fn builtin_paths_partition_filter_and_order() {
     // Factory builtins are default-enabled and appended AFTER the discovered
     // file paths (upstream `package-manager.ts:986-1001` adds the builtin loop
     // after every file resource, so a file extension wins first-wins
-    // conflicts). `builtin:subagent` in the list above is the real builtin;
-    // the factory order is subagent, mode, mcp, codemode, python,
-    // context-mode, tool-search, tool-repair, todo — mode is the foreman
-    // companion, python keeps its Settings/tool-selection name over the
-    // embedded QuickJS engine, context-mode is the Code Mode port, `todo` is
-    // the npm `@juicesharp/rpiv-todo` port appended last, and `phone` stays
-    // default-disabled (not inserted), see `crates/pir-core/src/plugins/
-    // builtin.rs` and `docs/todo-builtin.md`.
+    // conflicts). `builtin:subagent` in the list above is the real builtin.
+    // Only the default-ON builtins are appended: subagent, mode, todo. The
+    // rest (mcp, codemode, context-mode, tool-search, tool-repair, memory) and
+    // `phone` are default-off and join a plan only when named — see the
+    // `pir-builtins` crate docs for the measurement behind that.
 
     let ordered = order_extension_paths(
         &[PathBuf::from("cli.ts")],
@@ -1361,14 +1358,7 @@ fn builtin_paths_partition_filter_and_order() {
             PathBuf::from("defaults"),
             PathBuf::from("builtin:subagent"),
             PathBuf::from("builtin:mode"),
-            PathBuf::from("builtin:mcp"),
-            PathBuf::from("builtin:codemode"),
-            PathBuf::from("builtin:python"),
-            PathBuf::from("builtin:context-mode"),
-            PathBuf::from("builtin:tool-search"),
-            PathBuf::from("builtin:tool-repair"),
             PathBuf::from("builtin:todo"),
-            PathBuf::from("builtin:memory"),
         ]
     );
     let cli_only = order_extension_paths(
@@ -1391,7 +1381,16 @@ fn tool_repair_precedence_through_the_loader_pipeline() {
 
     let js_entry = PathBuf::from("C:/u/.pi/agent/npm/node_modules/pi-tool-repair/tool-repair.ts");
     let other = PathBuf::from("C:/u/.pi/agent/extensions/other.ts");
-    let ordered = order_extension_paths(&[], &[js_entry.clone(), other.clone()], false);
+    // `tool-repair` is default-off now (see the `pir-builtins` crate docs), so
+    // the builtin has to be named for the native-first precedence to apply at
+    // all. That is the case this test describes: a run that DOES carry the
+    // builtin suppresses the JS copy.
+    let builtin_entry = PathBuf::from("builtin:tool-repair");
+    let ordered = order_extension_paths(
+        &[builtin_entry.clone()],
+        &[js_entry.clone(), other.clone()],
+        false,
+    );
     assert!(ordered.contains(&PathBuf::from("builtin:tool-repair")));
 
     // Normal case: the default builtins survive, so the JS copy is

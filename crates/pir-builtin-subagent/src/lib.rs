@@ -530,7 +530,15 @@ pub fn bounded_messages_json(messages: &[JsonValue]) -> (JsonValue, usize) {
     // Hard per-result budget. Oldest non-system messages are dropped first:
     // the child's system message carries its declared tool set and
     // instructions, and the final message is never dropped.
-    let sizes: Vec<usize> = retained
+    //
+    // `sizes` is indexed in lockstep with `retained`, so it is removed from as
+    // well: keeping the original index vector would (a) leave `sizes[drop_at]`
+    // pointing at the wrong message once an earlier one was removed, so
+    // `total` stops matching the actual payload and the loop never converges,
+    // and (b) let `drop_at` advance past the end when the tail is a run of
+    // system/developer messages, making `retained[drop_at]` panic. `drop_at`
+    // is re-clamped every iteration for the same reason.
+    let mut sizes: Vec<usize> = retained
         .iter()
         .map(|value| serde_json::to_string(value).map(|t| t.len()).unwrap_or(0))
         .collect();
@@ -538,6 +546,9 @@ pub fn bounded_messages_json(messages: &[JsonValue]) -> (JsonValue, usize) {
     let mut dropped = 0usize;
     let mut drop_at = 0usize;
     while total > PER_TASK_OUTPUT_CAP && retained.len() - dropped > 1 {
+        if drop_at >= retained.len() {
+            break;
+        }
         let is_system = retained[drop_at]
             .get("role")
             .and_then(JsonValue::as_str)
@@ -548,6 +559,7 @@ pub fn bounded_messages_json(messages: &[JsonValue]) -> (JsonValue, usize) {
         }
         total = total.saturating_sub(sizes[drop_at] + 1);
         retained.remove(drop_at);
+        sizes.remove(drop_at);
         dropped += 1;
     }
     (JsonValue::Array(retained), dropped)

@@ -257,8 +257,22 @@ fn write_trust_file(path: &Path, data: &TrustFile) -> Result<(), String> {
         .parent()
         .map(|parent| parent.join(format!("{file_name}.tmp-{}", std::process::id())))
         .unwrap_or_else(|| PathBuf::from(format!("{file_name}.tmp-{}", std::process::id())));
-    fs::write(&temp_path, format!("{serialized}\n"))
-        .map_err(|error| format!("cannot write {}: {error}", temp_path.display()))?;
+    // Write the temp file with an explicit `sync_all` before the rename:
+    // without it a power loss can make the rename durable while the data is
+    // not, leaving a truncated `trust.json` that fails to parse. That failure
+    // is exactly the "store cannot be read" path in [`ProjectTrustStore::get`],
+    // so an unsynced trust write degrades a recorded "Do not trust" decision.
+    // Every other atomic writer in this crate (`config::settings::files`,
+    // `checkpoints`, `jobs`) syncs for the same reason.
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&temp_path)
+            .map_err(|error| format!("cannot write {}: {error}", temp_path.display()))?;
+        file.write_all(format!("{serialized}\n").as_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", temp_path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("cannot sync {}: {error}", temp_path.display()))?;
+    }
     // Same-directory rename is an atomic replace (POSIX rename; Windows
     // `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`).
     fs::rename(&temp_path, path).map_err(|error| {
@@ -288,13 +302,28 @@ impl ProjectTrustStore {
     /// the filesystem root and return the first entry with a `true`/`false`
     /// decision (upstream `findNearestTrustEntry`). The read runs under the
     /// trust-file lock (upstream `getEntry` → `withTrustFileLock`).
+    ///
+    /// A store that cannot be read is NOT "no decision is recorded": the
+    /// lookup returns an explicit `false` entry for `cwd` instead of `None`.
+    /// The two callers below fold `None` into *trusted* (a project with no
+    /// trust-requiring resources is implicitly trusted when nothing is
+    /// recorded), so mapping an unreadable store — a lock lost to a
+    /// concurrent writer, a hand-edited or crash-truncated `trust.json`, a
+    /// permission error — to `None` would silently overrule a recorded
+    /// "Do not trust" and fail open. `false` is the only honest answer when
+    /// the recorded decision cannot be read.
     pub fn get(&self, cwd: &Path) -> Option<ProjectTrustStoreEntry> {
         let data = match with_trust_file_lock(&self.path, || read_trust_file(&self.path)) {
             Ok(data) => data,
-            // A broken trust store (or an unacquirable lock) must not
-            // silently trust the project. (Upstream `getEntry` throws; the
-            // pir lookup API maps every failure to `None`.)
-            Err(_) => return None,
+            // Upstream `getEntry` throws here; pir has no error channel on
+            // this lookup, so it answers "denied" for the queried cwd rather
+            // than pretending nothing was recorded.
+            Err(_) => {
+                return Some(ProjectTrustStoreEntry {
+                    path: normalize_cwd(cwd),
+                    decision: false,
+                })
+            }
         };
         let mut current = normalize_cwd(cwd);
         loop {

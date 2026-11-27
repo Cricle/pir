@@ -204,6 +204,14 @@ The result is cached by URL+source for ttl seconds (default 24 hours); pass forc
 Use this for docs, specs and changelogs you want to query repeatedly across turns. Only http/https is supported; pages that need JavaScript to render are out of scope (this is a plain HTTP fetch, no browser). For content you already have locally, use ctx_index instead."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Fetch a URL and index it into the searchable knowledge base; the page body never \
+enters context, retrieve sections with ctx_search"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",

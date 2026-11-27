@@ -17,12 +17,14 @@
 //!    pir sends no `docs` block instead of pointing the model at paths it does
 //!    not have (the previous path-join-only section was worse than omitting
 //!    it). A source checkout keeps the full section.
-//! 3. **PIR-BIN-062** — the four pir-only `<rules>` bullets are a DOCUMENTED
+//! 3. **PIR-BIN-062** — the three pir-only `<rules>` bullets are a DOCUMENTED
 //!    deviation (`docs/system-prompt-audit.md` §4, B19): they encode pir
-//!    behaviours upstream lacks (`PIR_READ_BEFORE_EDIT` enforcement, the
-//!    literal-path rule, the broad-search guard, the finish-check). Their
-//!    exact list and gating are pinned so an edit cannot silently grow the
-//!    prompt or drop an enforced rule.
+//!    behaviours upstream lacks (the literal-path rule, the broad-search
+//!    guard, the finish-check). Their exact list and gating are pinned so an
+//!    edit cannot silently grow the prompt or drop an enforced rule. The
+//!    read-before-write bullet is deliberately absent — pi has none, and the
+//!    constraint it described is enforced in code by `PIR_READ_BEFORE_EDIT`,
+//!    not by prose. `no_read_before_write_bullet_is_rendered` pins that.
 //!
 //! Everything here reads the rendered prompt/definitions the real print host
 //! builds (`PrintToolLoadout` / `build_system_prompt_sections`); no fixture
@@ -230,17 +232,18 @@ fn modifier_and_exclude_selections_keep_the_active_set_order() {
 }
 
 // ---------------------------------------------------------------------------
-// PIR-BIN-062: the four pir-only rules are documented and gated
+// PIR-BIN-062: the three pir-only rules are documented and gated
 // ---------------------------------------------------------------------------
 
 /// The exact pir-only bullets, verbatim. These encode enforcement upstream does
 /// not have (`docs/system-prompt-audit.md` §4, B19):
-/// - the read-before-edit gate (`PIR_READ_BEFORE_EDIT`, default `edit-partial`),
 /// - the literal-path check (`coding_agent/tools/util.rs`),
 /// - the broad-search guard (`tools.broadSearchGuard`, default true),
 /// - the finish/verification check.
-const PIR_ONLY_RULES: [&str; 4] = [
-    "Read an existing file before editing it, and read it completely (no offset/limit) before overwriting it with write; after your own successful write/edit you do not need to re-read it unless the tool reports an external change",
+///
+/// There is no read-before-write bullet: upstream pi has none, and the gate it
+/// would describe (`PIR_READ_BEFORE_EDIT`) is enforced by the tool itself.
+const PIR_ONLY_RULES: [&str; 3] = [
     "Pass literal filesystem paths to read/edit/write; never use shell substitutions such as $(pwd) or backticks in path arguments",
     "Run shell commands from the current working directory; never scan /, /tmp, the home directory, or an entire drive to find project files, and do not run recursive searches outside the project",
     "Before finishing, re-read the task specification and verify the edge cases it names (empty input, trailing newlines, ranges, and error exits); run the relevant tests, not only the visible ones",
@@ -277,7 +280,7 @@ fn tool(name: &'static str) -> ToolInfo {
     ToolInfo::new(name, "probe tool")
 }
 
-/// read + bash + edit + write: all four bulge in, in this order, after the
+/// read + bash + edit + write: all three bulge in, in this order, after the
 /// per-tool guidelines and before the two upstream fixed bullets.
 #[test]
 fn pir_only_rules_appear_exactly_once_for_the_core_four() {
@@ -306,7 +309,7 @@ fn pir_only_rules_appear_exactly_once_for_the_core_four() {
 /// gates its conditional rule the same way).
 #[test]
 fn pir_only_rules_are_gated_on_the_tools_that_trigger_them() {
-    // read only: none of the four (no mutation tool, no shell).
+    // read only: none of the three (no mutation tool, no shell).
     let read_only = rules_of(&[tool("read")]);
     for rule in PIR_ONLY_RULES {
         assert!(
@@ -317,17 +320,43 @@ fn pir_only_rules_are_gated_on_the_tools_that_trigger_them() {
 
     // bash only: the cwd rule and the finish rule.
     let bash_only = rules_of(&[tool("bash")]);
+    assert!(bash_only.iter().any(|rule| rule == PIR_ONLY_RULES[1]));
     assert!(bash_only.iter().any(|rule| rule == PIR_ONLY_RULES[2]));
-    assert!(bash_only.iter().any(|rule| rule == PIR_ONLY_RULES[3]));
     assert!(!bash_only.iter().any(|rule| rule == PIR_ONLY_RULES[0]));
-    assert!(!bash_only.iter().any(|rule| rule == PIR_ONLY_RULES[1]));
 
-    // read + edit: the read-gate pair and the finish rule, no shell rule.
+    // read + edit: the literal-path rule and the finish rule, no shell rule.
     let read_edit = rules_of(&[tool("read"), tool("edit")]);
     assert!(read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[0]));
-    assert!(read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[1]));
-    assert!(read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[3]));
-    assert!(!read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[2]));
+    assert!(read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[2]));
+    assert!(!read_edit.iter().any(|rule| rule == PIR_ONLY_RULES[1]));
+}
+
+/// No read-before-write bullet, in any profile or tool set.
+///
+/// Upstream pi's `<rules>` has no such bullet, and pirate's old wording ("read
+/// it completely, no offset/limit") was obeyed literally on a measured bug
+/// hunt: whole 48 KB and 35 KB files entered the transcript, driving repeated
+/// compaction. The constraint itself still holds where it matters — `write` to
+/// a never-read file is refused by `PIR_READ_BEFORE_EDIT` — so the prose was
+/// pure cost with no gate behind it.
+#[test]
+fn no_read_before_write_bullet_is_rendered() {
+    const REMOVED: &str = "Before overwriting a file with write, read it completely";
+    const REMOVED_ORIGINAL: &str = "Read an existing file before editing it";
+    for profile in [true, false] {
+        let rules = rules_of_with_rules(
+            &[tool("read"), tool("bash"), tool("edit"), tool("write")],
+            PromptRuleOptions {
+                self_check: profile,
+            },
+        );
+        for rule in &rules {
+            assert!(
+                !rule.contains(REMOVED) && !rule.contains(REMOVED_ORIGINAL),
+                "the read-before-write bullet must not be rendered (self_check={profile}): {rule}"
+            );
+        }
+    }
 }
 
 /// The no-blind-wait efficiency rule is global: it applies to every tool set,
@@ -339,7 +368,7 @@ fn no_blind_wait_rule_is_always_present_before_the_upstream_tail() {
         vec![],
         vec![tool("read")],
         vec![tool("bash"), tool("edit")],
-        vec![tool("background_status"), tool("subagent")],
+        vec![tool("bg_status"), tool("subagent")],
     ] {
         let rules = rules_of(&tools);
         assert!(
@@ -361,7 +390,7 @@ fn no_blind_wait_rule_is_always_present_before_the_upstream_tail() {
 
 /// The `efficient` performance profile omits ONLY the advisory finish rule.
 ///
-/// The other three pir-only bullets mirror a hard tool/agent gate and must stay
+/// The other two pir-only bullets mirror a hard tool/agent gate and must stay
 /// in every profile. The finish rule is purely advisory, and upstream
 /// `buildRules` (`system-prompt.ts:88-127`) has no equivalent bullet at all.
 /// `balanced` (the `PromptRuleOptions::default`) stays byte-identical.
@@ -371,7 +400,7 @@ fn efficient_profile_omits_only_the_advisory_finish_rule() {
     let balanced = rules_of_with_rules(&core, PromptRuleOptions { self_check: true });
     let efficient = rules_of_with_rules(&core, PromptRuleOptions { self_check: false });
 
-    for rule in &PIR_ONLY_RULES[..3] {
+    for rule in &PIR_ONLY_RULES[..2] {
         assert_eq!(
             balanced
                 .iter()
@@ -392,13 +421,13 @@ fn efficient_profile_omits_only_the_advisory_finish_rule() {
     assert_eq!(
         balanced
             .iter()
-            .filter(|candidate| candidate.as_str() == PIR_ONLY_RULES[3])
+            .filter(|candidate| candidate.as_str() == PIR_ONLY_RULES[2])
             .count(),
         1,
         "balanced must keep the advisory finish rule: {balanced:#?}"
     );
     assert!(
-        !efficient.iter().any(|rule| rule == PIR_ONLY_RULES[3]),
+        !efficient.iter().any(|rule| rule == PIR_ONLY_RULES[2]),
         "efficient must omit the advisory finish rule: {efficient:#?}"
     );
     assert_eq!(efficient.len() + 1, balanced.len());

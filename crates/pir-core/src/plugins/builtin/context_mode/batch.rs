@@ -50,6 +50,14 @@ A failing command does not stop the batch; its block is indexed and the next com
 Do not use this for short commands whose output you will read whole anyway."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Run several shell commands in one call and get back only the sections matching \
+your queries; use instead of one bash call per inspection when output is large"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",
@@ -259,7 +267,14 @@ async fn run_command(
     if shell.stdin_transport() {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt as _;
-            let _ = stdin.write_all(command.as_bytes()).await;
+            // The command is the stdin payload on a `-s` shell; a failed
+            // write means it never ran, so fail instead of reporting the
+            // silent-EOF exit 0.
+            if let Err(error) = stdin.write_all(command.as_bytes()).await {
+                return Err(format!(
+                    "context-mode: could not deliver the command to the shell's stdin: {error}"
+                ));
+            }
             let _ = stdin.shutdown().await;
         }
     }

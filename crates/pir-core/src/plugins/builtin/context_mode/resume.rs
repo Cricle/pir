@@ -43,6 +43,14 @@ impl AgentTool for CtxResumeTool {
         "Rebuild the session's place after a compaction: the bounded state block (2,048 bytes) rendered from this session's journal — recent errors first, then index writes, execution results and other events, newest first within each class. `seq` returns one journal row whole. Read-only: it never writes or starts the sandbox. Use it after a long transcript was summarized, or to find the sequence number of a row you want in full."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Rebuild what this session already learned after a compaction: recent errors, \
+index writes and execution results from the journal"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",

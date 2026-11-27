@@ -42,13 +42,14 @@ crates/pir-core/src/extensions/runtime/host_functions/v8_diagnostics.rs 1 0 0  #
 crates/pir-core/src/extensions/runtime/qjs_alloc.rs 16 3 1  # QuickJS custom allocator (std::alloc slab) + arena accounting; the one reviewed allocator island
 crates/pir-core/src/extensions/runtime/runtime.rs 1 0 0  # rquickjs Module::load of the prelude/runtime module source
 crates/pir-core/src/file_identity.rs 4 0 0  # Win32 FILE_ID_INFO identity probe via GetFileInformationByHandleEx + FILE_READ_ATTRIBUTES-only path identity open (CreateFileW/from_raw_handle); moved out of session_manager/mod.rs so the spill exception shares the same implementation
-crates/pir-core/src/jobs.rs 16 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/GetProcessTimes/CloseHandle + Unix kill/getpgid/process-liveness probes + macOS proc_pidinfo(PROC_PIDTBSDINFO) start token (all with SAFETY notes)
+crates/pir-core/src/jobs.rs 11 0 0  # Win32 CreateProcessW(bInheritHandles=FALSE) detached supervisor, OpenProcess/WaitForSingleObject/CloseHandle + Unix kill/getpgid probes (all with SAFETY notes); the start-token probes moved to process_probe.rs
 crates/pir-core/src/mcp/stdio.rs 1 0 0  # libc::killpg on the spawned MCP server's process group
+crates/pir-core/src/process_probe.rs 5 0 0  # shared identity probes: macOS proc_pidinfo(PROC_PIDTBSDINFO) start token (2 blocks), Win32 OpenProcess/GetProcessTimes/CloseHandle (2 blocks), Unix /proc stat read (all with SAFETY notes)
 crates/pir-core/src/pir_node/modules/buffer.rs 5 0 0  # QuickJS typed-array bytes -> String::from_utf8_unchecked (validated first)
 crates/pir-core/src/pir_node/modules/fs.rs 7 0 0  # Win32 GetDiskFreeSpaceW out-pointers + reparse-point-aware path FFI, plus the Unix arms: libc::statvfs for statfs and libc::utimensat(AT_SYMLINK_NOFOLLOW) for lutimes (every block carries a SAFETY note)
 crates/pir-core/src/plugins/builtin/phone/session.rs 1 0 0  # libc::kill on the phone session's child process group
 crates/pir-core/src/plugins/subagent/process.rs 1 0 0  # libc::kill(-pid) on the spawned process worker's process group (SAFETY at the site)
-crates/pir-core/src/session_manager/retention.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes (the start-token probe is now delegated to jobs.rs instead of duplicated)
+crates/pir-core/src/session_manager/retention.rs 4 0 0  # Win32 OpenProcess/WaitForSingleObject/CloseHandle + Unix kill(pid,0), process-liveness probes with SAFETY notes (the start-token probe is delegated to process_probe.rs instead of duplicated)
 crates/pir-core/src/session_manager/tail_page.rs 1 0 0  # memmap2 read-only map of an append-only session file
 crates/pir-tui/src/alloc_trace.rs 0 4 1  # process-global GlobalAlloc delegation (R62 counters moved from lib to bin; PIR-BIN-022 zero-size fallback stays inside the impl)
 crates/pir-tui/src/spill_preview.rs 1 0 0  # memmap2 read-only map of a spill file (Arc<Mmap> preview, see PIR-TUI-023/R61 spill decision)

@@ -120,6 +120,24 @@ fn resolve_extension_paths_in(
             }
         })
         .collect();
+    // A `--tools` / `defaultTools` entry naming a tool that a NON-default
+    // builtin registers has to bring that builtin with it. The default plan is
+    // `todo`, `subagent`, `mode` only, so `--tools codemode` alone selects a
+    // tool nothing registered: the declared surface comes out empty and the
+    // request quietly loses the tool the user asked for. Appending the
+    // builtin here keeps the selection meaningful without re-enabling the
+    // whole default set. Entries already present are deduped by
+    // `order_extension_paths`, and `--no-extensions` still wins (it drops
+    // every default, but an explicit CLI path survives — which is exactly what
+    // this is).
+    let mut cli_extension_paths = cli_extension_paths;
+    if !cli.no_extensions {
+        let mut requested = cli.tools_entries();
+        requested.extend(settings.default_tools().unwrap_or_default());
+        cli_extension_paths.extend(
+            pir::coding_agent::tool_selection::builtin_paths_for_selected_tools(&requested),
+        );
+    }
     // `--only-builtin` short-circuits discovery entirely: no settings scope
     // expansion, no auto-directory probing, no installed-package scan. The
     // plan is CLI `builtin:<name>` entries plus the default builtins, and any

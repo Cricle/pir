@@ -13,14 +13,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pir::ai::types::{ContentBlock, Message, TextContent, UserMessage, UserRole};
 use pir::session_manager::{
     peek_session_info_for_test, peek_session_listing_for_test, peek_session_name_for_test,
-    read_bounded_line_for_test, reset_session_list_file_reads, session_list_file_reads, FileEntry,
-    MessageEntry, SessionManager, SessionSummary, StoredMessage,
+    read_bounded_line_for_test, reset_session_list_file_reads_in, session_list_file_reads_in,
+    FileEntry, MessageEntry, SessionManager, SessionSummary, StoredMessage,
 };
 
-/// Serializes the tests in this file: `session_list_file_reads` is a
-/// PROCESS-GLOBAL counter, so libtest's default parallel threads let another
-/// test's listing bump it between `reset` and the exact assertion. A poisoned
-/// lock (one failed assertion) still lets the remaining tests run.
+/// Serializes the tests in this file that share a `SessionManager` fixture.
+///
+/// It is NOT what makes the listing-read assertions correct: those use the
+/// PER-DIRECTORY counter (`session_list_file_reads_in`), so a sibling suite
+/// listing its own scratch dir in the same merged binary cannot move this
+/// file's number. A poisoned lock (one failed assertion) still lets the
+/// remaining tests run.
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -98,11 +101,11 @@ fn listing_opens_each_file_once_and_filtered_agrees_with_in_memory_filter() {
         .expect("write garbage session");
     std::fs::write(dir.path().join("notes.txt"), "ignored").expect("write non-session file");
 
-    reset_session_list_file_reads();
+    reset_session_list_file_reads_in(dir.path());
     let all = SessionManager::list_sessions(dir.path(), None);
     assert_eq!(all.len(), 3, "the garbage file is skipped: {:?}", ids(&all));
     assert_eq!(
-        session_list_file_reads(),
+        session_list_file_reads_in(dir.path()),
         4,
         "one open per .jsonl file (three sessions + the garbage file)"
     );
@@ -122,10 +125,10 @@ fn listing_opens_each_file_once_and_filtered_agrees_with_in_memory_filter() {
 
     // The filtered pass shares the single-read property: it still opens each
     // candidate once (the header decides the cwd, then the same reader peeks).
-    reset_session_list_file_reads();
+    reset_session_list_file_reads_in(dir.path());
     let _ = SessionManager::list_sessions(dir.path(), Some("C:\\proj"));
     assert_eq!(
-        session_list_file_reads(),
+        session_list_file_reads_in(dir.path()),
         4,
         "a filtered listing must not add a second open per file"
     );

@@ -6,22 +6,19 @@ use std::path::{Path, PathBuf};
 
 use pir::ai::types::{ContentBlock, TextContent, UserMessage, UserRole};
 use pir::coding_agent::session_resolve::{resolve_session_plan, SessionFlags, SessionPlan};
-use pir::session_manager::{FileEntry, MessageEntry, SessionHeader, SessionManager, StoredMessage};
+use pir::session_manager::{
+    reset_session_list_file_reads_in, session_list_file_reads_in, FileEntry, MessageEntry,
+    SessionHeader, SessionManager, StoredMessage,
+};
 
-/// Serializes the tests in this file that assert on
-/// `session_list_file_reads`, a PROCESS-GLOBAL counter.
+/// Serializes the tests in this file that share a `SessionManager` fixture.
 ///
-/// `continue_takes_newest_matching_without_listing` deliberately calls
-/// `list_sessions` at its end (to prove the cheap path differs from the
-/// listing path), so it bumps the same counter
-/// `headless_resume_takes_newest_matching_without_listing` resets and then
-/// asserts is exactly `0`. Under the default parallel harness that is a real
-/// race — observed as `left: 4, right: 0` — not a hypothetical one.
-///
-/// Not promoted to `tests/common/mod.rs`: `session_listing_single_read` (in
-/// `zz_merged_5`) and `tui_snapshot_refresh_w16` (only a doc mention) live in
-/// other test binaries, which are separate processes with their own copy of
-/// the counter, so a cross-file lock would buy nothing.
+/// The listing-read assertions do NOT rely on it: they use the
+/// PER-DIRECTORY counter (`session_list_file_reads_in`), so neither the
+/// sibling test in this file nor `session_listing_single_read` — which is
+/// merged into the same `zz_merged_4` binary and lists its own scratch dir —
+/// can move this file's number. Under the process-global counter that pair
+/// raced (`left: 4, right: 0`) because each file held its own private lock.
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -99,13 +96,12 @@ fn write_session(
 /// the newest session whose header cwd matches — WITHOUT materializing a
 /// listing. The listing peeks every file in the directory (message count,
 /// first message, the search corpus marker); the resolution needs one path,
-/// so `session_list_file_reads()` must stay 0 and the answer must equal
+/// so `session_list_file_reads_in(dir)` must stay 0 and the answer must equal
 /// `list_sessions(..).first()`.
 #[test]
 fn continue_takes_newest_matching_without_listing() {
-    // `session_list_file_reads` is PROCESS-GLOBAL and this test bumps it on
-    // purpose at the end, so it must not overlap the `== 0` assertion in
-    // `headless_resume_...` below. See `TEST_LOCK`.
+    // The per-directory counter keys on `dir`, which this test owns, so it
+    // does not need to serialize against `headless_resume_...` below.
     let _reads = test_lock();
     let dir = temp_dir("continue");
     let cwd = dir.join("project");
@@ -121,7 +117,7 @@ fn continue_takes_newest_matching_without_listing() {
     let expected = write_session(&dir, "c.jsonl", "id-c", &cwd_text, 7, 3_000);
     write_session(&dir, "z.jsonl", "id-z", &other.to_string_lossy(), 5, 4_000);
 
-    pir::session_manager::reset_session_list_file_reads();
+    reset_session_list_file_reads_in(&dir);
     let plan = resolve_session_plan(
         &SessionFlags {
             continue_recent: true,
@@ -134,7 +130,7 @@ fn continue_takes_newest_matching_without_listing() {
     .expect("plan");
     assert_eq!(plan, SessionPlan::Open(expected.clone()));
     assert_eq!(
-        pir::session_manager::session_list_file_reads(),
+        session_list_file_reads_in(&dir),
         0,
         "`--continue` must not materialize a full listing"
     );
@@ -146,14 +142,13 @@ fn continue_takes_newest_matching_without_listing() {
         listed.first().map(|summary| summary.path.clone()),
         Some(expected)
     );
-    assert!(pir::session_manager::session_list_file_reads() > 0);
+    assert!(session_list_file_reads_in(&dir) > 0);
 }
 
 /// Headless `-r` resolves to the same default row as `--continue`.
 #[test]
 fn headless_resume_takes_newest_matching_without_listing() {
-    // Same process-global counter as the test above; hold `TEST_LOCK` so the
-    // `== 0` assertion cannot observe that test's deliberate `list_sessions`.
+    // Its own scratch dir, so the per-directory counter is its own number.
     let _reads = test_lock();
     let dir = temp_dir("headless-resume");
     let cwd = dir.join("project");
@@ -162,7 +157,7 @@ fn headless_resume_takes_newest_matching_without_listing() {
     write_session(&dir, "a.jsonl", "id-a", &cwd_text, 2, 1_000);
     let expected = write_session(&dir, "b.jsonl", "id-b", &cwd_text, 2, 2_000);
 
-    pir::session_manager::reset_session_list_file_reads();
+    reset_session_list_file_reads_in(&dir);
     let plan = resolve_session_plan(
         &SessionFlags {
             resume: true,
@@ -174,7 +169,7 @@ fn headless_resume_takes_newest_matching_without_listing() {
     )
     .expect("plan");
     assert_eq!(plan, SessionPlan::Open(expected));
-    assert_eq!(pir::session_manager::session_list_file_reads(), 0);
+    assert_eq!(session_list_file_reads_in(&dir), 0);
 }
 
 /// No matching session: `--continue` starts a new one (unchanged).

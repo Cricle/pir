@@ -130,17 +130,23 @@ struct HostFixture {
     _dir: TempDir,
 }
 
-/// Build the host the way the print host does, but with the DEFAULT plan a
-/// normal CLI run resolves: `order_extension_paths` with no CLI `-e` paths and
-/// no settings paths inserts every `default_enabled` builtin (context-mode
-/// among them).
+/// Build the host the way the print host does, with `builtin:context-mode`
+/// requested explicitly.
+///
+/// It used to rely on a bare `order_extension_paths(&[], &[], false)` because
+/// `context-mode` was default-on. The default plan is now deliberately small
+/// (`todo`, `subagent`, `mode` only: the twelve `ctx_*` tools were 48% of the
+/// `tools[]` schema and produced no calls in six measured runs), so the tool
+/// surface has to be asked for. Everything these tests assert about the
+/// registered tools is unchanged; only the way the plan names the builtin is.
 fn default_host() -> HostFixture {
-    let plan = pir::plugins::order_extension_paths(&[], &[], false);
+    let cli_paths = vec![PathBuf::from("builtin:context-mode")];
+    let plan = pir::plugins::order_extension_paths(&cli_paths, &[], false);
     assert!(
         plan.iter().any(|path| pir::plugins::builtin_name(
             &path.to_string_lossy()
         ) == Some("context-mode")),
-        "a default plan must carry `builtin:context-mode`: {plan:?}"
+        "an explicit `builtin:context-mode` must reach the plan: {plan:?}"
     );
     let dir = TempDir::new("host");
     // A builtin-only plan: the plan-only handle — no QuickJS actor, no

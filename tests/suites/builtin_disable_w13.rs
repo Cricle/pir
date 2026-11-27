@@ -82,10 +82,18 @@ fn load_manager(global: &Path, cwd: &Path, trusted: bool) -> SettingsManager {
     SettingsManager::load(global, &cwd.join(".pi"), cwd, trusted)
 }
 
-/// The default builtin plan a normal CLI run resolves: every
-/// `default_enabled` factory builtin, no CLI `-e` paths, no settings paths.
+/// The builtin plan these disable tests operate on: every `default_enabled`
+/// factory builtin plus an explicit `builtin:context-mode`, no settings paths.
+///
+/// The explicit entry used to be unnecessary because `context-mode` was
+/// default-on. The default plan is now `todo`, `subagent`, `mode` only, but
+/// every test here is about the DISABLE machinery (settings keys, `-builtin:`,
+/// project trust), not about which builtins happen to be default-on. Naming
+/// the builtin keeps each fixture's `has_builtin(&plan, "context-mode")`
+/// assumption true and keeps the assertions about disabling it meaningful.
 fn default_plan() -> Vec<PathBuf> {
-    pir::plugins::order_extension_paths(&[], &[], false)
+    let cli_paths = vec![PathBuf::from("builtin:context-mode")];
+    pir::plugins::order_extension_paths(&cli_paths, &[], false)
 }
 
 fn has_builtin(plan: &[PathBuf], name: &str) -> bool {
@@ -596,7 +604,13 @@ fn project_plus_builtin_reenables_a_user_disable_only_when_trusted() {
         trusted.disabled_builtin_extensions()
     );
     let disabled = trusted.disabled_builtins_with_flags(&pir::plugins::disabled_from_flags(false));
-    let filtered = pir::plugins::filter_disabled_builtins(&default_plan(), &disabled);
+    // The plan has to name `builtin:mcp` for the re-enable to have anything to
+    // put back: `mcp` is no longer default-on, so a bare default plan would
+    // pass this assertion for the wrong reason (absent by default, not
+    // re-enabled by the project scope).
+    let with_mcp = vec![PathBuf::from("builtin:mcp")];
+    let plan = pir::plugins::order_extension_paths(&with_mcp, &[], false);
+    let filtered = pir::plugins::filter_disabled_builtins(&plan, &disabled);
     assert!(
         has_builtin(&filtered, "mcp"),
         "the re-enabled builtin is back on the plan: {filtered:?}"

@@ -45,6 +45,14 @@ impl AgentTool for CtxExecuteTool {
         "Execute one registered callable tool through the normal scheduler. Use this for bounded, composable analysis; context-mode tools cannot invoke themselves."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Execute one registered tool through the normal scheduler so sandbox code can \
+compose analysis steps"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(json!({
             "type": "object",

@@ -251,7 +251,7 @@ async fn server_session_exposes_the_full_core_tool_set() {
             "{name} must be part of the server tool surface: {names:?}"
         );
     }
-    for name in ["background_status", "background_abort"] {
+    for name in ["bg_status", "bg_abort"] {
         assert!(
             names.iter().any(|candidate| candidate == name),
             "{name} must be part of the server tool surface: {names:?}"

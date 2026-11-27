@@ -31,7 +31,7 @@ Contract, not a measurement log. Current baselines: [`RESULTS.md`](../RESULTS.md
    deliberate silent swap (`--no-fallback`/`PIR_NATIVE_FALLBACK=0` disables it).
 3. A `#[cfg]` must never change the feature-ON path.
 4. `Cargo.toml` is single-writer: declare the feature/optional deps before gating code.
-5. `scripts/feature_matrix.sh` asserts **119 cargo invocations**: 87 root-package rows (59 lib + 18 bin + 2 SDK consumer + 8 smoke) plus 32 support-crate rows (16 extracted crates × no-default + all-features). Every selectable
+5. `scripts/feature_matrix.sh` asserts **125 cargo invocations**: 89 root-package rows (61 lib + 18 bin + 2 SDK consumer + 8 smoke) plus 36 support-crate rows (18 extracted crates × no-default + all-features). Every selectable
 feature except `default`/`full` has its own `cargo check --lib --no-default-features --features <f>` row.
 
 
@@ -70,7 +70,7 @@ provider) and every OAuth flow drives the shared auth HTTP client, so every feat
 | `tool-edit` | `edit`; the TUI edit preview also compiles the module under `tui` |
 | `tool-write` | `write` |
 | `tool-ls` | `ls` |
-| `tool-background` | `background_status` + `background_abort` |
+| `tool-background` | `bg_status` + `bg_abort` |
 | `tools` | meta-feature over the seven `tool-*` leaves above |
 | `grep-find` | in-process ripgrep `grep`/`find`; an **independent leaf** — does NOT imply `tools` or any `tool-*`, so a search-only embed compiles grep/find without read/bash/edit/write/ls/background; `tool-grep`/`tool-find` deferred |
 | `image-tools` | inline images in `read` (the `image` crate; no separate `image` tool) |
@@ -87,6 +87,8 @@ provider) and every OAuth flow drives the shared auth HTTP client, so every feat
 | `client` | remote client (`pir::client`, `pir client`) |
 | `session` | JSONL persistence, tail-page reader (pulls the optional `memmap2`), discovery |
 | `skills` | skill discovery/loading |
+| `jobs` | `pir jobs` (start/list/status/wait/log/reap/kill/clean) + the detached `__jobs-supervise` supervisor; implied by `cli` and `subagent`. The shared start-token probe the session lock needs is NOT gated (it lives in `pir_core::process_probe`) |
+| `checkpoint-cli` | the `pir checkpoint` argv surface only (list/restore/run); implied by `cli`. The checkpoint engine that `edit`/`write` snapshot through stays always-compiled, so undo behavior never forks |
 | `sdk` | `pir::sdk` facade |
 | `subagent` | native `subagent` builtin + `/subagents` activity overlay (`ctrl+shift+a`); the companion `mode` builtin adds user-triggered `/mode foreman` / `/mode plan` / `/mode normal`, durable foreman journal, `/approvals` (worker + plan approvals), plan submission/approval with execution handoff, optional git-worktree isolation, process-per-task router, and `pir foreman run/status/logs/abort/approve/deny/resume/clean` detached runs |
 | `tool-repair` | tool-repair pipeline |
@@ -114,43 +116,58 @@ Remaining deferred split: `tool-grep`/`tool-find` (both stay under `grep-find`);
 
 ## 3. Default-on policy
 
-Default-on: `subagent`, `mcp`, `codemode`, `context-mode`, `tool-search`, `tool-repair`, `todo`,
-`memory` (mcp drags extensions; codemode needs extensions; context-mode lazy; memory's store lives next to the
-session transcript). `phone` is **off** even in `full` — it opens an outbound
-connection to the central relay and needs a server URL/device token. `--only-builtin` loads exactly the Rust builtins (no settings/package scan, QuickJS, SWC or `node:*`);
+Default-on: `subagent`, `mode`, `todo`. Every other compiled builtin — `mcp`,
+`codemode`, `context-mode`, `tool-search`, `tool-repair`, `memory`, `phone` —
+is **off** by default and loads only when something names it: `-e
+builtin:<name>`, `settings.extensions` (`+builtin:<name>` re-enables one a lower
+scope disabled), or a `--tools` / `defaultTools` entry naming a tool that
+builtin registers.
+
+The reason is measured, not stylistic. The previous default-on set declared 25
+tools at **39,530 bytes** of `tools[]` schema per request against upstream's 4
+tools / 2,527 bytes, and 48% of that payload was the twelve `ctx_*` tools.
+Across six measured runs of a read-and-edit bug hunt, `ctx_*` was called
+**zero** times — the model used `read`/`bash`/`grep` instead. Paying ~15x the
+schema on every request to expose tools the model declines is what this default
+avoids. `phone` was already off for its own reason (it opens an outbound
+connection to the central relay and needs a server URL/device token).
+
+A `--tools codemode` selection brings `builtin:codemode` onto the plan
+automatically (`tool_selection::builtin_paths_for_selected_tools`), so naming a
+default-off tool still works without an extra `-e`. `--only-builtin` loads
+exactly the Rust builtins (no settings/package scan, QuickJS, SWC or `node:*`);
 `--no-extensions` wins if both are given.
 
-### 3.1 Default tool loadout (documented superset)
+### 3.1 Default tool loadout
 
-**`balanced` (the default) declares a deliberate SUPERSET of upstream pi's
+**`balanced` (the default) declares a small superset of upstream pi's
 `DEFAULT_TOOL_NAMES`.** With no `--tools` / `settings.defaultTools`, a full
-build declares **24 tools**: the registration-active core nine plus the 15
+build declares **12 tools**: the registration-active core nine plus three
 default-active builtin-extension tools.
 
-Core nine: `background_abort`, `background_status`, `bash`, `edit`, `find`,
+Core nine: `bg_abort`, `bg_status`, `bash`, `edit`, `find`,
 `grep`, `ls`, `read`, `write` (`powershell` stays registered-but-inactive,
-exactly like upstream). Builtin fifteen: `ctx_batch`, `ctx_batch_execute`,
-`ctx_doctor`, `ctx_execute`, `ctx_execute_file`, `ctx_execute_tool`,
-`ctx_fetch_and_index`, `ctx_index`, `ctx_purge`, `ctx_resume`, `ctx_search`,
-`ctx_stats`, `todo`, `memory`, `subagent` — all default-active under the
-builtin-extension policy (§3).
-`--no-extensions` leaves the core nine; `codemode`, `tool_search`, `powershell`
-and MCP bridges stay registered-but-not-declared unless selected. Upstream pi
-declares four (`read`, `bash`, `edit`, `write`).
+exactly like upstream). Builtin three: `todo`, `subagent`, `submit_plan` —
+the default-on set (§3). `--no-extensions` leaves the core nine; `codemode`,
+`tool_search`, `powershell`, MCP bridges and the twelve `ctx_*` tools stay
+registered-but-not-declared unless selected or their builtin is enabled.
+Upstream pi declares four (`read`, `bash`, `edit`, `write`), and this build
+lists those same four FIRST (`DEFAULT_TOOL_NAMES` order), then the rest
+alphabetically.
 
-This is a product decision, not drift: the extra core five are pir's own
-capabilities — the in-process ripgrep `grep`/`find` pair, `ls`, and the
-scheduler-owned `background_status`/`background_abort` controls (see
-`docs/tui.md` and `MAPPING.md` for the background/detach surface) — and the 15
-builtins are the default-on extension layer. The measured cost of the full
-24-tool declaration is **~+33 KB of `tools[]` JSON on the first request
-(~+8.3k tokens at 4 chars/token), ~28 KB of it the builtins**, against pi's
-4-tool 2,969 B. (An earlier `~+30.7 KB / ~+7.7k tokens` figure is the 22-tool
-measurement taken before `ctx_batch`/`ctx_resume`/`ctx_execute_tool` were added;
-the builtin layer accounts for the difference.) This is the decided deliberate
-deviation, recorded 2026-11-14.
+The extra core five are pir's own capabilities — the in-process ripgrep
+`grep`/`find` pair, `ls`, and the scheduler-owned `bg_status`/`bg_abort`
+controls (see `docs/tui.md` and `MAPPING.md` for the background/detach
+surface). The 24-tool default that preceded this change measured ~33 KB of
+`tools[]` JSON per request against upstream's 4-tool 2,527 B; this 12-tool set
+is smaller by the whole default-off builtin layer (~19 KB of `ctx_*` schema
+alone), and the exact byte count is not re-recorded here — measure it with a
+request capture rather than trusting a stale figure.
 
-Two ways to shrink it, both first-class:
+> The `python` builtin was removed after that measurement (see §5). The
+> `~33 KB` figure is kept as the recorded historical baseline, not re-measured.
+
+Two ways to reach the upstream four, both first-class:
 
 - `--tools read,bash,edit,write` (or `settings.defaultTools`) — an explicit
   selection, identical to upstream's set;
@@ -233,6 +250,7 @@ import. Idle WS 6,208–8,356 KiB (6.1–8.2 MiB), warm start 30–43 ms across 
 | `skills` | discovery empty + one diagnostic; prompt renders |
 | `sdk` | `pir::sdk` absent (no stub); enable `sdk` |
 | `subagent`/`tool-repair`/`tool-search`/`todo`/`memory` | `builtin:<name>` reports “not compiled … feature off” |
+| `python` | **removed entirely** (no feature, no builtin, no `pir python` subcommand). `builtin:python` reports unknown-builtin; `pir python …` is not a known subcommand. The old name only ever ran JavaScript on QuickJS, so nothing executable was lost |
 | `phone` | builtin absent; default-off even in `full` |
 | `provider-*` | model listed; streaming returns the adapter-missing error. `openai-completions` is the exception: the plain chat adapter is core and always usable |
 | `cli` | no `pir` CLI binary (the `[[bin]]` target requires it); the library keeps the shared helpers, and the separate `pir-minimal` binary still builds with zero features |
@@ -244,7 +262,7 @@ import. Idle WS 6,208–8,356 KiB (6.1–8.2 MiB), warm start 30–43 ms across 
 | `tool-edit` | edit tool absent; with `tui` on the preview engine still compiles; explicit `--tools edit` names `tool-edit` |
 | `tool-write` | `write` absent; explicit `--tools write` names `tool-write` |
 | `tool-ls` | `ls` absent; explicit `--tools ls` names `tool-ls` |
-| `tool-background` | `background_status`/`background_abort` absent; explicit names report `tool-background` |
+| `tool-background` | `bg_status`/`bg_abort` absent; explicit names report `tool-background` |
 | `tools` | all seven leaves and `grep-find` absent ⇒ `CORE_TOOL_NAMES` empty; explicit core names report their leaf feature (`grep`/`find` → `grep-find`); unknown names silent |
 | `grep-find` | `grep`/`find` absent; system-grep fallback unless `--no-fallback`; explicit `--tools grep` names `grep-find` |
 | `image-tools` / `image-protocol` | `read` reports the image type/size but does not attach it / no halfblocks renderer; `/image` and `terminal.showImages: true` render the `[Image: …]` text fallback |
@@ -268,7 +286,7 @@ a user must never lose visible information silently (PROTOCOL v8 §5).
 ## 6. Verification
 
 ```bash
-bash scripts/feature_matrix.sh            # 119 invocations (87 root + 32 support-crate)
+bash scripts/feature_matrix.sh            # 125 invocations (89 root + 36 support-crate)
 cargo check --lib --no-default-features --features tool-read   # each feature alone
 cargo check --lib --no-default-features --features grep-find   # independent search leaf
 cargo check --bin pir-minimal --no-default-features            # zero-feature agent

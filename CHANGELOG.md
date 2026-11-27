@@ -6,6 +6,26 @@ Post-0.3.2 backlog closure: every verified `reproduced` item in the local issue
 board was fixed against upstream pi, the upstream tree was audited through
 v1.5.2, and the generated test harnesses were rebuilt.
 
+### `python` surface removed
+
+The `python` name outlived two interpreter migrations (embedded RustPython,
+then QuickJS behind the same name) and no longer carried a Python interpreter
+in any build, so the whole surface is gone rather than kept as a compatibility
+alias:
+
+- `pir python` (the CLI subcommand) and `native_cli::python` are deleted; the
+  native command surface is now `pir grep` / `pir sed` only.
+- The `python` builtin is deleted: `plugins/builtin/python.rs`, the shared
+  `plugins/builtin/js_vm.rs` session engine it was the only user of, its
+  `BuiltinExtensionDef` row, and its `pir-builtins::KNOWN_BUILTINS` row.
+  `builtin:python` now reports unknown-builtin.
+- The `python` cargo feature is deleted from `pir-core` and the `pir-sdk`
+  facade (`pir-core`'s `python = ["extensions"]` alias and the facade's
+  `python = ["pir-core/python"]` forward are both gone).
+- Unrelated python-adjacent code stays: `tool-repair`'s Llama `<|python_tag|>`
+  protocol parser, and the `python -m …` / `python3` mentions in bash-tool
+  docs.
+
 ### QuickJS AOT host (merged from `master`)
 
 - The embedded JS engine now boots from ahead-of-time QuickJS bytecode instead
@@ -20,11 +40,13 @@ v1.5.2, and the generated test harnesses were rebuilt.
   dependency blocks `cargo package`, so the source now lives in the package as
   a private module behind `extensions`. Its 20 modules, the `fs`/`http`/child
   process/worker host ops and the allocator moved with it.
-- RustPython is gone for good: `context-mode` and the `python` builtin both run
-  on the shared embedded QuickJS runtime (`plugins/builtin/js_vm.rs`), so the
-  sandbox, the extension host and `pir js` share one engine, one module loader
-  and one Node compatibility suite. The `python` tool name is kept for
-  Settings/tool-selection compatibility; only the interpreter changed.
+- RustPython was gone for good at that point: `context-mode` and the (then
+  still present) `python` builtin both ran on the shared embedded QuickJS
+  runtime (`plugins/builtin/js_vm.rs`), so the sandbox, the extension host and
+  `pir js` shared one engine, one module loader and one Node compatibility
+  suite. The `python` tool name was kept for Settings/tool-selection
+  compatibility; only the interpreter changed. Both the name and `js_vm.rs`
+  were removed afterwards — see "`python` surface removed" above.
 - Corrections made while landing the merge:
   - `__pir_host.exitProcess` is registered only when
     `ExtensionConfig::allow_process_exit` is set. It used to be unconditional,
@@ -44,10 +66,11 @@ v1.5.2, and the generated test harnesses were rebuilt.
     matches Linux CI.
   - The shim-deflate gate paths follow the crate layout
     (`crates/pir-core/src/extensions/api/js`, `crates/pir-core/assets/shims`).
-  - `pir-builtins::KNOWN_BUILTINS` gained the `python` row (and the engine
-    factory table is pinned against it); `pir-builtins` projects every row it
-    owns a factory for and documents that `python`'s factory stays in
-    `pir-core`, which is the only crate that can see the agent traits.
+  - `pir-builtins::KNOWN_BUILTINS` gained a `python` row at that time (and the
+    engine factory table was pinned against it); `pir-builtins` projected every
+    row it owned a factory for and documented that `python`'s factory stayed in
+    `pir-core`, the only crate that can see the agent traits. The row was
+    removed with the rest of the surface — see "`python` surface removed".
   - Native-first plugin precedence is the default (opt out with
     `PIR_PREFER_NATIVE=0`); the `tool-repair` and `phone` single-face rules
     apply regardless.
@@ -114,9 +137,10 @@ v1.5.2, and the generated test harnesses were rebuilt.
   root (facade, engine, TUI, phone server, native shell, and the twelve
   plugin/builtin crates).
 
-- Embedded RustPython and the `pir python` surface were removed; context-mode
-  continues through the QuickJS/code-mode path. The feature matrix and docs now
-  reflect the removal.
+- Embedded RustPython was removed at that point; context-mode continues through
+  the QuickJS/code-mode path. The feature matrix and docs reflected that
+  removal. The `pir python` name itself survived on QuickJS until it was
+  deleted outright — see "`python` surface removed" above.
 
 - Added the opt-in `pir-native-shell` workspace crate. Its headless
   `GuiState`/`NativeShellBridge` reducer consumes `pir_core::sdk::SdkEvent` and

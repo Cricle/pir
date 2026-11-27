@@ -220,8 +220,8 @@ const ALL_TOOLS: &[&str] = &[
     "ls",
     "tool_search",
     "todo",
-    "background_status",
-    "background_abort",
+    "bg_status",
+    "bg_abort",
     "bash",
     "edit",
     "write",
@@ -569,8 +569,8 @@ async fn foreman_hides_non_allowlisted_tool_declarations() {
         "ls",
         "tool_search",
         "todo",
-        "background_status",
-        "background_abort",
+        "bg_status",
+        "bg_abort",
     ] {
         assert!(
             !hidden.iter().any(|name| name == tool),
@@ -1527,8 +1527,8 @@ async fn foreman_blocks_direct_mutation_and_allows_read_only_and_subagent() {
         "ls",
         "tool_search",
         "todo",
-        "background_status",
-        "background_abort",
+        "bg_status",
+        "bg_abort",
     ] {
         let result = emit_tool(&host, tool).await;
         assert_ne!(

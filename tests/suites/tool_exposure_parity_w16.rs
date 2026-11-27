@@ -640,7 +640,7 @@ fn the_registration_active_core_set_excludes_default_inactive_tools() {
             "{expected} activates on registration: {registration_active:?}"
         );
     }
-    for expected in ["background_status", "background_abort"] {
+    for expected in ["bg_status", "bg_abort"] {
         assert!(
             registration_active.iter().any(|name| name == expected),
             "{expected} is a default-active core tool: {registration_active:?}"

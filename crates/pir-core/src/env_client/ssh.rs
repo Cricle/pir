@@ -577,7 +577,17 @@ where
             .filter(|line| !line.is_empty())
             .map(str::to_string)
             .collect(),
-        Err(_) => Vec::new(),
+        // A missing file is the normal first-use case. Any OTHER failure
+        // (permission denied, a sharing violation, invalid UTF-8) must abort
+        // the whole change instead of being read as "the file is empty":
+        // `change` is handed the existing lines to detect a CHANGED host key,
+        // and the temp-file rename below replaces the file wholesale. Mapping
+        // an unreadable file to `Vec::new()` would both skip the
+        // host-key-changed rejection (a wrong key is appended instead of
+        // refused) and publish a known_hosts containing only the new line,
+        // destroying every other trusted key in it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(SshFailure::other(format!("cannot read {}: {error}", file))),
     };
     let lines = change(existing)?;
     let temporary = format!("{file}.{}.tmp", hex(&uuid::Uuid::new_v4().into_bytes()));
@@ -598,12 +608,16 @@ where
             .await
             .map_err(|error| SshFailure::other(error.to_string()))?;
         drop(handle);
-        // The file holds the application's trusted host keys: owner-only.
+        // The file holds the application's trusted host keys (the trust
+        // anchor for every later ssh connection), so owner-only is part of
+        // the contract: a failed chmod must abort rather than publish a
+        // group/world-readable known_hosts.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-                .await;
+            tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|error| SshFailure::other(error.to_string()))?;
         }
         Ok::<(), SshFailure>(())
     }

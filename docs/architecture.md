@@ -207,6 +207,29 @@ The gates that used to walk `src/` know the new roots:
 - Compiled-in assets stay with the engine at `crates/pir-core/assets/`; the
   engine's `include_bytes!`/`include_str!` paths are package-local.
 
+## File size: existing debt and a rule for new work
+
+Thirty source files are over 3,000 lines (measured on this tree; `wc -l` over
+`crates/*/src` and `src`). The largest are `pir-tui/src/terminal.rs` (32.7k),
+`pir-core/src/session_manager/mod.rs` (7.5k), `pir-core/src/coding_agent/print.rs`
+(7.2k), `pir-tui/src/messages.rs` (5.7k), `pir-core/src/plugins/builtin/mcp.rs`
+(5.7k), `pir-core/src/agent/agent_loop.rs` (5.5k), `pir-tui/src/core.rs` (5.5k)
+and `pir-tui/src/altscreen_search.rs` (5.2k).
+
+`terminal.rs` is the extreme case: it carries the external overlay, the overlay
+widgets, the scoped-model selector and the session pick *and* unrelated concerns
+in one file (`grep '^pub struct'` finds `ExternalOverlay`, `ExternalOverlaySlot`,
+`ScopedModelsSelector`, `Overlay`, …).
+
+**The rule for new work: do not add to these files.** Put new code in a new
+module and keep the large file down to the moved-out call sites. A few lines
+that keep an existing `impl` coherent are the narrow exception.
+
+**Splitting them is deliberately not scheduled here.** It is a large mechanical
+change and would swamp any review that lands alongside it. If it is done, start
+with `terminal.rs` alone: move the overlay types into `overlay.rs` (~2,000 lines
+that are independently testable) and land nothing else in the same change.
+
 ## Verifying the split
 
 ```sh

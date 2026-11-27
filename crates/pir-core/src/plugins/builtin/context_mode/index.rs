@@ -2704,6 +2704,14 @@ Returns indexing metadata (file/chunk/source counts) and the ctx_search result s
 Use this for docs, specs, READMEs and API references you will query across turns. For one-off analysis of logs or command output, use ctx_execute or ctx_execute_file instead so the bytes are not persisted."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Index a file, directory or URL into the local searchable knowledge base instead \
+of reading it into context; retrieve sections later with ctx_search"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",
@@ -2919,6 +2927,14 @@ The knowledge base must already contain content — index it first with ctx_inde
 Use 2-4 specific technical terms per query and batch related questions here instead of re-reading raw sources; unlike ctx_execute, this searches content stored in previous calls."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Search the indexed knowledge base with several queries in one call and get \
+BM25-ranked sections with line hints"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",
@@ -3118,6 +3134,14 @@ impl AgentTool for CtxStatsTool {
         "Report this process's context-mode counters and the knowledge-base state: executions (ctx_execute, ctx_execute_file, and each ctx_batch_execute/ctx_batch command), bytes read in, bytes returned to context, auto-indexed outputs, journal usage for this session and for the whole project/all-time, chunk/source counts, the SQLite database path and its size. Read-only diagnostics; use it to see what is stored before purging or to check how much context the sandbox has saved."
     }
 
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Report context-mode counters and knowledge-base state: bytes kept out of context, \
+chunk/source counts, database size"
+                .to_owned(),
+        )
+    }
+
     fn parameters(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "type": "object",
@@ -3215,6 +3239,14 @@ impl AgentTool for CtxPurgeTool {
 
     fn description(&self) -> &'static str {
         "DESTRUCTIVE: permanently delete indexed data. Requires confirm: true; false or absent returns 'purge cancelled' and changes nothing. Scopes (supply at most one): `source` deletes that source's chunks and fetch cache; `session` deletes that session's journal rows (so ctx_resume no longer sees it); `project: true` wipes the whole project knowledge base (chunks, sources, fetch cache and journal). With no scope the whole knowledge base's chunks are removed. Returns the number of rows removed. Use only when the user explicitly asks to clear or reset the index; run ctx_stats first to preview what exists."
+    }
+
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Permanently delete indexed data (a source, this session's journal, or the whole \
+project base); destructive, needs confirm: true"
+                .to_owned(),
+        )
     }
 
     fn parameters(&self) -> Option<serde_json::Value> {
@@ -3366,6 +3398,14 @@ impl AgentTool for CtxDoctorTool {
 
     fn description(&self) -> &'static str {
         "Report local context-mode diagnostics without touching any service: platform, embedded JavaScript sandbox status (and worker spawn count), the knowledge-base database path/size/WAL size, FTS5 availability and schema version, chunk/source counts, and the hook settings (routing/auto-index on/off plus thresholds) with routing/index counters and the last hook error. Read-only: it never starts the JS worker and never creates the database; an absent knowledge base reads as zero chunks with exists=false. Use it instead of the upstream npm/cloud-only ctx_upgrade/ctx_insight tools to verify the local install and schema."
+    }
+
+    fn prompt_snippet(&self) -> Option<String> {
+        Some(
+            "Report local context-mode diagnostics: sandbox status, FTS5/schema version, \
+database size, hook settings and last error"
+                .to_owned(),
+        )
     }
 
     fn parameters(&self) -> Option<serde_json::Value> {

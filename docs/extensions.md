@@ -209,7 +209,7 @@ pir --only-builtin --no-extensions # --no-extensions wins (no builtins, no JS)
 - **No JS runtime**: only `builtin:<name>` pseudo-paths, so a plan-only `ExtensionHandle` (`has_js_runtime() ==
   false`) — no QuickJS actor, prelude, SWC transpile, `node:*` shims or npm/config scan.
 - **Native surface intact**: every builtin's tools/commands/hooks register through the unified plugin host
-  (`subagent`, `mcp`, `codemode`, `python`, `context-mode`, `tool_search`, `tool-repair`, `todo`, `memory`, plus
+  (`subagent`, `mcp`, `codemode`, `context-mode`, `tool_search`, `tool-repair`, `todo`, `memory`, plus
   `phone` when named).
 - **Precedence and hosts**: `--no-extensions` wins (unchanged: only explicit `-e` paths, no builtins injected); the
   flag is global and resolved once for TUI, RPC, print and `--mode json`, while `server`/`client` load no extension
