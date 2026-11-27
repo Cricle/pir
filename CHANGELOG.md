@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3 (2026-11-27)
 
 Post-0.3.2 backlog closure: every verified `reproduced` item in the local issue
 board was fixed against upstream pi, the upstream tree was audited through

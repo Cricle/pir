@@ -20,7 +20,7 @@ name = "pir_tui"
 # `pir-core`. Adding another front end (web, GUI, remote) means another crate
 # that depends on `pir-core` the same way — core never depends on a UI.
 [dependencies]
-pir-core = { path = "../pir-core", version = "0.3.2", default-features = false, features = [
+pir-core = { path = "../pir-core", version = "0.3.3", default-features = false, features = [
     # The TUI always renders `/export` and reuses the compaction settings
     # helpers print mode owns, plus the engine-side pieces of the live edit
     # preview and image protocol.

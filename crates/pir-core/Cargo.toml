@@ -25,42 +25,42 @@ path = "src/lib.rs"
 # front ends) depend on this crate; the `pir-sdk` facade re-exports it.
 [dependencies]
 anyhow = "1"
-pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.3" }
 # Provider-neutral AI value types, the AI error, the transport seam and the
 # event stream. Re-exported at the historical `crate::ai::{types,error,
 # transport,util,event_stream}` paths so no call site changes.
-pir-ai-types = { path = "../pir-ai-types", version = "0.3.2" }
+pir-ai-types = { path = "../pir-ai-types", version = "0.3.3" }
 # Durable conversation/task/document runtime. Optional: re-exported at the
 # historical `crate::durable` path by the `durable` feature (default-on via
 # `full`), so a slim embed skips its 56k lines.
-pir-durable = { path = "../pir-durable", version = "0.3.2", optional = true }
+pir-durable = { path = "../pir-durable", version = "0.3.3", optional = true }
 # Vendor-neutral span/metric/propagation/trace-store core. Pure std +
 # serde_json; no engine types. `pir-core` re-exports it at the historical
 # `crate::telemetry` path, so every internal `crate::telemetry::…` use keeps
 # resolving and the public `pir::telemetry` surface is unchanged.
-pir-telemetry = { path = "../pir-telemetry", version = "0.3.2" }
+pir-telemetry = { path = "../pir-telemetry", version = "0.3.3" }
 # Provider-agnostic wire protocol (strict CBOR, framing, schema validation).
 # Pure serde/ciborium; no engine types. Re-exported at the historical
 # `crate::protocol` path so no call site changes.
-pir-protocol = { path = "../pir-protocol", version = "0.3.2" }
+pir-protocol = { path = "../pir-protocol", version = "0.3.3" }
 # Builtin implementation crates. The pure logic lives there; `pir-core` keeps
 # the runtime halves (QuickJS, SQLite, rmcp transports, AgentSession) and the
 # host. Each edge is optional and bound to the feature with the same name, so
 # `--no-default-features` builds none of them.
-pir-builtin-subagent = { path = "../pir-builtin-subagent", version = "0.3.2", optional = true }
-pir-builtin-mode = { path = "../pir-builtin-mode", version = "0.3.2", optional = true }
-pir-builtin-mcp = { path = "../pir-builtin-mcp", version = "0.3.2", optional = true }
-pir-builtin-codemode = { path = "../pir-builtin-codemode", version = "0.3.2", optional = true }
-pir-builtin-context-mode = { path = "../pir-builtin-context-mode", version = "0.3.2", optional = true }
-pir-builtin-tool-search = { path = "../pir-builtin-tool-search", version = "0.3.2", optional = true }
-pir-builtin-tool-repair = { path = "../pir-builtin-tool-repair", version = "0.3.2", optional = true }
-pir-builtin-todo = { path = "../pir-builtin-todo", version = "0.3.2", optional = true }
-pir-builtin-memory = { path = "../pir-builtin-memory", version = "0.3.2", optional = true }
-pir-builtin-phone = { path = "../pir-builtin-phone", version = "0.3.2", optional = true }
+pir-builtin-subagent = { path = "../pir-builtin-subagent", version = "0.3.3", optional = true }
+pir-builtin-mode = { path = "../pir-builtin-mode", version = "0.3.3", optional = true }
+pir-builtin-mcp = { path = "../pir-builtin-mcp", version = "0.3.3", optional = true }
+pir-builtin-codemode = { path = "../pir-builtin-codemode", version = "0.3.3", optional = true }
+pir-builtin-context-mode = { path = "../pir-builtin-context-mode", version = "0.3.3", optional = true }
+pir-builtin-tool-search = { path = "../pir-builtin-tool-search", version = "0.3.3", optional = true }
+pir-builtin-tool-repair = { path = "../pir-builtin-tool-repair", version = "0.3.3", optional = true }
+pir-builtin-todo = { path = "../pir-builtin-todo", version = "0.3.3", optional = true }
+pir-builtin-memory = { path = "../pir-builtin-memory", version = "0.3.3", optional = true }
+pir-builtin-phone = { path = "../pir-builtin-phone", version = "0.3.3", optional = true }
 # The aggregate builtin catalog. `default-features = false` is load-bearing:
 # the catalog this crate installs must be exactly the set of builtins this
 # build compiled in, which is driven by the feature forwards below.
-pir-builtins = { path = "../pir-builtins", version = "0.3.2", default-features = false }
+pir-builtins = { path = "../pir-builtins", version = "0.3.3", default-features = false }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-std", "io-util", "sync", "time", "fs", "process", "signal"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }

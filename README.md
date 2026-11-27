@@ -6,7 +6,7 @@ dependency.
 
 ## Status
 
-0.3.2 (2026-11-15). End-to-end functional: agent loop, providers, sessions,
+0.3.3 (2026-11-27). End-to-end functional: agent loop, providers, sessions,
 extensions, TUI, RPC, server/client, SDK, builtins. Final result:
 [`RESULTS.md`](RESULTS.md); per-module truth: [MAPPING.md](MAPPING.md); feature
 contract: [`docs/FEATURES.md`](docs/FEATURES.md). Settled scope: chord delta
@@ -67,7 +67,7 @@ instead of carrying duplicates while embedders still see the same historical
 
 ```toml
 # Package name `pir-sdk`; the library is still imported as `pir`.
-pir-sdk = { version = "0.3.2", default-features = false, features = ["sdk"] }
+pir-sdk = { version = "0.3.3", default-features = false, features = ["sdk"] }
 ```
 
 Every optional surface is a cargo feature; `full` is the default, and the

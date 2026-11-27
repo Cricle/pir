@@ -40,7 +40,7 @@ desktop = ["headless", "dep:nsh-engine", "dep:nsh-platform-gpui", "dep:nsh-base"
 
 [dependencies]
 anyhow = "1"
-pir-core = { path = "../pir-core", version = "0.3.2", default-features = false, features = ["sdk"] }
+pir-core = { path = "../pir-core", version = "0.3.3", default-features = false, features = ["sdk"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }

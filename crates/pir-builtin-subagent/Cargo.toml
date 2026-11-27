@@ -14,7 +14,7 @@ include = ["/Cargo.toml", "/README.md", "/src/**", "/tests/**"]
 unsafe_code = "deny"
 
 [dependencies]
-pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.2" }
+pir-plugin-api = { path = "../pir-plugin-api", version = "0.3.3" }
 # Messages are handled as `serde_json::Value` rows and frontmatter is parsed
 # with `serde_yaml`; the crate itself defines no serde-derived type, so plain
 # `serde` is deliberately absent (a declared-but-unused dependency).

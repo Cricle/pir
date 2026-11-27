@@ -26,8 +26,8 @@ futures-util = "0.3"
 # the on-disk session record types + summary constants the pi-format bridge
 # reads, and the in-flight tool-argument mirror. All of these live here (not in
 # `pir-core`) so this crate has no dependency on the engine.
-pir-ai-types = { path = "../pir-ai-types", version = "0.3.2" }
-pir-telemetry = { path = "../pir-telemetry", version = "0.3.2" }
+pir-ai-types = { path = "../pir-ai-types", version = "0.3.3" }
+pir-telemetry = { path = "../pir-telemetry", version = "0.3.3" }
 rusqlite = { version = "0.31", features = ["bundled", "hooks"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
