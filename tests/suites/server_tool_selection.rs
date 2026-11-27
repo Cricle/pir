@@ -368,12 +368,26 @@ async fn server_prompt_declares_the_default_core_tool_set() {
             .map(|tool| tool.name.clone())
             .collect()
     };
+    // The declared order follows the same rule as
+    // `active_names_after(None)`: the core four (`DEFAULT_TOOL_NAMES`) first
+    // in their declared order, everything else alphabetical. Building the
+    // expectation by re-sorting `CORE_TOOL_NAMES` — whose declaration order
+    // is `read, bash, powershell, edit, write, grep, find, ls, bg_status,
+    // bg_abort` — would silently encode that order instead.
+    let core = pir::config::settings::DEFAULT_TOOL_NAMES;
     let mut expected: Vec<String> = CORE_TOOL_NAMES
         .iter()
         .filter(|name| **name != "powershell")
         .map(|name| (*name).to_owned())
         .collect();
-    expected.sort_unstable();
+    expected.sort_by_key(|name| {
+        (
+            core.iter()
+                .position(|core| core == name)
+                .unwrap_or(core.len()),
+            name.clone(),
+        )
+    });
     assert_eq!(
         names, expected,
         "the prompt must declare the default-active core set"

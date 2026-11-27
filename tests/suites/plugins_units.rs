@@ -258,23 +258,18 @@ fn cli_paths_come_first_then_project_then_global() {
     // Default-enabled factory builtins are appended AFTER the discovered file
     // paths (upstream package-manager.ts:986-1001): `builtin:subagent` dedups
     // into its CLI position, the default paths follow, then the remaining
-    // builtins in factory order; `phone` is compiled but default-disabled, so
-    // it is not inserted.
-
-    assert_eq!(ordered.len(), 12);
+    // DEFAULT-ON builtins in factory order. The default plan is deliberately
+    // `subagent`, `mode`, `todo` — every other builtin (`mcp`, `codemode`,
+    // `context-mode`, `tool-search`, `tool-repair`, `memory`, `phone`) is
+    // named-on-demand and therefore absent here.
+    assert_eq!(ordered.len(), 6);
     assert_eq!(ordered[0], PathBuf::from("cli.ts"));
     assert_eq!(ordered[1], builtin("subagent"));
     assert_eq!(ordered[2], PathBuf::from("D:/proj/.pi/extensions"));
     assert_eq!(ordered[3], PathBuf::from("C:/u/.pi/agent/extensions"));
 
     assert_eq!(ordered[4], builtin("mode"));
-    assert_eq!(ordered[5], builtin("mcp"));
-    assert_eq!(ordered[6], builtin("codemode"));
-    assert_eq!(ordered[7], builtin("context-mode"));
-    assert_eq!(ordered[8], builtin("tool-search"));
-    assert_eq!(ordered[9], builtin("tool-repair"));
-    assert_eq!(ordered[10], builtin("todo"));
-    assert_eq!(ordered[11], builtin("memory"));
+    assert_eq!(ordered[5], builtin("todo"));
 
     let cli_only = order_extension_paths(&cli, &defaults, true);
     assert_eq!(cli_only, cli);
